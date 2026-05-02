@@ -230,7 +230,7 @@ TOOL_USE_POLICY = """\
 
 
 CONSTRAINTS = """\
-## Section 7: 约束规则
+## 约束规则
 
 ### 数据引用
 

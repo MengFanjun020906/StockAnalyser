@@ -26,7 +26,7 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "你是 StockAnalyser Agent",
         "## 分析维度与能力域",
         "## Planning -> Execute 协议",
-        "## Section 7: 约束规则",
+        "## 约束规则",
         "## 账户感知规则",
         "## 重大事件触发规则",
         "## 持仓报告输出规范（position_review）",
@@ -53,7 +53,7 @@ def test_prompt_extra_instructions_are_appended_without_dropping_contract():
 
     assert "## 额外指令" in prompt
     assert "只分析用户指定股票。" in prompt
-    assert "## Section 7: 约束规则" in prompt
+    assert "## 约束规则" in prompt
     assert "## 持仓报告输出规范（position_review）" in prompt
 
 
