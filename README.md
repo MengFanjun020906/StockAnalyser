@@ -1,54 +1,79 @@
 <div align="center">
 
-# 📈 股票智能分析系统
+# 📈 StockAnalyser 股票智能分析系统
 
-[![GitHub stars](https://img.shields.io/github/stars/ZhuLinsen/daily_stock_analysis?style=social)](https://github.com/ZhuLinsen/daily_stock_analysis/stargazers)
-[![CI](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml)
+[![Repository](https://img.shields.io/badge/repo-MengFanjun020906%2FStockAnalyser-2088FF?logo=github)](https://github.com/MengFanjun020906/StockAnalyser)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/zhulinsen/daily_stock_analysis)
+[![Private Fork](https://img.shields.io/badge/private%20fork-account--aware%20analysis-6f42c1)](https://github.com/MengFanjun020906/StockAnalyser)
 
-<p>
-  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="ZhuLinsen%2Fdaily_stock_analysis | Trendshift" width="250" height="55"/></a>
-  <a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" width="250" height="54" /></a>
-</p>
+> 🤖 面向个人账户和持仓决策的 A股/港股/美股智能分析系统。目标不是每日固定输出报告，而是在用户主动询问或出现重大事件时，结合持仓、成本、账户类型和风险偏好，给出更贴近个人账户的分析和行动建议。
 
-> 🤖 基于 AI 大模型的 A股/港股/美股自选股智能分析系统，每日自动分析并推送「决策仪表盘」到企业微信/飞书/Telegram/Discord/Slack/邮箱
+[**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**目标输出**](#-目标输出) · [**分析原理**](docs/analysis-principles.md) · [**Agent 改造计划**](docs/agent-user-context-plan.md) · [**完整指南**](docs/full-guide.md) · [**常见问题**](docs/FAQ.md) · [**更新日志**](docs/CHANGELOG.md)
 
-[**功能特性**](#-功能特性) · [**快速开始**](#-快速开始) · [**推送效果**](#-推送效果) · [**完整指南**](docs/full-guide.md) · [**常见问题**](docs/FAQ.md) · [**更新日志**](docs/CHANGELOG.md)
-
-简体中文 | [English](docs/README_EN.md) | [繁體中文](docs/README_CHT.md)
 
 </div>
 
-## 💖 赞助商 (Sponsors)
-<div align="center">
-  <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="./sources/serpapi_banner_zh.png" alt="轻松抓取搜索引擎上的实时金融新闻数据 - SerpApi" height="160">
-  </a>
-</div>
-<br>
+## 🧭 当前状态与路线图
 
+### 当前已经具备
+
+- **多市场分析**：支持 A股、港股、美股、美股指数和常见 ETF。
+- **多维度数据链路**：覆盖技术面、实时行情、筹码、新闻舆情、公告、资金流、板块和基本面聚合。
+- **确定性技术信号**：基于均线、乖离率、量能、支撑压力、MACD、RSI 生成 `signal_score` 和技术买卖信号。
+- **LLM/Agent 综合分析**：将结构化数据转成趋势判断、账户影响、操作建议、买卖点位、止损、仓位和风险清单。
+- **Agent 问股**：支持工具调用、策略技能和多 Agent 编排，可调用行情、K线、技术分析、新闻搜索、持仓快照等工具。
+- **持仓管理底座**：已有账户、交易、现金流水、公司行动、FIFO/AVG 成本法、持仓快照、风险摘要和 CSV 导入能力。
+- **账户感知第一阶段**：已新增 `AgentUserContext` 契约，定义投资者画像、账户上下文、持仓上下文和报告意图，但尚未接入运行时。
+- **文档沉淀**：已补充 [分析原理](docs/analysis-principles.md) 和 [Agent 用户上下文改造计划](docs/agent-user-context-plan.md)。
+
+### 近期计划
+
+1. **Planning -> Execute Agent 外壳**
+   新增 Planner，先识别任务意图和所需能力域，再通过 capability -> tools 映射展开为实际工具调用，最后交给决策 Agent 生成报告。初期作为实验模式，不直接替换现有 Agent。
+
+2. **账户/持仓上下文接入**
+   复用现有 `PortfolioService` 和 `get_portfolio_snapshot`，把账户类型、融资融券状态、持仓数量、成本、仓位、浮盈亏等转成 `AgentUserContext` 注入 Agent。
+
+3. **持仓诊断报告 `position_review`**
+   对已经持仓的股票输出继续持有、加仓、减仓、止盈、止损、仓位调整和风险触发条件。
+
+4. **选股入场报告 `entry_analysis`**
+   对未持仓或候选股票输出是否值得进入候选池、理想入场点、次优入场点、首仓比例、止损位和淘汰条件。
+
+5. **Web 配置入口**
+   在 Web 端补充投资者画像和账户分析偏好，例如风险偏好、交易周期、单票仓位上限、默认止损比例和是否允许融资融券。
+
+6. **回测与个性化校准**
+   将历史信号表现、个股胜率、策略表现用于 Agent 内部可靠性判断和策略权重校准。
+
+### 暂不做的事
+
+- 不重建一套新的持仓账本，后续账户感知分析会复用现有持仓管理模块。
+- 不强制用户配置真实账户；没有账户上下文时仍保留普通选股分析模式。
+- 不在第一阶段改变当前 Web 手动分析和现有 Agent 的行为。
+- 不把未来产品方向定位为每日固定报告、大盘复盘报告或固定时间推送。
 
 ## ✨ 功能特性
 
 | 模块 | 功能 | 说明 |
 |------|------|------|
-| AI | 决策仪表盘 | 一句话核心结论 + 评分 + 买卖点位 + 风险警报 + 操作检查清单 |
+| AI | 账户感知分析 | 结合个股数据、账户约束、持仓成本、风险偏好输出行动建议 |
 | 分析 | 多维度分析 | 技术面、实时行情、筹码分布、新闻舆情、公告、资金流与基本面聚合 |
 | 市场 | 全球市场 | 支持 A股、港股、美股、美股指数及常见 ETF |
-| 策略 | 市场策略系统 | 内置 A股复盘、美股 Regime、均线、缠论、波浪、情绪周期等策略能力 |
-| 复盘 | 大盘复盘 | 每日市场概览、指数表现、涨跌统计与板块强弱（支持 cn / hk / us / both） |
+| 策略 | 市场策略系统 | 内置均线、缠论、波浪、情绪周期等策略能力，后续用于个性化计划 |
+| 触发 | 按需与事件触发 | 用户主动询问或重大事件出现时触发分析，避免固定日报噪音 |
 | Web | 双主题工作台 | 支持手动分析、配置管理、任务进度、历史报告、回测、持仓管理 |
 | 导入 | 智能导入与补全 | 支持图片、CSV/Excel、剪贴板导入，自选股输入支持代码/名称/拼音/别名补全 |
 | 历史 | 报告管理 | 支持历史报告查看、完整 Markdown 报告、重新分析与批量管理 |
 | 回测 | AI 回测验证 | 对历史分析进行事后验证，查看方向准确率和模拟收益 |
 | Agent 问股 | 策略对话 | 多轮策略问答，支持均线金叉/缠论/波浪等 11 种内置策略，Web/Bot/API 全链路 |
-| 推送 | 多渠道通知 | 支持企业微信、飞书、Telegram、Discord、Slack、邮件等主流渠道 |
-| 自动化 | 定时运行 | 支持 GitHub Actions、Docker、本地定时任务和 FastAPI 服务模式 |
+| 账户感知 | 持仓上下文规划 | 已定义投资者画像、账户、持仓和报告意图 schema，后续用于持仓诊断和选股入场分型报告 |
+| 通知 | 事件通知 | 保留企业微信、飞书、Telegram、Discord、Slack、邮件等渠道，用于主动请求或事件触发结果 |
+| 服务 | 本地/Web/API | 支持本地运行、Docker、FastAPI 服务和 Web 工作台 |
 
-> 功能细节、字段契约、基本面 P0 超时语义、交易纪律、数据源优先级、Web/API 行为请看 [完整配置与部署指南](docs/full-guide.md)。
+> 功能细节、字段契约、基本面 P0 超时语义、交易纪律、数据源优先级、Web/API 行为请看 [完整配置与部署指南](docs/full-guide.md)。分析链路、信号评分和 Agent 工具说明见 [分析原理文档](docs/analysis-principles.md)。账户感知 Agent 的第一阶段计划见 [Agent 用户上下文与分阶段改造计划](docs/agent-user-context-plan.md)。
 
 ### 技术栈与数据来源
 
@@ -63,18 +88,19 @@
 
 ## 🚀 快速开始
 
-### 方式一：GitHub Actions（推荐）
+### 方式一：本地运行 / Web 工作台（推荐）
 
-> 5 分钟完成部署，零成本，无需服务器。
+```bash
+git clone https://github.com/MengFanjun020906/StockAnalyser.git
+cd StockAnalyser
+pip install -r requirements.txt
+cp .env.example .env
+python main.py --serve-only
+```
 
+访问 `http://127.0.0.1:8000` 后，可以在 Web 工作台中配置模型、录入持仓、手动发起分析或进入 Agent 问股。
 
-#### 1. Fork 本仓库
-
-点击右上角 `Fork` 按钮（顺便点个 Star⭐ 支持一下）
-
-#### 2. 配置 Secrets
-
-`Settings` → `Secrets and variables` → `Actions` → `New repository secret`
+最小配置：
 
 **AI 模型配置（至少配置一个）**
 
@@ -90,9 +116,9 @@
 | `OPENAI_API_KEY` | OpenAI 兼容 API Key（支持 DeepSeek、通义千问等） | 可选 |
 | `OPENAI_BASE_URL` / `OPENAI_MODEL` | 使用 OpenAI 兼容服务时填写 | 可选 |
 
-> Ollama 更适合本地 / Docker 部署，GitHub Actions 推荐使用云端 API。
+> Ollama 适合本地 / Docker 部署；云端模型更适合需要稳定联网和多设备访问的场景。
 
-**通知渠道配置（至少配置一个）**
+**通知渠道配置（可选）**
 
 | Secret 名称 | 说明 |
 |------------|------|
@@ -101,9 +127,9 @@
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram |
 | `DISCORD_WEBHOOK_URL` | Discord Webhook |
 | `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` | Slack Bot |
-| `EMAIL_SENDER` + `EMAIL_PASSWORD` | 邮件推送 |
+| `EMAIL_SENDER` + `EMAIL_PASSWORD` | 邮件通知 |
 
-更多渠道、签名校验、分组邮件、Markdown 转图片等配置见 [通知渠道详细配置](docs/full-guide.md#通知渠道详细配置)。
+通知不是必需项。未来目标是只在用户主动请求或重大事件触发时发送，而不是每天固定推送。更多渠道、签名校验、分组邮件、Markdown 转图片等配置见 [通知渠道详细配置](docs/full-guide.md#通知渠道详细配置)。
 
 **自选股配置（必填）**
 
@@ -127,94 +153,77 @@
 
 更多搜索源、社交舆情和降级规则见 [搜索服务配置](docs/full-guide.md#搜索服务配置)。
 
-#### 3. 启用 Actions
-
-`Actions` 标签 → `I understand my workflows, go ahead and enable them`
-
-#### 4. 手动测试
-
-`Actions` → `每日股票分析` → `Run workflow` → `Run workflow`
-
-#### 完成
-
-默认每个**工作日 18:00（北京时间）**自动执行，也可手动触发。默认非交易日（含 A/H/US 节假日）不执行；强制运行、交易日检查、断点续传等规则见 [完整指南](docs/full-guide.md#定时任务配置)。
-
-### 方式二：本地运行 / Docker 部署
+### 方式二：命令行按需分析
 
 ```bash
-# 克隆项目
-git clone https://github.com/ZhuLinsen/daily_stock_analysis.git && cd daily_stock_analysis
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env && vim .env
-
-# 运行分析
-python main.py
-```
-
-常用命令：
-
-```bash
-python main.py --debug
-python main.py --dry-run
 python main.py --stocks 600519,hk00700,AAPL
-python main.py --market-review
-python main.py --schedule
-python main.py --serve-only
+python main.py --dry-run
+python main.py --debug
 ```
 
-> Docker 部署、定时任务、云服务器访问请参考 [完整指南](docs/full-guide.md)；桌面客户端打包请参考 [桌面端打包说明](docs/desktop-package.md)。
+### 方式三：可选的 GitHub Actions 手动触发
 
-## 📱 推送效果
+如果希望不用服务器也能运行，可以保留 GitHub Actions，但建议作为手动触发或事件触发入口，而不是每天固定跑。
 
-### 决策仪表盘
-```
-🎯 2026-02-08 决策仪表盘
-共分析3只股票 | 🟢买入:0 🟡观望:2 🔴卖出:1
+基本步骤：
 
-📊 分析结果摘要
-⚪ 中钨高新(000657): 观望 | 评分 65 | 看多
-⚪ 永鼎股份(600105): 观望 | 评分 48 | 震荡
-🟡 新莱应材(300260): 卖出 | 评分 35 | 看空
+1. 在私有仓库中配置 Actions Secrets / Variables。
+2. 填写至少一个 LLM Key 和 `STOCK_LIST`。
+3. 进入 Actions 页面，手动运行工作流。
 
-⚪ 中钨高新 (000657)
-📰 重要信息速览
-💭 舆情情绪: 市场关注其AI属性与业绩高增长，情绪偏积极，但需消化短期获利盘和主力流出压力。
-📊 业绩预期: 基于舆情信息，公司2025年前三季度业绩同比大幅增长，基本面强劲，为股价提供支撑。
+当前仓库仍保留上游的定时任务能力；如果不需要每日分析，应关闭或调整对应 workflow 的 schedule。
 
-🚨 风险警报:
+### 方式四：Docker 部署
 
-风险点1：2月5日主力资金大幅净卖出3.63亿元，需警惕短期抛压。
-风险点2：筹码集中度高达35.15%，表明筹码分散，拉升阻力可能较大。
-风险点3：舆情中提及公司历史违规记录及重组相关风险提示，需保持关注。
-✨ 利好催化:
-
-利好1：公司被市场定位为AI服务器HDI核心供应商，受益于AI产业发展。
-利好2：2025年前三季度扣非净利润同比暴涨407.52%，业绩表现强劲。
-📢 最新动态: 【最新消息】舆情显示公司是AI PCB微钻领域龙头，深度绑定全球头部PCB/载板厂。2月5日主力资金净卖出3.63亿元，需关注后续资金流向。
-
----
-生成时间: 18:00
+```bash
+docker-compose -f ./docker/docker-compose.yml up -d server
 ```
 
-### 大盘复盘
+> Docker、云服务器访问和桌面客户端打包请参考 [完整指南](docs/full-guide.md) 与 [桌面端打包说明](docs/desktop-package.md)。
+
+## 🎯 目标输出
+
+未来输出不再以“每日决策仪表盘”或“大盘复盘报告”为中心，而是围绕用户问题和事件触发生成更短、更具体的账户建议。
+
+### 用户主动询问
+
+```text
+用户：我持有 600519，成本 1580，普通账户，仓位 18%，现在要不要减？
+
+系统目标输出：
+- 当前结论：继续持有 / 减仓 / 止盈 / 止损
+- 与用户成本的关系：安全垫、浮盈亏、回撤空间
+- 技术状态：趋势、均线、量价、支撑压力
+- 事件影响：近期公告、新闻、资金流和行业变化
+- 操作计划：减仓条件、止损位、观察点、仓位上限
+- 不确定项：哪些数据缺失，哪些需要用户确认
 ```
-🎯 2026-01-10 大盘复盘
 
-📊 主要指数
-- 上证指数: 3250.12 (🟢+0.85%)
-- 深证成指: 10521.36 (🟢+1.02%)
-- 创业板指: 2156.78 (🟢+1.35%)
+### 重大事件触发
 
-📈 市场概况
-上涨: 3920 | 下跌: 1349 | 涨停: 155 | 跌停: 3
+```text
+触发源：持仓股出现减持、处罚、业绩预告、异常波动、重大公告或价格跌破关键位。
 
-🔥 板块表现
-领涨: 互联网服务、文化传媒、小金属
-领跌: 保险、航空机场、光伏设备
+系统目标输出：
+- 事件摘要：发生了什么，影响哪只持仓
+- 账户影响：影响持仓成本、安全垫、仓位和风险暴露
+- 风险等级：低 / 中 / 高
+- 建议动作：继续观察 / 降仓 / 止损 / 等待澄清
+- 触发条件：什么情况下升级为必须处理
+```
+
+### 选股或准备入场
+
+```text
+用户：帮我看看 300750 现在能不能开仓。
+
+系统目标输出：
+- 是否适合进入候选池
+- 当前是否适合买入
+- 理想入场点和次优入场点
+- 禁止追高线
+- 首仓比例
+- 止损位和淘汰条件
 ```
 
 ## ⚙️ 配置说明
@@ -252,73 +261,8 @@ DSA 聚焦日常分析报告；下面两个同系列项目分别覆盖选股、�
 - [AlphaSift](https://github.com/ZhuLinsen/alphasift)：多因子选股与全市场扫描，用于从股票池中提取候选标的。
 - [AlphaEvo](https://github.com/ZhuLinsen/alphaevo)：策略回测与自我进化，用于验证策略规则，并通过迭代探索策略参数与组合。
 
-## 🗺️ Roadmap
-
-查看已支持的功能和未来规划：[更新日志](docs/CHANGELOG.md)
-
-> 有建议？欢迎 [提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-
-> ⚠️ **UI 调整提示**：项目当前正在持续进行 Web UI 调整与升级，部分页面在过渡阶段可能仍存在样式、交互或兼容性问题。欢迎通过 [Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues) 反馈问题，或直接提交 [Pull Request](https://github.com/ZhuLinsen/daily_stock_analysis/pulls) 一起完善。
-
 ---
 
-## ☕ 支持项目
-
-如果本项目对你有帮助，欢迎支持项目的持续维护与迭代，感谢支持 🙏  
-赞赏可备注联系方式，祝股市长虹
-
-| 支付宝 (Alipay) | 微信支付 (WeChat) | 小红书 |
-| :---: | :---: | :---: |
-| <img src="./sources/alipay.jpg" width="200" alt="Alipay"> | <img src="./sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="./sources/xiaohongshu.png" width="200" alt="小红书"> |
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-详见 [贡献指南](docs/CONTRIBUTING.md)
-
-### 本地门禁（建议先跑）
-
-```bash
-pip install -r requirements.txt
-pip install flake8 pytest
-./scripts/ci_gate.sh
-```
-
-如修改前端（`apps/dsa-web`）：
-
-```bash
-cd apps/dsa-web
-npm ci
-npm run lint
-npm run build
-```
-
-## 📄 License
-
-[MIT License](LICENSE) © 2026 ZhuLinsen
-
-如果你在项目中使用或基于本项目进行二次开发，
-非常欢迎在 README 或文档中注明来源并附上本仓库链接。
-这将有助于项目的持续维护和社区发展。
-
-## 📬 联系与合作
-- 合作邮箱：zhuls345@gmail.com
-
-- GitHub Issues：[提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-
-## ⭐ Star History
-**如果觉得有用，请给个 ⭐ Star 支持一下！**
-
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
- </picture>
-</a>
 
 ## ⚠️ 免责声明
 

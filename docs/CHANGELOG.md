@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 LLM 渠道编辑器的官方来源、依赖兼容窗口、保存时的运行时模型清理规则，以及旧配置回退路径说明。
 - [测试] 补齐 task_queue 运行时配置同步回归证据，明确 `tests/test_task_queue_config_sync.py` 作为本轮验收项。
 - [改进] Bot `/status` 展示统一 LLM 主模型、Agent 模型、渠道模式、YAML 配置和更多通知渠道状态。
+- [文档] 新增分析原理专题文档，系统说明输入输出、数据工具、信号评分、LLM/Agent 决策和降级机制。
+- [文档] 新增 Agent 用户上下文与分阶段改造计划，并补充账户感知分析的 schema 契约。
+- [文档] README 增加当前状态与路线图，明确账户感知 Agent 的已完成底座、近期计划和暂不处理范围。
+- [文档] README 重写项目定位，明确未来转向按需/重大事件触发的账户感知分析，不再以每日仪表盘、大盘报告或固定推送为核心。
+- [新功能] 新增 planning Agent system prompt 契约模块，沉淀账户感知、按需触发和 planning-execute 的角色原则与输出约束。
+- [改进] planning Agent prompt 补充股票/账户领域分析维度与能力域，覆盖技术面、行情量价、筹码、资金、基本面、板块、消息事件、舆情、持仓和回测。
+- [文档] Agent 改造计划补充 capability -> tools 映射层，明确 planning-execute 后续如何从能力域展开到现有 ToolRegistry 工具。
+- [改进] planning Agent prompt 新增已持仓报告格式草案，约束持仓结论、账户影响、关键价格、行动计划和风险缺口。
+- [改进] planning Agent prompt 新增数据引用与 confidence 内部使用约束，禁止最终输出暴露置信度字段或编造缺失数据。
 
 ## [3.14.2] - 2026-04-30
 
