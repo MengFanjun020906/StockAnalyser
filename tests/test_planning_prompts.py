@@ -26,6 +26,10 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "你是 StockAnalyser Agent",
         "## 分析维度与能力域",
         "## Planning -> Execute 协议",
+        "### Planner 角色边界",
+        "### todo.md 风格计划格式",
+        "### 工具计划规范",
+        "### 结构化执行计划",
         "## 约束规则",
         "## 账户感知规则",
         "## 重大事件触发规则",
@@ -73,3 +77,23 @@ def test_constraints_keep_confidence_internal_only():
     assert "工具返回的 `confidence` 字段只允许用于内部判断数据可靠性" in CONSTRAINTS
     assert "禁止在最终用户输出中展示" in CONSTRAINTS
     assert "置信度 80%" in CONSTRAINTS
+
+
+def test_planning_protocol_requires_actionable_planner_contract():
+    prompt = build_planning_system_prompt()
+
+    required_planning_rules = [
+        "你是任务规划者，不是最终交易结论生成器",
+        "Planner 必须先选择主维度，再选择辅助维度",
+        "# todo",
+        "## 任务识别",
+        "## 维度计划",
+        "## 工具计划",
+        "## 反证检查",
+        "不直接假设存在 `get_tools_for_capability`",
+        '"tool_plan"',
+        '"risk_checks"',
+        "执行后复核",
+    ]
+    for rule in required_planning_rules:
+        assert rule in prompt
