@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] Agent 改造计划补充 capability -> tools 映射层，明确 planning-execute 后续如何从能力域展开到现有 ToolRegistry 工具。
 - [改进] planning Agent prompt 新增已持仓报告格式草案，约束持仓结论、账户影响、关键价格、行动计划和风险缺口。
 - [改进] planning Agent prompt 新增数据引用与 confidence 内部使用约束，禁止最终输出暴露置信度字段或编造缺失数据。
+- [测试] 新增 Agent 用户上下文 schema 与 planning prompt 拼接回归测试，锁定第一阶段契约不被后续改动破坏。
 
 ## [3.14.2] - 2026-04-30
 
