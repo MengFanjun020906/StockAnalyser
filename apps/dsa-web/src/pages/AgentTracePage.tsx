@@ -133,6 +133,7 @@ const AgentTracePage: React.FC = () => {
       planner: null,
       agent_user_context: null,
       context_summary: null,
+      artifact_dir: null,
     });
     try {
       const response = await agentApi.traceStream({
@@ -279,6 +280,7 @@ const AgentTracePage: React.FC = () => {
           planner: asRecord(event.planner) || current.planner,
           agent_user_context: asRecord(event.agent_user_context) || current.agent_user_context,
           context_summary: asRecord(event.context_summary) || current.context_summary,
+          artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : current.artifact_dir,
         };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: nextResult.session_id || `${Date.now()}`,
@@ -348,6 +350,11 @@ const AgentTracePage: React.FC = () => {
             {result?.session_id ? `session ${result.session_id}` : '等待运行'}
           </span>
         </div>
+        {result?.artifact_dir ? (
+          <div className="mt-2 truncate border-t border-border/50 pt-2 text-xs text-secondary-text">
+            Artifact: <span className="font-mono text-foreground">{result.artifact_dir}</span>
+          </div>
+        ) : null}
       </Card>
 
       <Card title="Trace History" subtitle="Local" padding="md" className="rounded-lg">
@@ -749,6 +756,7 @@ const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   planner: null,
   agent_user_context: null,
   context_summary: null,
+  artifact_dir: null,
 });
 
 const asRecord = (value: unknown): Record<string, unknown> | null => (

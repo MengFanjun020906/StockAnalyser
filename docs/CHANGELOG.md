@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Web 新增开发者 Agent Trace 页面与 `/api/v1/agent/trace/run`、`/api/v1/agent/trace/stream` 调试接口，流式展示 planning_execute 的 Planner、账户/持仓/用户画像摘要、事件时间线、工具调用参数/结果预览和最终输出。
 - [改进] Agent Trace 页面新增浏览器本地历史，保留最近 10 次运行结果，便于回看已完成的工具调用链路。
 - [改进] Agent Trace 页面改为可点击 Evidence Timeline 与大尺寸 Markdown 输出窗口；持仓报告输出规范补充未来价格情景与分层持仓策略要求。
+- [改进] planning Agent prompt 新增未持仓入场报告输出规范，采用可见 Planning -> Execute -> 入场决策格式，并约束入场区间、禁止追高线、首仓比例、加仓条件、止损目标、淘汰条件和复查触发。
+- [改进] Agent Trace 后端新增本地调试产物落盘目录，按 session 保存 request、context、planner、events、tool calls、evidence ledger、final 报告和 todo.md，便于开发者离线复盘调用链路。
+- [改进] planning Agent prompt 新增 Execute Protocol，明确 Evidence Ledger、工具失败降级、停止条件、Trace artifacts 和最终输出审计门槛；Trace `todo.md` 会在执行结束后反映工具成功/失败状态。
+- [改进] 新增 `start_all.sh` / `stop_all.sh` 本地开发启动脚本，一键启动或停止 FastAPI 后端与 Vite 前端，并将 PID 与日志保存到本地目录。
 - [改进] Agent 实时行情工具补充市场会话与最新可用交易日元数据，并约束持仓报告在休市/非交易日标注行情口径，避免把最近交易日涨跌幅误写成“今日涨跌幅”。
 - [改进] Agent SSE 完成事件补充模型、token 与工具调用日志，便于前端调试调用链路。
 - [新功能] 新增 `test_env.py` 环境 API 连通性检测工具，支持 LLM、搜索、行情、社媒情绪和通知通道 smoke test。

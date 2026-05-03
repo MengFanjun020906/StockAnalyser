@@ -7,6 +7,8 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -97,6 +99,7 @@ class AgentTraceRunResponse(BaseModel):
     planner: Optional[Dict[str, Any]] = None
     agent_user_context: Optional[Dict[str, Any]] = None
     context_summary: Optional[Dict[str, Any]] = None
+    artifact_dir: Optional[str] = None
 
 class SkillInfo(BaseModel):
     id: str
@@ -507,6 +510,324 @@ def _build_planner_trace(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"error": str(exc)}
 
 
+def _trace_artifact_root() -> Path:
+    return Path(get_config().database_path).expanduser().resolve().parent / "agent_traces"
+
+
+def _safe_trace_session_dir_name(session_id: str) -> str:
+    safe_session = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in session_id).strip("-")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{timestamp}-{safe_session or uuid.uuid4().hex}"
+
+
+def _write_trace_json(path: Path, payload: Any) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def _append_trace_event(path: Path, event: Dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False, default=str))
+        fh.write("\n")
+
+
+def _planner_to_todo_md(
+    planner: Optional[Dict[str, Any]],
+    context_summary: Optional[Dict[str, Any]],
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    if not planner:
+        lines = [
+            "# todo",
+            "",
+            "## 计划状态",
+            "- [ ] Planner 未生成",
+        ]
+        _append_execute_status_to_todo(lines, [], tool_calls or [])
+        return "\n".join(lines) + "\n"
+
+    tool_plan = planner.get("tool_execution_plan") or []
+    risk_checks = planner.get("risk_checks") or []
+    target_position = (context_summary or {}).get("target_position") if isinstance(context_summary, dict) else None
+    account_count = (context_summary or {}).get("account_count") if isinstance(context_summary, dict) else None
+    position_count = (context_summary or {}).get("position_count") if isinstance(context_summary, dict) else None
+
+    lines = [
+        "# todo",
+        "",
+        "## 任务识别",
+        f"- [x] intent: {planner.get('intent') or '-'}",
+        f"- [x] primary_symbol: {planner.get('primary_symbol') or '-'}",
+        f"- [x] has_position: {planner.get('has_position')}",
+        f"- [x] expected_output: {planner.get('expected_output') or '-'}",
+        f"- [x] context_accounts: {account_count if account_count is not None else '-'}",
+        f"- [x] context_positions: {position_count if position_count is not None else '-'}",
+    ]
+    if isinstance(target_position, dict):
+        lines.extend([
+            f"- [x] target_quantity: {target_position.get('quantity') or '-'}",
+            f"- [x] target_avg_cost: {target_position.get('avg_cost') or '-'}",
+            f"- [x] target_position_pct: {target_position.get('position_pct') or '-'}",
+        ])
+
+    lines.extend(["", "## 维度计划"])
+    for capability in planner.get("capabilities") or []:
+        lines.append(f"- [x] capability={capability}")
+    if not planner.get("capabilities"):
+        lines.append("- [ ] 无能力域")
+
+    lines.extend(["", "## 工具计划"])
+    if tool_plan:
+        for item in tool_plan:
+            if not isinstance(item, dict):
+                continue
+            tools = ", ".join(str(tool) for tool in item.get("tools") or []) or "-"
+            missing = ", ".join(str(tool) for tool in item.get("missing_tools") or []) or "-"
+            purpose = item.get("purpose") or "-"
+            lines.append(f"- [ ] capability={item.get('capability') or '-'} -> tools=[{tools}] -> purpose={purpose}")
+            if missing != "-":
+                lines.append(f"  missing_tools=[{missing}]")
+    else:
+        lines.append("- [ ] 无工具计划")
+
+    lines.extend(["", "## 风险检查"])
+    if risk_checks:
+        for check in risk_checks:
+            lines.append(f"- [ ] {check}")
+    else:
+        lines.append("- [ ] 无风险检查")
+
+    missing_tools = planner.get("missing_tools") or []
+    if missing_tools:
+        lines.extend(["", "## 缺失工具", *[f"- [ ] {tool}" for tool in missing_tools]])
+
+    _append_execute_status_to_todo(lines, tool_plan, tool_calls or [])
+
+    return "\n".join(lines) + "\n"
+
+
+def _append_execute_status_to_todo(
+    lines: List[str],
+    tool_plan: Any,
+    tool_calls: List[Dict[str, Any]],
+) -> None:
+    executed_tools = _summarize_executed_tools(tool_calls)
+    lines.extend(["", "## 执行状态"])
+    if tool_calls:
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            status = _tool_call_status(call)
+            checkbox = "x" if status == "success" else " "
+            tool_name = call.get("tool") or "-"
+            duration = call.get("duration")
+            result_length = call.get("result_length")
+            cached = " cached" if call.get("cached") else ""
+            timeout = " timeout" if call.get("timeout") else ""
+            lines.append(
+                f"- [{checkbox}] {tool_name}: {status}{cached}{timeout}, "
+                f"duration={duration if duration is not None else '-'}s, "
+                f"result_length={result_length if result_length is not None else '-'}"
+            )
+            arguments = call.get("arguments")
+            if arguments:
+                lines.append(f"  arguments={json.dumps(arguments, ensure_ascii=False, default=str)}")
+            preview = call.get("result_preview")
+            if preview:
+                lines.append(f"  result_preview={preview}")
+    else:
+        lines.append("- [ ] 尚未执行工具")
+
+    planned_tools = _planned_tool_names(tool_plan)
+    not_called = [tool for tool in planned_tools if tool not in executed_tools]
+    if not_called:
+        lines.extend(["", "## 未调用计划工具", *[f"- [ ] {tool}" for tool in not_called]])
+
+    lines.extend(["", "## Execute Protocol 复核"])
+    if tool_calls:
+        failed = [call.get("tool") for call in tool_calls if isinstance(call, dict) and _tool_call_status(call) != "success"]
+        lines.append(f"- [{'x' if not failed else ' '}] 工具失败已记录: {', '.join(str(item) for item in failed) if failed else '无'}")
+        lines.append("- [x] Evidence Ledger 已进入最终报告复核")
+        lines.append("- [x] 停止条件已复核")
+    else:
+        lines.append("- [ ] 等待工具执行后复核")
+
+
+def _planned_tool_names(tool_plan: Any) -> List[str]:
+    names: List[str] = []
+    for item in tool_plan or []:
+        if not isinstance(item, dict):
+            continue
+        for tool in item.get("tools") or []:
+            if tool and tool not in names:
+                names.append(str(tool))
+    return names
+
+
+def _summarize_executed_tools(tool_calls: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    executed: Dict[str, Dict[str, Any]] = {}
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        tool = str(call.get("tool") or "")
+        if tool:
+            executed[tool] = call
+    return executed
+
+
+def _tool_call_status(call: Dict[str, Any]) -> str:
+    if call.get("timeout"):
+        return "timeout"
+    return "success" if call.get("success") is not False else "failed"
+
+
+def _build_evidence_ledger(tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    entries: List[Dict[str, Any]] = []
+    for index, call in enumerate(tool_calls, start=1):
+        if not isinstance(call, dict):
+            continue
+        status = _tool_call_status(call)
+        limitation = _tool_call_limitation(call, status)
+        entries.append({
+            "index": index,
+            "step": call.get("step"),
+            "tool": call.get("tool") or "-",
+            "arguments": call.get("arguments") or {},
+            "status": status,
+            "duration": call.get("duration"),
+            "cached": bool(call.get("cached")),
+            "evidence": call.get("result_preview") or "",
+            "limitation": limitation,
+            "impact": _tool_call_impact(status, limitation),
+        })
+    return {
+        "schema_version": 1,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _tool_call_limitation(call: Dict[str, Any], status: str) -> str:
+    if status == "timeout":
+        return "工具调用超时，结果不可作为强证据。"
+    if status == "failed":
+        preview = call.get("result_preview") or ""
+        return f"工具调用失败或返回错误，需降级使用其他证据。{preview}".strip()
+    if call.get("cached"):
+        return "命中缓存结果，需结合行情时间戳判断时效。"
+    return "未记录额外局限；仍需结合最终报告中的数据口径和时效说明。"
+
+
+def _tool_call_impact(status: str, limitation: str) -> str:
+    if status == "success":
+        return "该工具结果可作为最终报告的证据输入，执行器需说明它支持或削弱了哪条判断。"
+    return f"该工具未提供可靠证据，执行器需在最终报告中降级结论。{limitation}"
+
+
+class TraceArtifactWriter:
+    """Best-effort file writer for developer trace artifacts."""
+
+    def __init__(self, session_id: str):
+        self.path = _trace_artifact_root() / _safe_trace_session_dir_name(session_id)
+        self._initialized = False
+
+    def initialize(self, *, request: AgentTraceRunRequest, context: Dict[str, Any]) -> None:
+        self.path.mkdir(parents=True, exist_ok=True)
+        self._initialized = True
+        context_summary = _build_trace_context_summary(context)
+        planner = _build_planner_trace(context)
+        _write_trace_json(
+            self.path / "request.json",
+            request.model_dump(mode="json"),
+        )
+        _write_trace_json(
+            self.path / "context.json",
+            {
+                "context": _jsonable_trace_context(context),
+                "context_summary": context_summary,
+                "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
+            },
+        )
+        _write_trace_json(self.path / "planner.json", planner)
+        (self.path / "todo.md").write_text(_planner_to_todo_md(planner, context_summary), encoding="utf-8")
+        (self.path / "events.ndjson").write_text("", encoding="utf-8")
+
+    def append_event(self, event: Dict[str, Any]) -> None:
+        if not self._initialized:
+            return
+        _append_trace_event(self.path / "events.ndjson", event)
+
+    def finalize(
+        self,
+        *,
+        result: Any = None,
+        error: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self._initialized:
+            return
+        tool_calls = (getattr(result, "tool_calls_log", []) if result is not None else []) or []
+        final_content = getattr(result, "content", "") if result is not None else ""
+        payload = {
+            "success": bool(getattr(result, "success", False)) if result is not None else False,
+            "error": error if error is not None else getattr(result, "error", None),
+            "total_steps": getattr(result, "total_steps", 0) if result is not None else 0,
+            "total_tokens": getattr(result, "total_tokens", 0) if result is not None else 0,
+            "provider": getattr(result, "provider", "") if result is not None else "",
+            "model": getattr(result, "model", "") if result is not None else "",
+            "artifact_dir": str(self.path),
+        }
+        if context is not None:
+            payload["context_summary"] = _build_trace_context_summary(context)
+        _write_trace_json(self.path / "tool_calls.json", tool_calls)
+        _write_trace_json(self.path / "evidence_ledger.json", _build_evidence_ledger(tool_calls))
+        _write_trace_json(self.path / "summary.json", payload)
+        (self.path / "final.md").write_text(final_content or "", encoding="utf-8")
+        if context is not None:
+            planner = _build_planner_trace(context)
+            context_summary = _build_trace_context_summary(context)
+            (self.path / "todo.md").write_text(
+                _planner_to_todo_md(planner, context_summary, tool_calls),
+                encoding="utf-8",
+            )
+
+
+def _jsonable_trace_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(context)
+    if "agent_user_context" in payload:
+        payload["agent_user_context"] = _serialize_agent_user_context(payload.get("agent_user_context"))
+    return json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _safe_artifact_initialize(writer: TraceArtifactWriter, *, request: AgentTraceRunRequest, context: Dict[str, Any]) -> None:
+    try:
+        writer.initialize(request=request, context=context)
+    except Exception as exc:
+        logger.warning("Agent trace artifact initialize failed: %s", exc)
+
+
+def _safe_artifact_event(writer: TraceArtifactWriter, event: Dict[str, Any]) -> None:
+    try:
+        writer.append_event(event)
+    except Exception as exc:
+        logger.debug("Agent trace artifact event write skipped: %s", exc)
+
+
+def _safe_artifact_finalize(
+    writer: TraceArtifactWriter,
+    *,
+    result: Any = None,
+    error: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        writer.finalize(result=result, error=error, context=context)
+    except Exception as exc:
+        logger.warning("Agent trace artifact finalize failed: %s", exc)
+
+
 @router.post("/trace/run", response_model=AgentTraceRunResponse)
 async def run_agent_trace(request: AgentTraceRunRequest):
     """Run an Agent request and return developer-oriented plan/execute trace data."""
@@ -521,6 +842,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
     if skills is not None:
         context["skills"] = skills
     events: List[Dict[str, Any]] = []
+    artifact_writer = TraceArtifactWriter(session_id)
+    _safe_artifact_initialize(artifact_writer, request=request, context=context)
 
     def progress_callback(event: dict):
         event_payload = dict(event)
@@ -528,6 +851,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
             tool = event_payload.get("tool", "")
             event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
         events.append(event_payload)
+        _safe_artifact_event(artifact_writer, event_payload)
 
     def run_sync():
         executor = _build_executor(config, skills or None)
@@ -543,6 +867,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         result = await loop.run_in_executor(None, run_sync)
     except Exception as exc:
         logger.error("Agent trace run failed: %s", exc, exc_info=True)
+        _safe_artifact_finalize(artifact_writer, error=str(exc), context=context)
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         try:
@@ -553,6 +878,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
             get_db().delete_conversation_session(session_id)
         except Exception as exc:
             logger.debug("Agent trace session cleanup skipped: %s", exc)
+
+    _safe_artifact_finalize(artifact_writer, result=result, context=context)
 
     return AgentTraceRunResponse(
         success=result.success,
@@ -569,6 +896,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         planner=_build_planner_trace(context),
         agent_user_context=_serialize_agent_user_context(context.get("agent_user_context")),
         context_summary=_build_trace_context_summary(context),
+        artifact_dir=str(artifact_writer.path),
     )
 
 
@@ -587,8 +915,11 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
     context = _build_trace_context(request=request, config=config)
     if skills is not None:
         context["skills"] = skills
+    artifact_writer = TraceArtifactWriter(session_id)
+    _safe_artifact_initialize(artifact_writer, request=request, context=context)
 
     def put_event(event: Dict[str, Any]) -> None:
+        _safe_artifact_event(artifact_writer, event)
         asyncio.run_coroutine_threadsafe(queue.put(event), loop)
 
     def progress_callback(event: dict):
@@ -628,6 +959,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 progress_callback=progress_callback,
                 context=context,
             )
+            _safe_artifact_finalize(artifact_writer, result=result, context=context)
             put_event({
                 "type": "done",
                 "success": result.success,
@@ -644,9 +976,11 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "planner": _build_planner_trace(context),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "context_summary": _build_trace_context_summary(context),
+                "artifact_dir": str(artifact_writer.path),
             })
         except Exception as exc:
             logger.error("Agent trace stream failed: %s", exc, exc_info=True)
+            _safe_artifact_finalize(artifact_writer, error=str(exc), context=context)
             put_event({"type": "error", "session_id": session_id, "message": str(exc)})
         finally:
             cleanup_trace_session()

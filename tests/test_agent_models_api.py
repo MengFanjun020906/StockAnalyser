@@ -4,6 +4,7 @@
 import asyncio
 import json
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -378,28 +379,57 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                 return future
 
         mock_db = MagicMock()
-        with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
-            "api.v1.endpoints.agent._build_executor",
-            return_value=executor,
-        ), patch(
-            "src.agent.conversation.conversation_manager.clear",
-        ) as mock_clear, patch(
-            "src.storage.get_db",
-            return_value=mock_db,
-        ), patch(
-            "api.v1.endpoints.agent.asyncio.get_running_loop",
-            side_effect=lambda: _ImmediateLoop(real_get_running_loop()),
-        ):
-            payload = asyncio.run(agent.run_agent_trace(request)).model_dump()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config.database_path = os.path.join(tmpdir, "stock_analysis.db")
+            with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
+                "api.v1.endpoints.agent._build_executor",
+                return_value=executor,
+            ), patch(
+                "src.agent.conversation.conversation_manager.clear",
+            ) as mock_clear, patch(
+                "src.storage.get_db",
+                return_value=mock_db,
+            ), patch(
+                "api.v1.endpoints.agent.asyncio.get_running_loop",
+                side_effect=lambda: _ImmediateLoop(real_get_running_loop()),
+            ):
+                payload = asyncio.run(agent.run_agent_trace(request)).model_dump()
 
-        mock_clear.assert_called_once_with(payload["session_id"])
-        mock_db.delete_conversation_session.assert_called_once_with(payload["session_id"])
-        self.assertTrue(payload["session_id"].startswith("trace-"))
-        self.assertTrue(payload["success"])
-        self.assertEqual(payload["content"], "trace ok")
-        self.assertEqual(payload["tool_calls"][0]["tool"], "get_realtime_quote")
-        self.assertEqual(payload["events"][0]["display_name"], "获取实时行情")
-        self.assertIsNone(payload["planner"])
+            mock_clear.assert_called_once_with(payload["session_id"])
+            mock_db.delete_conversation_session.assert_called_once_with(payload["session_id"])
+            self.assertTrue(payload["session_id"].startswith("trace-"))
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["content"], "trace ok")
+            self.assertEqual(payload["tool_calls"][0]["tool"], "get_realtime_quote")
+            self.assertEqual(payload["events"][0]["display_name"], "获取实时行情")
+            self.assertIsNone(payload["planner"])
+            self.assertTrue(payload["artifact_dir"])
+            self.assertTrue(os.path.isdir(payload["artifact_dir"]))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "context.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "planner.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "events.ndjson")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "tool_calls.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "evidence_ledger.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "final.md")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "todo.md")))
+            with open(os.path.join(payload["artifact_dir"], "events.ndjson"), encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual(lines[0]["type"], "tool_start")
+            with open(os.path.join(payload["artifact_dir"], "final.md"), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "trace ok")
+            with open(os.path.join(payload["artifact_dir"], "evidence_ledger.json"), encoding="utf-8") as fh:
+                evidence_ledger = json.load(fh)
+            self.assertEqual(evidence_ledger["entry_count"], 1)
+            self.assertEqual(evidence_ledger["entries"][0]["tool"], "get_realtime_quote")
+            self.assertEqual(evidence_ledger["entries"][0]["status"], "success")
+            self.assertIn("price", evidence_ledger["entries"][0]["evidence"])
+            with open(os.path.join(payload["artifact_dir"], "todo.md"), encoding="utf-8") as fh:
+                todo_md = fh.read()
+            self.assertIn("## 执行状态", todo_md)
+            self.assertIn("get_realtime_quote: success", todo_md)
+            self.assertIn('arguments={"stock_code": "600519"}', todo_md)
+            self.assertIn('result_preview={"price": 100}', todo_md)
+            self.assertIn("## Execute Protocol 复核", todo_md)
 
     def test_trace_stream_emits_context_planner_tool_and_done_events(self) -> None:
         config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
@@ -442,6 +472,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         )
 
         async def collect_events() -> list:
+            config.database_path = os.path.join(tempfile.mkdtemp(), "stock_analysis.db")
             with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
                 "api.v1.endpoints.agent._build_executor",
                 return_value=executor,
@@ -469,6 +500,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertIn("tool_done", event_types)
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["content"], "stream ok")
+        self.assertTrue(events[-1]["artifact_dir"])
         tool_event = next(event for event in events if event["type"] == "tool_done")
         self.assertEqual(tool_event["display_name"], "获取实时行情")
         self.assertEqual(tool_event["result_preview"], '{"price":100}')

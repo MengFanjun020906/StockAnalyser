@@ -1,6 +1,18 @@
 # Agent 用户上下文与分阶段改造计划
 
-本文档记录 Agent 从“通用问股助手”升级为“账户感知交易决策助手”的第一阶段设计。当前阶段只定义契约和实施边界，不改变现有分析执行链路。
+本文档记录 Agent 从“通用问股助手”升级为“账户感知交易决策助手”的分阶段设计与落地状态。第一阶段已完成契约定义；第二、三阶段已接入运行时；后续阶段按本文档继续推进。
+
+## 当前进度概览
+
+| 阶段 | 主题 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| 第一阶段 | 上下文契约与 planning prompt 契约 | 已完成 | `AgentUserContext` schema 与 planning prompt 已落地，并有测试覆盖。 |
+| 第二阶段 | Planner 外壳 | 已完成 | 已提供确定性 Planner、capability -> tools 映射和 `AGENT_ANALYSIS_MODE=planning_execute` 实验开关。 |
+| 第三阶段 | 持仓上下文接入 | 已完成 | 已从 `PortfolioService` 构造账户/持仓上下文，并在 planning_execute 模式下注入 Agent。 |
+| 第四阶段 | 双报告类型 | 已完成 | 已支持 `position_review`/`entry_analysis` 意图识别；未持仓入场报告采用可见 Planning -> Execute -> 入场决策格式。 |
+| 第五阶段 | Web 配置入口 | 部分完成 | `/agent-trace` 已支持账户、风险偏好、交易周期和备注调试输入；正式设置页/持仓页画像配置仍未完成。 |
+| 调试增强 | Trace UI、SSE 和本地落盘 | 已完成 | `/agent-trace`、SSE 事件流、浏览器历史和 `data/agent_traces/` 调试产物已落地。 |
+| 第六阶段 | 对抗式 Debate Agent | 未开始 | 仍处于方案设计阶段。 |
 
 ## 背景
 
@@ -19,9 +31,9 @@
 2. Agent 不只回答用户 prompt，而是结合用户账户类型、持仓数量、持仓成本、融资融券状态等上下文给出个性化建议。
 3. 支持多类型报告：已持仓报告和选股/入场报告采用不同分析目标和输出结构。
 
-## 第一阶段目标
+## 第一阶段目标（已完成）
 
-第一阶段只做“上下文契约”和“实施计划”：
+第一阶段只做“上下文契约”和“实施计划”，当前已完成：
 
 - 定义投资者画像、账户上下文、持仓上下文、报告意图 schema。
 - 明确这些 schema 与现有 `PortfolioService` 的关系。
@@ -42,7 +54,7 @@ src/schemas/agent_context.py
 src/agent/planning_prompts.py
 ```
 
-该文件先沉淀角色定义、核心原则、任务分类、planning -> execute 协议、账户感知规则、事件触发规则和输出约束。当前阶段暂不接入运行时。
+该文件先沉淀角色定义、核心原则、任务分类、planning -> execute 协议、账户感知规则、事件触发规则和输出约束。后续阶段已把该 prompt 契约接入 `planning_execute` 运行时。
 
 Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域划分为：
 
@@ -412,18 +424,60 @@ PortfolioService.get_portfolio_snapshot()
 - 上下文包含账户、现金、总权益、持仓数量、成本、市值、浮盈亏、仓位占比和价格可用性备注。
 - 构造失败会回退到无账户上下文，不阻断分析主流程，也不向日志明文输出账户明细。
 
-### 第四阶段：双报告类型
+### 第四阶段：双报告类型（已完成）
 
-- 新增 `position_review` 和 `entry_analysis` 输出约束。
-- `position_review` 的 prompt 草案已先落到 `src/agent/planning_prompts.py`，覆盖结论、持仓位置、关键价格、证据摘要、行动计划和风险缺口。
-- 已持仓时默认用持仓诊断。
-- 无持仓时默认用入场分析。
+计划任务：
 
-### 第五阶段：Web 配置入口
+- [x] 新增 `position_review` 和 `entry_analysis` 意图识别。
+- [x] 已持仓时默认进入持仓诊断。
+- [x] 无持仓且用户问“能不能买/是否适合入场”时默认进入入场分析。
+- [x] `position_review` 的 prompt 输出约束已落到 `src/agent/planning_prompts.py`，覆盖结论、持仓位置、关键价格、证据摘要、未来价格情景、分层行动计划和风险缺口。
+- [x] 持仓报告约束已补充休市/非交易日行情口径说明，避免把最近交易日涨跌幅误写成“今日涨跌幅”。
+- [x] 持仓报告约束已要求结合账户成本、仓位、现金和风险偏好给出动作建议，避免只输出一句“持有/不急着加仓”。
+- [x] `entry_analysis` 已补齐专项输出规范，采用可见 Planning -> Execute -> 入场决策格式，并包含入场决策表格、理想/次优入场区间、禁止追高线、首仓比例、加仓条件、止损位、目标位、淘汰条件和复查触发。
+- [x] 从用户角度复核后，普通聊天/分析页暂不强制暴露报告类型选择；默认由 Planner 根据持仓上下文和用户问题自动识别，避免增加用户理解成本。后续若用户明确需要手动覆盖，再作为 Web 产品化增强项处理。
 
-- 在设置或持仓页补充投资者画像。
-- 支持风险偏好、交易周期、单票上限、默认止损。
-- 支持报告类型选择。
+当前实现：
+
+- `src/agent/planner.py` 已根据 `AgentUserContext` 和用户问题输出 `position_review_report` 或 `entry_analysis_report`。
+- `src/agent/planning_prompts.py` 已包含 `## 持仓报告输出规范（position_review）` 和 `## 入场报告输出规范（entry_analysis）`；其中 `entry_analysis` 明确要求输出 Planning 摘要、Execute 证据摘要和入场决策表格。
+- `tests/test_agent_planner.py`、`tests/test_planning_prompts.py` 已覆盖持仓/非持仓意图、持仓报告输出约束和入场报告输出约束。
+
+### 第五阶段：Web 配置入口（部分完成）
+
+计划任务：
+
+- [x] 新增 `/agent-trace` 开发者调试页面，可选择账户并输入风险偏好、交易周期和用户画像备注。
+- [x] `/agent-trace` 顶部 `Context In Use` 会展示本次实际注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要。
+- [x] `/agent-trace` 支持 SSE 流式展示 context、planner、thinking、tool_start、tool_done 和 done/error，避免运行期间黑箱等待。
+- [x] `/agent-trace` 支持浏览器本地历史，便于回看已完成的执行链路。
+- [x] `/agent-trace` 状态栏会展示后端 `Artifact` 路径，方便定位本次落盘调试产物。
+- [ ] 正式设置页或持仓页尚未补充长期投资者画像配置入口。
+- [ ] 单票上限、总权益仓位上限、默认止损、最大可接受回撤等字段尚未在正式 Web 表单中维护。
+- [ ] 普通用户视角的报告类型选择尚未产品化；当前 `/agent-trace` 更偏开发调试。
+
+当前实现：
+
+- `apps/dsa-web/src/pages/AgentTracePage.tsx` 提供 Agent Trace 调试界面。
+- `api/v1/endpoints/agent.py` 的 `AgentTraceRunRequest` 支持 `account_id`、`stock_code`、`cost_method`、`risk_preference`、`trading_horizon` 和 `profile_notes`。
+- `apps/dsa-web/src/components/layout/SidebarNav.tsx` 已加入“链路”入口。
+
+### 调试增强：Trace UI 与本地落盘（已完成）
+
+计划任务：
+
+- [x] 新增 `/api/v1/agent/trace/run` 和 `/api/v1/agent/trace/stream`。
+- [x] 前端单独提供 `/agent-trace` 界面，展示 context、planner、工具调用、事件时间线和最终 Markdown 输出。
+- [x] 后端按 session 落盘调试产物到 `data/agent_traces/<timestamp>-<session_id>/`。
+- [x] 落盘文件包括 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`final.md`、`todo.md` 和 `summary.json`。
+- [x] `todo.md` 会在初始化时写入计划，在执行结束后补充工具成功/失败、参数、结果预览、未调用计划工具和 Execute Protocol 复核状态。
+- [x] `evidence_ledger.json` 会按工具调用整理 `tool`、`arguments`、`status`、`evidence`、`limitation` 和 `impact`，便于离线复盘。
+
+当前实现：
+
+- `api/v1/endpoints/agent.py` 提供 Trace API、SSE 和 `TraceArtifactWriter`。
+- `src/agent/planning_prompts.py` 已新增独立 `Execute Protocol`，明确 Evidence Ledger、工具失败降级、停止条件、Trace artifacts 和最终输出审计门槛。
+- `tests/test_agent_models_api.py` 已覆盖 Trace run/stream、落盘文件和 `todo.md` 执行状态。
 
 ### 第六阶段：对抗式 Debate Agent
 
@@ -497,9 +551,16 @@ AgentUserContext
 
 这个阶段的目标不是让输出更长，而是让最终结论经受独立反方检验。对于已持仓报告，反方重点挑战“继续持有/加仓”的安全性；对于入场报告，反方重点挑战“现在入场”的风险收益比。
 
-## 当前阶段验收标准
+## 当前验收状态
 
-- schema 能被 Python 编译。
-- 文档清楚说明字段语义和后续接入方式。
-- 当前分析流程、API 和 Web 行为不改变。
-- README 只说明本 fork 的定位，不堆具体字段细节。
+- [x] schema 能被 Python 编译。
+- [x] 文档清楚说明字段语义和后续接入方式。
+- [x] `planning_execute` 默认仍由实验开关控制，不改变 `normal` 默认行为。
+- [x] Planner 能输出能力域、工具执行计划、缺失工具、风险检查和期望报告类型。
+- [x] 普通单股 Agent 分析能在 `planning_execute` 模式下注入 `AgentUserContext`。
+- [x] `/agent-trace` 能展示账户上下文、Planner、SSE 事件、工具调用和最终输出。
+- [x] Trace 运行能落盘 request/context/planner/events/tool calls/evidence ledger/final/todo/summary。
+- [x] README 未继续膨胀，细节保留在专题文档中。
+- [x] `entry_analysis` 专项输出规范已补齐到与 `position_review` 同等级的可执行程度，并使用可见 Planning -> Execute 格式。
+- [ ] 正式用户画像配置入口还未在设置页或持仓页产品化。
+- [ ] Debate Agent 尚未开始实现。

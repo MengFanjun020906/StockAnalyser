@@ -1041,6 +1041,8 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 
 | 命令 | 说明 |
 |------|------|
+| `./start_all.sh` | 本地开发一键启动 FastAPI 后端与 Vite 前端，默认后端 `8000`、前端 `5173` |
+| `./stop_all.sh` | 停止 `start_all.sh` 启动的本地后端与前端 |
 | `python main.py --serve` | 启动 API 服务 + 执行一次完整分析 |
 | `python main.py --serve-only` | 仅启动 API 服务，手动触发分析 |
 
@@ -1220,7 +1222,10 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
 - 页面支持选择持仓账户、风险偏好、持有周期和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
 - 页面会把最近 10 次 Trace 完整结果保存在当前浏览器的 localStorage，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
+- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`final.md`、`todo.md` 和 `summary.json`；页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
+- planning prompt 包含独立的 `Execute Protocol`：要求执行器把工具结果落入 Evidence Ledger，记录失败降级、停止条件和最终输出审计门槛；`todo.md` 初始写入计划，执行结束后会补充工具成功/失败、参数、结果预览和 Execute 复核状态。
 - 默认调试 Prompt 使用真实用户问题示例，例如“我持有 600519，帮我分析未来走势，适合继续拿长线吗？”，而不是面向开发者的内部链路描述。
 - 页面把 Planner 压缩为 `Execution Thesis` 摘要，把事件流压缩为可点击的 `Evidence Timeline`，点击任一事件可查看完整载荷；最终输出使用大尺寸 Markdown 渲染窗口，适合阅读完整报告。
 - 出于安全与可解释性边界，页面展示的是可验证的 plan/execute 事实、工具证据和输出依据，不展示模型隐藏思维链。
 - 已持仓 `position_review` 输出必须包含 1-3 个月与 6-12 个月的上行/下行情景、可复盘价格或条件、分层持仓策略、加仓/减仓/止损条件和复查节奏。
+- 未持仓 `entry_analysis` 输出采用可见 Planning -> Execute -> 入场决策格式，必须包含计划摘要、证据摘要、入场决策表格、理想/次优入场区间、禁止追高线、首仓比例、加仓条件、止损位、目标位、淘汰条件和复查触发。

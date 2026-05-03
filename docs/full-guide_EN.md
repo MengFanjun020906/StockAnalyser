@@ -879,6 +879,8 @@ FastAPI provides RESTful API service for configuration management and triggering
 
 | Command | Description |
 |------|------|
+| `./start_all.sh` | Start the local FastAPI backend and Vite frontend for development, defaulting to backend `8000` and frontend `5173` |
+| `./stop_all.sh` | Stop the local backend and frontend started by `start_all.sh` |
 | `python main.py --serve` | Start API service + run full analysis once |
 | `python main.py --serve-only` | Start API service only, manually trigger analysis |
 
@@ -1016,10 +1018,13 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 - The Run button uses the `POST /api/v1/agent/trace/stream` SSE endpoint by default. Context, Planner, thinking updates, tool start, tool completion, and final done/error events are appended live so long-running traces are no longer a black-box wait.
 - It supports selecting a portfolio account, risk preference, trading horizon, and investor notes. The top `Context In Use` block shows the injected account, target position, cost, weight, unrealized PnL, and profile summary so developers can confirm whether the real portfolio context was used without digging through raw JSON.
 - The latest 10 trace results are saved in the current browser's localStorage and can be reopened from `Trace History`; the backend still deletes temporary `trace-*` sessions so normal chat history stays clean.
+- Each trace also writes local backend artifacts under `data/agent_traces/<timestamp>-<session_id>/`, including `request.json`, `context.json`, `planner.json`, `events.ndjson`, `tool_calls.json`, `evidence_ledger.json`, `final.md`, `todo.md`, and `summary.json`. The page status bar shows the current `Artifact` path. The directory lives under `/data/` and is ignored by Git by default.
+- The planning prompt includes a dedicated `Execute Protocol`: the executor must turn tool results into an Evidence Ledger, record failure downgrade paths, stop conditions, and final-output audit gates. `todo.md` is written with the initial plan and rewritten at the end with tool success/failure status, arguments, result previews, and execute-review state.
 - The default debug prompt is a realistic user question, such as asking whether a held stock is suitable for long-term holding, instead of an internal trace-oriented prompt.
 - The page compresses Planner data into an `Execution Thesis` summary, collapses runtime events into a clickable `Evidence Timeline`, and renders the final answer in a large Markdown report pane for easier reading.
 - For safety and explainability boundaries, it displays verifiable plan/execute facts, tool evidence, and output-supporting data, not hidden model chain-of-thought.
 - Held-position `position_review` output must include 1-3 month and 6-12 month upside/downside scenarios, reviewable price levels or conditions, layered holding strategy, add/reduce/stop-loss rules, and a review cadence.
+- No-position `entry_analysis` output uses a visible Planning -> Execute -> entry-decision format and must include a plan summary, evidence summary, entry-decision table, ideal/secondary entry zones, a no-chase line, initial position size, add conditions, stop loss, targets, reject conditions, and review triggers.
 
 ---
 

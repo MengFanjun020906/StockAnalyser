@@ -76,6 +76,7 @@ export interface AgentTraceRunResponse {
   planner?: Record<string, unknown> | null;
   agent_user_context?: Record<string, unknown> | null;
   context_summary?: Record<string, unknown> | null;
+  artifact_dir?: string | null;
 }
 
 export interface SkillInfo {

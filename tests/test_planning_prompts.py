@@ -1,6 +1,8 @@
 from src.agent.planning_prompts import (
     CONSTRAINTS,
+    ENTRY_ANALYSIS_OUTPUT_FORMAT,
     EVENT_TRIGGER_POLICY,
+    EXECUTE_PROTOCOL,
     POSITION_REVIEW_OUTPUT_FORMAT,
     TOOL_USE_POLICY,
     ZH_SYSTEM_PROMPT,
@@ -16,7 +18,7 @@ def test_default_zh_prompt_uses_single_section_source():
 
     assert ZH_SYSTEM_PROMPT == prompt
     assert build_zh_planning_system_prompt() == prompt
-    assert len(get_default_prompt_sections()) == 12
+    assert len(get_default_prompt_sections()) == 14
 
 
 def test_default_zh_prompt_contains_phase_one_contract_sections():
@@ -26,6 +28,7 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "你是 StockAnalyser Agent",
         "## 分析维度与能力域",
         "## Planning -> Execute 协议",
+        "## Execute Protocol",
         "### Planner 角色边界",
         "### todo.md 风格计划格式",
         "### 工具计划规范",
@@ -34,8 +37,11 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "## 账户感知规则",
         "## 重大事件触发规则",
         "## 持仓报告输出规范（position_review）",
+        "## 入场报告输出规范（entry_analysis）",
         "持仓动作表格",
         "执行动作矩阵",
+        "入场决策表格",
+        "分层建仓计划",
     ]
     for snippet in required_snippets:
         assert snippet in prompt
@@ -48,8 +54,10 @@ def test_prompt_options_can_remove_optional_policy_sections():
 
     assert TOOL_USE_POLICY not in prompt
     assert EVENT_TRIGGER_POLICY not in prompt
+    assert EXECUTE_PROTOCOL in prompt
     assert CONSTRAINTS in prompt
     assert POSITION_REVIEW_OUTPUT_FORMAT in prompt
+    assert ENTRY_ANALYSIS_OUTPUT_FORMAT in prompt
 
 
 def test_prompt_extra_instructions_are_appended_without_dropping_contract():
@@ -59,6 +67,7 @@ def test_prompt_extra_instructions_are_appended_without_dropping_contract():
     assert "只分析用户指定股票。" in prompt
     assert "## 约束规则" in prompt
     assert "## 持仓报告输出规范（position_review）" in prompt
+    assert "## 入场报告输出规范（entry_analysis）" in prompt
 
 
 def test_position_review_output_does_not_expose_confidence_field():
@@ -89,6 +98,38 @@ def test_position_review_requires_price_scenarios_and_layered_holding_strategy()
 
     for snippet in required_snippets:
         assert snippet in POSITION_REVIEW_OUTPUT_FORMAT
+        assert snippet in build_planning_system_prompt()
+
+
+def test_entry_analysis_requires_actionable_entry_plan():
+    required_snippets = [
+        "Planning 摘要",
+        "Execute 证据摘要",
+        "可见计划，不暴露隐藏思维链",
+        "证据账本摘要",
+        "停止条件",
+        "需要验证",
+        "入场决策表格",
+        "入场结论",
+        "OPEN/WAIT/REJECT/MONITOR",
+        "理想入场区间",
+        "次优入场区间",
+        "禁止追高线",
+        "首仓比例",
+        "加仓条件",
+        "止损位",
+        "第一目标位",
+        "第二目标位",
+        "淘汰条件",
+        "分层建仓计划",
+        "淘汰与复查条件",
+        "风险收益比",
+        "不得建议 OPEN",
+        "如果主证据缺失，不得给 OPEN",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in ENTRY_ANALYSIS_OUTPUT_FORMAT
         assert snippet in build_planning_system_prompt()
 
 
@@ -134,4 +175,26 @@ def test_planning_protocol_requires_actionable_planner_contract():
         "执行后复核",
     ]
     for rule in required_planning_rules:
+        assert rule in prompt
+
+
+def test_execute_protocol_requires_auditable_execution_contract():
+    prompt = build_planning_system_prompt()
+    required_execute_rules = [
+        "执行器的职责不是重新规划",
+        "Evidence Ledger",
+        "`tool_execution_plan`",
+        "每个工具结果都必须进入证据账本",
+        "每轮工具返回后更新 `todo.md` 状态",
+        "工具失败与降级",
+        "Trace Artifacts",
+        "`events.ndjson`",
+        "`tool_calls.json`",
+        "`evidence_ledger.json`",
+        "`final.md`",
+        "最终输出审计门槛",
+    ]
+
+    for rule in required_execute_rules:
+        assert rule in EXECUTE_PROTOCOL
         assert rule in prompt
