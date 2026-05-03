@@ -100,6 +100,14 @@ def serialize_tool_result(result: Any) -> str:
     return str(result)
 
 
+def _preview_tool_result(result_str: str, max_chars: int = 1200) -> str:
+    """Return a bounded preview for developer traces without bloating payloads."""
+    text = result_str if isinstance(result_str, str) else str(result_str)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
 def _normalize_tool_stock_code(value: Any) -> Any:
     """Canonicalize stock code arguments so equivalent HK variants share one cache key."""
     if not isinstance(value, str):
@@ -650,7 +658,12 @@ def _execute_tools(
     if len(tool_calls) == 1:
         tc = tool_calls[0]
         if progress_callback:
-            progress_callback({"type": "tool_start", "step": step, "tool": tc.name})
+            progress_callback({
+                "type": "tool_start",
+                "step": step,
+                "tool": tc.name,
+                "arguments": tc.arguments,
+            })
         timeout_triggered = False
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0:
             pool = ThreadPoolExecutor(max_workers=1)
@@ -675,12 +688,10 @@ def _execute_tools(
                 pool.shutdown(wait=not timeout_triggered, cancel_futures=timeout_triggered)
         else:
             _, result_str, success, dur, cached = _exec_single(tc)
-        if progress_callback:
-            progress_callback({"type": "tool_done", "step": step, "tool": tc.name, "success": success, "duration": dur})
         log_entry = {
             "step": step, "tool": tc.name, "arguments": tc.arguments,
             "success": success, "duration": dur, "result_length": len(result_str),
-            "cached": cached,
+            "cached": cached, "result_preview": _preview_tool_result(result_str),
         }
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 and not success:
             try:
@@ -689,11 +700,18 @@ def _execute_tools(
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         tool_calls_log.append(log_entry)
+        if progress_callback:
+            progress_callback({"type": "tool_done", **log_entry})
         results.append({"tc": tc, "result_str": result_str})
     else:
         for tc in tool_calls:
             if progress_callback:
-                progress_callback({"type": "tool_start", "step": step, "tool": tc.name})
+                progress_callback({
+                    "type": "tool_start",
+                    "step": step,
+                    "tool": tc.name,
+                    "arguments": tc.arguments,
+                })
 
         pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
         timeout_triggered = False
@@ -706,13 +724,14 @@ def _execute_tools(
             ):
                 pending.discard(future)
                 tc_item, result_str, success, dur, cached = future.result()
-                if progress_callback:
-                    progress_callback({"type": "tool_done", "step": step, "tool": tc_item.name, "success": success, "duration": dur})
-                tool_calls_log.append({
+                log_entry = {
                     "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
                     "success": success, "duration": dur, "result_length": len(result_str),
-                    "cached": cached,
-                })
+                    "cached": cached, "result_preview": _preview_tool_result(result_str),
+                }
+                tool_calls_log.append(log_entry)
+                if progress_callback:
+                    progress_callback({"type": "tool_done", **log_entry})
                 results.append({"tc": tc_item, "result_str": result_str})
         except FuturesTimeoutError:
             timeout_triggered = True
@@ -734,8 +753,13 @@ def _execute_tools(
                             "type": "tool_done",
                             "step": step,
                             "tool": tc_item.name,
+                            "arguments": tc_item.arguments,
                             "success": False,
                             "duration": round(tool_wait_timeout_seconds or 0.0, 2),
+                            "result_length": len(result_str),
+                            "cached": False,
+                            "timeout": True,
+                            "result_preview": _preview_tool_result(result_str),
                         })
                     tool_calls_log.append({
                         "step": step,
@@ -746,6 +770,7 @@ def _execute_tools(
                         "result_length": len(result_str),
                         "cached": False,
                         "timeout": True,
+                        "result_preview": _preview_tool_result(result_str),
                     })
                     results.append({"tc": tc_item, "result_str": result_str})
         finally:

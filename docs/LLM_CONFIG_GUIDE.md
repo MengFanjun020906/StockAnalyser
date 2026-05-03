@@ -61,6 +61,14 @@ LITELLM_MODEL=ollama/qwen3:8b
 > **恭喜！小白读到这里就可以去运行程序了！**
 > 想测测看通没通？在主目录打开命令行输入：`python test_env.py --llm`
 
+如果想一次检查 `.env` 里已经配置的 LLM、搜索、行情、社媒情绪和通知 API，可运行：
+
+```bash
+python test_env.py --all
+```
+
+默认只测试已配置的 API；企业微信、飞书、PushPlus、自定义 Webhook 这类会真实发消息的通道默认只做 dry-run 标记，确认要发送测试消息时再加 `--notify-send`。多 Key 配置默认只测每个 provider 的第一个 Key，排查轮换 Key 时可加 `--all-keys`。
+
 ---
 
 ## 方式二：渠道(Channels)模式配置（适合进阶/多模型）

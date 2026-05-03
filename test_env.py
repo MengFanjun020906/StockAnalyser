@@ -1,487 +1,715 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Smoke-test API credentials configured through `.env`.
+
+The tool only tests API families that are actually configured. Notification
+webhooks are dry-run by default to avoid sending messages; pass
+`--notify-send` when you explicitly want to send a test notification.
 """
-===================================
-A股自选股智能分析系统 - 环境验证测试
-===================================
 
-用于验证 .env 配置是否正确，包括：
-1. 配置加载测试
-2. 数据库查看
-3. 数据源测试
-4. LLM 调用测试
-5. 通知推送测试
+from __future__ import annotations
 
-使用方法：
-    python test_env.py              # 运行所有测试
-    python test_env.py --db         # 仅查看数据库
-    python test_env.py --llm        # 仅测试 LLM
-    python test_env.py --fetch      # 仅测试数据获取
-    python test_env.py --notify     # 仅测试通知
-
-"""
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import logging
 import os
-# Proxy config - controlled by USE_PROXY env var, off by default.
-# Set USE_PROXY=true in .env if you need a local proxy (e.g. mainland China).
-# GitHub Actions always skips this regardless of USE_PROXY.
-if os.getenv("GITHUB_ACTIONS") != "true" and os.getenv("USE_PROXY", "false").lower() == "true":
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+
+import requests
+
+
+DEFAULT_CATEGORIES = ("llm", "search", "data", "sentiment", "notify")
+_SENSITIVE_QUERY_RE = r"(?i)(api_key|apikey|token|access_token|key|secret)=([^&\s]+)"
+
+
+def configure_proxy_from_env() -> None:
+    """Honor the historical USE_PROXY switch used by this helper."""
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        return
+    if os.getenv("USE_PROXY", "false").lower() != "true":
+        return
     proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
     proxy_port = os.getenv("PROXY_PORT", "10809")
     proxy_url = f"http://{proxy_host}:{proxy_port}"
     os.environ["http_proxy"] = proxy_url
     os.environ["https_proxy"] = proxy_url
 
-import argparse
-import logging
-import sys
-from datetime import datetime, date, timedelta
-from typing import Optional
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-8s | %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+@dataclass
+class ApiCheckResult:
+    category: str
+    name: str
+    configured: bool
+    success: bool = False
+    skipped: bool = False
+    message: str = ""
+    details: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def status(self) -> str:
+        if not self.configured:
+            return "UNSET"
+        if self.skipped:
+            return "SKIP"
+        return "OK" if self.success else "FAIL"
 
-def print_header(title: str):
-    """打印标题"""
-    print("\n" + "=" * 60)
-    print(f"  {title}")
-    print("=" * 60)
-
-
-def print_section(title: str):
-    """打印小节"""
-    print(f"\n--- {title} ---")
-
-
-def test_config():
-    """测试配置加载"""
-    print_header("1. 配置加载测试")
-    
-    from src.config import get_config
-    config = get_config()
-    
-    print_section("基础配置")
-    print(f"  股票列表: {config.stock_list}")
-    print(f"  数据库路径: {config.database_path}")
-    print(f"  最大并发数: {config.max_workers}")
-    print(f"  调试模式: {config.debug}")
-    
-    print_section("API 配置")
-    print(f"  Tushare Token: {'已配置 ✓' if config.tushare_token else '未配置 ✗'}")
-    if config.tushare_token:
-        print(f"    Token 前8位: {config.tushare_token[:8]}...")
-    
-    print(f"  Gemini API Key: {'已配置 ✓' if config.gemini_api_key else '未配置 ✗'}")
-    if config.gemini_api_key:
-        print(f"    Key 前8位: {config.gemini_api_key[:8]}...")
-    print(f"  Gemini 主模型: {config.gemini_model}")
-    print(f"  Gemini 备选模型: {config.gemini_model_fallback}")
-    
-    print(f"  企业微信 Webhook: {'已配置 ✓' if config.wechat_webhook_url else '未配置 ✗'}")
-    
-    print_section("配置验证")
-    issues = config.validate_structured()
-    _prefix = {"error": "  ✗", "warning": "  ⚠", "info": "  ·"}
-    for issue in issues:
-        print(f"{_prefix.get(issue.severity, '  ?')} [{issue.severity.upper()}] {issue.message}")
-    if not any(i.severity in ("error", "warning") for i in issues):
-        print("  ✓ 关键配置项验证通过")
-    
-    return True
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["message"] = redact_sensitive_text(payload.get("message", ""))
+        payload["status"] = self.status
+        return payload
 
 
-def view_database():
-    """查看数据库内容"""
-    print_header("2. 数据库内容查看")
-    
-    from src.storage import get_db
-    from sqlalchemy import text
-    
-    db = get_db()
-    
-    print_section("数据库连接")
-    print(f"  ✓ 连接成功")
-    
-    # 使用独立的 session 查询
-    session = db.get_session()
-    try:
-        # 统计信息
-        result = session.execute(text("""
-            SELECT 
-                code,
-                COUNT(*) as count,
-                MIN(date) as min_date,
-                MAX(date) as max_date,
-                data_source
-            FROM stock_daily 
-            GROUP BY code
-            ORDER BY code
-        """))
-        stocks = result.fetchall()
-        
-        print_section(f"已存储股票数据 (共 {len(stocks)} 只)")
-        if stocks:
-            print(f"  {'代码':<10} {'记录数':<8} {'起始日期':<12} {'最新日期':<12} {'数据源'}")
-            print("  " + "-" * 60)
-            for row in stocks:
-                print(f"  {row[0]:<10} {row[1]:<8} {row[2]!s:<12} {row[3]!s:<12} {row[4] or 'Unknown'}")
-        else:
-            print("  暂无数据")
-        
-        # 查询今日数据
-        today = date.today()
-        result = session.execute(text("""
-            SELECT code, date, open, high, low, close, pct_chg, volume, ma5, ma10, ma20, volume_ratio
-            FROM stock_daily 
-            WHERE date = :today
-            ORDER BY code
-        """), {"today": today})
-        today_data = result.fetchall()
-        
-        print_section(f"今日数据 ({today})")
-        if today_data:
-            for row in today_data:
-                code, dt, open_, high, low, close, pct_chg, volume, ma5, ma10, ma20, vol_ratio = row
-                print(f"\n  【{code}】")
-                print(f"    开盘: {open_:.2f}  最高: {high:.2f}  最低: {low:.2f}  收盘: {close:.2f}")
-                print(f"    涨跌幅: {pct_chg:.2f}%  成交量: {volume/10000:.2f}万股")
-                print(f"    MA5: {ma5:.2f}  MA10: {ma10:.2f}  MA20: {ma20:.2f}  量比: {vol_ratio:.2f}")
-        else:
-            print("  今日暂无数据")
-        
-        # 查询最近10条数据
-        result = session.execute(text("""
-            SELECT code, date, close, pct_chg, volume, data_source
-            FROM stock_daily 
-            ORDER BY date DESC, code
-            LIMIT 10
-        """))
-        recent = result.fetchall()
-        
-        print_section("最近10条记录")
-        if recent:
-            print(f"  {'代码':<10} {'日期':<12} {'收盘':<10} {'涨跌%':<8} {'成交量':<15} {'来源'}")
-            print("  " + "-" * 70)
-            for row in recent:
-                vol_str = f"{row[4]/10000:.2f}万" if row[4] else "N/A"
-                print(f"  {row[0]:<10} {row[1]!s:<12} {row[2]:<10.2f} {row[3]:<8.2f} {vol_str:<15} {row[5] or 'Unknown'}")
-    finally:
-        session.close()
-    
-    return True
+def redact_sensitive_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+
+    import re
+
+    def _replace(match: Any) -> str:
+        return f"{match.group(1)}={mask_secret(match.group(2))}"
+
+    text = re.sub(_SENSITIVE_QUERY_RE, _replace, text)
+    return text
 
 
-def test_data_fetch(stock_code: str = "600519"):
-    """测试数据获取"""
-    print_header("3. 数据获取测试")
-    
-    from data_provider import DataFetcherManager
-    
-    manager = DataFetcherManager()
-    
-    print_section("数据源列表")
-    for i, name in enumerate(manager.available_fetchers, 1):
-        print(f"  {i}. {name}")
-    
-    print_section(f"获取 {stock_code} 数据")
-    print(f"  正在获取（可能需要几秒钟）...")
-    
-    try:
-        df, source = manager.get_daily_data(stock_code, days=5)
-        
-        print(f"  ✓ 获取成功")
-        print(f"    数据源: {source}")
-        print(f"    记录数: {len(df)}")
-        
-        print_section("数据预览（最近5条）")
-        if not df.empty:
-            preview_cols = ['date', 'open', 'high', 'low', 'close', 'pct_chg', 'volume']
-            existing_cols = [c for c in preview_cols if c in df.columns]
-            print(df[existing_cols].tail().to_string(index=False))
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ 获取失败: {e}")
-        return False
+def split_csv(value: Optional[str]) -> List[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
-def test_llm():
-    """测试 LLM 调用"""
-    print_header("4. LLM (Gemini) 调用测试")
-    
-    from src.analyzer import GeminiAnalyzer
-    from src.config import get_config
-    import time
-    
-    config = get_config()
-    
-    print_section("模型配置")
-    print(f"  主模型: {config.gemini_model}")
-    print(f"  备选模型: {config.gemini_model_fallback}")
-    
-    # 检查网络连接
-    print_section("网络连接检查")
-    try:
-        import socket
-        socket.setdefaulttimeout(10)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("generativelanguage.googleapis.com", 443))
-        print(f"  ✓ 可以连接到 Google API 服务器")
-    except Exception as e:
-        print(f"  ✗ 无法连接到 Google API 服务器: {e}")
-        print(f"  提示: 请检查网络连接或配置代理")
-        print(f"  提示: 可以设置环境变量 HTTPS_PROXY=http://your-proxy:port")
-        return False
-    
-    analyzer = GeminiAnalyzer()
-    
-    print_section("模型初始化")
-    if analyzer.is_available():
-        print(f"  ✓ 模型初始化成功")
-    else:
-        print(f"  ✗ 模型初始化失败（请检查 API Key）")
-        return False
-    
-    # 构造测试上下文
-    test_context = {
-        'code': '600519',
-        'date': date.today().isoformat(),
-        'today': {
-            'open': 1420.0,
-            'high': 1435.0,
-            'low': 1415.0,
-            'close': 1428.0,
-            'volume': 5000000,
-            'amount': 7140000000,
-            'pct_chg': 0.56,
-            'ma5': 1425.0,
-            'ma10': 1418.0,
-            'ma20': 1410.0,
-            'volume_ratio': 1.1,
-        },
-        'ma_status': '多头排列 📈',
-        'volume_change_ratio': 1.05,
-        'price_change_ratio': 0.56,
+def mask_secret(value: Optional[str]) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "*" * len(text)
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def clean_error(exc: BaseException, *, limit: int = 400) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    return redact_sensitive_text(message[:limit])
+
+
+def select_categories(args: argparse.Namespace) -> Set[str]:
+    selected = {
+        name
+        for name in ("llm", "search", "data", "sentiment", "notify")
+        if getattr(args, name, False)
     }
-    
-    print_section("发送测试请求")
-    print(f"  测试股票: 贵州茅台 (600519)")
-    print(f"  正在调用 Gemini API（超时: 60秒）...")
-    
-    start_time = time.time()
-    
-    try:
-        result = analyzer.analyze(test_context)
-        
-        elapsed = time.time() - start_time
-        print(f"\n  ✓ API 调用成功 (耗时: {elapsed:.2f}秒)")
-        
-        print_section("分析结果")
-        print(f"  情绪评分: {result.sentiment_score}/100")
-        print(f"  趋势预测: {result.trend_prediction}")
-        print(f"  操作建议: {result.operation_advice}")
-        print(f"  技术分析: {result.technical_analysis[:80]}..." if len(result.technical_analysis) > 80 else f"  技术分析: {result.technical_analysis}")
-        print(f"  消息面: {result.news_summary[:80]}..." if len(result.news_summary) > 80 else f"  消息面: {result.news_summary}")
-        print(f"  综合摘要: {result.analysis_summary}")
-        
-        if not result.success:
-            print(f"\n  ⚠ 注意: {result.error_message}")
-        
-        return result.success
-        
-    except Exception as e:
-        elapsed = time.time() - start_time
-        print(f"\n  ✗ API 调用失败 (耗时: {elapsed:.2f}秒)")
-        print(f"  错误: {e}")
-        
-        # 提供更详细的错误提示
-        error_str = str(e).lower()
-        if 'timeout' in error_str or 'unavailable' in error_str:
-            print(f"\n  诊断: 网络超时，可能原因:")
-            print(f"    1. 网络不通（需要代理访问 Google）")
-            print(f"    2. API 服务暂时不可用")
-            print(f"    3. 请求量过大被限流")
-        elif 'invalid' in error_str or 'api key' in error_str:
-            print(f"\n  诊断: API Key 可能无效")
-        elif 'model' in error_str:
-            print(f"\n  诊断: 模型名称可能不正确，尝试修改 .env 中的 GEMINI_MODEL")
-        
-        return False
+    if getattr(args, "fetch", False):
+        selected.add("data")
+    if args.all or not selected:
+        return set(DEFAULT_CATEGORIES)
+    return selected
 
 
-def test_notification():
-    """测试通知推送"""
-    print_header("5. 通知推送测试")
-    
-    from src.notification import NotificationService
-    from src.config import get_config
-    
-    config = get_config()
-    service = NotificationService()
-    
-    print_section("配置检查")
-    if service.is_available():
-        print(f"  ✓ 企业微信 Webhook 已配置")
-        webhook_preview = config.wechat_webhook_url[:50] + "..." if len(config.wechat_webhook_url) > 50 else config.wechat_webhook_url
-        print(f"    URL: {webhook_preview}")
-    else:
-        print(f"  ✗ 企业微信 Webhook 未配置")
-        return False
-    
-    print_section("发送测试消息")
-    
-    test_message = f"""## 🧪 系统测试消息
-
-这是一条来自 **A股自选股智能分析系统** 的测试消息。
-
-- 测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-- 测试目的: 验证企业微信 Webhook 配置
-
-如果您收到此消息，说明通知功能配置正确 ✓"""
-    
-    print(f"  正在发送...")
-    
-    try:
-        success = service.send_to_wechat(test_message)
-        
-        if success:
-            print(f"  ✓ 消息发送成功，请检查企业微信")
-        else:
-            print(f"  ✗ 消息发送失败")
-        
-        return success
-        
-    except Exception as e:
-        print(f"  ✗ 发送异常: {e}")
-        return False
+def selected_keys(keys: Sequence[str], *, all_keys: bool) -> List[str]:
+    cleaned = [key for key in keys if key]
+    if all_keys:
+        return cleaned
+    return cleaned[:1]
 
 
-def run_all_tests():
-    """运行所有测试"""
-    print("\n" + "🚀" * 20)
-    print("  A股自选股智能分析系统 - 环境验证")
-    print("  " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    print("🚀" * 20)
-    
-    results = {}
-    
-    # 1. 配置测试
-    try:
-        results['配置加载'] = test_config()
-    except Exception as e:
-        print(f"  ✗ 配置测试失败: {e}")
-        results['配置加载'] = False
-    
-    # 2. 数据库查看
-    try:
-        results['数据库'] = view_database()
-    except Exception as e:
-        print(f"  ✗ 数据库测试失败: {e}")
-        results['数据库'] = False
-    
-    # 3. 数据获取（跳过，避免太慢）
-    # results['数据获取'] = test_data_fetch()
-    
-    # 4. LLM 测试（可选）
-    # results['LLM调用'] = test_llm()
-    
-    # 汇总
-    print_header("测试结果汇总")
-    for name, passed in results.items():
-        status = "✓ 通过" if passed else "✗ 失败"
-        print(f"  {status}: {name}")
-    
-    print(f"\n提示: 使用 --llm 参数单独测试 LLM 调用")
-    print(f"提示: 使用 --fetch 参数单独测试数据获取")
-    print(f"提示: 使用 --notify 参数单独测试通知推送")
+def load_runtime_config():
+    from src.config import Config, get_config, setup_env
+
+    Config.reset_instance()
+    setup_env()
+    return get_config()
 
 
-def query_stock_data(stock_code: str, days: int = 10):
-    """查询指定股票的数据"""
-    print_header(f"查询股票数据: {stock_code}")
-    
-    from src.storage import get_db
-    from sqlalchemy import text
-    
-    db = get_db()
-    
-    session = db.get_session()
-    try:
-        result = session.execute(text("""
-            SELECT date, open, high, low, close, pct_chg, volume, amount, ma5, ma10, ma20, volume_ratio
-            FROM stock_daily 
-            WHERE code = :code
-            ORDER BY date DESC
-            LIMIT :limit
-        """), {"code": stock_code, "limit": days})
-        
-        rows = result.fetchall()
-        
-        if rows:
-            print(f"\n  最近 {len(rows)} 条记录:\n")
-            print(f"  {'日期':<12} {'开盘':<10} {'最高':<10} {'最低':<10} {'收盘':<10} {'涨跌%':<8} {'MA5':<10} {'MA10':<10} {'量比':<8}")
-            print("  " + "-" * 100)
-            for row in rows:
-                dt, open_, high, low, close, pct_chg, vol, amt, ma5, ma10, ma20, vol_ratio = row
-                print(f"  {dt!s:<12} {open_:<10.2f} {high:<10.2f} {low:<10.2f} {close:<10.2f} {pct_chg:<8.2f} {ma5:<10.2f} {ma10:<10.2f} {vol_ratio:<8.2f}")
-        else:
-            print(f"  未找到 {stock_code} 的数据")
-    finally:
-        session.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='A股自选股智能分析系统 - 环境验证测试',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+def result_from_exception(category: str, name: str, exc: BaseException) -> ApiCheckResult:
+    return ApiCheckResult(
+        category=category,
+        name=name,
+        configured=True,
+        success=False,
+        message=clean_error(exc),
     )
-    
-    parser.add_argument('--db', action='store_true', help='查看数据库内容')
-    parser.add_argument('--llm', action='store_true', help='测试 LLM 调用')
-    parser.add_argument('--fetch', action='store_true', help='测试数据获取')
-    parser.add_argument('--notify', action='store_true', help='测试通知推送')
-    parser.add_argument('--config', action='store_true', help='查看配置')
-    parser.add_argument('--stock', type=str, help='查询指定股票数据，如 --stock 600519')
-    parser.add_argument('--all', action='store_true', help='运行所有测试（包括 LLM）')
-    
-    args = parser.parse_args()
-    
-    # 如果没有指定任何参数，运行基础测试
-    if not any([args.db, args.llm, args.fetch, args.notify, args.config, args.stock, args.all]):
-        run_all_tests()
-        return 0
-    
-    # 根据参数运行指定测试
-    if args.config:
-        test_config()
-    
-    if args.db:
-        view_database()
-    
-    if args.stock:
-        query_stock_data(args.stock)
-    
-    if args.fetch:
-        test_data_fetch()
-    
-    if args.llm:
-        test_llm()
-    
-    if args.notify:
-        test_notification()
-    
-    if args.all:
-        test_config()
-        view_database()
-        test_data_fetch()
-        test_llm()
-        test_notification()
-    
-    return 0
+
+
+def _llm_completion_success(response: Any) -> bool:
+    choices = getattr(response, "choices", None)
+    if not choices and isinstance(response, dict):
+        choices = response.get("choices")
+    return bool(choices)
+
+
+def run_llm_checks(config: Any, *, timeout: float, all_keys: bool) -> List[ApiCheckResult]:
+    results: List[ApiCheckResult] = []
+
+    channels = getattr(config, "llm_channels", []) or []
+    if channels:
+        from src.services.system_config_service import SystemConfigService
+
+        service = SystemConfigService()
+        for channel in channels:
+            if channel.get("enabled") is False:
+                results.append(
+                    ApiCheckResult(
+                        category="llm",
+                        name=f"LLM channel:{channel.get('name') or 'channel'}",
+                        configured=True,
+                        skipped=True,
+                        message="channel disabled",
+                    )
+                )
+                continue
+            raw_keys = split_csv(channel.get("api_key") or ",".join(channel.get("api_keys") or []))
+            key_variants = selected_keys(raw_keys, all_keys=all_keys) or [""]
+            for index, api_key in enumerate(key_variants, start=1):
+                suffix = f" key {index}/{len(raw_keys)}" if raw_keys and all_keys else ""
+                name = f"LLM channel:{channel.get('name') or 'channel'}{suffix}"
+                try:
+                    response = service.test_llm_channel(
+                        name=str(channel.get("name") or "channel"),
+                        protocol=str(channel.get("protocol") or ""),
+                        base_url=str(channel.get("base_url") or ""),
+                        api_key=api_key,
+                        models=channel.get("models") or [],
+                        enabled=channel.get("enabled", True),
+                        timeout_seconds=timeout,
+                    )
+                    results.append(
+                        ApiCheckResult(
+                            category="llm",
+                            name=name,
+                            configured=True,
+                            success=bool(response.get("success")),
+                            message=response.get("message") or response.get("error") or "",
+                            details={
+                                "model": response.get("resolved_model"),
+                                "protocol": response.get("resolved_protocol"),
+                                "latency_ms": response.get("latency_ms"),
+                                "key": mask_secret(api_key),
+                            },
+                        )
+                    )
+                except Exception as exc:
+                    results.append(result_from_exception("llm", name, exc))
+        return results
+
+    model = (getattr(config, "litellm_model", "") or "").strip()
+    model_list = getattr(config, "llm_model_list", []) or []
+    if not model and not model_list:
+        return [
+            ApiCheckResult(
+                category="llm",
+                name="LLM",
+                configured=False,
+                skipped=True,
+                message="no LITELLM_MODEL, LLM_CHANNELS, LITELLM_CONFIG, or legacy provider API key configured",
+            )
+        ]
+
+    try:
+        import litellm
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        from src.config import extra_litellm_params, get_api_keys_for_model
+
+        LLMToolAdapter._register_custom_model_pricing()
+        messages = [{"role": "user", "content": "Reply with OK"}]
+
+        if model_list and getattr(config, "llm_models_source", "") == "litellm_config":
+            target_model = model or str(model_list[0].get("model_name") or "")
+            router = litellm.Router(model_list=model_list)
+            started = time.perf_counter()
+            response = router.completion(
+                model=target_model,
+                messages=messages,
+                temperature=getattr(config, "llm_temperature", 0.7),
+                max_tokens=16,
+                timeout=timeout,
+            )
+            results.append(
+                ApiCheckResult(
+                    category="llm",
+                    name="LLM config",
+                    configured=True,
+                    success=_llm_completion_success(response),
+                    message="LiteLLM config completion succeeded",
+                    details={"model": target_model, "latency_ms": int((time.perf_counter() - started) * 1000)},
+                )
+            )
+            return results
+
+        api_keys = get_api_keys_for_model(model, config)
+        key_variants = selected_keys(api_keys, all_keys=all_keys) or [""]
+        for index, api_key in enumerate(key_variants, start=1):
+            name = f"LLM:{model}" + (f" key {index}/{len(api_keys)}" if api_keys and all_keys else "")
+            kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": getattr(config, "llm_temperature", 0.7),
+                "max_tokens": 16,
+                "timeout": timeout,
+            }
+            if api_key:
+                kwargs["api_key"] = api_key
+            kwargs.update(extra_litellm_params(model, config))
+            started = time.perf_counter()
+            response = litellm.completion(**kwargs)
+            results.append(
+                ApiCheckResult(
+                    category="llm",
+                    name=name,
+                    configured=True,
+                    success=_llm_completion_success(response),
+                    message="LiteLLM completion succeeded",
+                    details={"model": model, "latency_ms": int((time.perf_counter() - started) * 1000), "key": mask_secret(api_key)},
+                )
+            )
+    except Exception as exc:
+        results.append(result_from_exception("llm", f"LLM:{model or 'configured'}", exc))
+
+    return results
+
+
+def _run_search_provider(
+    *,
+    name: str,
+    provider_factory: Any,
+    keys: Sequence[str],
+    all_keys: bool,
+) -> List[ApiCheckResult]:
+    results: List[ApiCheckResult] = []
+    if not keys:
+        return results
+    for index, key in enumerate(selected_keys(keys, all_keys=all_keys), start=1):
+        label = f"{name}" + (f" key {index}/{len(keys)}" if all_keys and len(keys) > 1 else "")
+        try:
+            provider = provider_factory([key])
+            response = provider.search("stock market news", max_results=1, days=7)
+            results.append(
+                ApiCheckResult(
+                    category="search",
+                    name=label,
+                    configured=True,
+                    success=bool(response.success),
+                    message="search request succeeded" if response.success else (response.error_message or "search request failed"),
+                    details={"results": len(response.results), "key": mask_secret(key)},
+                )
+            )
+        except Exception as exc:
+            results.append(result_from_exception("search", label, exc))
+    return results
+
+
+def run_search_checks(config: Any, *, all_keys: bool) -> List[ApiCheckResult]:
+    from src.search_service import (
+        AnspireSearchProvider,
+        BochaSearchProvider,
+        BraveSearchProvider,
+        MiniMaxSearchProvider,
+        SearXNGSearchProvider,
+        SerpAPISearchProvider,
+        TavilySearchProvider,
+    )
+
+    results: List[ApiCheckResult] = []
+    providers = [
+        ("Tavily", TavilySearchProvider, getattr(config, "tavily_api_keys", []) or []),
+        ("Bocha", BochaSearchProvider, getattr(config, "bocha_api_keys", []) or []),
+        ("Brave", BraveSearchProvider, getattr(config, "brave_api_keys", []) or []),
+        ("SerpAPI", SerpAPISearchProvider, getattr(config, "serpapi_keys", []) or []),
+        ("Anspire", AnspireSearchProvider, getattr(config, "anspire_api_keys", []) or []),
+        ("MiniMax", MiniMaxSearchProvider, getattr(config, "minimax_api_keys", []) or []),
+    ]
+    for name, factory, keys in providers:
+        results.extend(_run_search_provider(name=name, provider_factory=factory, keys=keys, all_keys=all_keys))
+
+    searxng_urls = getattr(config, "searxng_base_urls", []) or []
+    if searxng_urls:
+        try:
+            provider = SearXNGSearchProvider(base_urls=searxng_urls)
+            response = provider.search("stock market news", max_results=1, days=7)
+            results.append(
+                ApiCheckResult(
+                    category="search",
+                    name="SearXNG",
+                    configured=True,
+                    success=bool(response.success),
+                    message="search request succeeded" if response.success else (response.error_message or "search request failed"),
+                    details={"instances": len(searxng_urls), "results": len(response.results)},
+                )
+            )
+        except Exception as exc:
+            results.append(result_from_exception("search", "SearXNG", exc))
+
+    if not results:
+        results.append(
+            ApiCheckResult(
+                category="search",
+                name="Search APIs",
+                configured=False,
+                skipped=True,
+                message="no search API env vars configured",
+            )
+        )
+    return results
+
+
+def run_tushare_check(token: Optional[str], *, timeout: float) -> ApiCheckResult:
+    if not token:
+        return ApiCheckResult(category="data", name="Tushare", configured=False, skipped=True, message="TUSHARE_TOKEN not configured")
+
+    def post(api_name: str, params: Dict[str, Any], fields: str) -> Dict[str, Any]:
+        payload = {
+            "api_name": api_name,
+            "token": token,
+            "params": params,
+            "fields": fields,
+        }
+        response = requests.post("http://api.tushare.pro", json=payload, timeout=timeout)
+        if response.status_code != 200:
+            return {"ok": False, "message": f"HTTP {response.status_code}"}
+        data = response.json()
+        return {
+            "ok": data.get("code") == 0,
+            "message": "ok" if data.get("code") == 0 else str(data.get("msg") or data)[:300],
+            "items": len((data.get("data") or {}).get("items") or []),
+        }
+
+    try:
+        probes = {
+            "daily": post(
+                "daily",
+                {"ts_code": "600519.SH", "start_date": "20260401", "end_date": "20260430"},
+                "ts_code,trade_date,close",
+            ),
+            "trade_cal": post(
+                "trade_cal",
+                {
+                    "exchange": "",
+                    "start_date": "20180901",
+                    "end_date": "20181001",
+                    "is_open": "0",
+                },
+                "exchange,cal_date,is_open,pretrade_date",
+            ),
+        }
+        ok = any(item["ok"] for item in probes.values())
+        if ok:
+            failed = [f"{name}: {item['message']}" for name, item in probes.items() if not item["ok"]]
+            message = "Tushare request succeeded"
+            if failed:
+                message += f"; limited endpoint(s): {'; '.join(failed)}"
+        else:
+            message = "; ".join(f"{name}: {item['message']}" for name, item in probes.items())
+        return ApiCheckResult(
+            category="data",
+            name="Tushare",
+            configured=True,
+            success=ok,
+            message=message,
+            details={"key": mask_secret(token), "probes": probes},
+        )
+    except Exception as exc:
+        return result_from_exception("data", "Tushare", exc)
+
+
+def run_tickflow_check(api_key: Optional[str], *, timeout: float) -> ApiCheckResult:
+    if not api_key:
+        return ApiCheckResult(category="data", name="TickFlow", configured=False, skipped=True, message="TICKFLOW_API_KEY not configured")
+    try:
+        from data_provider.tickflow_fetcher import TickFlowFetcher
+
+        fetcher = TickFlowFetcher(api_key=api_key, timeout=timeout)
+        try:
+            indices = fetcher.get_main_indices("cn")
+        finally:
+            fetcher.close()
+        ok = bool(indices)
+        return ApiCheckResult(
+            category="data",
+            name="TickFlow",
+            configured=True,
+            success=ok,
+            message="main index quote request succeeded" if ok else "main index quote request returned no data",
+            details={"items": len(indices or []), "key": mask_secret(api_key)},
+        )
+    except Exception as exc:
+        return result_from_exception("data", "TickFlow", exc)
+
+
+def run_longbridge_check(config: Any) -> ApiCheckResult:
+    if not (
+        getattr(config, "longbridge_app_key", None)
+        and getattr(config, "longbridge_app_secret", None)
+        and getattr(config, "longbridge_access_token", None)
+    ):
+        return ApiCheckResult(category="data", name="Longbridge", configured=False, skipped=True, message="Longbridge credentials not configured")
+    try:
+        from data_provider.longbridge_fetcher import LongbridgeFetcher
+
+        fetcher = LongbridgeFetcher()
+        name = fetcher.get_stock_name("AAPL")
+        ctx = getattr(fetcher, "_ctx", None)
+        close = getattr(ctx, "close", None)
+        if callable(close):
+            close()
+        return ApiCheckResult(
+            category="data",
+            name="Longbridge",
+            configured=True,
+            success=bool(name),
+            message="static_info request succeeded" if name else "static_info request returned no data",
+            details={"symbol": "AAPL.US", "name": name or ""},
+        )
+    except Exception as exc:
+        return result_from_exception("data", "Longbridge", exc)
+
+
+def run_data_checks(config: Any, *, timeout: float) -> List[ApiCheckResult]:
+    return [
+        run_tushare_check(getattr(config, "tushare_token", None), timeout=timeout),
+        run_tickflow_check(getattr(config, "tickflow_api_key", None), timeout=timeout),
+        run_longbridge_check(config),
+    ]
+
+
+def run_sentiment_checks(config: Any) -> List[ApiCheckResult]:
+    api_key = getattr(config, "social_sentiment_api_key", None)
+    if not api_key:
+        return [
+            ApiCheckResult(
+                category="sentiment",
+                name="Social Sentiment",
+                configured=False,
+                skipped=True,
+                message="SOCIAL_SENTIMENT_API_KEY not configured",
+            )
+        ]
+    try:
+        from src.services.social_sentiment_service import SocialSentimentService
+
+        svc = SocialSentimentService(api_key=api_key, api_url=getattr(config, "social_sentiment_api_url", "https://api.adanos.org"))
+        data = svc.fetch_reddit_trending()
+        return [
+            ApiCheckResult(
+                category="sentiment",
+                name="Social Sentiment",
+                configured=True,
+                success=data is not None,
+                message="reddit trending request succeeded" if data is not None else "reddit trending request returned no data",
+                details={"items": len(data or []), "key": mask_secret(api_key)},
+            )
+        ]
+    except Exception as exc:
+        return [result_from_exception("sentiment", "Social Sentiment", exc)]
+
+
+def _feishu_sign(secret: str, timestamp: str) -> str:
+    key = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def run_notify_checks(config: Any, *, timeout: float, send: bool) -> List[ApiCheckResult]:
+    results: List[ApiCheckResult] = []
+
+    wechat_url = getattr(config, "wechat_webhook_url", None)
+    if wechat_url:
+        if not send:
+            results.append(ApiCheckResult(category="notify", name="WeChat Work", configured=True, skipped=True, message="dry-run; pass --notify-send to send a test message"))
+        else:
+            try:
+                response = requests.post(
+                    wechat_url,
+                    json={"msgtype": "text", "text": {"content": "daily_stock_analysis API smoke test"}},
+                    timeout=timeout,
+                )
+                results.append(ApiCheckResult(category="notify", name="WeChat Work", configured=True, success=response.status_code == 200 and response.json().get("errcode") == 0, message=response.text[:300]))
+            except Exception as exc:
+                results.append(result_from_exception("notify", "WeChat Work", exc))
+
+    feishu_url = getattr(config, "feishu_webhook_url", None)
+    if feishu_url:
+        if not send:
+            results.append(ApiCheckResult(category="notify", name="Feishu", configured=True, skipped=True, message="dry-run; pass --notify-send to send a test message"))
+        else:
+            try:
+                text = "daily_stock_analysis API smoke test"
+                if getattr(config, "feishu_webhook_keyword", None):
+                    text = f"{config.feishu_webhook_keyword} {text}"
+                payload: Dict[str, Any] = {"msg_type": "text", "content": {"text": text}}
+                secret = getattr(config, "feishu_webhook_secret", None)
+                if secret:
+                    timestamp = str(int(time.time()))
+                    payload["timestamp"] = timestamp
+                    payload["sign"] = _feishu_sign(secret, timestamp)
+                response = requests.post(feishu_url, json=payload, timeout=timeout)
+                body = response.json()
+                results.append(ApiCheckResult(category="notify", name="Feishu", configured=True, success=response.status_code == 200 and body.get("code") == 0, message=str(body)[:300]))
+            except Exception as exc:
+                results.append(result_from_exception("notify", "Feishu", exc))
+
+    telegram_token = getattr(config, "telegram_bot_token", None)
+    if telegram_token:
+        try:
+            if send and getattr(config, "telegram_chat_id", None):
+                url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+                payload = {"chat_id": config.telegram_chat_id, "text": "daily_stock_analysis API smoke test"}
+                if getattr(config, "telegram_message_thread_id", None):
+                    payload["message_thread_id"] = config.telegram_message_thread_id
+                response = requests.post(url, json=payload, timeout=timeout)
+                action = "sendMessage"
+            else:
+                url = f"https://api.telegram.org/bot{telegram_token}/getMe"
+                response = requests.get(url, timeout=timeout)
+                action = "getMe"
+            body = response.json()
+            results.append(ApiCheckResult(category="notify", name="Telegram", configured=True, success=response.status_code == 200 and body.get("ok") is True, message=f"{action}: {str(body)[:260]}", details={"key": mask_secret(telegram_token)}))
+        except Exception as exc:
+            results.append(result_from_exception("notify", "Telegram", exc))
+
+    pushover_user_key = getattr(config, "pushover_user_key", None)
+    pushover_api_token = getattr(config, "pushover_api_token", None)
+    if pushover_user_key or pushover_api_token:
+        if not (pushover_user_key and pushover_api_token):
+            results.append(ApiCheckResult(category="notify", name="Pushover", configured=True, success=False, message="PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must both be configured"))
+        else:
+            try:
+                response = requests.post(
+                    "https://api.pushover.net/1/users/validate.json",
+                    data={"token": pushover_api_token, "user": pushover_user_key},
+                    timeout=timeout,
+                )
+                body = response.json()
+                results.append(ApiCheckResult(category="notify", name="Pushover", configured=True, success=response.status_code == 200 and body.get("status") == 1, message=str(body)[:300]))
+            except Exception as exc:
+                results.append(result_from_exception("notify", "Pushover", exc))
+
+    pushplus_token = getattr(config, "pushplus_token", None)
+    if pushplus_token:
+        if not send:
+            results.append(ApiCheckResult(category="notify", name="PushPlus", configured=True, skipped=True, message="dry-run; pass --notify-send to send a test message", details={"key": mask_secret(pushplus_token)}))
+        else:
+            try:
+                payload = {"token": pushplus_token, "title": "daily_stock_analysis API smoke test", "content": "API smoke test"}
+                if getattr(config, "pushplus_topic", None):
+                    payload["topic"] = config.pushplus_topic
+                response = requests.post("https://www.pushplus.plus/send", json=payload, timeout=timeout)
+                body = response.json()
+                results.append(ApiCheckResult(category="notify", name="PushPlus", configured=True, success=response.status_code == 200 and body.get("code") == 200, message=str(body)[:300]))
+            except Exception as exc:
+                results.append(result_from_exception("notify", "PushPlus", exc))
+
+    custom_urls = getattr(config, "custom_webhook_urls", []) or []
+    if custom_urls:
+        if not send:
+            results.append(ApiCheckResult(category="notify", name="Custom Webhook", configured=True, skipped=True, message=f"dry-run for {len(custom_urls)} webhook(s); pass --notify-send to POST test payload"))
+        else:
+            headers = {"Content-Type": "application/json"}
+            bearer = getattr(config, "custom_webhook_bearer_token", None)
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
+            for index, url in enumerate(custom_urls, start=1):
+                try:
+                    response = requests.post(url, headers=headers, json={"title": "daily_stock_analysis API smoke test", "content": "API smoke test"}, timeout=timeout)
+                    results.append(ApiCheckResult(category="notify", name=f"Custom Webhook {index}", configured=True, success=200 <= response.status_code < 300, message=f"HTTP {response.status_code}: {response.text[:240]}"))
+                except Exception as exc:
+                    results.append(result_from_exception("notify", f"Custom Webhook {index}", exc))
+
+    if not results:
+        results.append(ApiCheckResult(category="notify", name="Notification APIs", configured=False, skipped=True, message="no notification API env vars configured"))
+    return results
+
+
+def format_results(results: Sequence[ApiCheckResult]) -> str:
+    visible = [item for item in results if item.configured or item.skipped]
+    category_width = max([len("category")] + [len(item.category) for item in visible])
+    name_width = max([len("name")] + [len(item.name) for item in visible])
+    lines = [f"{'status':<6} {'category':<{category_width}} {'name':<{name_width}} message"]
+    lines.append(f"{'-' * 6} {'-' * category_width} {'-' * name_width} {'-' * 7}")
+    for item in visible:
+        lines.append(f"{item.status:<6} {item.category:<{category_width}} {item.name:<{name_width}} {redact_sensitive_text(item.message)}")
+    return "\n".join(lines)
+
+
+def summarize(results: Sequence[ApiCheckResult]) -> str:
+    configured = [item for item in results if item.configured]
+    failed = [item for item in configured if not item.skipped and not item.success]
+    succeeded = [item for item in configured if item.success]
+    skipped = [item for item in configured if item.skipped]
+    return f"Summary: {len(succeeded)} OK, {len(failed)} FAIL, {len(skipped)} SKIP, {len(configured)} configured checks."
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Test API credentials configured in .env.")
+    parser.add_argument("--all", action="store_true", help="test all supported categories (default when no category flag is provided)")
+    parser.add_argument("--llm", action="store_true", help="test LLM credentials/channels")
+    parser.add_argument("--search", action="store_true", help="test search API credentials")
+    parser.add_argument("--data", action="store_true", help="test market data API credentials")
+    parser.add_argument("--fetch", action="store_true", help="legacy alias for --data")
+    parser.add_argument("--sentiment", action="store_true", help="test social sentiment API credentials")
+    parser.add_argument("--notify", action="store_true", help="test notification API credentials")
+    parser.add_argument("--notify-send", action="store_true", help="send real test messages for webhook-style notification channels")
+    parser.add_argument("--all-keys", action="store_true", help="test every comma-separated key instead of only the first key per provider")
+    parser.add_argument("--timeout", type=float, default=15.0, help="request timeout in seconds where supported")
+    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    parser.add_argument("--strict", action="store_true", help="exit with code 1 when any configured check fails")
+    parser.add_argument("--verbose", action="store_true", help="enable INFO logging from underlying providers")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.ERROR, format="%(levelname)s: %(message)s")
+    configure_proxy_from_env()
+
+    categories = select_categories(args)
+    results: List[ApiCheckResult] = []
+    try:
+        config = load_runtime_config()
+    except Exception as exc:
+        results.append(
+            ApiCheckResult(
+                category="config",
+                name="Runtime config",
+                configured=True,
+                success=False,
+                message=f"failed to load project config: {clean_error(exc)}",
+            )
+        )
+        if args.json:
+            print(json.dumps([item.to_dict() for item in results], ensure_ascii=False, indent=2))
+        else:
+            print(format_results(results))
+            print()
+            print("Summary: 0 OK, 1 FAIL, 0 SKIP, 1 configured checks.")
+        return 1
+
+    if "llm" in categories:
+        results.extend(run_llm_checks(config, timeout=args.timeout, all_keys=args.all_keys))
+    if "search" in categories:
+        results.extend(run_search_checks(config, all_keys=args.all_keys))
+    if "data" in categories:
+        results.extend(run_data_checks(config, timeout=args.timeout))
+    if "sentiment" in categories:
+        results.extend(run_sentiment_checks(config))
+    if "notify" in categories:
+        results.extend(run_notify_checks(config, timeout=args.timeout, send=args.notify_send))
+
+    if args.json:
+        print(json.dumps([item.to_dict() for item in results], ensure_ascii=False, indent=2))
+    else:
+        print(format_results(results))
+        print()
+        print(summarize(results))
+
+    has_failed_configured = any(item.configured and not item.skipped and not item.success for item in results)
+    return 1 if args.strict and has_failed_configured else 0
 
 
 if __name__ == "__main__":

@@ -26,11 +26,18 @@ try:
     import litellm  # noqa: F401
 except ModuleNotFoundError:
     sys.modules["litellm"] = MagicMock()
+try:
+    import json_repair  # noqa: F401
+except ModuleNotFoundError:
+    json_repair_stub = MagicMock()
+    json_repair_stub.repair_json.side_effect = lambda content, **_kwargs: content
+    sys.modules["json_repair"] = json_repair_stub
 
 from src.agent.executor import AgentExecutor, AgentResult
 from src.agent.llm_adapter import LLMResponse, ToolCall
 from src.agent.runner import parse_dashboard_json, run_agent_loop, serialize_tool_result
 from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter
+from src.schemas.agent_context import AgentUserContext, PositionContext, ReportContext
 
 
 # ============================================================
@@ -730,6 +737,54 @@ class TestBuildUserMessage(unittest.TestCase):
         )
         self.assertIn("股票代码: 600519", msg)
         self.assertIn("报告类型: daily", msg)
+
+    def test_message_injects_planning_context_and_plan(self):
+        context = AgentUserContext(
+            positions=[PositionContext(symbol="600519", quantity=100)],
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            ),
+        )
+
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertIn("AgentUserContext", msg)
+        self.assertIn("Planner 工具执行计划", msg)
+        self.assertIn('"intent": "position_review"', msg)
+        self.assertIn("capability -> tools", msg)
+
+    def test_run_uses_planning_system_prompt_when_context_requests_it(self):
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            )
+        )
+
+        result = executor.run(
+            "Analyze 600519",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
+        self.assertIn("Planning -> Execute", prompt)
+        self.assertIn("账户", prompt)
 
 
 # ============================================================

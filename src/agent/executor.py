@@ -20,8 +20,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.llm_adapter import LLMToolAdapter
+from src.agent.planner import build_planning_result
+from src.agent.planning_prompts import PromptBuildOptions, build_planning_system_prompt
 from src.agent.runner import run_agent_loop, parse_dashboard_json
 from src.agent.tools.registry import ToolRegistry
+from src.schemas.agent_context import AgentUserContext
 from src.report_language import normalize_report_language
 from src.market_context import get_market_role, get_market_guidelines
 
@@ -473,18 +476,37 @@ class AgentExecutor:
         stock_code = (context or {}).get("stock_code", "")
         market_role = get_market_role(stock_code, report_language)
         market_guidelines = get_market_guidelines(stock_code, report_language)
-        prompt_template = (
-            LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
-            if self.use_legacy_default_prompt
-            else AGENT_SYSTEM_PROMPT
-        )
-        system_prompt = prompt_template.format(
-            market_role=market_role,
-            market_guidelines=market_guidelines,
-            default_skill_policy_section=default_skill_policy_section,
-            skills_section=skills_section,
-            language_section=_build_language_section(report_language),
-        )
+        agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        planning_mode = _is_planning_execute_context(agent_user_context)
+        if planning_mode:
+            extra_sections = [
+                f"## 市场角色\n\n你当前以{market_role}身份分析本次请求。",
+                market_guidelines,
+                _build_language_section(report_language),
+            ]
+            if default_skill_policy_section:
+                extra_sections.append(default_skill_policy_section)
+            if skills_section:
+                extra_sections.append(skills_section)
+            system_prompt = build_planning_system_prompt(
+                PromptBuildOptions(
+                    language="en" if report_language == "en" else "zh",
+                    extra_instructions="\n\n".join(section.strip() for section in extra_sections if section.strip()),
+                )
+            )
+        else:
+            prompt_template = (
+                LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
+                if self.use_legacy_default_prompt
+                else AGENT_SYSTEM_PROMPT
+            )
+            system_prompt = prompt_template.format(
+                market_role=market_role,
+                market_guidelines=market_guidelines,
+                default_skill_policy_section=default_skill_policy_section,
+                skills_section=skills_section,
+                language_section=_build_language_section(report_language),
+            )
 
         # Build tool declarations in OpenAI format (litellm handles all providers)
         tool_decls = self.tool_registry.to_openai_tools()
@@ -637,6 +659,18 @@ class AgentExecutor:
         parts = [task]
         if context:
             report_language = normalize_report_language(context.get("report_language", "zh"))
+            agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+            if agent_user_context is not None:
+                planning_result = build_planning_result(
+                    agent_user_context,
+                    tool_registry=self.tool_registry,
+                )
+                parts.append("\n[系统生成的 AgentUserContext]\n" + agent_user_context.model_dump_json(indent=2))
+                parts.append("\n[系统生成的 Planner 工具执行计划]\n" + json.dumps(planning_result.to_dict(), ensure_ascii=False, indent=2))
+                parts.append(
+                    "\n请先遵循 Planner 的 capability -> tools 计划调用必要工具；"
+                    "如某工具缺失或返回失败，记录原因并使用已有证据降级分析。"
+                )
             if context.get("stock_code"):
                 parts.append(f"\n股票代码: {context['stock_code']}")
             if context.get("report_type"):
@@ -656,3 +690,18 @@ class AgentExecutor:
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)
+
+
+def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
+    """Return an AgentUserContext from a model/dict payload, or None if absent."""
+    if value is None:
+        return None
+    if isinstance(value, AgentUserContext):
+        return value
+    if isinstance(value, dict):
+        return AgentUserContext(**value)
+    return None
+
+
+def _is_planning_execute_context(context: Optional[AgentUserContext]) -> bool:
+    return bool(context and context.report.analysis_mode == "planning_execute")

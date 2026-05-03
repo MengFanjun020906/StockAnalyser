@@ -61,6 +61,19 @@ LITELLM_MODEL=ollama/qwen3:8b
 > **Congratulations! If you're a beginner, you can stop reading here and run the program!**
 > Want to test the connection? Open your terminal in the root directory and run: `python test_env.py --llm`
 
+To check all configured APIs in `.env` at once, including LLM, search, market data,
+social sentiment, and notification channels, run:
+
+```bash
+python test_env.py --all
+```
+
+The tool only tests APIs that are configured. Channels that would send real
+messages, such as WeChat Work, Feishu, PushPlus, and custom webhooks, are dry-run
+by default; add `--notify-send` only when you explicitly want to send test
+messages. Multi-key providers test the first key by default; add `--all-keys`
+when you need to inspect every rotated key.
+
 ---
 
 ## Method 2: Channels Mode Config (Advanced/Multi-model)

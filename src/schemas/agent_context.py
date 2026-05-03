@@ -122,7 +122,6 @@ class PositionContext(BaseModel):
     position_pct: Optional[float] = Field(
         None,
         ge=0,
-        le=100,
         description="Position weight within account or total portfolio.",
     )
     holding_days: Optional[int] = Field(None, ge=0)

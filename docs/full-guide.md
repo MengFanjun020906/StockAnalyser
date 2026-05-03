@@ -190,6 +190,7 @@ daily_stock_analysis/
 |--------|------|--------|:----:|
 | `LITELLM_MODEL` | 主模型，格式 `provider/model`（如 `gemini/gemini-2.5-flash`），推荐优先使用 | - | 否 |
 | `AGENT_LITELLM_MODEL` | Agent 主模型（可选）；留空继承主模型，无 provider 前缀按 `openai/<model>` 解析 | - | 否 |
+| `AGENT_ANALYSIS_MODE` | Agent 分析模式：`normal` 保持现有 ReAct 链路；`planning_execute` 启用账户感知 Planner prompt，并在可用时注入 `AgentUserContext` | `normal` | 否 |
 | `LITELLM_FALLBACK_MODELS` | 备选模型，逗号分隔 | - | 否 |
 | `LLM_CHANNELS` | 渠道名称列表（逗号分隔），配合 `LLM_{NAME}_*` 使用，详见 [LLM 配置指南](LLM_CONFIG_GUIDE.md) | - | 否 |
 | `LITELLM_CONFIG` | 高级模型路由 YAML 配置文件路径（高级） | - | 否 |
@@ -1210,3 +1211,16 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - Agent 可通过 `get_portfolio_snapshot` 获取面向账户的紧凑持仓摘要，默认包含精简风险块，适合控制 Token 开销。
 - 可选参数包括 `account_id`、`cost_method`、`as_of`、`include_positions`、`include_risk`。
 - 若风险块生成失败，快照仍会返回；若当前环境未启用持仓模块，工具会返回结构化 `not_supported`。
+- 当 `AGENT_ANALYSIS_MODE=planning_execute` 且普通单股 Agent 分析运行时，后端会 best-effort 从 `PortfolioService.get_portfolio_snapshot()` 构造 `AgentUserContext`，把账户、持仓、成本、仓位和浮盈亏上下文注入 Planner；构造失败会回退到无账户上下文，不阻断分析。
+- Agent 的 `get_realtime_quote` 会返回 `market_session`、`query_date`、`quote_trade_date`、`price_label`、`change_pct_label` 和 `freshness_note`。当查询日休市或非交易日时，报告必须把价格标注为“最新可用价（截至最近交易日）”，把涨跌幅标注为“最近交易日涨跌幅”，不得写成“今日涨跌幅”。
+
+### Agent Trace 调试界面
+
+- Web 侧边栏的“链路”页面面向开发者排查 Agent 执行链路，调用 `POST /api/v1/agent/trace/run` 执行一次独立调试请求。
+- 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
+- 页面支持选择持仓账户、风险偏好、持有周期和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
+- 页面会把最近 10 次 Trace 完整结果保存在当前浏览器的 localStorage，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
+- 默认调试 Prompt 使用真实用户问题示例，例如“我持有 600519，帮我分析未来走势，适合继续拿长线吗？”，而不是面向开发者的内部链路描述。
+- 页面把 Planner 压缩为 `Execution Thesis` 摘要，把事件流压缩为可点击的 `Evidence Timeline`，点击任一事件可查看完整载荷；最终输出使用大尺寸 Markdown 渲染窗口，适合阅读完整报告。
+- 出于安全与可解释性边界，页面展示的是可验证的 plan/execute 事实、工具证据和输出依据，不展示模型隐藏思维链。
+- 已持仓 `position_review` 输出必须包含 1-3 个月与 6-12 个月的上行/下行情景、可复盘价格或条件、分层持仓策略、加仓/减仓/止损条件和复查节奏。

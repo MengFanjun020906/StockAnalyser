@@ -73,6 +73,44 @@ def test_position_review_output_does_not_expose_confidence_field():
         assert forbidden not in build_planning_system_prompt()
 
 
+def test_position_review_requires_price_scenarios_and_layered_holding_strategy():
+    required_snippets = [
+        "1-3个月上行情景",
+        "1-3个月下行情景",
+        "6-12个月上行情景",
+        "6-12个月下行情景",
+        "#### 持仓策略：分层执行",
+        "当前仓位处理",
+        "加仓条件",
+        "减仓/止损条件",
+        "目标区间",
+        "复查节奏",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in POSITION_REVIEW_OUTPUT_FORMAT
+        assert snippet in build_planning_system_prompt()
+
+
+def test_prompt_requires_realtime_quote_session_wording():
+    required_snippets = [
+        "market_session",
+        "query_date",
+        "quote_trade_date",
+        "price_label",
+        "change_pct_label",
+        "freshness_note",
+        "查询日休市/非交易日",
+        "截至 quote_trade_date 的最新可用行情",
+        "不得写“今日 +x%”",
+        "最近交易日涨跌幅 +x%（查询日休市）",
+    ]
+
+    prompt = build_planning_system_prompt()
+    for snippet in required_snippets:
+        assert snippet in prompt
+
+
 def test_constraints_keep_confidence_internal_only():
     assert "工具返回的 `confidence` 字段只允许用于内部判断数据可靠性" in CONSTRAINTS
     assert "禁止在最终用户输出中展示" in CONSTRAINTS

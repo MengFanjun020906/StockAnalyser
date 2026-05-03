@@ -52,6 +52,7 @@ Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域�
 - 资金面 `capital_flow`
 - 基本面与估值 `fundamental_analysis`
 - 板块与行业 `sector_industry`
+- 市场状态 `regime_detection`
 - 消息面与事件 `news_event`
 - 舆情与情绪 `sentiment_analysis`
 - 账户与持仓 `portfolio_context`
@@ -227,10 +228,47 @@ Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域�
 | `capital_flow` | `get_capital_flow` |
 | `fundamental_analysis` | `get_stock_info` |
 | `chip_distribution` | `get_chip_distribution` |
+| `regime_detection` | `detect_market_regime`，第一版可由 `get_market_indices`, `get_sector_rankings`, `get_volume_analysis` 组合实现 |
 | `market_context` | `get_market_indices`, `get_sector_rankings` |
 | `backtest_memory` | `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary` |
 
 这样可以避免在 prompt 里硬编码过多工具细节，也方便后续按账户类型、市场、任务意图裁剪工具集。
+
+### 市场状态识别能力
+
+`regime_detection` 不作为“大盘报告”能力使用，而是作为 Agent 内部决策约束，用来判断当前市场环境是否支持把个股信号转化为真实动作。
+
+建议输出结构保持短而可判定：
+
+```json
+{
+  "market": "cn",
+  "regime": "trending_up | trending_down | range_bound | high_volatility | risk_off | event_driven | unknown",
+  "risk_level": "low | medium | high",
+  "index_alignment": {},
+  "breadth": {},
+  "sector_rotation": {},
+  "liquidity": {},
+  "evidence": [],
+  "conflicts": [],
+  "data_quality": "sufficient | limited | insufficient"
+}
+```
+
+使用边界：
+
+- 用户问“能不能买、要不要加仓、要不要卖、某事件对持仓影响”时，Planner 应默认纳入 `regime_detection`。
+- 用户只问财报解释、概念解释、历史复盘时，可以不调用，避免稀释核心问题。
+- `regime_detection` 只调整仓位、入场激进程度、止损纪律和信号有效期，不直接覆盖账户约束和个股证据。
+- 当市场处于 `risk_off` 或 `high_volatility` 时，即使个股信号偏多，也应降低仓位上限、提高确认条件、明确失效价位。
+- 当市场处于 `range_bound` 时，优先考虑回踩、箱体边界和等待确认，避免追高型入场。
+- 当市场处于 `event_driven` 时，提高消息面、资金面和事件时效权重，并说明技术指标可能滞后。
+
+在 Debate Agent 中，`regime_detection` 应进入双方共享的 `Shared Evidence Bundle`：
+
+- 主观点 Agent 可以引用它证明市场环境支持执行。
+- 反方 Agent 可以引用它挑战入场/加仓的风险收益比。
+- Judge Agent 用它做最终动作的风险调节，而不是机械折中。
 
 ## 报告类型规划
 
@@ -343,20 +381,36 @@ PortfolioService.get_portfolio_snapshot()
 
 ## 后续阶段建议
 
-### 第二阶段：Planner 外壳
+### 第二阶段：Planner 外壳（已完成）
 
 - 新增 planner 输入 `AgentUserContext`。
 - 复用 `src/agent/planning_prompts.py` 中的 system prompt。
-- 新增 capability -> tools 映射层，将 `technical_analysis`、`portfolio_context`、`news_event` 等能力域展开为当前 ToolRegistry 中的实际工具。
+- 新增 capability -> tools 映射层，将 `technical_analysis`、`portfolio_context`、`regime_detection`、`news_event` 等能力域展开为当前 ToolRegistry 中的实际工具。
 - 输出工具执行计划。
 - 不改变现有工具实现。
 - 普通单股分析先支持 `analysis_mode=planning_execute` 实验开关。
+- 第一版 `regime_detection` 可以先复用现有指数、板块、量价和市场宽度数据生成结构化市场状态；后续再独立沉淀为 `detect_market_regime` 工具。
 
-### 第三阶段：持仓上下文接入
+当前实现：
+
+- `src/agent/planner.py` 提供确定性 Planner 外壳和 `CAPABILITY_TOOL_MAP`。
+- `build_planning_result()` 会根据 `AgentUserContext.report.intent`、`primary_symbol` 和是否已有持仓选择能力域、风险检查项和期望输出类型。
+- 映射层只展开当前 `ToolRegistry` 已注册的工具，缺失工具记录在 `missing_tools`，不假设工具一定存在。
+- `AGENT_ANALYSIS_MODE=planning_execute` 作为实验开关；默认 `normal`，不改变现有 Agent 行为。
+- 第一版 `regime_detection` 仍按计划由 `get_market_indices`、`get_sector_rankings`、`get_volume_analysis` 组合表达，暂不新增独立工具。
+
+### 第三阶段：持仓上下文接入（已完成）
 
 - 从 `PortfolioService` 生成 `AgentUserContext`。
 - 支持按 `account_id`、`symbol`、`cost_method` 构造上下文。
 - 将持仓上下文注入 Agent Prompt。
+
+当前实现：
+
+- `src/agent/context_builder.py` 将 `PortfolioService.get_portfolio_snapshot()` 输出转换为 `AgentUserContext`。
+- 普通单股 Agent 分析在 `AGENT_ANALYSIS_MODE=planning_execute` 时，会 best-effort 构造账户上下文并注入 Agent prompt。
+- 上下文包含账户、现金、总权益、持仓数量、成本、市值、浮盈亏、仓位占比和价格可用性备注。
+- 构造失败会回退到无账户上下文，不阻断分析主流程，也不向日志明文输出账户明细。
 
 ### 第四阶段：双报告类型
 
@@ -370,6 +424,78 @@ PortfolioService.get_portfolio_snapshot()
 - 在设置或持仓页补充投资者画像。
 - 支持风险偏好、交易周期、单票上限、默认止损。
 - 支持报告类型选择。
+
+### 第六阶段：对抗式 Debate Agent
+
+单 Agent 自我反思容易变成形式化反思，实际输出仍倾向于支持自己的初始结论。后续可以引入独立反方 Agent，让主观点和反观点基于同一份证据进行对抗式辩论，再由 Judge Agent 做最终裁决。
+
+采用的模式是“强制反向立场辩论 + Judge 最终裁决”：
+
+- 主观点 Agent 先给出 primary thesis，例如看多、持有、加仓、开仓。
+- 反方 Agent 必须站到相反方向，例如看空、减仓、不入场、等待。
+- 反方 Agent 不能编造数据，只能基于同一份工具证据构造最强反证。
+- 双方都必须给出自己的失效条件，而不是只证明自己正确。
+- Judge Agent 不做简单折中，而是按证据强弱、账户风险、数据可靠性和用户目标裁决。
+
+建议角色：
+
+| 角色 | 职责 |
+| --- | --- |
+| `PrimaryThesisAgent` | 基于 planner 和工具证据生成主观点、主动作、入场/持仓计划和失效条件 |
+| `AdversarialThesisAgent` | 强制站在相反方向，构造最强反证、反向动作计划和主观点失效条件 |
+| `DebateJudgeAgent` | 对双方证据和矛盾点做裁决，输出最终动作、接受/驳回的论点和风控条件 |
+| `RiskGateAgent` | 可选后置风控门，检查最终动作是否违反仓位、杠杆、止损和账户约束 |
+
+建议流程：
+
+```text
+AgentUserContext
+  -> Planner
+  -> Shared Evidence Bundle
+  -> PrimaryThesisAgent
+  -> AdversarialThesisAgent
+  -> Debate rounds
+  -> DebateJudgeAgent
+  -> Final account-aware action plan
+```
+
+核心约束：
+
+- 双方必须使用同一份 `Shared Evidence Bundle`，避免各自选择性找数据。
+- 反方 Agent 的职责是构造最强 opposing case，不是为了反对而编造理由。
+- 每轮辩论必须围绕证据、反证、矛盾数据、失效条件和账户影响展开。
+- 工具 confidence 仍只作内部可靠性判断，最终输出不得展示 confidence 字段。
+- 如果双方证据冲突且 Judge 无法裁决，最终结果应为 `no_trade` 或 `insufficient_data`，而不是强行给买卖建议。
+
+建议结构化状态：
+
+```json
+{
+  "primary_thesis": {
+    "direction": "bullish",
+    "action": "hold | add | open",
+    "evidence": [],
+    "failure_conditions": []
+  },
+  "opposing_thesis": {
+    "direction": "bearish",
+    "action": "reduce | wait | reject",
+    "evidence": [],
+    "failure_conditions": []
+  },
+  "debate_rounds": [],
+  "unresolved_conflicts": [],
+  "judge_decision": {
+    "winner": "primary | opposing | no_trade | insufficient_data",
+    "final_action": "",
+    "accepted_arguments": [],
+    "rejected_arguments": [],
+    "risk_controls": []
+  }
+}
+```
+
+这个阶段的目标不是让输出更长，而是让最终结论经受独立反方检验。对于已持仓报告，反方重点挑战“继续持有/加仓”的安全性；对于入场报告，反方重点挑战“现在入场”的风险收益比。
 
 ## 当前阶段验收标准
 

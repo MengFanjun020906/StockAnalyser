@@ -2,6 +2,7 @@
 """Tests for the Agent models discovery service and endpoint."""
 
 import asyncio
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -334,6 +335,200 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         executor.chat.assert_called_once()
         self.assertEqual(executor.chat.call_args.kwargs["context"]["skills"], [])
         self.assertEqual(payload["content"], "ok")
+
+    def test_trace_run_returns_tool_log_and_progress_events(self) -> None:
+        config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
+        executor = MagicMock()
+        executor.chat.side_effect = lambda **kwargs: (
+            kwargs["progress_callback"]({"type": "tool_start", "step": 1, "tool": "get_realtime_quote"})
+            or SimpleNamespace(
+                success=True,
+                content="trace ok",
+                error=None,
+                total_steps=2,
+                total_tokens=123,
+                provider="deepseek",
+                model="deepseek/deepseek-v4-pro",
+                tool_calls_log=[
+                    {
+                        "step": 1,
+                        "tool": "get_realtime_quote",
+                        "arguments": {"stock_code": "600519"},
+                        "success": True,
+                        "duration": 0.1,
+                        "result_length": 20,
+                        "result_preview": '{"price": 100}',
+                    }
+                ],
+            )
+        )
+        request = agent.AgentTraceRunRequest(
+            message="分析 600519",
+            inject_portfolio_context=False,
+        )
+        real_get_running_loop = asyncio.get_running_loop
+
+        class _ImmediateLoop:
+            def __init__(self, loop):
+                self._loop = loop
+
+            def run_in_executor(self, _executor, func):
+                future = self._loop.create_future()
+                future.set_result(func())
+                return future
+
+        mock_db = MagicMock()
+        with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
+            "api.v1.endpoints.agent._build_executor",
+            return_value=executor,
+        ), patch(
+            "src.agent.conversation.conversation_manager.clear",
+        ) as mock_clear, patch(
+            "src.storage.get_db",
+            return_value=mock_db,
+        ), patch(
+            "api.v1.endpoints.agent.asyncio.get_running_loop",
+            side_effect=lambda: _ImmediateLoop(real_get_running_loop()),
+        ):
+            payload = asyncio.run(agent.run_agent_trace(request)).model_dump()
+
+        mock_clear.assert_called_once_with(payload["session_id"])
+        mock_db.delete_conversation_session.assert_called_once_with(payload["session_id"])
+        self.assertTrue(payload["session_id"].startswith("trace-"))
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["content"], "trace ok")
+        self.assertEqual(payload["tool_calls"][0]["tool"], "get_realtime_quote")
+        self.assertEqual(payload["events"][0]["display_name"], "获取实时行情")
+        self.assertIsNone(payload["planner"])
+
+    def test_trace_stream_emits_context_planner_tool_and_done_events(self) -> None:
+        config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
+        executor = MagicMock()
+        executor.chat.side_effect = lambda **kwargs: (
+            kwargs["progress_callback"]({
+                "type": "tool_done",
+                "step": 1,
+                "tool": "get_realtime_quote",
+                "arguments": {"stock_code": "600519"},
+                "success": True,
+                "duration": 0.1,
+                "result_length": 16,
+                "result_preview": '{"price":100}',
+            })
+            or SimpleNamespace(
+                success=True,
+                content="stream ok",
+                error=None,
+                total_steps=1,
+                total_tokens=42,
+                provider="deepseek",
+                model="deepseek/deepseek-v4-pro",
+                tool_calls_log=[
+                    {
+                        "step": 1,
+                        "tool": "get_realtime_quote",
+                        "arguments": {"stock_code": "600519"},
+                        "success": True,
+                        "duration": 0.1,
+                        "result_length": 16,
+                        "result_preview": '{"price":100}',
+                    }
+                ],
+            )
+        )
+        request = agent.AgentTraceRunRequest(
+            message="我持有 600519，适合继续拿长线吗？",
+            inject_portfolio_context=False,
+        )
+
+        async def collect_events() -> list:
+            with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
+                "api.v1.endpoints.agent._build_executor",
+                return_value=executor,
+            ), patch(
+                "src.agent.conversation.conversation_manager.clear",
+            ), patch(
+                "src.storage.get_db",
+                return_value=MagicMock(),
+            ):
+                response = await agent.stream_agent_trace(request)
+                chunks = []
+                async for chunk in response.body_iterator:
+                    chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+                parsed = []
+                for line in "".join(chunks).splitlines():
+                    if line.startswith("data: "):
+                        parsed.append(json.loads(line[6:]))
+                return parsed
+
+        events = asyncio.run(collect_events())
+        event_types = [event["type"] for event in events]
+
+        self.assertIn("context_ready", event_types)
+        self.assertIn("planner_ready", event_types)
+        self.assertIn("tool_done", event_types)
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["content"], "stream ok")
+        tool_event = next(event for event in events if event["type"] == "tool_done")
+        self.assertEqual(tool_event["display_name"], "获取实时行情")
+        self.assertEqual(tool_event["result_preview"], '{"price":100}')
+
+    def test_trace_run_context_summary_exposes_account_position_and_profile(self) -> None:
+        mock_portfolio_service = MagicMock()
+        mock_portfolio_service.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-05-03",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 7,
+                    "account_name": "A股主账户",
+                    "broker": None,
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 16982.65,
+                    "total_market_value": 719550.0,
+                    "total_equity": 736532.65,
+                    "cost_method": "fifo",
+                    "positions": [
+                        {
+                            "symbol": "600519",
+                            "market": "cn",
+                            "quantity": 150000,
+                            "avg_cost": 4.797,
+                            "total_cost": 719550.0,
+                            "last_price": 5.0,
+                            "market_value_base": 750000.0,
+                            "unrealized_pnl_base": 30450.0,
+                            "unrealized_pnl_pct": 4.231,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch("src.services.portfolio_service.PortfolioService", return_value=mock_portfolio_service):
+            context = agent._build_trace_context(
+                request=agent.AgentTraceRunRequest(
+                    message="我持有 600519，适合继续拿长线吗？",
+                    account_id=7,
+                    stock_code="600519",
+                    risk_preference="conservative",
+                    trading_horizon="long_term",
+                    investor_notes="不能承受大回撤",
+                ),
+                config=SimpleNamespace(report_language="zh"),
+            )
+        summary = agent._build_trace_context_summary(context)
+
+        mock_portfolio_service.get_portfolio_snapshot.assert_called_once()
+        self.assertEqual(mock_portfolio_service.get_portfolio_snapshot.call_args.kwargs["account_id"], 7)
+        self.assertEqual(summary["accounts"][0]["account_id"], 7)
+        self.assertEqual(summary["accounts"][0]["account_name"], "A股主账户")
+        self.assertEqual(summary["investor"]["risk_preference"], "conservative")
+        self.assertEqual(summary["investor"]["trading_horizon"], "long_term")
+        self.assertEqual(summary["target_position"]["symbol"], "600519")
+        self.assertEqual(summary["target_position"]["quantity"], 150000.0)
 class AgentModelsSourceDetectionTestCase(unittest.TestCase):
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

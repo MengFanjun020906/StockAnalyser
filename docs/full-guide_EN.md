@@ -168,6 +168,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 |--------|------|--------|:----:|
 | `LITELLM_MODEL` | Primary model, format `provider/model` (e.g. `gemini/gemini-2.5-flash`), recommended | - | No |
 | `AGENT_LITELLM_MODEL` | Optional Agent-only primary model; when empty it inherits the primary model, and bare names are normalized to `openai/<model>` | - | No |
+| `AGENT_ANALYSIS_MODE` | Agent analysis mode: `normal` keeps the existing ReAct flow; `planning_execute` enables the account-aware Planner prompt and injects `AgentUserContext` when available | `normal` | No |
 | `LITELLM_FALLBACK_MODELS` | Fallback models, comma-separated | - | No |
 | `LLM_CHANNELS` | Channel names (comma-separated), use with `LLM_{NAME}_*`, see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) | - | No |
 | `LITELLM_CONFIG` | Advanced model routing YAML path (expert use) | - | No |
@@ -1006,6 +1007,19 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 - When the cache is missing or stale, the tool keeps the original data-source fetch path; successful fetches are written back to `stock_daily` on a best-effort basis, and write failures do not block the Agent response.
 - `search_stock_news` and `search_comprehensive_intel` persist successful results to `news_intel` on a best-effort basis, reusing the existing URL / fallback-key deduplication logic.
 - `get_realtime_quote` does not use `stock_daily` as a realtime-quote cache and does not write intraday quotes into the daily-bar table; realtime quote caching should use a dedicated realtime store if needed.
+- When `AGENT_ANALYSIS_MODE=planning_execute` is used for normal single-stock Agent analysis, the backend best-effort builds `AgentUserContext` from `PortfolioService.get_portfolio_snapshot()` and injects account, position, cost, exposure, and unrealized PnL context into the Planner. If context construction fails, analysis falls back to no-account context instead of failing the request.
+- `get_realtime_quote` also returns `market_session`, `query_date`, `quote_trade_date`, `price_label`, `change_pct_label`, and `freshness_note`. On closed or non-trading days, Agent reports must label price as the latest available quote as of the last trading day and label percentage change as the latest trading-day change instead of saying "today's change".
+
+### Agent Trace Debug View
+
+- The Web sidebar "Trace" page is intended for developers who need to inspect Agent execution. It runs an isolated debug request through `POST /api/v1/agent/trace/run`.
+- The Run button uses the `POST /api/v1/agent/trace/stream` SSE endpoint by default. Context, Planner, thinking updates, tool start, tool completion, and final done/error events are appended live so long-running traces are no longer a black-box wait.
+- It supports selecting a portfolio account, risk preference, trading horizon, and investor notes. The top `Context In Use` block shows the injected account, target position, cost, weight, unrealized PnL, and profile summary so developers can confirm whether the real portfolio context was used without digging through raw JSON.
+- The latest 10 trace results are saved in the current browser's localStorage and can be reopened from `Trace History`; the backend still deletes temporary `trace-*` sessions so normal chat history stays clean.
+- The default debug prompt is a realistic user question, such as asking whether a held stock is suitable for long-term holding, instead of an internal trace-oriented prompt.
+- The page compresses Planner data into an `Execution Thesis` summary, collapses runtime events into a clickable `Evidence Timeline`, and renders the final answer in a large Markdown report pane for easier reading.
+- For safety and explainability boundaries, it displays verifiable plan/execute facts, tool evidence, and output-supporting data, not hidden model chain-of-thought.
+- Held-position `position_review` output must include 1-3 month and 6-12 month upside/downside scenarios, reviewable price levels or conditions, layered holding strategy, add/reduce/stop-loss rules, and a review cadence.
 
 ---
 

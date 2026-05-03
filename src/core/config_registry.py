@@ -1594,6 +1594,23 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min": 1, "max": 50},
         "display_order": 20,
     },
+    "AGENT_ANALYSIS_MODE": {
+        "title": "Agent Analysis Mode",
+        "description": "Agent analysis prompt mode. 'normal' keeps the existing ReAct flow; 'planning_execute' enables the account-aware planning prompt and injects AgentUserContext when available.",
+        "category": "agent",
+        "data_type": "string",
+        "ui_control": "select",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "normal",
+        "options": [
+            {"label": "Normal", "value": "normal"},
+            {"label": "Planning Execute", "value": "planning_execute"},
+        ],
+        "validation": {"enum": ["normal", "planning_execute"]},
+        "display_order": 25,
+    },
     "AGENT_SKILLS": {
         "title": "Agent Strategies",
         "description": "Comma-separated list of active agent strategy skills. Leave empty to use the primary default strategy skill declared in metadata (built-in default: bull_trend). When set to specific skills (not 'all'), scheduled tasks will automatically use the Agent pipeline.",

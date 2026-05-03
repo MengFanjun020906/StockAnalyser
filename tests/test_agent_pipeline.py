@@ -27,6 +27,9 @@ ensure_litellm_stub()
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+if "fake_useragent" not in sys.modules:
+    sys.modules["fake_useragent"] = MagicMock()
+
 
 def _builtin_strategy_names() -> set[str]:
     strategies_dir = Path(__file__).resolve().parent.parent / "strategies"
@@ -49,11 +52,13 @@ class TestAgentConfig(unittest.TestCase):
         config = Config._load_from_env()
         self.assertEqual(config.agent_litellm_model, "")
         self.assertFalse(config.agent_mode)
+        self.assertEqual(config.agent_analysis_mode, "normal")
         self.assertEqual(config.agent_max_steps, AGENT_MAX_STEPS_DEFAULT)
         self.assertEqual(config.agent_skills, [])
 
     @patch.dict(os.environ, {
         'AGENT_MODE': 'true',
+        'AGENT_ANALYSIS_MODE': 'planning_execute',
         'AGENT_MAX_STEPS': '15',
         'AGENT_SKILLS': 'dragon_head,shrink_pullback,volume_breakout',
     }, clear=True)
@@ -63,6 +68,7 @@ class TestAgentConfig(unittest.TestCase):
         Config._instance = None
         config = Config._load_from_env()
         self.assertTrue(config.agent_mode)
+        self.assertEqual(config.agent_analysis_mode, "planning_execute")
         self.assertEqual(config.agent_max_steps, 15)
         self.assertEqual(config.agent_skills, ['dragon_head', 'shrink_pullback', 'volume_breakout'])
 

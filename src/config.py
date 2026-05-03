@@ -675,6 +675,7 @@ class Config:
     agent_litellm_model: str = ""  # Optional Agent-only primary model; empty inherits LITELLM_MODEL
     agent_mode: bool = False
     _agent_mode_explicit: bool = False  # True when AGENT_MODE was explicitly set in env
+    agent_analysis_mode: str = "normal"  # Agent analysis mode: normal | planning_execute
     agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT
     agent_skills: List[str] = field(default_factory=list)
     agent_skill_dir: Optional[str] = None
@@ -922,6 +923,7 @@ class Config:
 
     # --- Post-init validation ---------------------------------------------------
     _VALID_AGENT_ARCH = {"single", "multi"}
+    _VALID_AGENT_ANALYSIS_MODE = {"normal", "planning_execute"}
     _VALID_ORCHESTRATOR_MODES = {"quick", "standard", "full", "specialist"}
     _VALID_SKILL_ROUTING = {"auto", "manual"}
     _WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS = frozenset(
@@ -944,6 +946,12 @@ class Config:
                 self.agent_arch, self._VALID_AGENT_ARCH,
             )
             object.__setattr__(self, "agent_arch", "single")
+        if self.agent_analysis_mode not in self._VALID_AGENT_ANALYSIS_MODE:
+            _log.warning(
+                "Invalid AGENT_ANALYSIS_MODE=%r, falling back to 'normal'. Valid: %s",
+                self.agent_analysis_mode, self._VALID_AGENT_ANALYSIS_MODE,
+            )
+            object.__setattr__(self, "agent_analysis_mode", "normal")
         if self.agent_orchestrator_mode in {"strategy", "skill"}:
             _log.info(
                 "AGENT_ORCHESTRATOR_MODE=%s is deprecated; normalizing to 'specialist'",
@@ -1343,6 +1351,7 @@ class Config:
             agent_litellm_model=agent_litellm_model,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
+            agent_analysis_mode=os.getenv('AGENT_ANALYSIS_MODE', 'normal').strip().lower(),
             agent_max_steps=parse_env_int(
                 os.getenv('AGENT_MAX_STEPS'),
                 AGENT_MAX_STEPS_DEFAULT,

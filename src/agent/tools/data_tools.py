@@ -10,7 +10,7 @@ Tools:
 """
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -232,6 +232,166 @@ def _compact_portfolio_risk(risk: dict, top_n: int = 10) -> dict:
 # get_realtime_quote
 # ============================================================
 
+def _to_iso_date(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _to_market_datetime(value: Any, tz_name: Optional[str]) -> datetime:
+    """Convert exchange-calendar timestamps to a market-local datetime."""
+    if hasattr(value, "tz_convert"):
+        converted = value.tz_convert(tz_name) if tz_name else value
+        return converted.to_pydatetime()
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
+
+
+def _resolve_realtime_market_phase(market: Optional[str], market_now: datetime) -> str:
+    """Best-effort intraday phase for quote wording."""
+    if not market:
+        return "unknown"
+
+    try:
+        from src.core import trading_calendar
+
+        if not getattr(trading_calendar, "_XCALS_AVAILABLE", False):
+            return "unknown"
+
+        exchange = trading_calendar.MARKET_EXCHANGE.get(market)
+        tz_name = trading_calendar.MARKET_TIMEZONE.get(market)
+        if not exchange or not tz_name:
+            return "unknown"
+
+        cal = trading_calendar.xcals.get_calendar(exchange)
+        local_date = market_now.date()
+        if not cal.is_session(local_date):
+            return "closed_non_trading_day"
+
+        session = cal.date_to_session(local_date, direction="previous")
+        session_open = _to_market_datetime(cal.session_open(session), tz_name)
+        session_close = _to_market_datetime(cal.session_close(session), tz_name)
+
+        if market_now < session_open:
+            return "pre_open"
+        if market_now > session_close:
+            return "post_close"
+        return "open"
+    except Exception as exc:
+        logger.debug("Unable to resolve realtime market phase for %s: %s", market, exc)
+        return "unknown"
+
+
+def _market_detection_codes(stock_code: str, quote: Any = None) -> List[str]:
+    candidates: List[str] = []
+    for raw in (stock_code, getattr(quote, "code", None)):
+        if raw is None:
+            continue
+        code = str(raw).strip()
+        if code and code not in candidates:
+            candidates.append(code)
+
+    try:
+        from data_provider.base import canonical_stock_code, normalize_stock_code
+
+        for raw in list(candidates):
+            for derived in (
+                canonical_stock_code(raw),
+                canonical_stock_code(normalize_stock_code(raw)),
+            ):
+                if derived and derived not in candidates:
+                    candidates.append(derived)
+    except Exception as exc:
+        logger.debug("Unable to build normalized market detection codes: %s", exc)
+
+    return candidates
+
+
+def _infer_market_for_quote(stock_code: str, quote: Any = None) -> Optional[str]:
+    from src.core import trading_calendar
+
+    for candidate in _market_detection_codes(stock_code, quote):
+        market = trading_calendar.get_market_for_stock(candidate)
+        if market:
+            return market
+    return None
+
+
+def _build_realtime_quote_session_metadata(stock_code: str, quote: Any = None) -> Dict[str, Any]:
+    """Return market/session metadata so reports can label quote freshness."""
+    try:
+        from src.core import trading_calendar
+
+        market = _infer_market_for_quote(stock_code, quote)
+        market_now = trading_calendar.get_market_now(market)
+        query_date = market_now.date()
+        is_trading_day = (
+            trading_calendar.is_market_open(market, query_date)
+            if market
+            else None
+        )
+        effective_trading_date = trading_calendar.get_effective_trading_date(
+            market, current_time=market_now
+        )
+        market_phase = _resolve_realtime_market_phase(market, market_now)
+
+        quote_trade_date = query_date
+        price_label = "盘中最新价"
+        change_pct_label = "今日盘中涨跌幅"
+        freshness_note = "当前为交易时段，price/change_pct 按盘中行情理解。"
+
+        if market_phase == "closed_non_trading_day" or is_trading_day is False:
+            quote_trade_date = effective_trading_date
+            price_label = "最新可用价"
+            change_pct_label = "最近交易日涨跌幅"
+            freshness_note = (
+                "查询日市场休市，price/change_pct 为最近可用交易日行情，"
+                "不代表查询日盘中涨跌。"
+            )
+        elif market_phase == "pre_open":
+            quote_trade_date = effective_trading_date
+            price_label = "开盘前最新可用价"
+            change_pct_label = "最近交易日涨跌幅"
+            freshness_note = (
+                "查询时市场尚未开盘，price/change_pct 通常为开盘前最新可用行情。"
+            )
+        elif market_phase == "post_close":
+            price_label = "收盘后最新价"
+            change_pct_label = "当日涨跌幅"
+            freshness_note = "查询时市场已收盘，price/change_pct 按当日收盘后行情理解。"
+        elif market_phase == "unknown":
+            price_label = "最新价"
+            change_pct_label = "涨跌幅"
+            freshness_note = (
+                "无法确认当前市场会话，引用 price/change_pct 时必须说明行情时效不确定。"
+            )
+
+        return {
+            "market": market,
+            "market_time": market_now.isoformat(),
+            "query_date": query_date.isoformat(),
+            "is_trading_day": is_trading_day,
+            "market_session": market_phase,
+            "is_market_open_now": market_phase == "open",
+            "effective_trading_date": _to_iso_date(effective_trading_date),
+            "quote_trade_date": _to_iso_date(quote_trade_date),
+            "price_label": price_label,
+            "change_pct_label": change_pct_label,
+            "freshness_note": freshness_note,
+        }
+    except Exception as exc:
+        logger.debug("Unable to build realtime quote session metadata: %s", exc)
+        return {
+            "market": None,
+            "market_session": "unknown",
+            "is_market_open_now": None,
+            "freshness_note": "无法确认行情会话，引用实时行情时需保守标注时效。",
+        }
+
+
 def _handle_get_realtime_quote(stock_code: str) -> dict:
     """Get real-time stock quote."""
     manager = _get_fetcher_manager()
@@ -243,7 +403,7 @@ def _handle_get_realtime_quote(stock_code: str) -> dict:
             "note": "All data sources unavailable (network or circuit-breaker). Skip this tool and proceed with historical data only.",
         }
 
-    return {
+    result = {
         "code": quote.code,
         "name": quote.name,
         "price": quote.price,
@@ -265,12 +425,15 @@ def _handle_get_realtime_quote(stock_code: str) -> dict:
         "change_60d": quote.change_60d,
         "source": quote.source.value if hasattr(quote.source, 'value') else str(quote.source),
     }
+    result.update(_build_realtime_quote_session_metadata(stock_code, quote))
+    return result
 
 
 get_realtime_quote_tool = ToolDefinition(
     name="get_realtime_quote",
     description="Get real-time stock quote including price, change%, volume ratio, "
-                "turnover rate, PE, PB, market cap. Returns live market data.",
+                "turnover rate, PE, PB, market cap, and market session metadata "
+                "for quote freshness wording.",
     parameters=[
         ToolParameter(
             name="stock_code",

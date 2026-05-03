@@ -23,6 +23,61 @@ export interface ChatResponse {
   error?: string;
 }
 
+export interface AgentTraceRunRequest {
+  message: string;
+  account_id?: number;
+  stock_code?: string;
+  stock_name?: string;
+  skills?: string[];
+  context?: unknown;
+  inject_portfolio_context?: boolean;
+  analysis_mode?: string;
+  risk_preference?: string;
+  trading_horizon?: string;
+  investor_notes?: string;
+}
+
+export interface AgentTraceEvent {
+  type: string;
+  step?: number;
+  tool?: string;
+  display_name?: string;
+  success?: boolean;
+  duration?: number;
+  message?: string;
+  [key: string]: unknown;
+}
+
+export interface AgentTraceToolCall {
+  step: number;
+  tool: string;
+  arguments?: Record<string, unknown>;
+  success: boolean;
+  duration?: number;
+  result_length?: number;
+  result_preview?: string;
+  cached?: boolean;
+  timeout?: boolean;
+  [key: string]: unknown;
+}
+
+export interface AgentTraceRunResponse {
+  success: boolean;
+  session_id: string;
+  content: string;
+  error?: string | null;
+  total_steps: number;
+  total_tokens: number;
+  provider: string;
+  model: string;
+  mode: string;
+  events: AgentTraceEvent[];
+  tool_calls: AgentTraceToolCall[];
+  planner?: Record<string, unknown> | null;
+  agent_user_context?: Record<string, unknown> | null;
+  context_summary?: Record<string, unknown> | null;
+}
+
 export interface SkillInfo {
   id: string;
   name: string;
@@ -55,6 +110,29 @@ export const agentApi = {
       timeout: 120000,
     });
     return response.data;
+  },
+  async runTrace(payload: AgentTraceRunRequest): Promise<AgentTraceRunResponse> {
+    const response = await apiClient.post<AgentTraceRunResponse>('/api/v1/agent/trace/run', payload, {
+      timeout: 180000,
+    });
+    return response.data;
+  },
+  async traceStream(
+    payload: AgentTraceRunRequest,
+    options?: ChatStreamOptions,
+  ): Promise<Response> {
+    const base = API_BASE_URL || '';
+    const response = await fetch(`${base}/api/v1/agent/trace/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      credentials: 'include',
+      signal: options?.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Trace stream failed: HTTP ${response.status}`);
+    }
+    return response;
   },
   async getSkills(): Promise<SkillsResponse> {
     const response = await apiClient.get<SkillsResponse>('/api/v1/agent/skills');

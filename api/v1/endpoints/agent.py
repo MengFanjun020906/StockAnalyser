@@ -62,6 +62,42 @@ class ChatResponse(BaseModel):
     session_id: str
     error: Optional[str] = None
 
+
+class AgentTraceRunRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=20000)
+    session_id: Optional[str] = None
+    account_id: Optional[int] = None
+    stock_code: Optional[str] = None
+    stock_name: Optional[str] = None
+    skills: Optional[List[str]] = Field(default=None, validation_alias=AliasChoices("skills", "strategies"))
+    context: Optional[Dict[str, Any]] = None
+    inject_portfolio_context: bool = True
+    analysis_mode: str = "planning_execute"
+    risk_preference: Optional[str] = None
+    trading_horizon: Optional[str] = None
+    investor_notes: Optional[str] = None
+
+    @property
+    def effective_skills(self) -> Optional[List[str]]:
+        return self.skills
+
+
+class AgentTraceRunResponse(BaseModel):
+    success: bool
+    session_id: str
+    content: str = ""
+    error: Optional[str] = None
+    total_steps: int = 0
+    total_tokens: int = 0
+    provider: str = ""
+    model: str = ""
+    mode: str = ""
+    events: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    planner: Optional[Dict[str, Any]] = None
+    agent_user_context: Optional[Dict[str, Any]] = None
+    context_summary: Optional[Dict[str, Any]] = None
+
 class SkillInfo(BaseModel):
     id: str
     name: str
@@ -276,6 +312,377 @@ def _build_executor(config, skills: Optional[List[str]] = None):
     return build_agent_executor(config, skills=skills)
 
 
+def _infer_stock_code_from_message(message: str) -> str:
+    """Best-effort stock code extraction for developer trace convenience."""
+    import re
+
+    patterns = [
+        r"\b(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ|SS))?\b",
+        r"\bHK\s?(\d{1,5})\b",
+        r"\b(\d{5})\.HK\b",
+        r"\b([A-Z]{1,5}(?:\.[A-Z])?)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message.strip(), flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(0).strip().upper().replace(" ", "")
+        if value in {"AGENT", "PLAN", "EXECUTE", "API", "LLM"}:
+            continue
+        if value.endswith(".HK") and value[:5].isdigit():
+            return "HK" + value[:5]
+        return value
+    return ""
+
+
+def _build_trace_context(
+    *,
+    request: AgentTraceRunRequest,
+    config: Any,
+) -> Dict[str, Any]:
+    context = dict(request.context or {})
+    stock_code = (request.stock_code or context.get("stock_code") or _infer_stock_code_from_message(request.message) or "").strip()
+    if stock_code:
+        context["stock_code"] = stock_code
+    if request.stock_name:
+        context["stock_name"] = request.stock_name
+    context.setdefault("report_type", "detailed")
+    context.setdefault("report_language", getattr(config, "report_language", "zh"))
+
+    should_inject = request.inject_portfolio_context and request.analysis_mode == "planning_execute"
+    if should_inject and "agent_user_context" not in context:
+        try:
+            from src.agent.context_builder import build_agent_user_context_from_portfolio_service
+            from src.services.portfolio_service import PortfolioService
+
+            context["agent_user_context"] = build_agent_user_context_from_portfolio_service(
+                PortfolioService(),
+                account_id=request.account_id,
+                symbol=stock_code or None,
+                cost_method="fifo",
+                user_prompt=request.message,
+                analysis_mode="planning_execute",
+                report_language=context.get("report_language", "zh"),
+            )
+            _apply_trace_investor_profile(
+                context["agent_user_context"],
+                risk_preference=request.risk_preference,
+                trading_horizon=request.trading_horizon,
+                notes=request.investor_notes,
+            )
+        except Exception as exc:
+            logger.warning("Agent trace portfolio context injection failed: %s", exc)
+            context["_trace_context_error"] = str(exc)
+
+    return context
+
+
+def _serialize_agent_user_context(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _apply_trace_investor_profile(
+    agent_user_context: Any,
+    *,
+    risk_preference: Optional[str],
+    trading_horizon: Optional[str],
+    notes: Optional[str],
+) -> None:
+    investor = getattr(agent_user_context, "investor", None)
+    if investor is None:
+        if isinstance(agent_user_context, dict):
+            investor = agent_user_context.setdefault("investor", {})
+        else:
+            return
+
+    updates = {
+        "risk_preference": risk_preference,
+        "trading_horizon": trading_horizon,
+        "notes": notes,
+    }
+    for key, value in updates.items():
+        if value in (None, ""):
+            continue
+        if isinstance(investor, dict):
+            investor[key] = value
+        else:
+            try:
+                setattr(investor, key, value)
+            except Exception:
+                logger.debug("Agent trace investor profile field skipped: %s", key)
+
+
+def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _serialize_agent_user_context(context.get("agent_user_context"))
+    summary: Dict[str, Any] = {
+        "context_error": context.get("_trace_context_error"),
+        "stock_code": context.get("stock_code"),
+        "account_count": 0,
+        "position_count": 0,
+        "target_position": None,
+        "accounts": [],
+        "investor": None,
+        "metadata": {},
+    }
+    if not payload:
+        return summary
+
+    accounts = payload.get("accounts") or []
+    positions = payload.get("positions") or []
+    investor = payload.get("investor") or {}
+    report = payload.get("report") or {}
+    primary_symbol = report.get("primary_symbol") or context.get("stock_code")
+    normalized_primary = str(primary_symbol or "").strip().lower()
+
+    summary["account_count"] = len(accounts)
+    summary["position_count"] = len(positions)
+    summary["investor"] = {
+        "risk_preference": investor.get("risk_preference"),
+        "trading_horizon": investor.get("trading_horizon"),
+        "max_single_position_pct": investor.get("max_single_position_pct"),
+        "max_total_equity_exposure_pct": investor.get("max_total_equity_exposure_pct"),
+        "max_acceptable_drawdown_pct": investor.get("max_acceptable_drawdown_pct"),
+        "default_stop_loss_pct": investor.get("default_stop_loss_pct"),
+        "notes": investor.get("notes"),
+    }
+    summary["accounts"] = [
+        {
+            "account_id": item.get("account_id"),
+            "account_name": item.get("account_name"),
+            "broker": item.get("broker"),
+            "market": item.get("market"),
+            "base_currency": item.get("base_currency"),
+            "total_equity": item.get("total_equity"),
+            "available_cash": item.get("available_cash"),
+            "total_market_value": item.get("total_market_value"),
+            "cost_method": item.get("cost_method"),
+        }
+        for item in accounts
+        if isinstance(item, dict)
+    ]
+    summary["target_position"] = next(
+        (
+            {
+                "symbol": item.get("symbol"),
+                "account_id": item.get("account_id"),
+                "quantity": item.get("quantity"),
+                "avg_cost": item.get("avg_cost"),
+                "last_price": item.get("last_price"),
+                "market_value": item.get("market_value"),
+                "unrealized_pnl": item.get("unrealized_pnl"),
+                "unrealized_pnl_pct": item.get("unrealized_pnl_pct"),
+                "position_pct": item.get("position_pct"),
+            }
+            for item in positions
+            if isinstance(item, dict)
+            and str(item.get("symbol") or "").strip().lower() == normalized_primary
+        ),
+        None,
+    )
+    summary["metadata"] = payload.get("metadata") or {}
+    return summary
+
+
+def _build_planner_trace(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    agent_user_context = context.get("agent_user_context")
+    if agent_user_context is None:
+        return None
+    try:
+        from src.agent.executor import _coerce_agent_user_context
+        from src.agent.factory import get_tool_registry
+        from src.agent.planner import build_planning_result
+
+        coerced = _coerce_agent_user_context(agent_user_context)
+        if coerced is None:
+            return None
+        return build_planning_result(coerced, tool_registry=get_tool_registry()).to_dict()
+    except Exception as exc:
+        logger.warning("Agent trace planner build failed: %s", exc)
+        return {"error": str(exc)}
+
+
+@router.post("/trace/run", response_model=AgentTraceRunResponse)
+async def run_agent_trace(request: AgentTraceRunRequest):
+    """Run an Agent request and return developer-oriented plan/execute trace data."""
+    config = get_config()
+    if not config.is_agent_available():
+        raise HTTPException(status_code=400, detail="Agent mode is not enabled")
+
+    requested_session_id = (request.session_id or uuid.uuid4().hex).strip()
+    session_id = requested_session_id if requested_session_id.startswith("trace-") else f"trace-{requested_session_id}"
+    skills = request.effective_skills
+    context = _build_trace_context(request=request, config=config)
+    if skills is not None:
+        context["skills"] = skills
+    events: List[Dict[str, Any]] = []
+
+    def progress_callback(event: dict):
+        event_payload = dict(event)
+        if event_payload.get("type") in ("tool_start", "tool_done"):
+            tool = event_payload.get("tool", "")
+            event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
+        events.append(event_payload)
+
+    def run_sync():
+        executor = _build_executor(config, skills or None)
+        return executor.chat(
+            message=request.message,
+            session_id=session_id,
+            progress_callback=progress_callback,
+            context=context,
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, run_sync)
+    except Exception as exc:
+        logger.error("Agent trace run failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        try:
+            from src.agent.conversation import conversation_manager
+            from src.storage import get_db
+
+            conversation_manager.clear(session_id)
+            get_db().delete_conversation_session(session_id)
+        except Exception as exc:
+            logger.debug("Agent trace session cleanup skipped: %s", exc)
+
+    return AgentTraceRunResponse(
+        success=result.success,
+        session_id=session_id,
+        content=result.content,
+        error=result.error,
+        total_steps=result.total_steps,
+        total_tokens=result.total_tokens,
+        provider=result.provider,
+        model=result.model,
+        mode=request.analysis_mode,
+        events=events,
+        tool_calls=result.tool_calls_log,
+        planner=_build_planner_trace(context),
+        agent_user_context=_serialize_agent_user_context(context.get("agent_user_context")),
+        context_summary=_build_trace_context_summary(context),
+    )
+
+
+@router.post("/trace/stream")
+async def stream_agent_trace(request: AgentTraceRunRequest):
+    """Run an Agent trace request and stream plan/execute events as SSE."""
+    config = get_config()
+    if not config.is_agent_available():
+        raise HTTPException(status_code=400, detail="Agent mode is not enabled")
+
+    requested_session_id = (request.session_id or uuid.uuid4().hex).strip()
+    session_id = requested_session_id if requested_session_id.startswith("trace-") else f"trace-{requested_session_id}"
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    skills = request.effective_skills
+    context = _build_trace_context(request=request, config=config)
+    if skills is not None:
+        context["skills"] = skills
+
+    def put_event(event: Dict[str, Any]) -> None:
+        asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+
+    def progress_callback(event: dict):
+        event_payload = dict(event)
+        if event_payload.get("type") in ("tool_start", "tool_done"):
+            tool = event_payload.get("tool", "")
+            event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
+        put_event(event_payload)
+
+    def cleanup_trace_session() -> None:
+        try:
+            from src.agent.conversation import conversation_manager
+            from src.storage import get_db
+
+            conversation_manager.clear(session_id)
+            get_db().delete_conversation_session(session_id)
+        except Exception as exc:
+            logger.debug("Agent trace stream session cleanup skipped: %s", exc)
+
+    def run_sync():
+        try:
+            put_event({
+                "type": "context_ready",
+                "session_id": session_id,
+                "context_summary": _build_trace_context_summary(context),
+                "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
+            })
+            put_event({
+                "type": "planner_ready",
+                "session_id": session_id,
+                "planner": _build_planner_trace(context),
+            })
+            executor = _build_executor(config, skills or None)
+            result = executor.chat(
+                message=request.message,
+                session_id=session_id,
+                progress_callback=progress_callback,
+                context=context,
+            )
+            put_event({
+                "type": "done",
+                "success": result.success,
+                "session_id": session_id,
+                "content": result.content,
+                "error": result.error,
+                "total_steps": result.total_steps,
+                "total_tokens": result.total_tokens,
+                "provider": result.provider,
+                "model": result.model,
+                "mode": request.analysis_mode,
+                "events": [],
+                "tool_calls": result.tool_calls_log,
+                "planner": _build_planner_trace(context),
+                "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
+                "context_summary": _build_trace_context_summary(context),
+            })
+        except Exception as exc:
+            logger.error("Agent trace stream failed: %s", exc, exc_info=True)
+            put_event({"type": "error", "session_id": session_id, "message": str(exc)})
+        finally:
+            cleanup_trace_session()
+
+    async def event_generator():
+        fut = loop.run_in_executor(None, run_sync)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=300.0)
+                except asyncio.TimeoutError:
+                    event = {"type": "error", "session_id": session_id, "message": "Trace 分析超时"}
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                if event.get("type") in ("done", "error"):
+                    break
+        finally:
+            try:
+                await asyncio.wait_for(fut, timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                logger.debug("agent trace stream cleanup timed out after 5s for session %s", session_id)
+            except Exception as exc:
+                logger.warning("agent trace stream cleanup error (ignored): %s", exc, exc_info=True)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 async def _run_research_in_background(
     agent,
     question: str,
@@ -420,6 +827,10 @@ async def agent_chat_stream(request: ChatRequest):
                     "content": result.content,
                     "error": result.error,
                     "total_steps": result.total_steps,
+                    "total_tokens": result.total_tokens,
+                    "provider": result.provider,
+                    "model": result.model,
+                    "tool_calls": result.tool_calls_log,
                     "session_id": session_id,
                 }),
                 loop,
