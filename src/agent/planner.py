@@ -19,6 +19,7 @@ CapabilityName = str
 
 
 CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
+    "watchlist_discovery": ["discover_watchlist_candidates"],
     "technical_analysis": [
         "analyze_trend",
         "calculate_ma",
@@ -46,6 +47,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
 
 
 CAPABILITY_PURPOSES: Dict[CapabilityName, str] = {
+    "watchlist_discovery": "在用户未提供股票代码时生成可继续分析的候选股池。",
     "technical_analysis": "判断趋势、均线、量价和形态是否支持行动。",
     "realtime_quote": "确认当前价格、涨跌幅和盘中状态。",
     "portfolio_context": "读取账户、仓位、成本、浮盈亏和风险约束。",
@@ -186,6 +188,7 @@ def _select_capabilities(intent: str, has_position: bool, primary_symbol: Option
         return ["portfolio_context", "regime_detection", "market_context"]
     if intent == "watchlist_scan":
         return [
+            "watchlist_discovery",
             "realtime_quote",
             "technical_analysis",
             "market_context",

@@ -10,6 +10,7 @@ import type { PortfolioAccountItem } from '../types/portfolio';
 import { cn } from '../utils/cn';
 
 const DEFAULT_PROMPT = '我持有 600519，帮我分析未来走势，适合继续拿长线吗？如果要加仓或减仓，关键观察点是什么？';
+const DEFAULT_STOCK_CODE = '600519';
 const RISK_OPTIONS = [
   { value: 'conservative', label: '保守' },
   { value: 'balanced', label: '均衡' },
@@ -20,6 +21,13 @@ const HORIZON_OPTIONS = [
   { value: 'swing', label: '波段' },
   { value: 'medium_term', label: '中线' },
   { value: 'long_term', label: '长线' },
+];
+const REPORT_INTENT_OPTIONS = [
+  { value: 'auto', label: '自动识别' },
+  { value: 'position_review', label: '持仓诊断' },
+  { value: 'entry_analysis', label: '入场分析' },
+  { value: 'risk_review', label: '账户风控' },
+  { value: 'event_impact', label: '事件影响' },
 ];
 const TRACE_HISTORY_KEY = 'dsa.agentTrace.history.v1';
 const TRACE_HISTORY_LIMIT = 10;
@@ -63,11 +71,16 @@ type TraceHistoryItem = {
 
 const AgentTracePage: React.FC = () => {
   const [message, setMessage] = useState(DEFAULT_PROMPT);
-  const [stockCode, setStockCode] = useState('600519');
+  const [stockCode, setStockCode] = useState(DEFAULT_STOCK_CODE);
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
+  const [reportIntent, setReportIntent] = useState('auto');
   const [riskPreference, setRiskPreference] = useState('balanced');
   const [tradingHorizon, setTradingHorizon] = useState('long_term');
+  const [maxSinglePositionPct, setMaxSinglePositionPct] = useState('20');
+  const [maxTotalEquityExposurePct, setMaxTotalEquityExposurePct] = useState('80');
+  const [maxAcceptableDrawdownPct, setMaxAcceptableDrawdownPct] = useState('15');
+  const [defaultStopLossPct, setDefaultStopLossPct] = useState('8');
   const [investorNotes, setInvestorNotes] = useState('偏长期持有，关注回撤控制和分批操作。');
   const [injectPortfolioContext, setInjectPortfolioContext] = useState(true);
   const [result, setResult] = useState<AgentTraceRunResponse | null>(null);
@@ -112,6 +125,7 @@ const AgentTracePage: React.FC = () => {
   );
 
   const handleRun = async () => {
+    const stockCodeToSend = shouldSendStockCode(message, stockCode) ? stockCode.trim() : undefined;
     setRunning(true);
     setTraceStatus('running');
     setStatusMessage('正在准备上下文...');
@@ -133,17 +147,23 @@ const AgentTracePage: React.FC = () => {
       planner: null,
       agent_user_context: null,
       context_summary: null,
+      debate: null,
       artifact_dir: null,
     });
     try {
       const response = await agentApi.traceStream({
         message,
         account_id: selectedAccountId ? Number(selectedAccountId) : undefined,
-        stock_code: stockCode.trim() || undefined,
+        stock_code: stockCodeToSend,
         inject_portfolio_context: injectPortfolioContext,
         analysis_mode: 'planning_execute',
+        report_intent: reportIntent === 'auto' ? undefined : reportIntent,
         risk_preference: riskPreference,
         trading_horizon: tradingHorizon,
+        max_single_position_pct: parseOptionalPercent(maxSinglePositionPct),
+        max_total_equity_exposure_pct: parseOptionalPercent(maxTotalEquityExposurePct),
+        max_acceptable_drawdown_pct: parseOptionalPercent(maxAcceptableDrawdownPct),
+        default_stop_loss_pct: parseOptionalPercent(defaultStopLossPct),
         investor_notes: investorNotes.trim() || undefined,
       });
       await consumeTraceStream(response);
@@ -166,6 +186,15 @@ const AgentTracePage: React.FC = () => {
     setMessage(item.message);
     setStockCode(item.stockCode);
     setSelectedAccountId(item.accountId ? String(item.accountId) : '');
+    const investor = (item.result.context_summary?.investor || {}) as Record<string, unknown>;
+    const plannerIntent = item.result.planner?.intent;
+    setReportIntent(typeof plannerIntent === 'string' ? plannerIntent : 'auto');
+    setRiskPreference(typeof investor.risk_preference === 'string' ? investor.risk_preference : 'balanced');
+    setTradingHorizon(typeof investor.trading_horizon === 'string' ? investor.trading_horizon : 'long_term');
+    setMaxSinglePositionPct(formatPercentInput(investor.max_single_position_pct));
+    setMaxTotalEquityExposurePct(formatPercentInput(investor.max_total_equity_exposure_pct));
+    setMaxAcceptableDrawdownPct(formatPercentInput(investor.max_acceptable_drawdown_pct));
+    setDefaultStopLossPct(formatPercentInput(investor.default_stop_loss_pct));
   };
 
   const handleClearHistory = () => {
@@ -260,6 +289,16 @@ const AgentTracePage: React.FC = () => {
       }));
       return;
     }
+    if (type.startsWith('debate_')) {
+      const message = event.message
+        || (type === 'debate_start' ? 'Debate 已开始' : type === 'debate_judge_done' ? 'Judge 裁决已生成' : 'Debate 阶段已更新');
+      setStatusMessage(message);
+      setResult((prev) => ({
+        ...(prev || createEmptyTraceResult()),
+        events: [...(prev?.events || []), eventToTraceEvent(event)],
+      }));
+      return;
+    }
     if (type === 'done') {
       setTraceStatus(event.success ? 'done' : 'error');
       setStatusMessage(event.success ? 'Trace 已完成' : String(event.error || 'Trace 失败'));
@@ -280,13 +319,14 @@ const AgentTracePage: React.FC = () => {
           planner: asRecord(event.planner) || current.planner,
           agent_user_context: asRecord(event.agent_user_context) || current.agent_user_context,
           context_summary: asRecord(event.context_summary) || current.context_summary,
+          debate: asRecord(event.debate) || current.debate,
           artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : current.artifact_dir,
         };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: nextResult.session_id || `${Date.now()}`,
           createdAt: new Date().toISOString(),
           message,
-          stockCode,
+          stockCode: shouldSendStockCode(message, stockCode) ? stockCode.trim() : '',
           accountId: selectedAccountId ? Number(selectedAccountId) : undefined,
           status: nextResult.success ? 'success' : 'error',
           result: nextResult,
@@ -310,7 +350,7 @@ const AgentTracePage: React.FC = () => {
           id: nextResult.session_id || `${Date.now()}`,
           createdAt: new Date().toISOString(),
           message,
-          stockCode,
+          stockCode: shouldSendStockCode(message, stockCode) ? stockCode.trim() : '',
           accountId: selectedAccountId ? Number(selectedAccountId) : undefined,
           status: 'error',
           result: nextResult,
@@ -392,7 +432,7 @@ const AgentTracePage: React.FC = () => {
       </Card>
 
       <Card padding="md" className="rounded-lg">
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_180px_220px_180px_180px]">
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_180px_220px_180px_180px_180px]">
           <label className="block">
             <span className="mb-2 block text-xs font-medium text-secondary-text">调试 Prompt</span>
             <textarea
@@ -409,6 +449,9 @@ const AgentTracePage: React.FC = () => {
               className="h-10 w-full rounded-lg border border-border/70 bg-base px-3 text-sm text-foreground outline-none focus:border-cyan/50 focus:ring-4 focus:ring-cyan/10"
               placeholder="600519"
             />
+            {stockCode.trim() && !shouldSendStockCode(message, stockCode) ? (
+              <span className="mt-1 block text-xs text-warning">当前问题像选股/组合配置，将不会发送该股票代码。</span>
+            ) : null}
           </label>
           <label className="block">
             <span className="mb-2 block text-xs font-medium text-secondary-text">持仓账户</span>
@@ -423,6 +466,16 @@ const AgentTracePage: React.FC = () => {
                   {account.name} · {account.market.toUpperCase()} · {account.baseCurrency}
                 </option>
               ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-2 block text-xs font-medium text-secondary-text">报告意图</span>
+            <select
+              value={reportIntent}
+              onChange={(event) => setReportIntent(event.target.value)}
+              className="h-10 w-full rounded-lg border border-border/70 bg-base px-3 text-sm text-foreground outline-none focus:border-cyan/50 focus:ring-4 focus:ring-cyan/10"
+            >
+              {REPORT_INTENT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>
           <label className="block">
@@ -454,6 +507,12 @@ const AgentTracePage: React.FC = () => {
             />
             注入持仓上下文
           </label>
+        </div>
+        <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <PercentInput label="单票上限" value={maxSinglePositionPct} onChange={setMaxSinglePositionPct} placeholder="20" />
+          <PercentInput label="总权益上限" value={maxTotalEquityExposurePct} onChange={setMaxTotalEquityExposurePct} placeholder="80" />
+          <PercentInput label="最大回撤" value={maxAcceptableDrawdownPct} onChange={setMaxAcceptableDrawdownPct} placeholder="15" />
+          <PercentInput label="默认止损" value={defaultStopLossPct} onChange={setDefaultStopLossPct} placeholder="8" />
         </div>
         <label className="mt-4 block">
           <span className="mb-2 block text-xs font-medium text-secondary-text">用户画像备注</span>
@@ -487,6 +546,8 @@ const AgentTracePage: React.FC = () => {
               </div>
             </Card>
           ) : null}
+
+          <DebatePanel result={result} />
 
           <Card title="Final Output" subtitle="Markdown Report" padding="md" className="rounded-lg">
             {result.error ? (
@@ -632,6 +693,27 @@ const TraceMeta: React.FC<{ label: string; value: string }> = ({ label, value })
   </div>
 );
 
+const PercentInput: React.FC<{
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}> = ({ label, value, onChange, placeholder }) => (
+  <label className="block">
+    <span className="mb-2 block text-xs font-medium text-secondary-text">{label}</span>
+    <div className="flex h-10 items-center rounded-lg border border-border/70 bg-base px-3 focus-within:border-cyan/50 focus-within:ring-4 focus-within:ring-cyan/10">
+      <input
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        inputMode="decimal"
+        className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none"
+        placeholder={placeholder}
+      />
+      <span className="ml-2 text-xs text-secondary-text">%</span>
+    </div>
+  </label>
+);
+
 const TracePanelTitle: React.FC<{ icon: React.ComponentType<{ className?: string }>; title: string }> = ({ icon: Icon, title }) => (
   <div className="flex items-center gap-2 text-sm font-medium text-foreground">
     <Icon className="h-4 w-4 text-cyan" />
@@ -673,6 +755,10 @@ const ContextSummaryPanel: React.FC<{ result: AgentTraceRunResponse }> = ({ resu
         <TraceMeta label="持仓数" value={String(summary.position_count ?? 0)} />
         <TraceMeta label="风险偏好" value={String(investor.risk_preference ?? '-')} />
         <TraceMeta label="持有周期" value={String(investor.trading_horizon ?? '-')} />
+        <TraceMeta label="单票上限" value={formatPercent(investor.max_single_position_pct)} />
+        <TraceMeta label="总权益上限" value={formatPercent(investor.max_total_equity_exposure_pct)} />
+        <TraceMeta label="最大回撤" value={formatPercent(investor.max_acceptable_drawdown_pct)} />
+        <TraceMeta label="默认止损" value={formatPercent(investor.default_stop_loss_pct)} />
       </div>
       <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(280px,0.8fr)]">
         <div className="overflow-hidden rounded-lg border border-border/60">
@@ -716,9 +802,227 @@ const ContextSummaryPanel: React.FC<{ result: AgentTraceRunResponse }> = ({ resu
   );
 };
 
+const DebatePanel: React.FC<{ result: AgentTraceRunResponse }> = ({ result }) => {
+  const debate = result.debate;
+  if (!debate) return null;
+  const enabled = debate.enabled === true;
+  const success = debate.success === true;
+  if (!enabled) return null;
+
+  const primary = asRecord(debate.primary_thesis) || {};
+  const opposing = asRecord(debate.opposing_thesis) || {};
+  const judge = asRecord(debate.judge_decision) || {};
+  const unresolved = toStringList(debate.unresolved_conflicts);
+  const dimensionAssessments = toRecordList(judge.dimension_assessments);
+  const reasonPoints = toStringList(judge.reason_points);
+  const decisionSummary = String(judge.decision_summary || judge.reason || '-');
+
+  return (
+    <Card title="Debate Judge" subtitle="Adversarial Review" padding="md" className="rounded-lg">
+      {!success ? (
+        <div className="mb-3 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-warning">
+          Debate 未完成：{String(debate.error || debate.skipped_reason || 'unknown')}
+        </div>
+      ) : null}
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <TraceMeta label="模式" value={String(debate.mode || '-')} />
+        <TraceMeta label="意图" value={String(debate.intent || '-')} />
+        <TraceMeta label="Winner" value={String(judge.winner || '-')} />
+        <TraceMeta label="Final Action" value={String(judge.final_action || '-')} />
+      </div>
+      <div className="mt-4 grid gap-4 xl:grid-cols-3">
+        <DebateThesisCard title="主观点" thesis={primary} />
+        <DebateThesisCard title="反方" thesis={opposing} />
+        <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+          <TracePanelTitle icon={ClipboardList} title="Judge 裁决" />
+          <div className="mt-3 rounded-lg border border-border/60 bg-surface p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-md bg-foreground px-2 py-1 text-xs font-semibold text-base">
+                {String(judge.final_action || '-')}
+              </span>
+              <span className="rounded-md border border-border/70 px-2 py-1 text-xs font-medium text-secondary-text">
+                winner: {String(judge.winner || '-')}
+              </span>
+            </div>
+            <p className="mt-3 text-sm leading-6 text-foreground">{decisionSummary}</p>
+          </div>
+          {dimensionAssessments.length ? <DimensionAssessmentGrid items={dimensionAssessments} /> : null}
+          <KeyValueList label="裁决理由" items={reasonPoints.length ? reasonPoints : toStringList(judge.reason)} />
+          <KeyValueList label="采纳" items={toStringList(judge.accepted_arguments)} />
+          <KeyValueList label="驳回" items={toStringList(judge.rejected_arguments)} />
+          <KeyValueList label="风控" items={toStringList(judge.risk_controls)} />
+          {unresolved.length ? <KeyValueList label="未决冲突" items={unresolved} /> : null}
+        </div>
+      </div>
+      <SessionOutputsPanel debate={debate} finalContent={result.content} />
+    </Card>
+  );
+};
+
+const DebateThesisCard: React.FC<{ title: string; thesis: Record<string, unknown> }> = ({ title, thesis }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Braces} title={title} />
+    <div className="mt-3 grid gap-2">
+      <TraceMeta label="立场" value={String(thesis.direction || '-')} />
+      <TraceMeta label="动作" value={String(thesis.action || '-')} />
+    </div>
+    <p className="mt-3 text-sm text-foreground">{String(thesis.summary || '-')}</p>
+    <KeyValueList label="证据" items={toStringList(thesis.evidence)} />
+    <DimensionEvidenceList value={thesis.evidence_by_dimension} />
+    <KeyValueList label="失效条件" items={toStringList(thesis.failure_conditions)} />
+  </div>
+);
+
+const KeyValueList: React.FC<{ label: string; items: string[] }> = ({ label, items }) => {
+  if (!items.length) return null;
+  return (
+    <div className="mt-3">
+      <p className="text-xs font-medium uppercase tracking-wide text-secondary-text">{label}</p>
+      <ul className="mt-1 space-y-1 text-sm text-secondary-text">
+        {items.map((item, index) => <li key={`${label}-${index}`}>{item}</li>)}
+      </ul>
+    </div>
+  );
+};
+
+const DIMENSION_LABELS: Record<string, string> = {
+  account_risk: '账户风险',
+  technical: '技术面',
+  capital_flow: '资金面',
+  news_event: '消息面',
+  fundamental: '基本面',
+  data_quality: '数据质量',
+  chip_distribution: '筹码面',
+  market_state: '市场状态',
+};
+
+const VERDICT_TONES: Record<string, string> = {
+  supports_primary: 'border-success/30 bg-success/10 text-success',
+  supports_opposing: 'border-danger/30 bg-danger/10 text-danger',
+  mixed: 'border-warning/30 bg-warning/10 text-warning',
+  insufficient_data: 'border-border bg-surface text-secondary-text',
+};
+
+const DimensionAssessmentGrid: React.FC<{ items: Record<string, unknown>[] }> = ({ items }) => (
+  <div className="mt-3 grid gap-2">
+    {items.map((item, index) => {
+      const dimension = String(item.dimension || '-');
+      const verdict = String(item.verdict || '-');
+      const tone = VERDICT_TONES[verdict] || 'border-border bg-surface text-secondary-text';
+      const evidence = toStringList(item.evidence);
+      const missing = toStringList(item.missing);
+      return (
+        <details key={`${dimension}-${index}`} className="rounded-lg border border-border/60 bg-surface p-3">
+          <summary className="cursor-pointer list-none">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-sm font-medium text-foreground">{DIMENSION_LABELS[dimension] || dimension}</span>
+              <span className={`rounded-md border px-2 py-1 text-xs font-medium ${tone}`}>
+                {verdict} · {String(item.weight || '-')}
+              </span>
+            </div>
+            <p className="mt-2 text-sm leading-6 text-secondary-text">{String(item.summary || '-')}</p>
+          </summary>
+          <KeyValueList label="证据" items={evidence} />
+          <KeyValueList label="缺口" items={missing} />
+        </details>
+      );
+    })}
+  </div>
+);
+
+const DimensionEvidenceList: React.FC<{ value: unknown }> = ({ value }) => {
+  const record = asRecord(value);
+  if (!record) return null;
+  const entries = Object.entries(record)
+    .map(([key, val]) => [key, toStringList(val)] as const)
+    .filter(([, items]) => items.length);
+  if (!entries.length) return null;
+  return (
+    <div className="mt-3">
+      <p className="text-xs font-medium uppercase tracking-wide text-secondary-text">分维度证据</p>
+      <div className="mt-2 grid gap-2">
+        {entries.map(([key, items]) => (
+          <div key={key} className="rounded-md border border-border/60 bg-surface p-2">
+            <p className="text-xs font-medium text-foreground">{DIMENSION_LABELS[key] || key}</p>
+            <ul className="mt-1 space-y-1 text-xs leading-5 text-secondary-text">
+              {items.map((item, index) => <li key={`${key}-${index}`}>{item}</li>)}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const SessionOutputsPanel: React.FC<{ debate: Record<string, unknown>; finalContent: string }> = ({ debate, finalContent }) => {
+  const debugOutputs = asRecord(debate.debug_outputs) || {};
+  const items = [
+    { label: '原始主报告输出', value: debugOutputs.primary_report_raw },
+    { label: 'Primary Thesis 原始输出', value: debugOutputs.primary_thesis_raw },
+    { label: 'Opposing Thesis 原始输出', value: debugOutputs.opposing_thesis_raw },
+    { label: 'Judge 原始输出', value: debugOutputs.judge_raw },
+    { label: '最终合并输出', value: debugOutputs.final_report_with_debate || finalContent },
+  ].filter((item) => typeof item.value === 'string' && item.value.trim());
+
+  if (!items.length) return null;
+  return (
+    <div className="mt-4">
+      <TracePanelTitle icon={ClipboardList} title="Session Outputs" />
+      <div className="mt-3 grid gap-3 xl:grid-cols-2">
+        {items.map((item) => (
+          <details key={item.label} className="rounded-lg border border-border/60 bg-base/70 p-3" open={item.label === 'Judge 原始输出'}>
+            <summary className="cursor-pointer text-sm font-medium text-foreground">{item.label}</summary>
+            <pre className="mt-3 max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-surface p-3 text-xs text-secondary-text">
+              {String(item.value)}
+            </pre>
+          </details>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const formatNumber = (value: unknown): string => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+};
+
+const formatPercent = (value: unknown): string => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`;
+};
+
+const formatPercentInput = (value: unknown): string => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '';
+  return String(value);
+};
+
+const parseOptionalPercent = (value: string): number | undefined => {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) return undefined;
+  return Math.min(100, Math.max(0, parsed));
+};
+
+const shouldSendStockCode = (message: string, stockCode: string): boolean => {
+  const code = stockCode.trim();
+  if (!code) return false;
+  if (code !== DEFAULT_STOCK_CODE) return true;
+  if (message.includes(code)) return true;
+  return !/(选股|筛选|推荐.*股|股票池|组合|配置|分配仓位|仓位分配|买什么|挑.*股)/.test(message);
+};
+
+const toStringList = (value: unknown): string[] => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
+  if (typeof value === 'string') return value ? [value] : [];
+  return [String(value)];
+};
+
+const toRecordList = (value: unknown): Record<string, unknown>[] => {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
 };
 
 const formatDateTime = (value: string): string => {
@@ -756,6 +1060,7 @@ const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   planner: null,
   agent_user_context: null,
   context_summary: null,
+  debate: null,
   artifact_dir: null,
 });
 

@@ -786,6 +786,130 @@ class TestBuildUserMessage(unittest.TestCase):
         self.assertIn("Planning -> Execute", prompt)
         self.assertIn("账户", prompt)
 
+    def test_chat_uses_planning_system_prompt_when_context_requests_it(self):
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content="选股需要先按 Planner 完成工具链路。",
+            tool_calls=[],
+            usage={"total_tokens": 20},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+                target_symbols=["600519", "300750"],
+            )
+        )
+
+        result = executor.chat(
+            "我现在有5w元，你帮我选一下股，并做一下持仓配置的分析",
+            session_id="test-planning-chat",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
+        user_message = adapter.call_with_tools.call_args.args[0][-1]["content"]
+        self.assertIn("Planning -> Execute", prompt)
+        self.assertIn("Execute Protocol", prompt)
+        self.assertIn("AgentUserContext", user_message)
+        self.assertIn("Planner 工具执行计划", user_message)
+
+    def test_watchlist_scan_without_candidates_cannot_finish_before_discovery(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="discover_watchlist_candidates",
+                description="Discover candidates",
+                parameters=[],
+                handler=lambda **_: {"status": "ok", "candidates": [{"code": "600519", "name": "贵州茅台"}]},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content="直接给最终选股结论",
+            tool_calls=[],
+            usage={"total_tokens": 20},
+            provider="openai",
+        )
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+            )
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=1)
+        result = executor.chat(
+            "我现在有5w元，你帮我选一下股，并做一下持仓配置的分析",
+            session_id="test-watchlist-guard",
+            context={"agent_user_context": context},
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("discover_watchlist_candidates", result.error)
+        self.assertIn("系统审计", adapter.call_with_tools.call_args.args[0][-1]["content"])
+
+    def test_chat_appends_debate_appendix_after_planning_execute_tools(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[ToolParameter(name="stock_code", type="string", description="Stock code")],
+                handler=lambda stock_code: {"price": 100, "stock_code": stock_code},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="checking",
+                tool_calls=[ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "600519"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+            LLMResponse(
+                content="## 最终结论\n\n持仓策略：持有。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+        ]
+        adapter.call_text.side_effect = [
+            LLMResponse(content='{"direction":"bullish","action":"hold","summary":"主观点持有","evidence":["price=100"],"failure_conditions":["跌破成本"],"account_impact":"仓位受限"}', usage={"total_tokens": 3}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"direction":"neutral_bearish","action":"reduce","summary":"反方减仓","evidence":["仓位风险"],"failure_conditions":["趋势确认"],"primary_challenges":["仓位风险"],"account_impact":"回撤风险"}', usage={"total_tokens": 4}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"winner":"primary","final_action":"hold","reason":"持有证据更强但保留风控","accepted_arguments":["price=100"],"rejected_arguments":["立即减仓"],"risk_controls":["跌破成本复查"],"unresolved_conflicts":[]}', usage={"total_tokens": 5}, provider="openai", model="openai/debate"),
+        ]
+        context = AgentUserContext(
+            positions=[PositionContext(symbol="600519", quantity=100, avg_cost=90)],
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="position_review",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            ),
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+        result = executor.chat(
+            "我持有 600519，适合继续拿长线吗？",
+            session_id="test-debate",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("## 对抗式辩论裁决", result.content)
+        self.assertEqual(result.debate["judge_decision"]["final_action"], "hold")
+        self.assertIn("## 最终结论", result.debate["debug_outputs"]["primary_report_raw"])
+        self.assertIn("## 对抗式辩论裁决", result.debate["debug_outputs"]["final_report_with_debate"])
+        self.assertEqual(adapter.call_text.call_count, 3)
+        self.assertEqual(result.total_tokens, 42)
+
 
 # ============================================================
 # AgentResult dataclass

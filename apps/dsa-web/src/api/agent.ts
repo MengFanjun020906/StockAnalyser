@@ -32,8 +32,13 @@ export interface AgentTraceRunRequest {
   context?: unknown;
   inject_portfolio_context?: boolean;
   analysis_mode?: string;
+  report_intent?: string;
   risk_preference?: string;
   trading_horizon?: string;
+  max_single_position_pct?: number;
+  max_total_equity_exposure_pct?: number;
+  max_acceptable_drawdown_pct?: number;
+  default_stop_loss_pct?: number;
   investor_notes?: string;
 }
 
@@ -76,6 +81,7 @@ export interface AgentTraceRunResponse {
   planner?: Record<string, unknown> | null;
   agent_user_context?: Record<string, unknown> | null;
   context_summary?: Record<string, unknown> | null;
+  debate?: Record<string, unknown> | null;
   artifact_dir?: string | null;
 }
 

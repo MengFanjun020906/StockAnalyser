@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Tool name → friendly label for progress messages
 _THINKING_TOOL_LABELS: Dict[str, str] = {
+    "discover_watchlist_candidates": "候选股发现",
     "get_realtime_quote": "行情获取",
     "get_daily_history": "K线数据获取",
     "analyze_trend": "技术指标分析",
@@ -362,6 +363,47 @@ def _build_budget_guard_result(
     )
 
 
+def _is_watchlist_scan_without_candidates(messages: List[Dict[str, Any]]) -> bool:
+    """Return True when Planner says watchlist_scan but no candidate tool ran yet."""
+    combined = "\n".join(str(msg.get("content") or "") for msg in messages if isinstance(msg, dict))
+    return (
+        '"intent": "watchlist_scan"' in combined
+        and '"target_symbols": []' in combined
+        and "discover_watchlist_candidates" in combined
+        and not any(
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and str(msg.get("name") or "").split(":", 1)[-1] == "discover_watchlist_candidates"
+            for msg in messages
+        )
+    )
+
+
+def _build_watchlist_discovery_guard_result(
+    *,
+    step: int,
+    tool_calls_log: List[Dict[str, Any]],
+    total_tokens: int,
+    provider_used: str,
+    models_used: List[str],
+    messages: List[Dict[str, Any]],
+) -> RunLoopResult:
+    return RunLoopResult(
+        success=False,
+        content="",
+        tool_calls_log=tool_calls_log,
+        total_steps=step,
+        total_tokens=total_tokens,
+        provider=provider_used,
+        models_used=models_used,
+        error=(
+            "watchlist_scan requires discover_watchlist_candidates before final answer "
+            "when target_symbols is empty."
+        ),
+        messages=messages,
+    )
+
+
 # ============================================================
 # Core loop
 # ============================================================
@@ -570,6 +612,30 @@ def run_agent_loop(
 
         else:
             # ---- final answer branch ----
+            if _is_watchlist_scan_without_candidates(messages):
+                logger.warning(
+                    "Agent tried to finish watchlist_scan before candidate discovery at step %d",
+                    step + 1,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统审计] 当前是 watchlist_scan 且 target_symbols 为空。"
+                        "必须先调用 discover_watchlist_candidates 生成候选股池，"
+                        "再对候选调用行情、技术、消息和资金工具。不得直接输出最终选股报告。"
+                    ),
+                })
+                if step + 1 >= max_steps:
+                    return _build_watchlist_discovery_guard_result(
+                        step=step + 1,
+                        tool_calls_log=tool_calls_log,
+                        total_tokens=total_tokens,
+                        provider_used=provider_used,
+                        models_used=models_used,
+                        messages=messages,
+                    )
+                continue
+
             logger.info(
                 "Agent completed in %d steps (%.1fs, %d tokens)",
                 step + 1,

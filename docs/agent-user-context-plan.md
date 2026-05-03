@@ -10,9 +10,9 @@
 | 第二阶段 | Planner 外壳 | 已完成 | 已提供确定性 Planner、capability -> tools 映射和 `AGENT_ANALYSIS_MODE=planning_execute` 实验开关。 |
 | 第三阶段 | 持仓上下文接入 | 已完成 | 已从 `PortfolioService` 构造账户/持仓上下文，并在 planning_execute 模式下注入 Agent。 |
 | 第四阶段 | 双报告类型 | 已完成 | 已支持 `position_review`/`entry_analysis` 意图识别；未持仓入场报告采用可见 Planning -> Execute -> 入场决策格式。 |
-| 第五阶段 | Web 配置入口 | 部分完成 | `/agent-trace` 已支持账户、风险偏好、交易周期和备注调试输入；正式设置页/持仓页画像配置仍未完成。 |
+| 第五阶段 | Web 配置入口 | 已完成（开发调试模式） | `/agent-trace` 已支持账户、报告意图、风险偏好、交易周期、仓位/回撤/止损约束和备注调试输入；正式设置页暂缓产品化。 |
 | 调试增强 | Trace UI、SSE 和本地落盘 | 已完成 | `/agent-trace`、SSE 事件流、浏览器历史和 `data/agent_traces/` 调试产物已落地。 |
-| 第六阶段 | 对抗式 Debate Agent | 未开始 | 仍处于方案设计阶段。 |
+| 第六阶段 | 对抗式 Debate Agent | 已完成（开发调试模式） | planning_execute 在工具证据形成后追加强制反向立场辩论和 Judge 裁决；`/agent-trace` 与 `debate.json` 可复盘。 |
 
 ## 背景
 
@@ -342,6 +342,12 @@ Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域�
 - 最优先观察对象
 - 今日不适合交易对象
 
+执行约束：
+
+- 如果用户没有提供股票代码或候选池，Planner 必须先进入 `watchlist_discovery`，调用 `discover_watchlist_candidates` 生成候选股池。
+- 候选发现只代表“可继续分析的种子列表”，不代表推荐；最终排序必须基于候选后续的行情、技术、消息和资金证据。
+- 如果候选发现失败或候选为空，最终报告必须明确写“候选池不足，无法完成选股排序”，不能只基于指数/板块排行给出具体组合。
+
 ### `risk_review`
 
 适用于账户风控。
@@ -443,23 +449,23 @@ PortfolioService.get_portfolio_snapshot()
 - `src/agent/planning_prompts.py` 已包含 `## 持仓报告输出规范（position_review）` 和 `## 入场报告输出规范（entry_analysis）`；其中 `entry_analysis` 明确要求输出 Planning 摘要、Execute 证据摘要和入场决策表格。
 - `tests/test_agent_planner.py`、`tests/test_planning_prompts.py` 已覆盖持仓/非持仓意图、持仓报告输出约束和入场报告输出约束。
 
-### 第五阶段：Web 配置入口（部分完成）
+### 第五阶段：Web 配置入口（已完成，保留开发调试模式）
 
 计划任务：
 
 - [x] 新增 `/agent-trace` 开发者调试页面，可选择账户并输入风险偏好、交易周期和用户画像备注。
+- [x] `/agent-trace` 支持报告意图覆盖：自动识别、持仓诊断、入场分析、账户风控和事件影响。
+- [x] `/agent-trace` 支持调试单票上限、总权益仓位上限、最大可接受回撤和默认止损。
 - [x] `/agent-trace` 顶部 `Context In Use` 会展示本次实际注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要。
 - [x] `/agent-trace` 支持 SSE 流式展示 context、planner、thinking、tool_start、tool_done 和 done/error，避免运行期间黑箱等待。
 - [x] `/agent-trace` 支持浏览器本地历史，便于回看已完成的执行链路。
 - [x] `/agent-trace` 状态栏会展示后端 `Artifact` 路径，方便定位本次落盘调试产物。
-- [ ] 正式设置页或持仓页尚未补充长期投资者画像配置入口。
-- [ ] 单票上限、总权益仓位上限、默认止损、最大可接受回撤等字段尚未在正式 Web 表单中维护。
-- [ ] 普通用户视角的报告类型选择尚未产品化；当前 `/agent-trace` 更偏开发调试。
+- [x] 从当前目标看，正式设置页/持仓页画像配置暂缓产品化；第五阶段保留开发调试模式，避免为普通用户增加额外表单负担。
 
 当前实现：
 
 - `apps/dsa-web/src/pages/AgentTracePage.tsx` 提供 Agent Trace 调试界面。
-- `api/v1/endpoints/agent.py` 的 `AgentTraceRunRequest` 支持 `account_id`、`stock_code`、`cost_method`、`risk_preference`、`trading_horizon` 和 `profile_notes`。
+- `api/v1/endpoints/agent.py` 的 `AgentTraceRunRequest` 支持 `account_id`、`stock_code`、`report_intent`、`risk_preference`、`trading_horizon`、`max_single_position_pct`、`max_total_equity_exposure_pct`、`max_acceptable_drawdown_pct`、`default_stop_loss_pct` 和 `investor_notes`。
 - `apps/dsa-web/src/components/layout/SidebarNav.tsx` 已加入“链路”入口。
 
 ### 调试增强：Trace UI 与本地落盘（已完成）
@@ -469,7 +475,7 @@ PortfolioService.get_portfolio_snapshot()
 - [x] 新增 `/api/v1/agent/trace/run` 和 `/api/v1/agent/trace/stream`。
 - [x] 前端单独提供 `/agent-trace` 界面，展示 context、planner、工具调用、事件时间线和最终 Markdown 输出。
 - [x] 后端按 session 落盘调试产物到 `data/agent_traces/<timestamp>-<session_id>/`。
-- [x] 落盘文件包括 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`final.md`、`todo.md` 和 `summary.json`。
+- [x] 落盘文件包括 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`。
 - [x] `todo.md` 会在初始化时写入计划，在执行结束后补充工具成功/失败、参数、结果预览、未调用计划工具和 Execute Protocol 复核状态。
 - [x] `evidence_ledger.json` 会按工具调用整理 `tool`、`arguments`、`status`、`evidence`、`limitation` 和 `impact`，便于离线复盘。
 
@@ -481,7 +487,7 @@ PortfolioService.get_portfolio_snapshot()
 
 ### 第六阶段：对抗式 Debate Agent
 
-单 Agent 自我反思容易变成形式化反思，实际输出仍倾向于支持自己的初始结论。后续可以引入独立反方 Agent，让主观点和反观点基于同一份证据进行对抗式辩论，再由 Judge Agent 做最终裁决。
+单 Agent 自我反思容易变成形式化反思，实际输出仍倾向于支持自己的初始结论。本阶段已引入独立反方 Agent，让主观点和反观点基于同一份证据进行对抗式辩论，再由 Judge Agent 做最终裁决。
 
 采用的模式是“强制反向立场辩论 + Judge 最终裁决”：
 
@@ -491,16 +497,16 @@ PortfolioService.get_portfolio_snapshot()
 - 双方都必须给出自己的失效条件，而不是只证明自己正确。
 - Judge Agent 不做简单折中，而是按证据强弱、账户风险、数据可靠性和用户目标裁决。
 
-建议角色：
+当前角色：
 
 | 角色 | 职责 |
 | --- | --- |
 | `PrimaryThesisAgent` | 基于 planner 和工具证据生成主观点、主动作、入场/持仓计划和失效条件 |
 | `AdversarialThesisAgent` | 强制站在相反方向，构造最强反证、反向动作计划和主观点失效条件 |
 | `DebateJudgeAgent` | 对双方证据和矛盾点做裁决，输出最终动作、接受/驳回的论点和风控条件 |
-| `RiskGateAgent` | 可选后置风控门，检查最终动作是否违反仓位、杠杆、止损和账户约束 |
+| `RiskGateAgent` | 暂未单独实现；当前由 `DebateJudgeAgent` 的 risk_controls 覆盖基础风控条件 |
 
-建议流程：
+当前流程：
 
 ```text
 AgentUserContext
@@ -512,6 +518,17 @@ AgentUserContext
   -> DebateJudgeAgent
   -> Final account-aware action plan
 ```
+
+当前实现：
+
+- `src/agent/debate.py` 提供 `PrimaryThesisAgent`、`AdversarialThesisAgent` 和 `DebateJudgeAgent` 的轻量运行时编排。
+- `src/agent/executor.py` 只在 `planning_execute`、存在 `AgentUserContext` 且已有成功工具证据时触发 Debate；`normal` 模式不受影响。
+- `src/agent/tools/market_tools.py` 提供 `discover_watchlist_candidates`，用于 watchlist_scan 在无用户候选股票代码时先生成候选池；`src/agent/runner.py` 会阻止空候选 watchlist_scan 直接输出最终选股结论。
+- Debate 三方共用同一份 `Shared Evidence Bundle`，包含用户问题、主报告、`AgentUserContext`、Planner 和工具 Evidence Ledger。
+- `api/v1/endpoints/agent.py` 的 Trace 响应和 SSE `done` 事件会返回 `debate` 字段，并在调试目录写入 `debate.json`。
+- `apps/dsa-web/src/pages/AgentTracePage.tsx` 新增 `Debate Judge` 模块，展示主观点、反方观点、Judge 裁决、分维度证据、采纳/驳回论点和风控条件；Judge 输出会显式区分账户风险、技术面、资金面、消息面、基本面和数据质量。
+- 开发调试模式下，`debate.debug_outputs` 会保留同一 session 内的原始主报告输出、Primary Thesis 原始输出、Opposing Thesis 原始输出、Judge 原始输出和最终合并输出；这些是模型可见输出和结构化 JSON，不包含隐藏思维链。
+- SSE 事件会记录 `debate_start`、`debate_primary_done`、`debate_opposing_done` 和 `debate_judge_done`，便于在 Evidence Timeline 中定位 Debate 每一步。
 
 核心约束：
 
@@ -559,8 +576,8 @@ AgentUserContext
 - [x] Planner 能输出能力域、工具执行计划、缺失工具、风险检查和期望报告类型。
 - [x] 普通单股 Agent 分析能在 `planning_execute` 模式下注入 `AgentUserContext`。
 - [x] `/agent-trace` 能展示账户上下文、Planner、SSE 事件、工具调用和最终输出。
-- [x] Trace 运行能落盘 request/context/planner/events/tool calls/evidence ledger/final/todo/summary。
+- [x] Trace 运行能落盘 request/context/planner/events/tool calls/evidence ledger/debate/final/todo/summary。
 - [x] README 未继续膨胀，细节保留在专题文档中。
 - [x] `entry_analysis` 专项输出规范已补齐到与 `position_review` 同等级的可执行程度，并使用可见 Planning -> Execute 格式。
-- [ ] 正式用户画像配置入口还未在设置页或持仓页产品化。
-- [ ] Debate Agent 尚未开始实现。
+- [x] 第五阶段按开发调试模式收口；正式用户画像配置入口暂缓产品化，不作为当前阶段阻塞项。
+- [x] Debate Agent 已按“强制反向立场辩论 + Judge 最终裁决”接入 planning_execute，覆盖持仓模式和选股/入场模式。

@@ -74,3 +74,21 @@ def test_build_planning_result_defaults_to_entry_analysis_without_position():
     assert result.expected_output == "entry_analysis_report"
     assert "portfolio_context" not in result.capabilities
     assert "fundamental_analysis" in result.capabilities
+
+
+def test_build_planning_result_watchlist_scan_starts_with_candidate_discovery():
+    context = AgentUserContext(
+        report=ReportContext(
+            analysis_mode="planning_execute",
+            intent="watchlist_scan",
+        ),
+    )
+
+    result = build_planning_result(
+        context,
+        tool_registry=_registry("discover_watchlist_candidates", "get_realtime_quote", "analyze_trend"),
+    )
+
+    assert result.intent == "watchlist_scan"
+    assert result.capabilities[0] == "watchlist_discovery"
+    assert result.required_tools[0] == "discover_watchlist_candidates"

@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 
 - [新功能] Web 新增开发者 Agent Trace 页面与 `/api/v1/agent/trace/run`、`/api/v1/agent/trace/stream` 调试接口，流式展示 planning_execute 的 Planner、账户/持仓/用户画像摘要、事件时间线、工具调用参数/结果预览和最终输出。
+- [新功能] planning_execute 新增对抗式 Debate Agent，基于同一份 Evidence Bundle 生成主观点、强制反方观点和 Judge 裁决，并在 Agent Trace 展示 `Debate Judge` 模块和落盘 `debate.json`。
+- [改进] Agent Trace 的 `Debate Judge` 模块补充同一 session 内的原始主报告、Primary/Opposing/Judge 原始输出和最终合并输出，便于开发模式下排查对抗链路。
+- [改进] Debate Judge 输出改为摘要、分维度证据和要点化裁决，并强制审视账户风险、技术面、资金面、消息面与数据质量，避免裁决被技术面单一维度主导。
+- [修复] Agent Trace 选股/组合配置类 Prompt 不再误发送默认 `600519` 股票代码；无持仓注入时也会生成最小 planning 上下文，避免 Planner 为空后退回单股分析链路。
+- [修复] Agent Trace 流式执行入口改为使用 planning_execute system prompt 和 Execute Protocol，避免前端显示 Planner 计划但后端按普通聊天链路提前结束。
+- [修复] watchlist_scan 新增候选股发现工具与执行审计，用户未提供股票代码时先生成候选池再进入单股取证，避免只基于大盘/板块工具提前输出选股结论。
+- [修复] 对抗式 Debate Agent 覆盖 `watchlist_scan` 选股/组合配置场景，避免选股 Trace 已生成候选报告但 `debate.json` 为空。
+- [改进] Agent Trace 调试表单补充报告意图、单票上限、总权益仓位上限、最大回撤和默认止损输入，便于在开发模式下完整模拟投资者画像约束。
 - [改进] Agent Trace 页面新增浏览器本地历史，保留最近 10 次运行结果，便于回看已完成的工具调用链路。
 - [改进] Agent Trace 页面改为可点击 Evidence Timeline 与大尺寸 Markdown 输出窗口；持仓报告输出规范补充未来价格情景与分层持仓策略要求。
 - [改进] planning Agent prompt 新增未持仓入场报告输出规范，采用可见 Planning -> Execute -> 入场决策格式，并约束入场区间、禁止追高线、首仓比例、加仓条件、止损目标、淘汰条件和复查触发。

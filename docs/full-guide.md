@@ -1220,10 +1220,12 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 
 - Web 侧边栏的“链路”页面面向开发者排查 Agent 执行链路，调用 `POST /api/v1/agent/trace/run` 执行一次独立调试请求。
 - 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
-- 页面支持选择持仓账户、风险偏好、持有周期和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
+- 页面支持选择持仓账户、报告意图、风险偏好、持有周期、单票上限、总权益仓位上限、最大回撤、默认止损和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
 - 页面会把最近 10 次 Trace 完整结果保存在当前浏览器的 localStorage，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
-- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`final.md`、`todo.md` 和 `summary.json`；页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
+- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`；页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
 - planning prompt 包含独立的 `Execute Protocol`：要求执行器把工具结果落入 Evidence Ledger，记录失败降级、停止条件和最终输出审计门槛；`todo.md` 初始写入计划，执行结束后会补充工具成功/失败、参数、结果预览和 Execute 复核状态。
+- planning_execute 工具证据形成后会进入对抗式 Debate：主观点 Agent、强制反方 Agent 和 Judge Agent 共用同一份 Evidence Bundle；Judge 会按证据强弱、账户风险、数据可靠性和用户目标裁决，页面 `Debate Judge` 模块和 `debate.json` 可用于排查持仓模式与选股/入场模式的裁决链路。Judge 输出会拆成结论摘要、分维度证据、要点化理由、采纳/驳回论点和风控条件，并分别标注账户风险、技术面、资金面、消息面、基本面和数据质量；资金面或消息面缺失时必须显式写出缺口，不能被技术面结论覆盖。
+- 开发调试模式下，`Debate Judge` 还会展示同一 session 内的原始主报告输出、Primary/Opposing/Judge 原始 JSON 输出和最终合并输出；这些内容用于调试模型可见输出，不展示隐藏思维链。
 - 默认调试 Prompt 使用真实用户问题示例，例如“我持有 600519，帮我分析未来走势，适合继续拿长线吗？”，而不是面向开发者的内部链路描述。
 - 页面把 Planner 压缩为 `Execution Thesis` 摘要，把事件流压缩为可点击的 `Evidence Timeline`，点击任一事件可查看完整载荷；最终输出使用大尺寸 Markdown 渲染窗口，适合阅读完整报告。
 - 出于安全与可解释性边界，页面展示的是可验证的 plan/execute 事实、工具证据和输出依据，不展示模型隐藏思维链。

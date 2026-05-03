@@ -16,10 +16,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
+from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
 from src.services.agent_model_service import list_agent_model_deployments
 
 # Tool name -> Chinese display name mapping
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
+    "discover_watchlist_candidates": "发现候选股",
     "get_realtime_quote":         "获取实时行情",
     "get_daily_history":          "获取历史K线",
     "get_chip_distribution":      "分析筹码分布",
@@ -75,8 +77,13 @@ class AgentTraceRunRequest(BaseModel):
     context: Optional[Dict[str, Any]] = None
     inject_portfolio_context: bool = True
     analysis_mode: str = "planning_execute"
+    report_intent: Optional[ReportIntent] = None
     risk_preference: Optional[str] = None
     trading_horizon: Optional[str] = None
+    max_single_position_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    max_total_equity_exposure_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    max_acceptable_drawdown_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    default_stop_loss_pct: Optional[float] = Field(default=None, ge=0, le=100)
     investor_notes: Optional[str] = None
 
     @property
@@ -99,6 +106,7 @@ class AgentTraceRunResponse(BaseModel):
     planner: Optional[Dict[str, Any]] = None
     agent_user_context: Optional[Dict[str, Any]] = None
     context_summary: Optional[Dict[str, Any]] = None
+    debate: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
 
 class SkillInfo(BaseModel):
@@ -371,13 +379,79 @@ def _build_trace_context(
                 context["agent_user_context"],
                 risk_preference=request.risk_preference,
                 trading_horizon=request.trading_horizon,
+                max_single_position_pct=request.max_single_position_pct,
+                max_total_equity_exposure_pct=request.max_total_equity_exposure_pct,
+                max_acceptable_drawdown_pct=request.max_acceptable_drawdown_pct,
+                default_stop_loss_pct=request.default_stop_loss_pct,
                 notes=request.investor_notes,
+            )
+            _apply_trace_report_overrides(
+                context["agent_user_context"],
+                report_intent=request.report_intent,
             )
         except Exception as exc:
             logger.warning("Agent trace portfolio context injection failed: %s", exc)
             context["_trace_context_error"] = str(exc)
 
+    if request.analysis_mode == "planning_execute" and "agent_user_context" not in context:
+        context["agent_user_context"] = _build_minimal_trace_agent_user_context(
+            request=request,
+            stock_code=stock_code,
+            language=context.get("report_language", "zh"),
+        )
+
     return context
+
+
+def _build_minimal_trace_agent_user_context(
+    *,
+    request: AgentTraceRunRequest,
+    stock_code: str,
+    language: str,
+) -> AgentUserContext:
+    intent = _resolve_trace_report_intent(request=request, stock_code=stock_code)
+    target_symbols = [stock_code] if stock_code else []
+    context = AgentUserContext(
+        report=ReportContext(
+            intent=intent,
+            analysis_mode="planning_execute",
+            target_symbols=target_symbols,
+            primary_symbol=stock_code or None,
+            language="en" if language == "en" else "zh",
+            include_entry_plan=True,
+            include_position_plan=True,
+            include_risk_review=True,
+            include_watchlist_ranking=intent == "watchlist_scan",
+            user_prompt=request.message,
+        ),
+    )
+    _apply_trace_investor_profile(
+        context,
+        risk_preference=request.risk_preference,
+        trading_horizon=request.trading_horizon,
+        max_single_position_pct=request.max_single_position_pct,
+        max_total_equity_exposure_pct=request.max_total_equity_exposure_pct,
+        max_acceptable_drawdown_pct=request.max_acceptable_drawdown_pct,
+        default_stop_loss_pct=request.default_stop_loss_pct,
+        notes=request.investor_notes,
+    )
+    return context
+
+
+def _resolve_trace_report_intent(*, request: AgentTraceRunRequest, stock_code: str) -> ReportIntent:
+    if request.report_intent and request.report_intent != "auto":
+        if not stock_code and _looks_like_stock_selection_request(request.message):
+            return "watchlist_scan"
+        return request.report_intent
+    if _looks_like_stock_selection_request(request.message):
+        return "watchlist_scan"
+    return "entry_analysis" if stock_code else "qa"
+
+
+def _looks_like_stock_selection_request(message: str) -> bool:
+    import re
+
+    return bool(re.search(r"(选股|筛选|推荐.*股|股票池|组合|配置|分配仓位|仓位分配|买什么|挑.*股)", message))
 
 
 def _serialize_agent_user_context(value: Any) -> Optional[Dict[str, Any]]:
@@ -395,6 +469,10 @@ def _apply_trace_investor_profile(
     *,
     risk_preference: Optional[str],
     trading_horizon: Optional[str],
+    max_single_position_pct: Optional[float],
+    max_total_equity_exposure_pct: Optional[float],
+    max_acceptable_drawdown_pct: Optional[float],
+    default_stop_loss_pct: Optional[float],
     notes: Optional[str],
 ) -> None:
     investor = getattr(agent_user_context, "investor", None)
@@ -407,6 +485,10 @@ def _apply_trace_investor_profile(
     updates = {
         "risk_preference": risk_preference,
         "trading_horizon": trading_horizon,
+        "max_single_position_pct": max_single_position_pct,
+        "max_total_equity_exposure_pct": max_total_equity_exposure_pct,
+        "max_acceptable_drawdown_pct": max_acceptable_drawdown_pct,
+        "default_stop_loss_pct": default_stop_loss_pct,
         "notes": notes,
     }
     for key, value in updates.items():
@@ -419,6 +501,28 @@ def _apply_trace_investor_profile(
                 setattr(investor, key, value)
             except Exception:
                 logger.debug("Agent trace investor profile field skipped: %s", key)
+
+
+def _apply_trace_report_overrides(
+    agent_user_context: Any,
+    *,
+    report_intent: Optional[str],
+) -> None:
+    if not report_intent:
+        return
+    report = getattr(agent_user_context, "report", None)
+    if report is None:
+        if isinstance(agent_user_context, dict):
+            report = agent_user_context.setdefault("report", {})
+        else:
+            return
+    if isinstance(report, dict):
+        report["intent"] = report_intent
+        return
+    try:
+        setattr(report, "intent", report_intent)
+    except Exception:
+        logger.debug("Agent trace report intent override skipped")
 
 
 def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -732,6 +836,7 @@ class TraceArtifactWriter:
     def __init__(self, session_id: str):
         self.path = _trace_artifact_root() / _safe_trace_session_dir_name(session_id)
         self._initialized = False
+        self._events: List[Dict[str, Any]] = []
 
     def initialize(self, *, request: AgentTraceRunRequest, context: Dict[str, Any]) -> None:
         self.path.mkdir(parents=True, exist_ok=True)
@@ -757,6 +862,7 @@ class TraceArtifactWriter:
     def append_event(self, event: Dict[str, Any]) -> None:
         if not self._initialized:
             return
+        self._events.append(event)
         _append_trace_event(self.path / "events.ndjson", event)
 
     def finalize(
@@ -783,6 +889,10 @@ class TraceArtifactWriter:
             payload["context_summary"] = _build_trace_context_summary(context)
         _write_trace_json(self.path / "tool_calls.json", tool_calls)
         _write_trace_json(self.path / "evidence_ledger.json", _build_evidence_ledger(tool_calls))
+        debate = getattr(result, "debate", None) if result is not None else None
+        if debate is None:
+            debate = _build_debate_from_trace_events(self._events)
+        _write_trace_json(self.path / "debate.json", debate)
         _write_trace_json(self.path / "summary.json", payload)
         (self.path / "final.md").write_text(final_content or "", encoding="utf-8")
         if context is not None:
@@ -799,6 +909,34 @@ def _jsonable_trace_context(context: Dict[str, Any]) -> Dict[str, Any]:
     if "agent_user_context" in payload:
         payload["agent_user_context"] = _serialize_agent_user_context(payload.get("agent_user_context"))
     return json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _build_debate_from_trace_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    debate_events = [
+        event for event in events
+        if str(event.get("type", "")).startswith("debate_")
+    ]
+    if not debate_events:
+        return None
+
+    intent = next((event.get("intent") for event in debate_events if event.get("intent")), None)
+    primary_event = next((event for event in debate_events if event.get("type") == "debate_primary_done"), {})
+    opposing_event = next((event for event in debate_events if event.get("type") == "debate_opposing_done"), {})
+    judge_event = next((event for event in debate_events if event.get("type") == "debate_judge_done"), {})
+
+    return {
+        "mode": "adversarial_debate",
+        "intent": intent,
+        "primary_thesis": primary_event.get("primary_thesis"),
+        "opposing_thesis": opposing_event.get("opposing_thesis"),
+        "judge_decision": judge_event.get("judge_decision"),
+        "debug_outputs": {
+            "primary_thesis_raw": primary_event.get("raw_output", ""),
+            "opposing_thesis_raw": opposing_event.get("raw_output", ""),
+            "judge_raw": judge_event.get("raw_output", ""),
+        },
+        "recovered_from_events": True,
+    }
 
 
 def _safe_artifact_initialize(writer: TraceArtifactWriter, *, request: AgentTraceRunRequest, context: Dict[str, Any]) -> None:
@@ -896,6 +1034,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         planner=_build_planner_trace(context),
         agent_user_context=_serialize_agent_user_context(context.get("agent_user_context")),
         context_summary=_build_trace_context_summary(context),
+        debate=result.debate,
         artifact_dir=str(artifact_writer.path),
     )
 
@@ -976,6 +1115,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "planner": _build_planner_trace(context),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "context_summary": _build_trace_context_summary(context),
+                "debate": result.debate,
                 "artifact_dir": str(artifact_writer.path),
             })
         except Exception as exc:

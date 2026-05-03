@@ -1,5 +1,6 @@
 from src.agent.planning_prompts import (
     CONSTRAINTS,
+    DEBATE_PROTOCOL,
     ENTRY_ANALYSIS_OUTPUT_FORMAT,
     EVENT_TRIGGER_POLICY,
     EXECUTE_PROTOCOL,
@@ -18,7 +19,7 @@ def test_default_zh_prompt_uses_single_section_source():
 
     assert ZH_SYSTEM_PROMPT == prompt
     assert build_zh_planning_system_prompt() == prompt
-    assert len(get_default_prompt_sections()) == 14
+    assert len(get_default_prompt_sections()) == 15
 
 
 def test_default_zh_prompt_contains_phase_one_contract_sections():
@@ -29,6 +30,7 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "## 分析维度与能力域",
         "## Planning -> Execute 协议",
         "## Execute Protocol",
+        "## Debate Protocol",
         "### Planner 角色边界",
         "### todo.md 风格计划格式",
         "### 工具计划规范",
@@ -55,6 +57,7 @@ def test_prompt_options_can_remove_optional_policy_sections():
     assert TOOL_USE_POLICY not in prompt
     assert EVENT_TRIGGER_POLICY not in prompt
     assert EXECUTE_PROTOCOL in prompt
+    assert DEBATE_PROTOCOL in prompt
     assert CONSTRAINTS in prompt
     assert POSITION_REVIEW_OUTPUT_FORMAT in prompt
     assert ENTRY_ANALYSIS_OUTPUT_FORMAT in prompt
@@ -197,4 +200,22 @@ def test_execute_protocol_requires_auditable_execution_contract():
 
     for rule in required_execute_rules:
         assert rule in EXECUTE_PROTOCOL
+        assert rule in prompt
+
+
+def test_debate_protocol_requires_forced_opposition_and_judge():
+    prompt = build_planning_system_prompt()
+    required_rules = [
+        "强制反向立场辩论 + Judge 最终裁决",
+        "Shared Evidence Bundle",
+        "Adversarial Thesis Agent",
+        "反方 Agent 不能调用新工具、不能编造数据",
+        "双方必须给出自己的失效条件",
+        "Judge 必须输出 `insufficient_data` 或 `no_trade`",
+        "持仓模式 position_review",
+        "选股模式 entry_analysis",
+    ]
+
+    for rule in required_rules:
+        assert rule in DEBATE_PROTOCOL
         assert rule in prompt

@@ -418,6 +418,14 @@ EXECUTE_PROTOCOL = """\
 - `final.md`：最终 Markdown 报告。
 - `summary.json`：模型、token、步骤数、成功状态、错误信息和 artifact_dir。
 
+### watchlist_scan 候选发现停止条件
+
+当 `intent=watchlist_scan` 且 `target_symbols` 为空时：
+- 第一阶段必须调用 `discover_watchlist_candidates`。
+- 如果候选发现返回 `status=ok/partial` 且 `candidates` 非空，必须选择主要候选继续调用单股行情、技术、消息和资金工具。
+- 如果候选发现失败或无候选，最终报告必须写“候选池不足，无法完成选股排序”，并只输出补充候选池的方法，不得给具体买入组合。
+- 不允许只基于 `get_market_indices` / `get_sector_rankings` 输出最终股票排序或仓位配置。
+
 ### 最终输出审计门槛
 
 输出前必须自检：
@@ -429,6 +437,47 @@ EXECUTE_PROTOCOL = """\
 - 是否没有泄露隐藏思维链、内部阈值和 confidence 字段。"""
 
 
+DEBATE_PROTOCOL = """\
+## Debate Protocol
+
+planning_execute 模式在工具证据形成后，必须进入“强制反向立场辩论 + Judge 最终裁决”。
+该阶段借鉴 TradingAgents 的多角色研究思路：先形成共享证据包，再由主观点与反方围绕同一状态辩论，最后由 Judge 按证据和风险裁决。
+
+### 角色分工
+
+- Primary Thesis Agent：基于最终报告和 Evidence Ledger 提出主观点，例如看多、持有、加仓或开仓。
+- Adversarial Thesis Agent：必须站到相反方向，例如看空、减仓、不入场、等待或拒绝。
+- Debate Judge Agent：不做简单折中，按证据强弱、账户风险、数据可靠性和用户目标裁决。
+
+### 共享证据约束
+
+- 三个角色只能使用同一份 Shared Evidence Bundle：AgentUserContext、Planner、Evidence Ledger、用户问题和主报告。
+- 反方 Agent 不能调用新工具、不能编造数据、不能选择性引用不存在的新闻或价格。
+- 双方必须给出自己的失效条件，而不是只证明自己正确。
+- 如果证据不足以裁决，Judge 必须输出 `insufficient_data` 或 `no_trade`，不得强行给买卖建议。
+
+### 持仓模式 position_review
+
+- 主观点重点论证继续持有、加仓或等待确认的合理性。
+- 反方重点挑战“继续持有/加仓”的安全性：仓位过重、成本安全垫不足、止损距离过大、风险事件、行情时效或数据缺口。
+- Judge 的最终动作必须落到 hold / add / reduce / take_profit / stop_loss / wait / monitor 之一。
+
+### 选股模式 entry_analysis / watchlist_scan
+
+- 主观点重点论证开仓或等待右侧确认后入场的合理性。
+- 对 watchlist_scan，主观点重点论证候选排序、组合配置和分批执行方案的合理性。
+- 对 watchlist_scan，如果用户未提供候选股票代码，候选发现是第一执行阶段；缺少候选发现证据时，Primary 不得声称“已完成选股”，Judge 必须裁定 insufficient_data / wait。
+- 反方重点挑战“现在入场/当前排序/仓位配置”的风险收益比：追高风险、止损不清、板块退潮、事件未确认、数据缺口或候选池不足。
+- Judge 的最终动作必须落到 open / wait / reject / monitor 之一；watchlist_scan 还必须说明是否采纳当前候选排序与仓位配置。
+
+### 输出要求
+
+最终报告可以展示 Debate 的可审计摘要，但不得展示隐藏思维链。可展示：
+- 主观点立场、动作、核心证据和失效条件。
+- 反方立场、动作、核心反证和失效条件。
+- Judge 裁决、采纳/驳回论点、风控条件和未决冲突。"""
+
+
 TOOL_USE_POLICY = """\
 ## 工具使用策略
 
@@ -436,6 +485,8 @@ TOOL_USE_POLICY = """\
 - 不要为了显得全面而调用所有工具。
 - 对持仓诊断，优先需要 portfolio_snapshot、realtime_quote、trend_analysis、news_intel。
 - 对开仓分析，优先需要 realtime_quote、daily_history、trend_analysis、news_intel。
+- 对 watchlist_scan/选股，如果用户没有提供股票代码或候选池，必须先调用 `discover_watchlist_candidates` 生成候选股池；没有候选股池时不得输出最终选股排序或仓位配置。
+- `discover_watchlist_candidates` 只产生候选，不代表推荐。候选出来后，必须至少对主要候选调用行情、技术、消息和资金工具，再输出排序。
 - 对事件影响，优先需要 news_intel，并结合持仓成本、仓位和关键技术位。
 - 对融资融券账户，必须检查 margin_debt、maintenance_ratio、risk_line_ratio 或等价风险字段。
 - 工具失败时记录失败原因，使用已有证据继续，但必须降低结论强度。
@@ -960,6 +1011,7 @@ DEFAULT_ZH_PROMPT_SECTIONS = (
     ANALYSIS_DIMENSIONS,
     PLANNING_PROTOCOL,
     EXECUTE_PROTOCOL,
+    DEBATE_PROTOCOL,
     TOOL_USE_POLICY,
     CONSTRAINTS,
     ACCOUNT_CONTEXT_POLICY,
@@ -1065,6 +1117,7 @@ __all__ = [
     "ANALYSIS_DIMENSIONS",
     "CONSTRAINTS",
     "CORE_PRINCIPLES",
+    "DEBATE_PROTOCOL",
     "EN_SYSTEM_PROMPT",
     "ENTRY_ANALYSIS_OUTPUT_FORMAT",
     "EXECUTE_PROTOCOL",

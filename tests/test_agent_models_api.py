@@ -350,6 +350,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                 total_tokens=123,
                 provider="deepseek",
                 model="deepseek/deepseek-v4-pro",
+                debate={"enabled": True, "success": True, "judge_decision": {"final_action": "hold"}},
                 tool_calls_log=[
                     {
                         "step": 1,
@@ -402,7 +403,8 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertEqual(payload["content"], "trace ok")
             self.assertEqual(payload["tool_calls"][0]["tool"], "get_realtime_quote")
             self.assertEqual(payload["events"][0]["display_name"], "获取实时行情")
-            self.assertIsNone(payload["planner"])
+            self.assertEqual(payload["planner"]["intent"], "entry_analysis")
+            self.assertEqual(payload["planner"]["primary_symbol"], "600519")
             self.assertTrue(payload["artifact_dir"])
             self.assertTrue(os.path.isdir(payload["artifact_dir"]))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "context.json")))
@@ -410,8 +412,10 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "events.ndjson")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "tool_calls.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "evidence_ledger.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "debate.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "final.md")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "todo.md")))
+            self.assertEqual(payload["debate"]["judge_decision"]["final_action"], "hold")
             with open(os.path.join(payload["artifact_dir"], "events.ndjson"), encoding="utf-8") as fh:
                 lines = [json.loads(line) for line in fh if line.strip()]
             self.assertEqual(lines[0]["type"], "tool_start")
@@ -423,6 +427,9 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertEqual(evidence_ledger["entries"][0]["tool"], "get_realtime_quote")
             self.assertEqual(evidence_ledger["entries"][0]["status"], "success")
             self.assertIn("price", evidence_ledger["entries"][0]["evidence"])
+            with open(os.path.join(payload["artifact_dir"], "debate.json"), encoding="utf-8") as fh:
+                debate = json.load(fh)
+            self.assertEqual(debate["judge_decision"]["final_action"], "hold")
             with open(os.path.join(payload["artifact_dir"], "todo.md"), encoding="utf-8") as fh:
                 todo_md = fh.read()
             self.assertIn("## 执行状态", todo_md)
@@ -453,6 +460,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                 total_tokens=42,
                 provider="deepseek",
                 model="deepseek/deepseek-v4-pro",
+                debate={"enabled": True, "success": True, "judge_decision": {"final_action": "hold"}},
                 tool_calls_log=[
                     {
                         "step": 1,
@@ -500,6 +508,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertIn("tool_done", event_types)
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["content"], "stream ok")
+        self.assertEqual(events[-1]["debate"]["judge_decision"]["final_action"], "hold")
         self.assertTrue(events[-1]["artifact_dir"])
         tool_event = next(event for event in events if event["type"] == "tool_done")
         self.assertEqual(tool_event["display_name"], "获取实时行情")
@@ -545,8 +554,13 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                     message="我持有 600519，适合继续拿长线吗？",
                     account_id=7,
                     stock_code="600519",
+                    report_intent="position_review",
                     risk_preference="conservative",
                     trading_horizon="long_term",
+                    max_single_position_pct=25,
+                    max_total_equity_exposure_pct=75,
+                    max_acceptable_drawdown_pct=12,
+                    default_stop_loss_pct=8,
                     investor_notes="不能承受大回撤",
                 ),
                 config=SimpleNamespace(report_language="zh"),
@@ -559,8 +573,40 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(summary["accounts"][0]["account_name"], "A股主账户")
         self.assertEqual(summary["investor"]["risk_preference"], "conservative")
         self.assertEqual(summary["investor"]["trading_horizon"], "long_term")
+        self.assertEqual(summary["investor"]["max_single_position_pct"], 25)
+        self.assertEqual(summary["investor"]["max_total_equity_exposure_pct"], 75)
+        self.assertEqual(summary["investor"]["max_acceptable_drawdown_pct"], 12)
+        self.assertEqual(summary["investor"]["default_stop_loss_pct"], 8)
+        self.assertEqual(context["agent_user_context"].report.intent, "position_review")
         self.assertEqual(summary["target_position"]["symbol"], "600519")
         self.assertEqual(summary["target_position"]["quantity"], 150000.0)
+
+    def test_trace_context_builds_minimal_planner_context_for_stock_selection_without_portfolio(self):
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="我现在有5w，我希望你帮我选股，并告诉我怎么分配仓位",
+                inject_portfolio_context=False,
+                report_intent="entry_analysis",
+                risk_preference="balanced",
+                trading_horizon="long_term",
+                max_single_position_pct=20,
+                max_total_equity_exposure_pct=80,
+                max_acceptable_drawdown_pct=15,
+                default_stop_loss_pct=8,
+                investor_notes="偏长期持有",
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertNotIn("stock_code", context)
+        self.assertIsNotNone(context["agent_user_context"])
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertEqual(context["agent_user_context"].report.primary_symbol, None)
+        self.assertEqual(context["agent_user_context"].investor.max_single_position_pct, 20)
+        planner = agent._build_planner_trace(context)
+        self.assertIsNotNone(planner)
+        self.assertEqual(planner["intent"], "watchlist_scan")
+        self.assertIsNone(planner["primary_symbol"])
 class AgentModelsSourceDetectionTestCase(unittest.TestCase):
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
