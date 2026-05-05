@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Agent 选股 Prompt 拆分到独立 `src/agent/stock_selection_prompts.py`，并新增 `SelectionRunContext` 管理阶段 `summary/full/full_ref`，避免选股上下文持续膨胀。
 - [改进] Agent Trace 落盘新增 `stock_selection.json`、`selection_context.json` 和 `final_report.json`，便于复盘选股阶段状态、证据摘要和最终裁决。
 - [修复] `get_capital_flow` 调用 AkShare 个股资金流时按 A 股代码补充 `market=sh/sz/bj`，并修复结构化工具失败仍在 Trace 中显示 OK 的状态误判。
+- [文档] 新增 Agent 工具能力缺口分析，梳理行情、技术、资金、消息、情绪、宏观和图谱工具边界，并提出市场情绪与地缘风险工具路线图。
+- [文档] 扩展 Agent 用户上下文计划，补充工具补全、连续对话、方案保存、模拟盘托管、自进化、回测、regime、策略库和量化交易长期路线图。
+- [文档] 重写 README，将首页说明收敛到当前私有分支的 agent-trace / planning_execute 主链路，并标注上游遗留能力为非当前维护重点。
 
 
 
