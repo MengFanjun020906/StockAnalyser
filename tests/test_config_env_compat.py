@@ -53,6 +53,40 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_load_from_env_reads_graphiti_config(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "GRAPHITI_ENABLED": "true",
+                "NEO4J_URI": "bolt://neo4j.example:7687",
+                "NEO4J_USER": "neo4j_user",
+                "NEO4J_PASSWORD": "neo4j_secret",
+                "GRAPHITI_LLM_MODEL": "openai/gpt-4o-mini",
+                "GRAPHITI_EMBEDDING_MODEL": "openai/text-embedding-3-small",
+                "GRAPHITI_EMBEDDING_BASE_URL": "https://embed.example.com/v1",
+                "GRAPHITI_EMBEDDING_API_KEY": "embed-secret",
+                "GRAPHITI_GROUP_STRATEGY": "single",
+            },
+            clear=True,
+        ):
+            with patch.object(Config, "_parse_stock_email_groups", return_value=[]):
+                config = Config._load_from_env()
+
+        self.assertTrue(config.graphiti_enabled)
+        self.assertEqual(config.graphiti_neo4j_uri, "bolt://neo4j.example:7687")
+        self.assertEqual(config.graphiti_neo4j_user, "neo4j_user")
+        self.assertEqual(config.graphiti_neo4j_password, "neo4j_secret")
+        self.assertEqual(config.graphiti_llm_model, "openai/gpt-4o-mini")
+        self.assertEqual(config.graphiti_embedding_model, "openai/text-embedding-3-small")
+        self.assertEqual(config.graphiti_embedding_base_url, "https://embed.example.com/v1")
+        self.assertEqual(config.graphiti_embedding_api_key, "embed-secret")
+        self.assertEqual(config.graphiti_group_strategy, "single")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_schedule_run_immediately_falls_back_to_legacy_run_immediately(
         self,
         _mock_parse_yaml,

@@ -91,6 +91,16 @@ def _normalize_code(raw: Any) -> str:
     return s
 
 
+def _akshare_fund_flow_market(stock_code: str) -> str:
+    """Return AkShare market parameter for A-share fund-flow endpoints."""
+    code = _normalize_code(stock_code)
+    if code.startswith(("60", "68", "900")):
+        return "sh"
+    if code.startswith(("43", "81", "82", "83", "87", "88", "92")):
+        return "bj"
+    return "sz"
+
+
 def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     """
     Return first non-empty row value whose column name contains any keyword.
@@ -417,6 +427,7 @@ class AkshareFundamentalAdapter:
         """
         Return stock + sector capital flow.
         """
+        market = _akshare_fund_flow_market(stock_code)
         result: Dict[str, Any] = {
             "status": "not_supported",
             "stock_flow": {},
@@ -426,6 +437,7 @@ class AkshareFundamentalAdapter:
         }
 
         stock_df, stock_source, stock_errors = self._call_df_candidates([
+            ("stock_individual_fund_flow", {"stock": stock_code, "market": market}),
             ("stock_individual_fund_flow", {"stock": stock_code}),
             ("stock_individual_fund_flow", {"symbol": stock_code}),
             ("stock_individual_fund_flow", {}),

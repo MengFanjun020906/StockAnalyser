@@ -6,6 +6,7 @@ Agent API endpoints.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,11 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from src.config import get_config
 from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
 from src.services.agent_model_service import list_agent_model_deployments
+
+try:
+    from src.services.graphiti import get_graphiti_service
+except Exception:  # pragma: no cover
+    get_graphiti_service = None
 
 # Tool name -> Chinese display name mapping
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
@@ -107,6 +113,7 @@ class AgentTraceRunResponse(BaseModel):
     agent_user_context: Optional[Dict[str, Any]] = None
     context_summary: Optional[Dict[str, Any]] = None
     debate: Optional[Dict[str, Any]] = None
+    stock_selection: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
 
 class SkillInfo(BaseModel):
@@ -784,7 +791,87 @@ def _summarize_executed_tools(tool_calls: List[Dict[str, Any]]) -> Dict[str, Dic
 def _tool_call_status(call: Dict[str, Any]) -> str:
     if call.get("timeout"):
         return "timeout"
-    return "success" if call.get("success") is not False else "failed"
+    status = str(call.get("status") or "").strip().lower()
+    if status == "not_supported":
+        return "success"
+    if _tool_call_has_errors(call) and str(call.get("status") or "").lower() != "not_supported":
+        return "failed"
+    if _tool_result_preview_has_errors(call.get("result_preview")):
+        return "failed"
+    return "success" if call.get("success") is True else "failed"
+
+
+def _tool_call_has_errors(call: Dict[str, Any]) -> bool:
+    if not isinstance(call, dict):
+        return False
+    if call.get("error"):
+        return True
+    errors = call.get("errors")
+    if isinstance(errors, list):
+        return any(str(item).strip() for item in errors)
+    return bool(errors)
+
+
+def _tool_result_preview_has_errors(preview: Any) -> bool:
+    payload = _parse_result_preview(preview)
+    return _structured_tool_payload_has_errors(payload)
+
+
+def _parse_result_preview(preview: Any) -> Any:
+    if isinstance(preview, (dict, list)):
+        return preview
+    if not isinstance(preview, str):
+        return None
+    text = preview.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _structured_tool_payload_has_errors(payload: Any) -> bool:
+    if isinstance(payload, list):
+        return any(_structured_tool_payload_has_errors(item) for item in payload)
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or "").strip().lower()
+    if status == "not_supported":
+        return False
+    if status in {"failed", "error", "tool_failed", "timeout"}:
+        return True
+    if payload.get("timeout") is True:
+        return True
+    if payload.get("success") is False:
+        return True
+    if payload.get("error"):
+        return True
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        return any(str(item).strip() for item in errors)
+    return bool(errors)
+
+
+def _normalize_tool_call_status(call: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(call, dict):
+        return call
+    normalized = dict(call)
+    normalized["success"] = _tool_call_status(normalized) == "success"
+    return normalized
+
+
+def _normalize_tool_calls_status(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        _normalize_tool_call_status(call) if isinstance(call, dict) else call
+        for call in tool_calls or []
+    ]
+
+
+def _normalize_tool_event_status(event: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(event, dict) or event.get("type") != "tool_done":
+        return event
+    return _normalize_tool_call_status(event)
 
 
 def _build_evidence_ledger(tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -834,6 +921,7 @@ class TraceArtifactWriter:
     """Best-effort file writer for developer trace artifacts."""
 
     def __init__(self, session_id: str):
+        self.session_id = session_id
         self.path = _trace_artifact_root() / _safe_trace_session_dir_name(session_id)
         self._initialized = False
         self._events: List[Dict[str, Any]] = []
@@ -871,10 +959,13 @@ class TraceArtifactWriter:
         result: Any = None,
         error: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
+        request: Optional[AgentTraceRunRequest] = None,
     ) -> None:
         if not self._initialized:
             return
-        tool_calls = (getattr(result, "tool_calls_log", []) if result is not None else []) or []
+        tool_calls = _normalize_tool_calls_status(
+            (getattr(result, "tool_calls_log", []) if result is not None else []) or []
+        )
         final_content = getattr(result, "content", "") if result is not None else ""
         payload = {
             "success": bool(getattr(result, "success", False)) if result is not None else False,
@@ -893,6 +984,19 @@ class TraceArtifactWriter:
         if debate is None:
             debate = _build_debate_from_trace_events(self._events)
         _write_trace_json(self.path / "debate.json", debate)
+        stock_selection = getattr(result, "stock_selection", None) if result is not None else None
+        if stock_selection:
+            _write_trace_json(self.path / "stock_selection.json", stock_selection)
+            selection_context = stock_selection.get("selection_context") or {}
+            _write_trace_json(self.path / "selection_context.json", selection_context)
+            final_report_json = stock_selection.get("final_report_json") or {}
+            _write_trace_json(self.path / "final_report.json", final_report_json)
+            stages = (selection_context.get("stages") or {}) if isinstance(selection_context, dict) else {}
+            for stage_name, stage_payload in stages.items():
+                if not isinstance(stage_payload, dict):
+                    continue
+                safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(stage_name)).strip("._") or "stage"
+                _write_trace_json(self.path / f"{safe_name}.json", stage_payload)
         _write_trace_json(self.path / "summary.json", payload)
         (self.path / "final.md").write_text(final_content or "", encoding="utf-8")
         if context is not None:
@@ -902,6 +1006,14 @@ class TraceArtifactWriter:
                 _planner_to_todo_md(planner, context_summary, tool_calls),
                 encoding="utf-8",
             )
+        if request is not None and context is not None:
+            _ingest_trace_to_graphiti(
+                session_id=self.session_id,
+                artifact_dir=str(self.path),
+                request=request,
+                context=context,
+                result=result,
+            )
 
 
 def _jsonable_trace_context(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -909,6 +1021,70 @@ def _jsonable_trace_context(context: Dict[str, Any]) -> Dict[str, Any]:
     if "agent_user_context" in payload:
         payload["agent_user_context"] = _serialize_agent_user_context(payload.get("agent_user_context"))
     return json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _ingest_trace_to_graphiti(
+    *,
+    session_id: str,
+    artifact_dir: str,
+    request: AgentTraceRunRequest,
+    context: Dict[str, Any],
+    result: Any,
+) -> None:
+    config = get_config()
+    if not getattr(config, "graphiti_enabled", False):
+        return
+
+    try:
+        service = get_graphiti_service()
+        if not service.is_available():
+            logger.debug("Agent trace Graphiti service unavailable, skip ingest")
+            return
+
+        title = request.stock_name or context.get("stock_name") or request.message[:80]
+        trace_type = "stock_selection" if _looks_like_stock_selection_request(request.message) else "single_stock_analysis"
+        market = _resolve_trace_market(context)
+        service.ingest_trace_sync(
+            session_id=session_id,
+            trace_type=trace_type,
+            title=title,
+            result={
+                "success": getattr(result, "success", False) if result is not None else False,
+                "error": getattr(result, "error", None) if result is not None else None,
+                "content": getattr(result, "content", "") if result is not None else "",
+                "tool_calls": _normalize_tool_calls_status(getattr(result, "tool_calls_log", []) if result is not None else []),
+                "debate": getattr(result, "debate", None) if result is not None else None,
+                "stock_selection": getattr(result, "stock_selection", None) if result is not None else None,
+                "artifact_dir": artifact_dir,
+            },
+            context={
+                "stock_code": context.get("stock_code"),
+                "stock_name": context.get("stock_name") or request.stock_name,
+                "analysis_mode": request.analysis_mode,
+                "report_type": context.get("report_type"),
+                "report_language": context.get("report_language"),
+                "account_id": request.account_id,
+                "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
+                "context_summary": _build_trace_context_summary(context),
+                "planner": _build_planner_trace(context),
+            },
+            artifact_dir=artifact_dir,
+            market=market,
+            user_id=str(request.account_id) if request.account_id is not None else None,
+        )
+    except Exception as exc:
+        logger.warning("Agent trace Graphiti ingestion failed for %s: %s", session_id, exc, exc_info=True)
+
+
+def _resolve_trace_market(context: Dict[str, Any]) -> str | None:
+    payload = _serialize_agent_user_context(context.get("agent_user_context"))
+    if not isinstance(payload, dict):
+        return context.get("market")
+    accounts = payload.get("accounts") or []
+    for account in accounts:
+        if isinstance(account, dict) and account.get("market"):
+            return str(account.get("market"))
+    return context.get("market")
 
 
 def _build_debate_from_trace_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -959,9 +1135,10 @@ def _safe_artifact_finalize(
     result: Any = None,
     error: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
+    request: Optional[AgentTraceRunRequest] = None,
 ) -> None:
     try:
-        writer.finalize(result=result, error=error, context=context)
+        writer.finalize(result=result, error=error, context=context, request=request)
     except Exception as exc:
         logger.warning("Agent trace artifact finalize failed: %s", exc)
 
@@ -985,6 +1162,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
 
     def progress_callback(event: dict):
         event_payload = dict(event)
+        event_payload = _normalize_tool_event_status(event_payload)
         if event_payload.get("type") in ("tool_start", "tool_done"):
             tool = event_payload.get("tool", "")
             event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
@@ -1005,7 +1183,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         result = await loop.run_in_executor(None, run_sync)
     except Exception as exc:
         logger.error("Agent trace run failed: %s", exc, exc_info=True)
-        _safe_artifact_finalize(artifact_writer, error=str(exc), context=context)
+        _safe_artifact_finalize(artifact_writer, error=str(exc), context=context, request=request)
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         try:
@@ -1017,7 +1195,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         except Exception as exc:
             logger.debug("Agent trace session cleanup skipped: %s", exc)
 
-    _safe_artifact_finalize(artifact_writer, result=result, context=context)
+    _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
 
     return AgentTraceRunResponse(
         success=result.success,
@@ -1030,11 +1208,12 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         model=result.model,
         mode=request.analysis_mode,
         events=events,
-        tool_calls=result.tool_calls_log,
+        tool_calls=_normalize_tool_calls_status(result.tool_calls_log),
         planner=_build_planner_trace(context),
         agent_user_context=_serialize_agent_user_context(context.get("agent_user_context")),
         context_summary=_build_trace_context_summary(context),
         debate=result.debate,
+        stock_selection=getattr(result, "stock_selection", None),
         artifact_dir=str(artifact_writer.path),
     )
 
@@ -1063,6 +1242,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
 
     def progress_callback(event: dict):
         event_payload = dict(event)
+        event_payload = _normalize_tool_event_status(event_payload)
         if event_payload.get("type") in ("tool_start", "tool_done"):
             tool = event_payload.get("tool", "")
             event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
@@ -1098,7 +1278,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 progress_callback=progress_callback,
                 context=context,
             )
-            _safe_artifact_finalize(artifact_writer, result=result, context=context)
+            _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
             put_event({
                 "type": "done",
                 "success": result.success,
@@ -1111,16 +1291,17 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "model": result.model,
                 "mode": request.analysis_mode,
                 "events": [],
-                "tool_calls": result.tool_calls_log,
+                "tool_calls": _normalize_tool_calls_status(result.tool_calls_log),
                 "planner": _build_planner_trace(context),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "context_summary": _build_trace_context_summary(context),
                 "debate": result.debate,
+                "stock_selection": getattr(result, "stock_selection", None),
                 "artifact_dir": str(artifact_writer.path),
             })
         except Exception as exc:
             logger.error("Agent trace stream failed: %s", exc, exc_info=True)
-            _safe_artifact_finalize(artifact_writer, error=str(exc), context=context)
+            _safe_artifact_finalize(artifact_writer, error=str(exc), context=context, request=request)
             put_event({"type": "error", "session_id": session_id, "message": str(exc)})
         finally:
             cleanup_trace_session()
@@ -1279,6 +1460,7 @@ async def agent_chat_stream(request: ChatRequest):
         stream_ctx["skills"] = skills
 
     def progress_callback(event: dict):
+        event = _normalize_tool_event_status(dict(event))
         # Enrich tool events with display names
         if event.get("type") in ("tool_start", "tool_done"):
             tool = event.get("tool", "")

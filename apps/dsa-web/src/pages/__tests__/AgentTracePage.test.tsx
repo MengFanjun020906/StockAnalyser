@@ -273,6 +273,47 @@ describe('AgentTracePage', () => {
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
   });
 
+  it('does not show OK for get_capital_flow events without explicit success', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'tool_done',
+        step: 1,
+        tool: 'get_capital_flow',
+        display_name: '获取资金流向',
+        arguments: { stock_code: '600519' },
+        duration: 30.1,
+        result_length: 120,
+        result_preview: '{"status":"partial","main_net_inflow":123.4,"errors":["capital flow fetch failed"]}',
+      },
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-flow-failed',
+        content: '资金流工具失败，资金面证据缺失。',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'deepseek',
+        model: 'deepseek/deepseek-v4-pro',
+        mode: 'planning_execute',
+        planner: { intent: 'entry_analysis', required_tools: ['get_capital_flow'] },
+        agent_user_context: { report: { analysis_mode: 'planning_execute' } },
+        context_summary: { account_count: 0, position_count: 0, accounts: [], investor: null },
+        debate: null,
+      },
+    ]));
+
+    render(<AgentTracePage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /运行 Trace/ }));
+
+    expect((await screen.findAllByText('get_capital_flow')).length).toBeGreaterThan(0);
+    expect(screen.getByText('FAIL')).toBeInTheDocument();
+    expect(screen.getByText('资金流工具失败，资金面证据缺失。')).toBeInTheDocument();
+    expect(screen.getAllByText(/capital flow fetch failed/).length).toBeGreaterThan(0);
+  });
+
   it('does not send the default stock code for stock-selection prompts', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
     mocks.traceStream.mockResolvedValue(makeStreamResponse([
@@ -292,6 +333,37 @@ describe('AgentTracePage', () => {
         agent_user_context: { report: { intent: 'watchlist_scan' } },
         context_summary: { account_count: 0, position_count: 0, accounts: [], investor: null },
         debate: null,
+        stock_selection: {
+          enabled: true,
+          success: true,
+          selection_context: {
+            candidate_strategy: 'hot_sector',
+            next_step: 'render_final_report',
+            stages: {
+              candidate_discovery: { status: 'ok', summary: { candidate_codes: ['600001', '600002'] }, full_ref: 'candidate_discovery.json' },
+              candidate_screening: { status: 'ok', summary: { deep_dive_targets: ['600001'] }, full_ref: 'candidate_screening.json' },
+              single_stock_deep_dive: { status: 'ok', summary: { wait_targets: ['600001'] }, full_ref: 'deep_dive_results.json' },
+              portfolio_allocation: { status: 'ok', summary: { portfolio_action: 'wait' }, full_ref: 'portfolio_allocation.json' },
+              adversarial_review: { status: 'ok', summary: { opposing_summary: '资金面缺失' }, full_ref: 'adversarial_review.json' },
+              judge_decision: { status: 'ok', summary: { final_action: 'wait', primary_plan_verdict: 'accept_with_changes', decision_summary: '等待确认', next_step: 'render_final_report' }, full_ref: 'judge_decision.json' },
+            },
+          },
+          final_report_json: {
+            candidate_discovery: { summary: { candidate_codes: ['600001', '600002'], main_limitations: ['候选需要深度取证'] } },
+            candidate_screening: { summary: { deep_dive_targets: ['600001'], main_limitations: ['资金面待确认'] } },
+            single_stock_deep_dive: { summary: { wait_targets: ['600001'], open_targets: [], reject_targets: [] } },
+            portfolio_allocation: {
+              summary: { portfolio_action: 'wait', core_reason: '等待确认' },
+              full: {
+                positions_plan: [
+                  { rank: 1, code: '600001', name: '测试一', action: 'wait', initial_position_pct: 0, entry_condition: '回踩确认' },
+                ],
+              },
+            },
+            adversarial_review: { summary: { top_risk_points: ['资金面缺失'], top_evidence_gaps: ['capital_flow'] } },
+            judge_decision: { summary: { final_action: 'wait', primary_plan_verdict: 'accept_with_changes', decision_summary: '等待确认', next_step: 'render_final_report' }, full: { risk_controls: ['不追高'] } },
+          },
+        },
         artifact_dir: '/tmp/trace-selection',
       },
     ]));
@@ -309,6 +381,13 @@ describe('AgentTracePage', () => {
       }));
     });
     expect(screen.getByText('选股结论')).toBeInTheDocument();
+    expect(screen.getByText('Stock Selection Pipeline')).toBeInTheDocument();
+    expect(screen.getByText('hot_sector')).toBeInTheDocument();
+    expect(screen.getByText('candidate_discovery.json')).toBeInTheDocument();
+    expect(screen.getAllByText('600001').length).toBeGreaterThan(0);
+    expect(screen.getByText('回踩确认')).toBeInTheDocument();
+    expect(screen.getByText('capital_flow')).toBeInTheDocument();
+    expect(screen.getByText('不追高')).toBeInTheDocument();
   });
 });
 

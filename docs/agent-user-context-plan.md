@@ -13,6 +13,7 @@
 | 第五阶段 | Web 配置入口 | 已完成（开发调试模式） | `/agent-trace` 已支持账户、报告意图、风险偏好、交易周期、仓位/回撤/止损约束和备注调试输入；正式设置页暂缓产品化。 |
 | 调试增强 | Trace UI、SSE 和本地落盘 | 已完成 | `/agent-trace`、SSE 事件流、浏览器历史和 `data/agent_traces/` 调试产物已落地。 |
 | 第六阶段 | 对抗式 Debate Agent | 已完成（开发调试模式） | planning_execute 在工具证据形成后追加强制反向立场辩论和 Judge 裁决；`/agent-trace` 与 `debate.json` 可复盘。 |
+| 第七阶段 | 阶段化选股流水线 | 已完成（开发调试模式） | `watchlist_scan` 优先走候选发现、初筛、单股深度分析、组合配置、反方审查和 Judge 裁决；`SelectionRunContext` 以 `summary/full/full_ref` 管理上下文并落盘 `stock_selection.json`。 |
 
 ## 背景
 
@@ -523,7 +524,7 @@ AgentUserContext
 
 - `src/agent/debate.py` 提供 `PrimaryThesisAgent`、`AdversarialThesisAgent` 和 `DebateJudgeAgent` 的轻量运行时编排。
 - `src/agent/executor.py` 只在 `planning_execute`、存在 `AgentUserContext` 且已有成功工具证据时触发 Debate；`normal` 模式不受影响。
-- `src/agent/tools/market_tools.py` 提供 `discover_watchlist_candidates`，用于 watchlist_scan 在无用户候选股票代码时先生成候选池；`src/agent/runner.py` 会阻止空候选 watchlist_scan 直接输出最终选股结论。
+- `src/agent/tools/market_tools.py` 提供 `discover_watchlist_candidates`，用于 watchlist_scan 在无用户候选股票代码时先生成候选池；`src/agent/stock_selection.py` 在 planning_execute 的 watchlist_scan 下优先执行阶段化选股流水线，并通过 `SelectionRunContext` 管理候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决；`src/agent/runner.py` 仍保留审计兜底，阻止空候选 watchlist_scan 直接输出最终选股结论。
 - Debate 三方共用同一份 `Shared Evidence Bundle`，包含用户问题、主报告、`AgentUserContext`、Planner 和工具 Evidence Ledger。
 - `api/v1/endpoints/agent.py` 的 Trace 响应和 SSE `done` 事件会返回 `debate` 字段，并在调试目录写入 `debate.json`。
 - `apps/dsa-web/src/pages/AgentTracePage.tsx` 新增 `Debate Judge` 模块，展示主观点、反方观点、Judge 裁决、分维度证据、采纳/驳回论点和风控条件；Judge 输出会显式区分账户风险、技术面、资金面、消息面、基本面和数据质量。

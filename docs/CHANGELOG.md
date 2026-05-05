@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
 
+- [新功能] planning_execute 的 `watchlist_scan` 接入五阶段选股流水线，按候选发现、初筛、单股深度分析、组合配置、反方审查和 Judge 裁决输出结构化 `stock_selection` 结果。
+- [新功能] 新增 Graphiti 时序知识图谱最小集成路径，支持可选 Neo4j 配置、分析结果入图和 Agent 知识图谱检索工具。
+- [改进] `test_env.py` 新增 `--graph` 检查，支持检测 Neo4j 连通性和 Graphiti embedding 模型配置。
+- [修复] Graphiti 写入和查询前显式初始化 Neo4j 索引，避免首次空库查询因缺少 `edge_name_and_fact` 全文索引失败。
+- [修复] Graphiti 自定义实体字段改名，避免 `Stock.name` / `Sector.name` 与 Graphiti 保留字段冲突导致 `agent-trace` 入图被 schema 校验拒绝。
+- [改进] Agent 选股 Prompt 拆分到独立 `src/agent/stock_selection_prompts.py`，并新增 `SelectionRunContext` 管理阶段 `summary/full/full_ref`，避免选股上下文持续膨胀。
+- [改进] Agent Trace 落盘新增 `stock_selection.json`、`selection_context.json` 和 `final_report.json`，便于复盘选股阶段状态、证据摘要和最终裁决。
+- [修复] `get_capital_flow` 调用 AkShare 个股资金流时按 A 股代码补充 `market=sh/sz/bj`，并修复结构化工具失败仍在 Trace 中显示 OK 的状态误判。
 
 
 
@@ -21,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] Agent Trace 流式执行入口改为使用 planning_execute system prompt 和 Execute Protocol，避免前端显示 Planner 计划但后端按普通聊天链路提前结束。
 - [修复] watchlist_scan 新增候选股发现工具与执行审计，用户未提供股票代码时先生成候选池再进入单股取证，避免只基于大盘/板块工具提前输出选股结论。
 - [修复] 对抗式 Debate Agent 覆盖 `watchlist_scan` 选股/组合配置场景，避免选股 Trace 已生成候选报告但 `debate.json` 为空。
+- [修复] Agent Trace 对工具返回显式 `error/errors` 的结果一律显示失败，并避免流式事件缺少 `success` 字段时前端默认显示 OK。
+- [修复] planning_execute 的最终 Markdown 输出会清理“第三步/第二步”这类执行步骤标题，避免入场报告把证据摘要误写成流程编号。
 - [改进] Agent Trace 调试表单补充报告意图、单票上限、总权益仓位上限、最大回撤和默认止损输入，便于在开发模式下完整模拟投资者画像约束。
 - [改进] Agent Trace 页面新增浏览器本地历史，保留最近 10 次运行结果，便于回看已完成的工具调用链路。
 - [改进] Agent Trace 页面改为可点击 Evidence Timeline 与大尺寸 Markdown 输出窗口；持仓报告输出规范补充未来价格情景与分层持仓策略要求。
@@ -28,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Agent Trace 后端新增本地调试产物落盘目录，按 session 保存 request、context、planner、events、tool calls、evidence ledger、final 报告和 todo.md，便于开发者离线复盘调用链路。
 - [改进] planning Agent prompt 新增 Execute Protocol，明确 Evidence Ledger、工具失败降级、停止条件、Trace artifacts 和最终输出审计门槛；Trace `todo.md` 会在执行结束后反映工具成功/失败状态。
 - [改进] 新增 `start_all.sh` / `stop_all.sh` 本地开发启动脚本，一键启动或停止 FastAPI 后端与 Vite 前端，并将 PID 与日志保存到本地目录。
+- [改进] `start_all.sh` / `stop_all.sh` 纳入 Graphiti Neo4j 容器，本地一键启动默认同时准备知识图谱存储。
 - [改进] Agent 实时行情工具补充市场会话与最新可用交易日元数据，并约束持仓报告在休市/非交易日标注行情口径，避免把最近交易日涨跌幅误写成“今日涨跌幅”。
 - [改进] Agent SSE 完成事件补充模型、token 与工具调用日志，便于前端调试调用链路。
 - [新功能] 新增 `test_env.py` 环境 API 连通性检测工具，支持 LLM、搜索、行情、社媒情绪和通知通道 smoke test。

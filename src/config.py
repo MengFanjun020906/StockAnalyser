@@ -179,6 +179,12 @@ def normalize_news_strategy_profile(value: Optional[str]) -> str:
     return candidate if candidate in NEWS_STRATEGY_WINDOWS else "short"
 
 
+def normalize_graphiti_group_strategy(value: Optional[str]) -> str:
+    """Normalize Graphiti group strategy to supported values."""
+    candidate = (value or "market").strip().lower()
+    return candidate if candidate in {"market", "user", "single"} else "market"
+
+
 def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Optional[str]) -> int:
     """Resolve effective news window days from profile and global max-age."""
     profile = normalize_news_strategy_profile(news_strategy_profile)
@@ -670,6 +676,17 @@ class Config:
     news_max_age_days: int = 3   # 新闻最大时效（天）
     news_strategy_profile: str = "short"  # 新闻窗口策略档位：ultra_short/short/medium/long
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
+
+    # === Graphiti 知识图谱配置 ===
+    graphiti_enabled: bool = False
+    graphiti_neo4j_uri: str = "bolt://localhost:7687"
+    graphiti_neo4j_user: str = "neo4j"
+    graphiti_neo4j_password: Optional[str] = None
+    graphiti_llm_model: str = ""
+    graphiti_embedding_model: str = ""
+    graphiti_embedding_base_url: Optional[str] = None
+    graphiti_embedding_api_key: Optional[str] = None
+    graphiti_group_strategy: str = "market"
 
     # === Agent 模式配置 ===
     agent_litellm_model: str = ""  # Optional Agent-only primary model; empty inherits LITELLM_MODEL
@@ -1348,6 +1365,15 @@ class Config:
                 os.getenv('NEWS_STRATEGY_PROFILE', 'short')
             ),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
+            graphiti_enabled=os.getenv('GRAPHITI_ENABLED', 'false').lower() == 'true',
+            graphiti_neo4j_uri=os.getenv('NEO4J_URI', 'bolt://localhost:7687'),
+            graphiti_neo4j_user=os.getenv('NEO4J_USER', 'neo4j'),
+            graphiti_neo4j_password=os.getenv('NEO4J_PASSWORD') or None,
+            graphiti_llm_model=os.getenv('GRAPHITI_LLM_MODEL', '').strip(),
+            graphiti_embedding_model=os.getenv('GRAPHITI_EMBEDDING_MODEL', '').strip(),
+            graphiti_embedding_base_url=os.getenv('GRAPHITI_EMBEDDING_BASE_URL') or None,
+            graphiti_embedding_api_key=os.getenv('GRAPHITI_EMBEDDING_API_KEY') or None,
+            graphiti_group_strategy=normalize_graphiti_group_strategy(os.getenv('GRAPHITI_GROUP_STRATEGY', 'market')),
             agent_litellm_model=agent_litellm_model,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
@@ -2170,6 +2196,32 @@ class Config:
             primary environment variable / field name it relates to.
         """
         issues: List[ConfigIssue] = []
+
+        if self.graphiti_enabled:
+            if not self.graphiti_neo4j_uri.strip():
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message="GRAPHITI_ENABLED=true 时必须配置 NEO4J_URI",
+                    field="NEO4J_URI",
+                ))
+            if not self.graphiti_neo4j_user.strip():
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message="GRAPHITI_ENABLED=true 时必须配置 NEO4J_USER",
+                    field="NEO4J_USER",
+                ))
+            if not (self.graphiti_neo4j_password or "").strip():
+                issues.append(ConfigIssue(
+                    severity="warning",
+                    message="GRAPHITI_ENABLED=true 但未配置 NEO4J_PASSWORD，Neo4j 可能无法连接",
+                    field="NEO4J_PASSWORD",
+                ))
+            if self.graphiti_embedding_model and "/" not in self.graphiti_embedding_model:
+                issues.append(ConfigIssue(
+                    severity="warning",
+                    message="GRAPHITI_EMBEDDING_MODEL 建议使用 provider/model 格式，例如 openai/text-embedding-3-small",
+                    field="GRAPHITI_EMBEDDING_MODEL",
+                ))
 
         # --- Stock list ---
         if not self.stock_list:

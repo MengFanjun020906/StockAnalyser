@@ -6,6 +6,7 @@
 #   定时模式: docker-compose -f ./docker/docker-compose.yml up -d
 #   FastAPI模式: docker-compose -f ./docker/docker-compose.yml up -d server
 #   同时启动: docker-compose -f ./docker/docker-compose.yml up -d analyzer server
+#   Graphiti/Neo4j: docker-compose -f ./docker/docker-compose.yml --profile graphiti up -d neo4j
 
 name: daily-stock-analysis
 version: '3.8'
@@ -53,6 +54,22 @@ x-common: &common
         memory: 256M
 
 services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: stock-graphiti-neo4j
+    profiles:
+      - graphiti
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-changeme}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+
   # 定时任务模式
   analyzer:
     <<: *common
@@ -66,3 +83,7 @@ services:
     # 若使用 network_mode: host，则以下 ports 映射无效，端口由 command 中的 --port 指定
     ports:
       - "${API_PORT:-8000}:${API_PORT:-8000}"
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

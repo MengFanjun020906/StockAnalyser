@@ -9,11 +9,15 @@ BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+START_NEO4J="${START_NEO4J:-true}"
 
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
 BACKEND_LOG="$LOG_DIR/backend.log"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
+DOCKER_COMPOSE_FILE="$ROOT_DIR/docker/docker-compose.yml"
+BACKEND_TRACKED="true"
+FRONTEND_TRACKED="true"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
@@ -63,6 +67,45 @@ wait_for_url() {
   return 1
 }
 
+wait_for_port() {
+  local name="$1"
+  local port="$2"
+  local attempts="${3:-60}"
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 0
+  fi
+  for _ in $(seq 1 "$attempts"); do
+    if is_port_busy "$port"; then
+      printf '%s is ready on port %s\n' "$name" "$port"
+      return 0
+    fi
+    sleep 1
+  done
+  printf '%s did not become ready on port %s in time.\n' "$name" "$port"
+  return 1
+}
+
+find_docker_compose() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD=(docker-compose)
+  else
+    printf 'Docker Compose is required to start Neo4j. Set START_NEO4J=false to skip it.\n'
+    return 1
+  fi
+}
+
+ensure_docker_daemon_running() {
+  if ! command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    printf 'Docker daemon is not running. Start Docker Desktop, or set START_NEO4J=false to skip Neo4j.\n'
+    return 1
+  fi
+}
+
 ensure_tracked_process_running() {
   local name="$1"
   local pid_file="$2"
@@ -79,6 +122,34 @@ ensure_tracked_process_running() {
   return 1
 }
 
+ensure_optional_tracked_process_running() {
+  local name="$1"
+  local pid_file="$2"
+  local log_file="$3"
+  local tracked="$4"
+
+  if [[ "$tracked" != "true" ]]; then
+    return 0
+  fi
+  ensure_tracked_process_running "$name" "$pid_file" "$log_file"
+}
+
+start_neo4j() {
+  if [[ "$START_NEO4J" != "true" ]]; then
+    printf 'Skipping Neo4j startup because START_NEO4J=%s.\n' "$START_NEO4J"
+    return 0
+  fi
+
+  local -a DOCKER_COMPOSE_CMD
+  find_docker_compose
+  ensure_docker_daemon_running
+  printf 'Starting Neo4j for Graphiti on bolt://127.0.0.1:7687 ...\n'
+  (
+    cd "$ROOT_DIR"
+    "${DOCKER_COMPOSE_CMD[@]}" --profile graphiti -f "$DOCKER_COMPOSE_FILE" up -d neo4j
+  )
+}
+
 start_backend() {
   if is_pid_running "$BACKEND_PID_FILE"; then
     printf 'Backend already running, pid=%s\n' "$(cat "$BACKEND_PID_FILE")"
@@ -86,6 +157,7 @@ start_backend() {
   fi
   if is_port_busy "$BACKEND_PORT"; then
     printf 'Backend port %s is already in use. Skip starting backend.\n' "$BACKEND_PORT"
+    BACKEND_TRACKED="false"
     return 0
   fi
 
@@ -110,6 +182,7 @@ start_frontend() {
   fi
   if is_port_busy "$FRONTEND_PORT"; then
     printf 'Frontend port %s is already in use. Skip starting frontend.\n' "$FRONTEND_PORT"
+    FRONTEND_TRACKED="false"
     return 0
   fi
   if [[ ! -d "$ROOT_DIR/apps/dsa-web/node_modules" ]]; then
@@ -129,17 +202,24 @@ start_frontend() {
   )
 }
 
+start_neo4j
 start_backend
 start_frontend
 
-ensure_tracked_process_running "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG"
-ensure_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG"
+if [[ "$START_NEO4J" == "true" ]]; then
+  wait_for_port "Neo4j" 7687 90
+fi
+ensure_optional_tracked_process_running "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG" "$BACKEND_TRACKED"
+ensure_optional_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG" "$FRONTEND_TRACKED"
 wait_for_url "Backend" "http://127.0.0.1:$BACKEND_PORT/api/health" 45
 wait_for_url "Frontend" "http://127.0.0.1:$FRONTEND_PORT" 45
-ensure_tracked_process_running "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG"
-ensure_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG"
+ensure_optional_tracked_process_running "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG" "$BACKEND_TRACKED"
+ensure_optional_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG" "$FRONTEND_TRACKED"
 
 printf '\nStarted services:\n'
+if [[ "$START_NEO4J" == "true" ]]; then
+  printf '  Neo4j:    bolt://127.0.0.1:7687  browser=http://127.0.0.1:7474\n'
+fi
 printf '  Backend:  http://127.0.0.1:%s  log=%s\n' "$BACKEND_PORT" "$BACKEND_LOG"
 printf '  Frontend: http://127.0.0.1:%s  log=%s\n' "$FRONTEND_PORT" "$FRONTEND_LOG"
 printf '\nStop with: ./stop_all.sh\n'

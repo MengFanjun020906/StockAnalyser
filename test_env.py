@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 import requests
 
 
-DEFAULT_CATEGORIES = ("llm", "search", "data", "sentiment", "notify")
+DEFAULT_CATEGORIES = ("llm", "search", "data", "graph", "sentiment", "notify")
 _SENSITIVE_QUERY_RE = r"(?i)(api_key|apikey|token|access_token|key|secret)=([^&\s]+)"
 
 
@@ -101,7 +101,7 @@ def clean_error(exc: BaseException, *, limit: int = 400) -> str:
 def select_categories(args: argparse.Namespace) -> Set[str]:
     selected = {
         name
-        for name in ("llm", "search", "data", "sentiment", "notify")
+        for name in ("llm", "search", "data", "graph", "sentiment", "notify")
         if getattr(args, name, False)
     }
     if getattr(args, "fetch", False):
@@ -477,6 +477,105 @@ def run_data_checks(config: Any, *, timeout: float) -> List[ApiCheckResult]:
     ]
 
 
+def run_neo4j_check(config: Any) -> ApiCheckResult:
+    uri = getattr(config, "graphiti_neo4j_uri", None)
+    user = getattr(config, "graphiti_neo4j_user", None)
+    password = getattr(config, "graphiti_neo4j_password", None)
+    if not (uri and user and password):
+        return ApiCheckResult(
+            category="graph",
+            name="Neo4j",
+            configured=False,
+            skipped=True,
+            message="NEO4J_URI, NEO4J_USER, or NEO4J_PASSWORD not configured",
+        )
+
+    try:
+        from neo4j import GraphDatabase
+
+        driver = GraphDatabase.driver(uri, auth=(user, password))
+        try:
+            started = time.perf_counter()
+            driver.verify_connectivity()
+            latency_ms = int((time.perf_counter() - started) * 1000)
+        finally:
+            driver.close()
+        return ApiCheckResult(
+            category="graph",
+            name="Neo4j",
+            configured=True,
+            success=True,
+            message="Neo4j connectivity check succeeded",
+            details={"uri": uri, "user": user, "latency_ms": latency_ms},
+        )
+    except Exception as exc:
+        return result_from_exception("graph", "Neo4j", exc)
+
+
+def _embedding_success(response: Any) -> bool:
+    data = getattr(response, "data", None)
+    if data is None and isinstance(response, dict):
+        data = response.get("data")
+    if not data:
+        return False
+    first = data[0]
+    if isinstance(first, dict):
+        return bool(first.get("embedding"))
+    return bool(getattr(first, "embedding", None))
+
+
+def run_graphiti_embedding_check(config: Any, *, timeout: float) -> ApiCheckResult:
+    model = (getattr(config, "graphiti_embedding_model", "") or "").strip()
+    api_base = getattr(config, "graphiti_embedding_base_url", None)
+    api_key = getattr(config, "graphiti_embedding_api_key", None)
+    if not model:
+        return ApiCheckResult(
+            category="graph",
+            name="Graphiti embedding",
+            configured=False,
+            skipped=True,
+            message="GRAPHITI_EMBEDDING_MODEL not configured",
+        )
+
+    try:
+        import litellm
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "input": ["daily_stock_analysis graph smoke test"],
+            "timeout": timeout,
+        }
+        if api_base:
+            kwargs["api_base"] = api_base
+        if api_key:
+            kwargs["api_key"] = api_key
+        started = time.perf_counter()
+        response = litellm.embedding(**kwargs)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return ApiCheckResult(
+            category="graph",
+            name=f"Graphiti embedding:{model}",
+            configured=True,
+            success=_embedding_success(response),
+            message="embedding request succeeded" if _embedding_success(response) else "embedding response contained no vector",
+            details={
+                "model": model,
+                "base_url": api_base or "",
+                "key": mask_secret(api_key),
+                "latency_ms": latency_ms,
+            },
+        )
+    except Exception as exc:
+        return result_from_exception("graph", f"Graphiti embedding:{model}", exc)
+
+
+def run_graph_checks(config: Any, *, timeout: float) -> List[ApiCheckResult]:
+    return [
+        run_neo4j_check(config),
+        run_graphiti_embedding_check(config, timeout=timeout),
+    ]
+
+
 def run_sentiment_checks(config: Any) -> List[ApiCheckResult]:
     api_key = getattr(config, "social_sentiment_api_key", None)
     if not api_key:
@@ -651,6 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--search", action="store_true", help="test search API credentials")
     parser.add_argument("--data", action="store_true", help="test market data API credentials")
     parser.add_argument("--fetch", action="store_true", help="legacy alias for --data")
+    parser.add_argument("--graph", action="store_true", help="test Neo4j and Graphiti embedding configuration")
     parser.add_argument("--sentiment", action="store_true", help="test social sentiment API credentials")
     parser.add_argument("--notify", action="store_true", help="test notification API credentials")
     parser.add_argument("--notify-send", action="store_true", help="send real test messages for webhook-style notification channels")
@@ -696,6 +796,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results.extend(run_search_checks(config, all_keys=args.all_keys))
     if "data" in categories:
         results.extend(run_data_checks(config, timeout=args.timeout))
+    if "graph" in categories:
+        results.extend(run_graph_checks(config, timeout=args.timeout))
     if "sentiment" in categories:
         results.extend(run_sentiment_checks(config))
     if "notify" in categories:

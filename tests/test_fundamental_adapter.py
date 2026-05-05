@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from data_provider.fundamental_adapter import (
     AkshareFundamentalAdapter,
+    _akshare_fund_flow_market,
     _build_dividend_payload,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
@@ -27,6 +28,29 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("每10股派发2.5元"), 0.25, places=6)
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("每股派0.8元"), 0.8, places=6)
         self.assertIsNone(_parse_dividend_plan_to_per_share("仅送股，不现金分红"))
+
+    def test_akshare_fund_flow_market_is_derived_from_code(self) -> None:
+        self.assertEqual(_akshare_fund_flow_market("300456"), "sz")
+        self.assertEqual(_akshare_fund_flow_market("000001"), "sz")
+        self.assertEqual(_akshare_fund_flow_market("600519"), "sh")
+        self.assertEqual(_akshare_fund_flow_market("688001"), "sh")
+        self.assertEqual(_akshare_fund_flow_market("BJ920748"), "bj")
+
+    def test_capital_flow_passes_market_to_akshare_individual_flow(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        seen = []
+
+        def _fake_call_df_candidates(candidates):
+            seen.append(candidates)
+            if len(seen) == 1:
+                return pd.DataFrame({"股票代码": ["300456"], "主力净流入": [123.0]}), "stock_individual_fund_flow", []
+            return None, None, []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_capital_flow("300456")
+
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 123.0)
+        self.assertEqual(seen[0][0], ("stock_individual_fund_flow", {"stock": "300456", "market": "sz"}))
 
     def test_extract_latest_row_returns_none_when_code_mismatch(self) -> None:
         df = pd.DataFrame(

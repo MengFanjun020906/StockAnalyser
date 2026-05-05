@@ -167,6 +167,55 @@ def _is_non_retriable_tool_result(result: Any) -> bool:
     )
 
 
+def _is_failed_tool_result(result: Any) -> bool:
+    """Return True when a tool returned a structured failure payload."""
+    if not isinstance(result, dict):
+        return False
+
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"failed", "error", "tool_failed", "timeout"}:
+        return True
+    if status != "not_supported" and _result_has_errors(result):
+        return True
+    if result.get("timeout") is True:
+        return True
+    if result.get("success") is False:
+        return True
+    return bool(result.get("error")) and result.get("status") != "not_supported"
+
+
+def _result_has_errors(result: Dict[str, Any]) -> bool:
+    if result.get("error"):
+        return True
+    errors = result.get("errors")
+    if isinstance(errors, list):
+        return any(str(item).strip() for item in errors)
+    return bool(errors)
+
+
+def _has_effective_tool_data(result: Dict[str, Any]) -> bool:
+    """Return True when a partial payload still contains usable evidence."""
+    ignored_keys = {"status", "errors", "error", "note", "message", "stock_code", "code"}
+    for key, value in result.items():
+        if key in ignored_keys:
+            continue
+        if _contains_effective_value(value):
+            return True
+    return False
+
+
+def _contains_effective_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value == "":
+        return False
+    if isinstance(value, dict):
+        return any(_contains_effective_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_effective_value(item) for item in value)
+    return True
+
+
 def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
     """Extract and parse a Decision Dashboard JSON from agent text.
 
@@ -709,7 +758,7 @@ def _execute_tools(
         try:
             res = tool_registry.execute(tc_item.name, **tc_item.arguments)
             res_str = serialize_tool_result(res)
-            ok = True
+            ok = not _is_failed_tool_result(res)
             if cache_key and non_retriable_tool_results is not None and _is_non_retriable_tool_result(res):
                 non_retriable_tool_results[cache_key] = res_str
         except Exception as e:

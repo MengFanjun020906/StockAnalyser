@@ -82,6 +82,7 @@ export interface AgentTraceRunResponse {
   agent_user_context?: Record<string, unknown> | null;
   context_summary?: Record<string, unknown> | null;
   debate?: Record<string, unknown> | null;
+  stock_selection?: Record<string, unknown> | null;
   artifact_dir?: string | null;
 }
 

@@ -29,18 +29,23 @@ def test_result_status_values():
 
 
 def test_select_categories_defaults_to_all():
-    args = argparse.Namespace(all=False, llm=False, search=False, data=False, fetch=False, sentiment=False, notify=False)
+    args = argparse.Namespace(all=False, llm=False, search=False, data=False, fetch=False, graph=False, sentiment=False, notify=False)
     assert test_env.select_categories(args) == set(test_env.DEFAULT_CATEGORIES)
 
 
 def test_select_categories_uses_explicit_flags():
-    args = argparse.Namespace(all=False, llm=True, search=False, data=True, fetch=False, sentiment=False, notify=False)
+    args = argparse.Namespace(all=False, llm=True, search=False, data=True, fetch=False, graph=False, sentiment=False, notify=False)
     assert test_env.select_categories(args) == {"llm", "data"}
 
 
 def test_select_categories_supports_fetch_alias():
-    args = argparse.Namespace(all=False, llm=False, search=False, data=False, fetch=True, sentiment=False, notify=False)
+    args = argparse.Namespace(all=False, llm=False, search=False, data=False, fetch=True, graph=False, sentiment=False, notify=False)
     assert test_env.select_categories(args) == {"data"}
+
+
+def test_select_categories_supports_graph():
+    args = argparse.Namespace(all=False, llm=False, search=False, data=False, fetch=False, graph=True, sentiment=False, notify=False)
+    assert test_env.select_categories(args) == {"graph"}
 
 
 def test_selected_keys_defaults_to_first_key():

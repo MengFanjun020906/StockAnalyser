@@ -1041,8 +1041,8 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 
 | 命令 | 说明 |
 |------|------|
-| `./start_all.sh` | 本地开发一键启动 FastAPI 后端与 Vite 前端，默认后端 `8000`、前端 `5173` |
-| `./stop_all.sh` | 停止 `start_all.sh` 启动的本地后端与前端 |
+| `./start_all.sh` | 本地开发一键启动 Neo4j、FastAPI 后端与 Vite 前端，默认 Neo4j `7687`/`7474`、后端 `8000`、前端 `5173`；如需跳过 Neo4j，可设置 `START_NEO4J=false` |
+| `./stop_all.sh` | 停止 `start_all.sh` 启动的本地后端、前端与 Neo4j 容器；如需保留 Neo4j 运行，可设置 `STOP_NEO4J=false` |
 | `python main.py --serve` | 启动 API 服务 + 执行一次完整分析 |
 | `python main.py --serve-only` | 仅启动 API 服务，手动触发分析 |
 
@@ -1222,7 +1222,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
 - 页面支持选择持仓账户、报告意图、风险偏好、持有周期、单票上限、总权益仓位上限、最大回撤、默认止损和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
 - 页面会把最近 10 次 Trace 完整结果保存在当前浏览器的 localStorage，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
-- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`；页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
+- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`；当 `watchlist_scan` 使用阶段化选股流水线时，还会写入 `stock_selection.json`、`selection_context.json`、`final_report.json` 以及各阶段 JSON 产物，便于复盘候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决。页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
 - planning prompt 包含独立的 `Execute Protocol`：要求执行器把工具结果落入 Evidence Ledger，记录失败降级、停止条件和最终输出审计门槛；`todo.md` 初始写入计划，执行结束后会补充工具成功/失败、参数、结果预览和 Execute 复核状态。
 - planning_execute 工具证据形成后会进入对抗式 Debate：主观点 Agent、强制反方 Agent 和 Judge Agent 共用同一份 Evidence Bundle；Judge 会按证据强弱、账户风险、数据可靠性和用户目标裁决，页面 `Debate Judge` 模块和 `debate.json` 可用于排查持仓模式与选股/入场模式的裁决链路。Judge 输出会拆成结论摘要、分维度证据、要点化理由、采纳/驳回论点和风控条件，并分别标注账户风险、技术面、资金面、消息面、基本面和数据质量；资金面或消息面缺失时必须显式写出缺口，不能被技术面结论覆盖。
 - 开发调试模式下，`Debate Judge` 还会展示同一 session 内的原始主报告输出、Primary/Opposing/Judge 原始 JSON 输出和最终合并输出；这些内容用于调试模型可见输出，不展示隐藏思维链。

@@ -16,6 +16,7 @@ same implementation.
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -24,6 +25,7 @@ from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.planner import build_planning_result
 from src.agent.planning_prompts import PromptBuildOptions, build_planning_system_prompt
 from src.agent.runner import run_agent_loop, parse_dashboard_json
+from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
 from src.agent.tools.registry import ToolRegistry
 from src.schemas.agent_context import AgentUserContext
 from src.report_language import normalize_report_language
@@ -49,6 +51,7 @@ class AgentResult:
     model: str = ""                            # comma-separated models used (supports fallback)
     error: Optional[str] = None
     debate: Optional[Dict[str, Any]] = None
+    stock_selection: Optional[Dict[str, Any]] = None
 
 
 # ============================================================
@@ -639,6 +642,26 @@ class AgentExecutor:
         inline implementation while sharing the single authoritative loop
         in :mod:`src.agent.runner`.
         """
+        stock_selection = self._maybe_run_stock_selection(
+            context=context,
+            original_task=original_task,
+            progress_callback=progress_callback,
+        )
+        if stock_selection and stock_selection.success:
+            return AgentResult(
+                success=True,
+                content=stock_selection.final_markdown,
+                dashboard=None,
+                tool_calls_log=stock_selection.tool_calls_log,
+                total_steps=len(stock_selection.tool_calls_log),
+                total_tokens=stock_selection.total_tokens,
+                provider="agent",
+                model=", ".join(stock_selection.models_used),
+                error=None,
+                debate=None,
+                stock_selection=stock_selection.to_dict(),
+            )
+
         loop_result = run_agent_loop(
             messages=messages,
             tool_registry=self.tool_registry,
@@ -658,6 +681,9 @@ class AgentExecutor:
             progress_callback=progress_callback,
         )
         final_content = loop_result.content
+        agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        if _is_planning_execute_context(agent_user_context):
+            final_content = _normalize_planning_execute_final_content(final_content)
         if debate and debate.success:
             final_content = f"{final_content.rstrip()}\n\n{format_debate_appendix(debate)}".rstrip()
             debate.debug_outputs["final_report_with_debate"] = final_content
@@ -680,6 +706,7 @@ class AgentExecutor:
                 model=model_str,
                 error=None if dashboard else "Failed to parse dashboard JSON from agent response",
                 debate=debate.to_dict() if debate else None,
+                stock_selection=stock_selection.to_dict() if stock_selection else None,
             )
 
         return AgentResult(
@@ -693,6 +720,28 @@ class AgentExecutor:
             model=model_str,
             error=loop_result.error,
             debate=debate.to_dict() if debate else None,
+            stock_selection=stock_selection.to_dict() if stock_selection else None,
+        )
+
+    def _maybe_run_stock_selection(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        original_task: str,
+        progress_callback: Optional[Callable],
+    ):
+        context = context or {}
+        agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+        if not should_run_stock_selection(agent_user_context):
+            return None
+        return run_stock_selection_pipeline(
+            task=original_task,
+            agent_user_context=agent_user_context,
+            tool_registry=self.tool_registry,
+            llm_adapter=self.llm_adapter,
+            timeout_seconds=self.timeout_seconds,
+            progress_callback=progress_callback,
+            run_id=context.get("session_id") or "selection-run",
         )
 
     def _maybe_run_debate(
@@ -775,3 +824,13 @@ def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
 
 def _is_planning_execute_context(context: Optional[AgentUserContext]) -> bool:
     return bool(context and context.report.analysis_mode == "planning_execute")
+
+
+_FINAL_OUTPUT_STEP_TITLE_RE = re.compile(r"(?m)^(第[一二三四五六七八九十]+(?:步|阶段))[:：][ \t]*")
+
+
+def _normalize_planning_execute_final_content(content: str) -> str:
+    """Remove execution-step labels from final markdown while keeping analysis text."""
+    if not content:
+        return content
+    return _FINAL_OUTPUT_STEP_TITLE_RE.sub("", content)

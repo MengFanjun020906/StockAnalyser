@@ -438,6 +438,28 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertIn('result_preview={"price": 100}', todo_md)
             self.assertIn("## Execute Protocol 复核", todo_md)
 
+    def test_trace_tool_status_marks_preview_errors_failed(self) -> None:
+        call = {
+            "step": 1,
+            "tool": "get_capital_flow",
+            "arguments": {"stock_code": "600519"},
+            "success": True,
+            "duration": 30.0,
+            "result_preview": json.dumps({
+                "status": "ok",
+                "main_net_inflow": 123.4,
+                "errors": ["capital flow fetch failed"],
+            }, ensure_ascii=False),
+        }
+
+        normalized = agent._normalize_tool_calls_status([call])
+        ledger = agent._build_evidence_ledger(normalized)
+        event = agent._normalize_tool_event_status({"type": "tool_done", **call})
+
+        self.assertFalse(normalized[0]["success"])
+        self.assertEqual(ledger["entries"][0]["status"], "failed")
+        self.assertFalse(event["success"])
+
     def test_trace_stream_emits_context_planner_tool_and_done_events(self) -> None:
         config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
         executor = MagicMock()
@@ -513,6 +535,60 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         tool_event = next(event for event in events if event["type"] == "tool_done")
         self.assertEqual(tool_event["display_name"], "获取实时行情")
         self.assertEqual(tool_event["result_preview"], '{"price":100}')
+
+    def test_trace_finalize_ingests_graphiti_episode(self) -> None:
+        config = SimpleNamespace(
+            is_agent_available=lambda: True,
+            report_language="zh",
+            graphiti_enabled=True,
+        )
+        executor = MagicMock()
+        executor.chat.return_value = SimpleNamespace(
+            success=True,
+            content="trace ok",
+            error=None,
+            total_steps=1,
+            total_tokens=10,
+            provider="deepseek",
+            model="deepseek/deepseek-v4-pro",
+            debate=None,
+            stock_selection=None,
+            tool_calls_log=[],
+        )
+        request = agent.AgentTraceRunRequest(
+            message="分析 600519",
+            stock_code="600519",
+            analysis_mode="planning_execute",
+            inject_portfolio_context=False,
+        )
+
+        mock_service = MagicMock()
+        mock_service.is_available.return_value = True
+
+        async def collect() -> dict:
+            config.database_path = os.path.join(tempfile.mkdtemp(), "stock_analysis.db")
+            with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
+                "api.v1.endpoints.agent._build_executor",
+                return_value=executor,
+            ), patch(
+                "src.agent.conversation.conversation_manager.clear",
+            ), patch(
+                "src.storage.get_db",
+                return_value=MagicMock(),
+            ), patch(
+                "api.v1.endpoints.agent.get_graphiti_service",
+                return_value=mock_service,
+            ):
+                return (await agent.run_agent_trace(request)).model_dump()
+
+        payload = asyncio.run(collect())
+
+        self.assertTrue(payload["artifact_dir"])
+        mock_service.ingest_trace_sync.assert_called_once()
+        kwargs = mock_service.ingest_trace_sync.call_args.kwargs
+        self.assertEqual(kwargs["session_id"], payload["session_id"])
+        self.assertEqual(kwargs["trace_type"], "single_stock_analysis")
+        self.assertEqual(kwargs["artifact_dir"], payload["artifact_dir"])
 
     def test_trace_run_context_summary_exposes_account_position_and_profile(self) -> None:
         mock_portfolio_service = MagicMock()

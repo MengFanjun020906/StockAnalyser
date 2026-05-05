@@ -513,6 +513,17 @@ class StockAnalysisPipeline:
                     )
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) 保存分析历史失败: {e}")
+                try:
+                    self._ingest_analysis_to_graphiti(
+                        code=code,
+                        stock_name=stock_name,
+                        report_type=report_type,
+                        result=result,
+                        context=enhanced_context,
+                        news_context=news_context,
+                    )
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) Graphiti 入图失败: {e}")
 
             return result
 
@@ -686,6 +697,38 @@ class StockAnalysisPipeline:
         )
 
         return enhanced
+
+    def _ingest_analysis_to_graphiti(
+        self,
+        *,
+        code: str,
+        stock_name: str,
+        report_type: ReportType,
+        result: AnalysisResult,
+        context: Dict[str, Any],
+        news_context: Optional[str],
+    ) -> None:
+        """Best-effort write of analysis results to Graphiti."""
+        if not getattr(self.config, "graphiti_enabled", False):
+            return
+
+        try:
+            from src.services.graphiti import get_graphiti_service
+
+            market = get_market_for_stock(normalize_stock_code(code)) or "cn"
+            service = get_graphiti_service()
+            service.ingest_analysis_sync(
+                code=code,
+                stock_name=stock_name,
+                report_type=report_type.value,
+                result=result,
+                context=context,
+                news_context=news_context,
+                market=market,
+                user_id=getattr(self.source_message, "sender_id", None),
+            )
+        except Exception as exc:
+            logger.warning("%s(%s) Graphiti 入图调用失败: %s", stock_name, code, exc, exc_info=True)
 
     def _attach_belong_boards_to_fundamental_context(
         self,
@@ -916,6 +959,17 @@ class StockAnalysisPipeline:
                     )
                 except Exception as e:
                     logger.warning(f"[{code}] 保存 Agent 分析历史失败: {e}")
+                try:
+                    self._ingest_analysis_to_graphiti(
+                        code=code,
+                        stock_name=resolved_stock_name,
+                        report_type=report_type,
+                        result=result,
+                        context=initial_context,
+                        news_context=None,
+                    )
+                except Exception as e:
+                    logger.warning(f"[{code}] Agent Graphiti 入图失败: {e}")
 
             return result
 
