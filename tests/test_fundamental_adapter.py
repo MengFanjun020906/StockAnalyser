@@ -40,7 +40,7 @@ class TestFundamentalAdapter(unittest.TestCase):
         adapter = AkshareFundamentalAdapter()
         seen = []
 
-        def _fake_call_df_candidates(candidates):
+        def _fake_call_df_candidates(candidates, **_kwargs):
             seen.append(candidates)
             if len(seen) == 1:
                 return pd.DataFrame({"股票代码": ["300456"], "主力净流入": [123.0]}), "stock_individual_fund_flow", []
@@ -51,6 +51,147 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         self.assertEqual(result["stock_flow"]["main_net_inflow"], 123.0)
         self.assertEqual(seen[0][0], ("stock_individual_fund_flow", {"stock": "300456", "market": "sz"}))
+
+    def test_capital_flow_failure_preserves_connection_error_and_skips_slow_fallbacks(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        seen = []
+
+        def _fake_call_df_candidates(candidates, **_kwargs):
+            seen.append(candidates)
+            return None, None, ["stock_individual_fund_flow:ConnectionError:Failed to resolve push2his.eastmoney.com"]
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_capital_flow("688469")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Failed to resolve", result["errors"][0])
+        flattened_candidates = [(name, kwargs) for batch in seen for name, kwargs in batch]
+        self.assertNotIn(("stock_main_fund_flow", {"symbol": "688469"}), flattened_candidates)
+        self.assertNotIn(("stock_main_fund_flow", {}), flattened_candidates)
+        self.assertNotIn(("stock_sector_fund_flow_rank", {}), flattened_candidates)
+        self.assertNotIn(("stock_sector_fund_flow_summary", {}), flattened_candidates)
+
+    def test_market_capital_flow_normalizes_market_and_rankings(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        seen = []
+
+        market_df = pd.DataFrame(
+            {
+                "日期": ["2026-05-07"],
+                "主力净流入": [100.0],
+                "超大单净流入": [60.0],
+                "大单净流入": [40.0],
+                "中单净流入": [20.0],
+                "小单净流入": [-20.0],
+            }
+        )
+        ranking_df = pd.DataFrame(
+            {
+                "板块名称": ["白酒", "半导体", "煤炭"],
+                "主力净流入": [300.0, 200.0, -100.0],
+            }
+        )
+
+        def _fake_call_df_candidates(candidates):
+            seen.append(candidates)
+            if len(seen) == 1:
+                return market_df, "stock_market_fund_flow", []
+            if len(seen) in (2, 3, 4):
+                return ranking_df, "stock_fund_flow_individual", []
+            return None, None, []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_market_capital_flow(top_n=2)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["market_flow"]["main_net_inflow"], 100.0)
+        self.assertEqual(len(result["individual_rankings"]["top"]), 2)
+        self.assertEqual(result["individual_rankings"]["top"][0]["name"], "白酒")
+        self.assertTrue(result["source_chain"])
+
+    def test_northbound_capital_flow_returns_summary_and_history(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        summary_df = pd.DataFrame(
+            {
+                "日期": ["2026-05-07"],
+                "北向资金": [1200.0],
+                "南向资金": [-200.0],
+            }
+        )
+        hist_df = pd.DataFrame(
+            {
+                "日期": ["2026-05-07", "2026-05-06"],
+                "净买入": [100.0, -50.0],
+                "买入": [200.0, 150.0],
+                "卖出": [100.0, 200.0],
+            }
+        )
+        seen = []
+
+        def _fake_call_df_candidates(candidates):
+            seen.append(candidates)
+            if len(seen) == 1:
+                return summary_df, "stock_hsgt_fund_flow_summary_em", []
+            if len(seen) == 2:
+                return hist_df, "stock_hsgt_hist_em", []
+            return None, None, []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_northbound_capital_flow(limit=2)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["summary"]["northbound_net_inflow"], 1200.0)
+        self.assertEqual(len(result["history"]), 2)
+        self.assertTrue(result["source_chain"])
+
+    def test_margin_trading_summary_returns_exchange_data(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        account_df = pd.DataFrame(
+            {
+                "日期": ["2026-05-07"],
+                "融资余额": [900.0],
+                "融券余额": [100.0],
+                "融资融券余额": [1000.0],
+            }
+        )
+        sse_df = pd.DataFrame(
+            {
+                "日期": ["2026-05-07", "2026-05-06"],
+                "融资余额": [800.0, 700.0],
+                "融资买入额": [120.0, 110.0],
+                "融资偿还额": [80.0, 90.0],
+                "融券余额": [50.0, 55.0],
+            }
+        )
+        szse_df = pd.DataFrame(
+            {
+                "日期": ["2026-05-07"],
+                "融资余额": [600.0],
+                "融资买入额": [90.0],
+                "融资偿还额": [70.0],
+                "融券余额": [30.0],
+            }
+        )
+        seen = []
+
+        def _fake_call_df_candidates(candidates):
+            seen.append(candidates)
+            if len(seen) == 1:
+                return account_df, "stock_margin_account_info", []
+            if len(seen) == 2:
+                return sse_df, "stock_margin_sse", []
+            if len(seen) == 3:
+                return szse_df, "stock_margin_szse", []
+            return None, None, []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_margin_trading_summary(limit=2)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["account_info"]["margin_balance"], 1000.0)
+        self.assertEqual(len(result["sse"]), 2)
+        self.assertEqual(len(result["szse"]), 1)
+        self.assertTrue(result["source_chain"])
 
     def test_extract_latest_row_returns_none_when_code_mismatch(self) -> None:
         df = pd.DataFrame(

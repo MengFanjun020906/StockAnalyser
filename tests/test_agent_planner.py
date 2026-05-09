@@ -28,6 +28,26 @@ def test_get_tools_for_capability_filters_missing_registry_tools():
     assert plan.capability == "technical_analysis"
 
 
+def test_get_tools_for_capability_includes_extended_capital_flow_tools():
+    plan = get_tools_for_capability(
+        "capital_flow",
+        tool_registry=_registry(
+            "get_capital_flow",
+            "get_market_capital_flow",
+            "get_northbound_capital_flow",
+            "get_margin_trading_summary",
+        ),
+    )
+
+    assert plan.tools == [
+        "get_capital_flow",
+        "get_market_capital_flow",
+        "get_northbound_capital_flow",
+        "get_margin_trading_summary",
+    ]
+    assert plan.missing_tools == []
+
+
 def test_build_planning_result_selects_position_review_capabilities():
     context = AgentUserContext(
         positions=[PositionContext(symbol="600519", quantity=100, avg_cost=1500)],
@@ -44,6 +64,10 @@ def test_build_planning_result_selects_position_review_capabilities():
             "get_portfolio_snapshot",
             "get_realtime_quote",
             "analyze_trend",
+            "get_capital_flow",
+            "get_market_capital_flow",
+            "get_northbound_capital_flow",
+            "get_margin_trading_summary",
             "get_market_indices",
             "get_sector_rankings",
         ),
@@ -56,6 +80,7 @@ def test_build_planning_result_selects_position_review_capabilities():
     assert "regime_detection" in result.capabilities
     assert "get_portfolio_snapshot" in result.required_tools
     assert "margin_pressure" in result.risk_checks
+    assert "get_market_capital_flow" in result.required_tools
 
 
 def test_build_planning_result_defaults_to_entry_analysis_without_position():

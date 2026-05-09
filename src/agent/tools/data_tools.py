@@ -534,12 +534,39 @@ get_daily_history_tool = ToolDefinition(
 def _handle_get_chip_distribution(stock_code: str) -> dict:
     """Get chip distribution data."""
     manager = _get_fetcher_manager()
-    chip = manager.get_chip_distribution(stock_code)
+    if hasattr(manager, "get_chip_distribution_context"):
+        ctx = manager.get_chip_distribution_context(stock_code)
+        chip = ctx.get("data")
+        if chip is None:
+            return {
+                "stock_code": ctx.get("stock_code", stock_code),
+                "status": ctx.get("status", "failed"),
+                "error_summary": ctx.get("error_summary") or "chip distribution unavailable",
+                "errors": ctx.get("errors", []),
+                "source_chain": ctx.get("source_chain", []),
+                "profit_ratio": None,
+                "avg_cost": None,
+                "cost_90_low": None,
+                "cost_90_high": None,
+                "concentration_90": None,
+                "cost_70_low": None,
+                "cost_70_high": None,
+                "concentration_70": None,
+            }
+    else:
+        chip = manager.get_chip_distribution(stock_code)
 
     if chip is None:
-        return {"error": f"No chip distribution data available for {stock_code}"}
+        return {
+            "stock_code": stock_code,
+            "status": "failed",
+            "error_summary": f"No chip distribution data available for {stock_code}",
+            "errors": [f"No chip distribution data available for {stock_code}"],
+        }
 
     return {
+        "stock_code": chip.code,
+        "status": "ok",
         "code": chip.code,
         "date": chip.date,
         "source": chip.source,
@@ -798,7 +825,12 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
     """Get main-force capital flow data for a stock."""
     manager = _get_fetcher_manager()
     try:
-        ctx = manager.get_capital_flow_context(stock_code)
+        try:
+            from src.config import get_config
+            timeout = float(getattr(get_config(), "agent_capital_flow_timeout_seconds", 3.0))
+        except Exception:
+            timeout = 3.0
+        ctx = manager.get_capital_flow_context(stock_code, budget_seconds=timeout)
     except Exception as exc:
         logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
         return {
@@ -819,6 +851,17 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
     stock_flow = data.get("stock_flow") or {}
     sector_rankings = data.get("sector_rankings") or {}
     errors = ctx.get("errors") or []
+    error_summary = None
+    if errors:
+        joined_errors = " | ".join(str(item) for item in errors if str(item).strip())
+        if "push2his.eastmoney.com" in joined_errors or "push2.eastmoney.com" in joined_errors:
+            error_summary = "Eastmoney capital-flow endpoint unreachable"
+        elif "RemoteDisconnected" in joined_errors or "remote end closed" in joined_errors.lower():
+            error_summary = "Eastmoney capital-flow endpoint disconnected"
+        elif "timeout" in joined_errors.lower():
+            error_summary = "capital-flow endpoint timeout"
+        else:
+            error_summary = str(errors[0])
 
     return {
         "stock_code": stock_code,
@@ -830,6 +873,7 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
             "top_inflow_sectors": sector_rankings.get("top", [])[:3],
             "top_outflow_sectors": sector_rankings.get("bottom", [])[:3],
         },
+        "error_summary": error_summary,
         "errors": errors,
     }
 
@@ -855,3 +899,113 @@ get_capital_flow_tool = ToolDefinition(
 
 
 ALL_DATA_TOOLS.append(get_capital_flow_tool)
+
+
+# ============================================================
+# market-level capital flow tools
+# ============================================================
+
+def _get_fundamental_adapter():
+    from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+
+    return AkshareFundamentalAdapter()
+
+
+def _handle_get_market_capital_flow(top_n: int = 5) -> dict:
+    """Get market-level fund-flow rankings and broad money movement."""
+    try:
+        result = _get_fundamental_adapter().get_market_capital_flow(top_n=top_n)
+    except Exception as exc:
+        logger.warning("get_market_capital_flow failed: %s", exc)
+        return {"status": "error", "error": f"market capital flow fetch failed: {exc}"}
+    return result
+
+
+get_market_capital_flow_tool = ToolDefinition(
+    name="get_market_capital_flow",
+    description=(
+        "Get A-share market-level capital flow. Returns broad market fund-flow snapshot plus "
+        "top/bottom individual-stock, industry, and concept fund-flow rankings. Useful for "
+        "judging whether market liquidity supports entry or stock selection."
+    ),
+    parameters=[
+        ToolParameter(
+            name="top_n",
+            type="integer",
+            description="Number of top/bottom fund-flow ranking rows to return (default: 5, max: 20).",
+            required=False,
+            default=5,
+        ),
+    ],
+    handler=_handle_get_market_capital_flow,
+    category="data",
+)
+
+
+def _handle_get_northbound_capital_flow(limit: int = 10) -> dict:
+    """Get northbound Stock Connect fund-flow summary and recent history."""
+    try:
+        result = _get_fundamental_adapter().get_northbound_capital_flow(limit=limit)
+    except Exception as exc:
+        logger.warning("get_northbound_capital_flow failed: %s", exc)
+        return {"status": "error", "error": f"northbound capital flow fetch failed: {exc}"}
+    return result
+
+
+get_northbound_capital_flow_tool = ToolDefinition(
+    name="get_northbound_capital_flow",
+    description=(
+        "Get northbound Stock Connect capital flow summary and recent history. Useful for "
+        "checking foreign capital risk appetite toward A-shares and whether northbound flow "
+        "confirms or weakens a market/sector signal."
+    ),
+    parameters=[
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Number of recent history rows to return (default: 10, max: 60).",
+            required=False,
+            default=10,
+        ),
+    ],
+    handler=_handle_get_northbound_capital_flow,
+    category="data",
+)
+
+
+def _handle_get_margin_trading_summary(limit: int = 10) -> dict:
+    """Get market-level margin financing and securities-lending summary."""
+    try:
+        result = _get_fundamental_adapter().get_margin_trading_summary(limit=limit)
+    except Exception as exc:
+        logger.warning("get_margin_trading_summary failed: %s", exc)
+        return {"status": "error", "error": f"margin trading summary fetch failed: {exc}"}
+    return result
+
+
+get_margin_trading_summary_tool = ToolDefinition(
+    name="get_margin_trading_summary",
+    description=(
+        "Get A-share margin financing / securities-lending summary. Useful for judging "
+        "leveraged liquidity, risk appetite, and whether a market move is supported by "
+        "margin financing or vulnerable to deleveraging."
+    ),
+    parameters=[
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Number of recent exchange summary rows to return (default: 10, max: 60).",
+            required=False,
+            default=10,
+        ),
+    ],
+    handler=_handle_get_margin_trading_summary,
+    category="data",
+)
+
+
+ALL_DATA_TOOLS.extend([
+    get_market_capital_flow_tool,
+    get_northbound_capital_flow_tool,
+    get_margin_trading_summary_tool,
+])

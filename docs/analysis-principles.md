@@ -285,10 +285,16 @@ ENABLE_CHIP_DISTRIBUTION=false
 ENABLE_FUNDAMENTAL_PIPELINE=true
 FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=1.5
 FUNDAMENTAL_FETCH_TIMEOUT_SECONDS=0.8
+AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS=3.0
 FUNDAMENTAL_RETRY_MAX=1
 FUNDAMENTAL_CACHE_TTL_SECONDS=120
 FUNDAMENTAL_CACHE_MAX_ENTRIES=256
 ```
+
+`FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` 控制聚合上下文里单个基本面 block 的快速预算；
+`AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` 只控制 Agent 显式调用 `get_capital_flow`
+时的预算。资金流端点通常比估值/板块类接口慢，显式工具应保留更完整的错误诊断，
+不能因为基本面聚合的短预算把数据源连接断开、权限或 DNS 问题全部压缩成 timeout。
 
 注意：当前基本面聚合对 A 股支持更完整，港股/美股会有部分 `not_supported` 降级。
 
@@ -348,10 +354,14 @@ Agent 模式会注册工具，供 LLM 按阶段调用。主要工具包括：
 | --- | --- | --- |
 | `get_realtime_quote` | data | 获取实时行情、量比、换手率、估值、市值 |
 | `get_daily_history` | data | 获取日线 OHLCV 和缓存状态 |
-| `get_chip_distribution` | data | 获取筹码分布 |
+| `get_chip_distribution` | data | 获取筹码分布；失败时返回 `status/errors/source_chain/error_summary`，区分禁用、不支持、熔断和数据源异常 |
 | `get_analysis_context` | data | 获取数据库中的技术上下文 |
 | `get_stock_info` | data | 获取估值、基本面、板块等压缩上下文 |
-| `get_capital_flow` | data | 获取 A 股主力资金流 |
+| `get_capital_flow` | data | 获取 A 股个股主力资金流；显式工具使用 `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` 预算并保留东财连接错误摘要 |
+| `discover_watchlist_candidates` | market | 生成选股候选池；默认使用 Sequoia 量化策略、强势板块成分股等多路召回并统一评分，仅在无候选时使用固定种子池兜底 |
+| `get_market_capital_flow` | data | 获取 A 股市场资金快照、个股/行业/概念资金流排名 |
+| `get_northbound_capital_flow` | data | 获取北向资金摘要和近期历史 |
+| `get_margin_trading_summary` | data | 获取融资融券余额、融资买入和交易所两融摘要 |
 | `get_portfolio_snapshot` | data | 获取持仓和风险摘要 |
 | `analyze_trend` | analysis | 执行确定性趋势分析 |
 | `calculate_ma` | analysis | 计算自定义均线和乖离率 |

@@ -61,6 +61,7 @@ export interface AgentTraceToolCall {
   duration?: number;
   result_length?: number;
   result_preview?: string;
+  result_json?: unknown;
   cached?: boolean;
   timeout?: boolean;
   [key: string]: unknown;
@@ -83,6 +84,7 @@ export interface AgentTraceRunResponse {
   context_summary?: Record<string, unknown> | null;
   debate?: Record<string, unknown> | null;
   stock_selection?: Record<string, unknown> | null;
+  risk_gate?: Record<string, unknown> | null;
   artifact_dir?: string | null;
 }
 

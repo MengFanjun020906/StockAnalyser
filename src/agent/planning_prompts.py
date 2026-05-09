@@ -98,8 +98,11 @@ ANALYSIS_DIMENSIONS = """\
 4. 资金面（capital_flow）
    - 主力净流入 / 净流出
    - 5日、10日累计资金流
+   - 市场整体资金流、个股/行业/概念资金流排名
+   - 北向资金流入流出
+   - 融资融券余额、融资买入和杠杆资金风险偏好
    - 龙虎榜、机构席位、板块资金流
-   - 涉及短线强弱、主力承接、出货风险时选用
+   - 涉及短线强弱、主力承接、出货风险、市场流动性和杠杆风险时选用
 
 5. 基本面与估值（fundamental_analysis）
    - PE、PB、市值、流通市值
@@ -292,7 +295,7 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `realtime_quote` -> `get_realtime_quote`
 - `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`
 - `news_event` -> `search_comprehensive_intel`, `search_stock_news`
-- `capital_flow` -> `get_capital_flow`
+- `capital_flow` -> `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary`
 - `chip_distribution` -> `get_chip_distribution`
 - `fundamental_analysis` -> `get_stock_info`
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`
@@ -422,6 +425,7 @@ EXECUTE_PROTOCOL = """\
 
 当 `intent=watchlist_scan` 且 `target_symbols` 为空时：
 - 第一阶段必须调用 `discover_watchlist_candidates`。
+- 默认使用 `candidate_source=auto`，候选发现会同时汇总 Sequoia 风格量化策略池和强势板块成分股等多路召回，并做统一评分；只有多路召回均无候选时才使用固定种子池兜底。
 - 如果候选发现返回 `status=ok/partial` 且 `candidates` 非空，必须选择主要候选继续调用单股行情、技术、消息和资金工具。
 - 如果候选发现失败或无候选，最终报告必须写“候选池不足，无法完成选股排序”，并只输出补充候选池的方法，不得给具体买入组合。
 - 不允许只基于 `get_market_indices` / `get_sector_rankings` 输出最终股票排序或仓位配置。

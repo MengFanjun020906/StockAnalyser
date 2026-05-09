@@ -871,6 +871,8 @@ class Config:
     fundamental_stage_timeout_seconds: float = 1.5
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = 0.8
+    # Agent 显式资金流工具超时（秒）；资金流端点常慢于基本面聚合预算
+    agent_capital_flow_timeout_seconds: float = 3.0
     # 单能力失败重试次数（已包含首次）
     fundamental_retry_max: int = 1
     # 基本面上下文短 TTL（秒）
@@ -1590,6 +1592,12 @@ class Config:
                 os.getenv('FUNDAMENTAL_FETCH_TIMEOUT_SECONDS'),
                 0.8,
                 field_name='FUNDAMENTAL_FETCH_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_capital_flow_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
             fundamental_retry_max=parse_env_int(os.getenv('FUNDAMENTAL_RETRY_MAX'), 1, field_name='FUNDAMENTAL_RETRY_MAX', minimum=0),

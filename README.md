@@ -23,6 +23,28 @@
 - [阶段化选股 Prompt 设计](docs/agent-stock-selection-prompts.md)
 - [更新日志](docs/CHANGELOG.md)
 
+## 系统分层命名规范
+
+后续架构、接口、Trace 产物和前端页面统一使用 `L1-Ln` 表示主链路层级。`L` 只表示系统执行层，不再混用为“信号等级”。信号内部如需表达单源、聚合、决策，后续统一使用 `S1/S2/S3`，避免和系统层级冲突。
+
+| 层级 | 名称 | 职责 | 当前对应能力 |
+| --- | --- | --- | --- |
+| `L1 Data & Candidate Layer` | 数据与候选池层 | 拉取市场数据并从全市场或用户输入生成“值得继续取证”的候选，不直接输出买入结论 | 行情、板块、`discover_watchlist_candidates`、Sequoia 六类策略、多路召回、强势板块候选、用户自选候选 |
+| `L2 Evidence Layer` | 证据取证层 | 对候选逐只补齐行情、技术、资金、消息、基本面和数据质量证据 | `get_realtime_quote`、`analyze_trend`、`calculate_ma`、`get_capital_flow`、`search_stock_news`、Evidence Ledger |
+| `L3 Signal Layer` | 信号层 | 把证据转成结构化信号，并标注方向、置信度、冲突点和证据缺口 | 技术面、资金面、基本面、情绪面、事件面信号；后续内部使用 `S1/S2/S3` 表示单源/聚合/决策信号 |
+| `L4 Decision Layer` | 决策层 | 基于候选质量、信号冲突、账户约束和市场状态形成可解释裁决 | 阶段化选股、单股深度分析、Primary/Opposing/Judge、最终动作 `open/wait/reject/monitor` |
+| `L5 Risk Gate Layer` | 风控闸门层 | 用确定性规则校验交易动作是否允许执行，LLM 只能解释不能绕过 | `risk_gate`、T+1、涨跌停、ST/退市风险、止损、仓位、现金、数据质量门槛 |
+| `L6 Plan Layer` | 方案层 | 保存机器可读的交易方案和复查条件，让报告变成可跟踪计划 | `TradePlan`、入场区间、首仓比例、加仓/止损/淘汰条件、`risk_gate.json` |
+| `L7 Execution & Tracking Layer` | 托管跟踪层 | 在模拟盘中跟踪方案触发、执行、回撤、收益和偏离原因 | 后续模拟盘托管、方案状态机、执行日志、结果反馈 |
+| `L8 Learning Layer` | 复盘进化层 | 把 Trace、模拟盘、回测和用户反馈沉淀为策略改进候选 | Graphiti 记忆、回测系统、策略库、自进化提案、人审上线 |
+
+命名规则：
+
+- 目录、接口、前端 Tab 和 Trace 区块优先使用 `Lx + 英文短名 + 中文名`，例如 `L1 Data & Candidate Layer / 数据与候选池层`。
+- 每层只做本层职责，不跨层输出结论：`L1` 只能给数据与候选，不能给买入；`L2` 只能给证据，不能替代裁决；`L5` 可以阻断方案，但不负责生成候选。
+- 跨层数据必须显式引用来源，例如 `L5` 的结论要能追溯到 `L3` 证据和 `L4` 信号，`L7` 的方案必须带 `L6` 风控结果。
+- 后续前端按该层级设计导航和面板：先展示 `L1-L3` 的数据与证据，再展示 `L4-L6` 的信号、裁决和风控，最后展示 `L7-L9` 的托管、复盘和进化。
+
 ## 当前主链路
 
 ### 1. `/agent-trace` 是主要入口
@@ -33,7 +55,7 @@
 
 - 输入用户问题、目标股票、报告意图和风险偏好。
 - 注入账户、持仓、仓位上限、最大回撤、默认止损等上下文。
-- 流式展示 Planner、工具调用、Evidence Timeline、Debate Judge 和最终输出。
+- 按 `L1-L8` 折叠面板流式展示数据与候选池、SSE 事件、工具调用、证据层、信号层、Debate Judge、Risk Gate、TradePlan 和最终输出。
 - 按 session 落盘 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`stock_selection.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`。
 - 在 Graphiti 开启时，将 agent-trace 对话作为 episode 入知识图谱。
 

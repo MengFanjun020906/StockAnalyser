@@ -1459,19 +1459,23 @@ class AkshareFetcher(BaseFetcher):
             ChipDistribution 对象（最新一天的数据），获取失败返回 None
         """
         import akshare as ak
+        self.last_chip_distribution_error = None
 
         # 美股没有筹码分布数据（Akshare 不支持）
         if _is_us_code(stock_code):
+            self.last_chip_distribution_error = "not_supported: US stock"
             logger.debug(f"[API跳过] {stock_code} 是美股，无筹码分布数据")
             return None
 
         # 港股没有筹码分布数据（stock_cyq_em 是 A 股专属接口）
         if _is_hk_code(stock_code):
+            self.last_chip_distribution_error = "not_supported: HK stock"
             logger.debug(f"[API跳过] {stock_code} 是港股，无筹码分布数据")
             return None
 
         # ETF/指数没有筹码分布数据
         if _is_etf_code(stock_code):
+            self.last_chip_distribution_error = "not_supported: ETF/index"
             logger.debug(f"[API跳过] {stock_code} 是 ETF/指数，无筹码分布数据")
             return None
         
@@ -1489,6 +1493,7 @@ class AkshareFetcher(BaseFetcher):
             api_elapsed = _time.time() - api_start
             
             if df.empty:
+                self.last_chip_distribution_error = "empty result from ak.stock_cyq_em"
                 logger.warning(f"[API返回] ak.stock_cyq_em 返回空数据, 耗时 {api_elapsed:.2f}s")
                 return None
             
@@ -1518,6 +1523,9 @@ class AkshareFetcher(BaseFetcher):
             return chip
             
         except Exception as e:
+            error_type = type(e).__name__
+            message = " ".join(str(e).strip().split())
+            self.last_chip_distribution_error = f"{error_type}:{message}"
             logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
             return None
     

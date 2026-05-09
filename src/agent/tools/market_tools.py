@@ -11,6 +11,7 @@ Tools:
 import logging
 from typing import Any, Dict, Iterable, List, Optional
 
+from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -33,19 +34,90 @@ def _get_fetcher_manager():
 
 
 def _dedupe_candidates(candidates: Iterable[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    seen = set()
-    result: List[Dict[str, Any]] = []
+    return _merge_and_score_candidates(candidates, limit=limit)
+
+
+def _candidate_base_score(item: Dict[str, Any]) -> float:
+    raw_score = item.get("signal_score")
+    try:
+        return float(raw_score)
+    except Exception:
+        pass
+    for key in ("change_pct", "涨跌幅"):
+        if key in item:
+            try:
+                return max(45.0, min(75.0, 55.0 + float(item.get(key) or 0) * 2.0))
+            except Exception:
+                continue
+    return 50.0
+
+
+def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    by_code: Dict[str, Dict[str, Any]] = {}
     for item in candidates:
         code = str(item.get("code") or item.get("stock_code") or "").strip()
-        if not code or code in seen:
+        if not code:
             continue
-        seen.add(code)
-        payload = dict(item)
-        payload["code"] = code
-        result.append(payload)
-        if len(result) >= limit:
-            break
-    return result
+        source = str(item.get("source") or "unknown").strip() or "unknown"
+        base_score = _candidate_base_score(item)
+        if code not in by_code:
+            payload = dict(item)
+            payload["code"] = code
+            payload["name"] = str(payload.get("name") or payload.get("stock_name") or code)
+            payload["recall_sources"] = [source]
+            payload["raw_recall_count"] = 1
+            payload["signal_score"] = round(base_score, 2)
+            by_code[code] = payload
+            continue
+
+        current = by_code[code]
+        sources = list(current.get("recall_sources") or [])
+        if source not in sources:
+            sources.append(source)
+        current["recall_sources"] = sources
+        current["raw_recall_count"] = int(current.get("raw_recall_count") or 1) + 1
+        current["signal_score"] = round(max(float(current.get("signal_score") or 0), base_score) + min(len(sources) - 1, 3) * 4, 2)
+
+        current_strategies = list(current.get("matched_strategies") or [])
+        for strategy in item.get("matched_strategies") or []:
+            strategy_text = str(strategy or "").strip()
+            if strategy_text and strategy_text not in current_strategies:
+                current_strategies.append(strategy_text)
+        if current_strategies:
+            current["matched_strategies"] = current_strategies
+
+        current_tags = list(current.get("strategy_tags") or [])
+        for tag in item.get("strategy_tags") or []:
+            tag_text = str(tag or "").strip()
+            if tag_text and tag_text not in current_tags:
+                current_tags.append(tag_text)
+        if current_tags:
+            current["strategy_tags"] = current_tags
+
+        if len(sources) > 1:
+            current["source"] = "multi_recall"
+            current["reason"] = f"多路召回共振：{', '.join(sources)}。"
+
+        metrics = dict(current.get("metrics") or {})
+        if item.get("metrics"):
+            metrics[source] = item.get("metrics")
+        for key in ("change_pct", "price", "amount", "turnover_rate", "pe_ratio", "pb_ratio"):
+            if key in item and key not in current:
+                current[key] = item.get(key)
+        if metrics:
+            current["metrics"] = metrics
+
+    merged = list(by_code.values())
+    merged.sort(
+        key=lambda item: (
+            float(item.get("signal_score") or 0),
+            len(item.get("recall_sources") or []),
+            len(item.get("matched_strategies") or []),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    return merged[: max(1, limit)]
 
 
 def _normalize_stock_candidate(row: Dict[str, Any], *, source: str, reason: str) -> Optional[Dict[str, Any]]:
@@ -210,10 +282,15 @@ def _handle_discover_watchlist_candidates(
     market: str = "cn",
     seed_symbols: Optional[List[str]] = None,
     sector_names: Optional[List[str]] = None,
+    candidate_source: str = "auto",
+    strategy_names: Optional[List[str]] = None,
     limit: int = 8,
 ) -> dict:
     """Build a deterministic candidate list for watchlist_scan."""
     effective_limit = max(1, min(int(limit or 8), 20))
+    source_mode = str(candidate_source or "auto").strip().lower()
+    if source_mode not in {"auto", "sequoia", "sector", "fallback"}:
+        source_mode = "auto"
     discovery_steps: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
 
@@ -254,13 +331,59 @@ def _handle_discover_watchlist_candidates(
             "next_required_tools": [],
         }
 
+    sequoia_result: Dict[str, Any] = {}
+    if source_mode in {"auto", "sequoia"}:
+        sequoia_result = SequoiaCandidateProvider().discover(
+            limit=effective_limit if source_mode == "sequoia" else min(50, effective_limit * 3),
+            strategy_names=strategy_names,
+        )
+        sequoia_candidates = sequoia_result.get("candidates") or []
+        discovery_steps.append({
+            "source": "sequoia",
+            "status": sequoia_result.get("status", "failed"),
+            "count": len(sequoia_candidates),
+            "db_path": sequoia_result.get("db_path"),
+            "strategy_names": sequoia_result.get("strategy_names", []),
+            "diagnostics": sequoia_result.get("diagnostics", []),
+            **({"error": sequoia_result.get("error")} if sequoia_result.get("error") else {}),
+        })
+        candidates.extend(sequoia_candidates)
+        if source_mode == "sequoia":
+            candidates = _dedupe_candidates(candidates, effective_limit)
+            return _candidate_discovery_response(
+                status="ok" if candidates else "partial",
+                market=market,
+                candidates=candidates,
+                discovery_steps=discovery_steps,
+                fallback_used=False,
+                candidate_source="sequoia",
+                note="Sequoia 量化策略只生成候选池，不代表最终推荐；后续必须逐只取证后再排序和配置仓位。",
+            )
+
+    if source_mode == "fallback":
+        candidates = [
+            {**item, "source": "fallback_seed_pool"}
+            for item in DEFAULT_WATCHLIST_SEEDS
+        ]
+        discovery_steps.append({"source": "fallback_seed_pool", "status": "ok", "count": len(candidates)})
+        candidates = _dedupe_candidates(candidates, effective_limit)
+        return _candidate_discovery_response(
+            status="partial",
+            market=market,
+            candidates=candidates,
+            discovery_steps=discovery_steps,
+            fallback_used=True,
+            candidate_source="fallback",
+            note="使用固定候选种子池，仅用于保证后续取证链路可运行，不代表推荐。",
+        )
+
     sectors = [str(name).strip() for name in (sector_names or []) if str(name or "").strip()]
-    if not sectors:
+    if source_mode in {"auto", "sector"} and not sectors:
         sectors = _top_sector_names(top_n=5)
         discovery_steps.append({"source": "get_sector_rankings", "status": "ok" if sectors else "empty", "sectors": sectors})
 
-    for sector in sectors:
-        sector_candidates = _fetch_sector_constituents(sector, limit=effective_limit)
+    for sector in sectors if source_mode in {"auto", "sector"} else []:
+        sector_candidates = _fetch_sector_constituents(sector, limit=effective_limit if source_mode == "sector" else min(20, effective_limit * 2))
         discovery_steps.append({
             "source": "sector_constituents",
             "sector": sector,
@@ -268,8 +391,7 @@ def _handle_discover_watchlist_candidates(
             "count": len(sector_candidates),
         })
         candidates.extend(sector_candidates)
-        candidates = _dedupe_candidates(candidates, effective_limit)
-        if len(candidates) >= effective_limit:
+        if source_mode == "sector" and len(_dedupe_candidates(candidates, effective_limit)) >= effective_limit:
             break
 
     fallback_used = False
@@ -282,9 +404,32 @@ def _handle_discover_watchlist_candidates(
         discovery_steps.append({"source": "fallback_seed_pool", "status": "ok", "count": len(candidates)})
 
     candidates = _dedupe_candidates(candidates, effective_limit)
+    candidate_source = "fallback" if fallback_used else ("multi_recall" if source_mode == "auto" else "sector")
+    return _candidate_discovery_response(
+        status="partial" if fallback_used else "ok",
+        market=market,
+        candidates=candidates,
+        discovery_steps=discovery_steps,
+        fallback_used=fallback_used,
+        candidate_source=candidate_source,
+        note="这是多路召回后的候选发现结果，不是最终推荐。必须继续对候选逐只取证后才能输出排序和仓位配置。",
+    )
+
+
+def _candidate_discovery_response(
+    *,
+    status: str,
+    market: str,
+    candidates: List[Dict[str, Any]],
+    discovery_steps: List[Dict[str, Any]],
+    fallback_used: bool,
+    candidate_source: str,
+    note: str,
+) -> Dict[str, Any]:
     return {
-        "status": "partial" if fallback_used else "ok",
+        "status": status,
         "market": market,
+        "candidate_source": candidate_source,
         "candidate_count": len(candidates),
         "candidates": candidates,
         "discovery_steps": discovery_steps,
@@ -298,7 +443,7 @@ def _handle_discover_watchlist_candidates(
             "search_stock_news",
             "get_capital_flow",
         ],
-        "note": "这是候选发现结果，不是最终推荐。必须继续对候选逐只取证后才能输出排序和仓位配置。",
+        "note": note,
     }
 
 
@@ -329,6 +474,21 @@ discover_watchlist_candidates_tool = ToolDefinition(
             name="sector_names",
             type="array",
             description="Optional sector names from get_sector_rankings to fetch constituents from.",
+            required=False,
+            default=[],
+        ),
+        ToolParameter(
+            name="candidate_source",
+            type="string",
+            description="Candidate source: auto, sequoia, sector, or fallback. auto tries Sequoia quantitative candidates first, then sector constituents, then fallback seeds.",
+            required=False,
+            default="auto",
+            enum=["auto", "sequoia", "sector", "fallback"],
+        ),
+        ToolParameter(
+            name="strategy_names",
+            type="array",
+            description="Optional Sequoia strategy names: ma_volume, turtle_trade, high_tight_flag, limit_up_shakeout, uptrend_limit_down, rps_breakout, or all.",
             required=False,
             default=[],
         ),

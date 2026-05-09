@@ -413,9 +413,12 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "tool_calls.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "evidence_ledger.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "debate.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "risk_gate.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "final.md")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "todo.md")))
             self.assertEqual(payload["debate"]["judge_decision"]["final_action"], "hold")
+            self.assertEqual(payload["risk_gate"]["trade_plan"]["action"], "hold")
+            self.assertEqual(payload["risk_gate"]["risk_gate"]["status"], "passed")
             with open(os.path.join(payload["artifact_dir"], "events.ndjson"), encoding="utf-8") as fh:
                 lines = [json.loads(line) for line in fh if line.strip()]
             self.assertEqual(lines[0]["type"], "tool_start")
@@ -430,6 +433,10 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             with open(os.path.join(payload["artifact_dir"], "debate.json"), encoding="utf-8") as fh:
                 debate = json.load(fh)
             self.assertEqual(debate["judge_decision"]["final_action"], "hold")
+            with open(os.path.join(payload["artifact_dir"], "risk_gate.json"), encoding="utf-8") as fh:
+                risk_gate = json.load(fh)
+            self.assertEqual(risk_gate["source"], "debate_judge")
+            self.assertEqual(risk_gate["risk_gate"]["allowed_action"], "hold")
             with open(os.path.join(payload["artifact_dir"], "todo.md"), encoding="utf-8") as fh:
                 todo_md = fh.read()
             self.assertIn("## 执行状态", todo_md)
@@ -531,10 +538,109 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["content"], "stream ok")
         self.assertEqual(events[-1]["debate"]["judge_decision"]["final_action"], "hold")
+        self.assertEqual(events[-1]["risk_gate"]["risk_gate"]["status"], "passed")
         self.assertTrue(events[-1]["artifact_dir"])
         tool_event = next(event for event in events if event["type"] == "tool_done")
         self.assertEqual(tool_event["display_name"], "获取实时行情")
         self.assertEqual(tool_event["result_preview"], '{"price":100}')
+
+    def test_trace_risk_gate_blocks_t_plus_one_sell(self) -> None:
+        config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
+        executor = MagicMock()
+        executor.chat.return_value = SimpleNamespace(
+            success=True,
+            content="trace ok",
+            error=None,
+            total_steps=1,
+            total_tokens=42,
+            provider="deepseek",
+            model="deepseek/deepseek-v4-pro",
+            debate={
+                "enabled": True,
+                "success": True,
+                "judge_decision": {
+                    "final_action": "sell",
+                    "risk_controls": ["跌破成本区复查"],
+                    "confidence": 0.9,
+                },
+            },
+            stock_selection=None,
+            tool_calls_log=[
+                {
+                    "step": 1,
+                    "tool": "get_realtime_quote",
+                    "arguments": {"stock_code": "600519"},
+                    "success": True,
+                    "duration": 0.1,
+                    "result_length": 32,
+                    "result_preview": '{"price":100,"is_limit_down":false}',
+                }
+            ],
+        )
+        request = agent.AgentTraceRunRequest(
+            message="我今天买了 600519，现在能卖吗？",
+            stock_code="600519",
+            inject_portfolio_context=False,
+            context={
+                "agent_user_context": {
+                    "positions": [
+                        {
+                            "symbol": "600519",
+                            "quantity": 100,
+                            "avg_cost": 99,
+                            "last_price": 100,
+                            "holding_days": 0,
+                        }
+                    ],
+                    "report": {
+                        "analysis_mode": "planning_execute",
+                        "intent": "position_review",
+                        "primary_symbol": "600519",
+                        "target_symbols": ["600519"],
+                    },
+                }
+            },
+        )
+        real_get_running_loop = asyncio.get_running_loop
+
+        class _ImmediateLoop:
+            def __init__(self, loop):
+                self._loop = loop
+
+            def run_in_executor(self, _executor, func):
+                future = self._loop.create_future()
+                future.set_result(func())
+                return future
+
+        mock_db = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config.database_path = os.path.join(tmpdir, "stock_analysis.db")
+            with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
+                "api.v1.endpoints.agent._build_executor",
+                return_value=executor,
+            ), patch(
+                "src.agent.conversation.conversation_manager.clear",
+            ), patch(
+                "src.storage.get_db",
+                return_value=mock_db,
+            ), patch(
+                "api.v1.endpoints.agent.asyncio.get_running_loop",
+                side_effect=lambda: _ImmediateLoop(real_get_running_loop()),
+            ):
+                payload = asyncio.run(agent.run_agent_trace(request)).model_dump()
+
+            self.assertEqual(payload["risk_gate"]["trade_plan"]["action"], "sell")
+            self.assertEqual(payload["risk_gate"]["risk_gate"]["status"], "blocked")
+            self.assertEqual(payload["risk_gate"]["risk_gate"]["allowed_action"], "manual_review")
+            rule_ids = {
+                check["rule_id"]
+                for check in payload["risk_gate"]["risk_gate"]["checks"]
+                if check["passed"] is False
+            }
+            self.assertIn("a_share_t_plus_one", rule_ids)
+            with open(os.path.join(payload["artifact_dir"], "risk_gate.json"), encoding="utf-8") as fh:
+                risk_gate = json.load(fh)
+            self.assertEqual(risk_gate["risk_gate"]["status"], "blocked")
 
     def test_trace_finalize_ingests_graphiti_episode(self) -> None:
         config = SimpleNamespace(

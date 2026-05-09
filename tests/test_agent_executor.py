@@ -204,6 +204,55 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertEqual(result.tool_calls_log[0]["tool"], "echo")
         self.assertTrue(result.tool_calls_log[0]["success"])
 
+    def test_candidate_discovery_keeps_structured_result_json(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="discover_watchlist_candidates",
+                description="Discover candidates",
+                parameters=[],
+                handler=lambda **_: {
+                    "status": "ok",
+                    "candidate_source": "multi_recall",
+                    "candidates": [
+                        {
+                            "code": "301183",
+                            "source": "sequoia:multi_strategy",
+                            "matched_strategies": ["ma_volume", "turtle_trade", "rps_breakout"],
+                            "reason": "多策略共振。",
+                            "signal_score": 100,
+                        }
+                    ],
+                },
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gather candidates.",
+                tool_calls=[ToolCall(id="c1", name="discover_watchlist_candidates", arguments={})],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[{"role": "user", "content": "帮我选股"}],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("result_json", result.tool_calls_log[0])
+        self.assertEqual(result.tool_calls_log[0]["result_json"]["candidates"][0]["code"], "301183")
+
     def test_multiple_tool_calls_in_one_step(self):
         """Agent requests multiple tool calls in a single response."""
         registry = _make_registry_with_echo()

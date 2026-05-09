@@ -109,6 +109,16 @@ def _preview_tool_result(result_str: str, max_chars: int = 1200) -> str:
     return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
 
 
+def _structured_trace_result(tool_name: str, result_str: str) -> Any:
+    """Return compact structured payloads for tools whose previews drive trace UI."""
+    if tool_name != "discover_watchlist_candidates":
+        return None
+    try:
+        return json.loads(result_str)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _normalize_tool_stock_code(value: Any) -> Any:
     """Canonicalize stock code arguments so equivalent HK variants share one cache key."""
     if not isinstance(value, str):
@@ -808,6 +818,9 @@ def _execute_tools(
             "success": success, "duration": dur, "result_length": len(result_str),
             "cached": cached, "result_preview": _preview_tool_result(result_str),
         }
+        structured_result = _structured_trace_result(tc.name, result_str)
+        if structured_result is not None:
+            log_entry["result_json"] = structured_result
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 and not success:
             try:
                 if json.loads(result_str).get("timeout") is True:
@@ -844,6 +857,9 @@ def _execute_tools(
                     "success": success, "duration": dur, "result_length": len(result_str),
                     "cached": cached, "result_preview": _preview_tool_result(result_str),
                 }
+                structured_result = _structured_trace_result(tc_item.name, result_str)
+                if structured_result is not None:
+                    log_entry["result_json"] = structured_result
                 tool_calls_log.append(log_entry)
                 if progress_callback:
                     progress_callback({"type": "tool_done", **log_entry})

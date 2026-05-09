@@ -1440,6 +1440,149 @@ class DataFetcherManager:
         logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
         return None
 
+    def get_chip_distribution_context(self, stock_code: str) -> Dict[str, Any]:
+        """
+        获取筹码分布数据并保留可诊断的失败原因。
+
+        与 get_chip_distribution 保持兼容：成功时返回同一份 ChipDistribution；
+        失败时返回 status/source_chain/errors，供 Agent Trace 和 LLM 判断是禁用、
+        不支持、熔断、空结果还是数据源异常。
+        """
+        from .realtime_types import get_chip_circuit_breaker
+        from src.config import get_config
+
+        raw_code = stock_code
+        stock_code = normalize_stock_code(stock_code)
+        source_chain: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        config = get_config()
+        if not config.enable_chip_distribution:
+            return {
+                "stock_code": stock_code,
+                "status": "disabled",
+                "data": None,
+                "source_chain": [{
+                    "provider": "chip_distribution",
+                    "result": "disabled",
+                    "duration_ms": 0,
+                }],
+                "errors": ["ENABLE_CHIP_DISTRIBUTION=false"],
+                "error_summary": "chip distribution disabled",
+            }
+
+        if _market_tag(raw_code) != "cn" or _is_etf_code(raw_code):
+            return {
+                "stock_code": stock_code,
+                "status": "not_supported",
+                "data": None,
+                "source_chain": [{
+                    "provider": "chip_distribution",
+                    "result": "not_supported",
+                    "duration_ms": 0,
+                }],
+                "errors": ["chip distribution only supports A-share stocks"],
+                "error_summary": "chip distribution not supported for this symbol",
+            }
+
+        circuit_breaker = get_chip_circuit_breaker()
+
+        for fetcher in self._get_fetchers_snapshot():
+            if not hasattr(fetcher, 'get_chip_distribution'):
+                continue
+
+            fetcher_name = fetcher.name
+            source_key = f"{fetcher_name.replace('Fetcher', '').lower()}_chip"
+            if not circuit_breaker.is_available(source_key):
+                source_chain.append({
+                    "provider": source_key,
+                    "result": "circuit_open",
+                    "duration_ms": 0,
+                })
+                errors.append(f"{source_key}: circuit breaker open")
+                continue
+
+            start = time.time()
+            try:
+                chip = self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code)
+                duration_ms = int((time.time() - start) * 1000)
+                if chip is not None:
+                    circuit_breaker.record_success(source_key)
+                    logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})")
+                    return {
+                        "stock_code": stock_code,
+                        "status": "ok",
+                        "data": chip,
+                        "source_chain": [{
+                            "provider": source_key,
+                            "result": "ok",
+                            "duration_ms": duration_ms,
+                        }],
+                        "errors": [],
+                        "error_summary": None,
+                    }
+
+                last_error = getattr(fetcher, "last_chip_distribution_error", None)
+                if last_error:
+                    error_text = f"{source_key}:{last_error}"
+                    errors.append(error_text)
+                    result_label = "failed"
+                    circuit_breaker.record_failure(source_key, error_text)
+                else:
+                    error_text = f"{source_key}: empty result"
+                    errors.append(error_text)
+                    result_label = "empty"
+                    circuit_breaker.record_inconclusive(source_key)
+                source_chain.append({
+                    "provider": source_key,
+                    "result": result_label,
+                    "duration_ms": duration_ms,
+                })
+            except Exception as e:
+                duration_ms = int((time.time() - start) * 1000)
+                error_type, message = summarize_exception(e)
+                error_text = f"{source_key}:{error_type}:{message}"
+                logger.warning(f"[筹码分布] {fetcher_name} 获取 {stock_code} 失败: {message}")
+                circuit_breaker.record_failure(source_key, error_text)
+                source_chain.append({
+                    "provider": source_key,
+                    "result": "failed",
+                    "duration_ms": duration_ms,
+                })
+                errors.append(error_text)
+
+        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
+        return {
+            "stock_code": stock_code,
+            "status": "failed",
+            "data": None,
+            "source_chain": source_chain,
+            "errors": errors or ["chip distribution unavailable"],
+            "error_summary": self._summarize_chip_distribution_errors(errors),
+        }
+
+    @staticmethod
+    def _summarize_chip_distribution_errors(errors: List[str]) -> str:
+        joined = " | ".join(str(item) for item in errors if str(item).strip())
+        lowered = joined.lower()
+        if "circuit breaker open" in lowered:
+            return "chip distribution circuit breaker open"
+        has_tushare_permission_error = "抱歉，您没有接口" in joined or "访问权限" in joined or "permission" in lowered
+        has_eastmoney_disconnect = "push2his.eastmoney.com" in joined or "remotedisconnected" in lowered
+        if has_tushare_permission_error and has_eastmoney_disconnect:
+            return "Eastmoney chip endpoint disconnected; Tushare permission denied"
+        if has_tushare_permission_error:
+            return "Tushare chip distribution permission denied"
+        if has_eastmoney_disconnect:
+            return "Eastmoney chip distribution endpoint disconnected"
+        if "failed to resolve" in lowered or "nameresolutionerror" in lowered:
+            return "chip distribution endpoint DNS resolution failed"
+        if "timeout" in lowered:
+            return "chip distribution endpoint timeout"
+        if joined:
+            return str(errors[0])
+        return "chip distribution unavailable"
+
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
         """
         获取股票中文名称（自动切换数据源）
@@ -2309,6 +2452,8 @@ class DataFetcherManager:
         adapter_status = str(payload.get("status", "not_supported"))
         if has_stock_flow or has_sector_rankings:
             capital_flow_status = "ok"
+        elif adapter_status == "failed":
+            capital_flow_status = "failed"
         elif adapter_status == "not_supported":
             capital_flow_status = "not_supported"
         else:

@@ -271,12 +271,36 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
     return df.iloc[0]
 
 
+def _first_column_by_keywords(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    for col in df.columns:
+        col_s = str(col)
+        if any(keyword in col_s for keyword in keywords):
+            return col
+    return None
+
+
+def _row_date_value(row: pd.Series) -> Optional[str]:
+    value = _pick_by_keywords(row, ["日期", "交易日", "时间", "date"])
+    parsed = _safe_datetime(value)
+    return parsed.date().isoformat() if parsed else (_safe_str(value) or None)
+
+
+def _compact_numeric_row(row: pd.Series, field_map: Dict[str, List[str]]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for target_key, keywords in field_map.items():
+        payload[target_key] = _safe_float(_pick_by_keywords(row, keywords))
+    return payload
+
+
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
 
     def _call_df_candidates(
         self,
         candidates: List[Tuple[str, Dict[str, Any]]],
+        stop_error_keywords: Optional[List[str]] = None,
     ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
         errors: List[str] = []
         try:
@@ -295,7 +319,13 @@ class AkshareFundamentalAdapter:
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     return df, func_name, errors
             except Exception as exc:
-                errors.append(f"{func_name}:{type(exc).__name__}")
+                message = str(exc).strip().replace("\n", " ")
+                if len(message) > 220:
+                    message = message[:217] + "..."
+                error_text = f"{func_name}:{type(exc).__name__}:{message}"
+                errors.append(error_text)
+                if stop_error_keywords and any(keyword in error_text for keyword in stop_error_keywords):
+                    break
                 continue
         return None, None, errors
 
@@ -423,6 +453,230 @@ class AkshareFundamentalAdapter:
         result["status"] = "partial" if has_content else "not_supported"
         return result
 
+    def get_market_capital_flow(self, top_n: int = 5) -> Dict[str, Any]:
+        """Return market/sector/industry capital flow snapshots."""
+        effective_top_n = max(1, min(int(top_n or 5), 20))
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "market_flow": {},
+            "individual_rankings": {"top": [], "bottom": []},
+            "industry_rankings": {"top": [], "bottom": []},
+            "concept_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        market_df, market_source, market_errors = self._call_df_candidates([
+            ("stock_market_fund_flow", {}),
+        ])
+        result["errors"].extend(market_errors)
+        if market_df is not None and not market_df.empty:
+            row = market_df.iloc[0]
+            result["market_flow"] = {
+                "date": _row_date_value(row),
+                **_compact_numeric_row(
+                    row,
+                    {
+                        "main_net_inflow": ["主力净流入", "主力净额", "净流入", "净额"],
+                        "super_large_net_inflow": ["超大单净流入", "超大单净额"],
+                        "large_net_inflow": ["大单净流入", "大单净额"],
+                        "medium_net_inflow": ["中单净流入", "中单净额"],
+                        "small_net_inflow": ["小单净流入", "小单净额"],
+                    },
+                ),
+            }
+            result["source_chain"].append(f"market_flow:{market_source}")
+
+        for key, candidates in {
+            "individual_rankings": [
+                ("stock_fund_flow_individual", {"symbol": "即时"}),
+                ("stock_individual_fund_flow_rank", {"indicator": "今日"}),
+                ("stock_individual_fund_flow_rank", {"indicator": "5日"}),
+            ],
+            "industry_rankings": [
+                ("stock_fund_flow_industry", {"symbol": "即时"}),
+                ("stock_sector_fund_flow_rank", {}),
+                ("stock_sector_fund_flow_summary", {}),
+            ],
+            "concept_rankings": [
+                ("stock_fund_flow_concept", {"symbol": "即时"}),
+                ("stock_concept_fund_flow_hist", {}),
+            ],
+        }.items():
+            df, source, errors = self._call_df_candidates(candidates)
+            result["errors"].extend(errors)
+            rankings = self._rank_flow_dataframe(df, effective_top_n)
+            if rankings["top"] or rankings["bottom"]:
+                result[key] = rankings
+                result["source_chain"].append(f"{key}:{source}")
+
+        has_content = bool(
+            any(v is not None for v in result["market_flow"].values())
+            or any(result[key]["top"] or result[key]["bottom"] for key in ("individual_rankings", "industry_rankings", "concept_rankings"))
+        )
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_northbound_capital_flow(self, limit: int = 10) -> Dict[str, Any]:
+        """Return northbound / Stock Connect capital-flow summary."""
+        effective_limit = max(1, min(int(limit or 10), 60))
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "summary": {},
+            "history": [],
+            "source_chain": [],
+            "errors": [],
+        }
+
+        summary_df, summary_source, summary_errors = self._call_df_candidates([
+            ("stock_hsgt_fund_flow_summary_em", {}),
+        ])
+        result["errors"].extend(summary_errors)
+        if summary_df is not None and not summary_df.empty:
+            row = summary_df.iloc[0]
+            result["summary"] = {
+                "date": _row_date_value(row),
+                **_compact_numeric_row(
+                    row,
+                    {
+                        "northbound_net_inflow": ["北向资金", "北上资金", "沪股通", "深股通", "净流入", "净买入"],
+                        "southbound_net_inflow": ["南向资金", "港股通"],
+                        "buy_amount": ["买入", "流入"],
+                        "sell_amount": ["卖出", "流出"],
+                    },
+                ),
+            }
+            result["source_chain"].append(f"northbound_summary:{summary_source}")
+
+        hist_df, hist_source, hist_errors = self._call_df_candidates([
+            ("stock_hsgt_hist_em", {"symbol": "北向资金"}),
+        ])
+        result["errors"].extend(hist_errors)
+        if hist_df is not None and not hist_df.empty:
+            rows = hist_df.tail(effective_limit).to_dict(orient="records")
+            result["history"] = [self._compact_northbound_history_row(row) for row in rows]
+            result["source_chain"].append(f"northbound_history:{hist_source}")
+
+        has_content = bool(result["summary"] or result["history"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_margin_trading_summary(self, limit: int = 10) -> Dict[str, Any]:
+        """Return margin financing/securities-lending summary for A-share markets."""
+        effective_limit = max(1, min(int(limit or 10), 60))
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "account_info": {},
+            "sse": [],
+            "szse": [],
+            "source_chain": [],
+            "errors": [],
+        }
+
+        account_df, account_source, account_errors = self._call_df_candidates([
+            ("stock_margin_account_info", {}),
+        ])
+        result["errors"].extend(account_errors)
+        if account_df is not None and not account_df.empty:
+            row = account_df.iloc[0]
+            result["account_info"] = {
+                "date": _row_date_value(row),
+                **_compact_numeric_row(
+                    row,
+                    {
+                        "financing_balance": ["融资余额"],
+                        "securities_lending_balance": ["融券余额"],
+                        "margin_balance": ["两融余额", "融资融券余额"],
+                        "financing_buy_amount": ["融资买入额"],
+                        "financing_repayment_amount": ["融资偿还额"],
+                    },
+                ),
+            }
+            result["source_chain"].append(f"margin_account:{account_source}")
+
+        now = datetime.now()
+        start_date = (now - timedelta(days=effective_limit * 3)).strftime("%Y%m%d")
+        end_date = now.strftime("%Y%m%d")
+        sse_df, sse_source, sse_errors = self._call_df_candidates([
+            ("stock_margin_sse", {"start_date": start_date, "end_date": end_date}),
+        ])
+        result["errors"].extend(sse_errors)
+        if sse_df is not None and not sse_df.empty:
+            result["sse"] = [
+                self._compact_margin_row(row)
+                for row in sse_df.tail(effective_limit).to_dict(orient="records")
+            ]
+            result["source_chain"].append(f"margin_sse:{sse_source}")
+
+        szse_df, szse_source, szse_errors = self._call_df_candidates([
+            ("stock_margin_szse", {"date": end_date}),
+        ])
+        result["errors"].extend(szse_errors)
+        if szse_df is not None and not szse_df.empty:
+            result["szse"] = [
+                self._compact_margin_row(row)
+                for row in szse_df.tail(effective_limit).to_dict(orient="records")
+            ]
+            result["source_chain"].append(f"margin_szse:{szse_source}")
+
+        has_content = bool(result["account_info"] or result["sse"] or result["szse"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def _rank_flow_dataframe(self, df: Optional[pd.DataFrame], top_n: int) -> Dict[str, List[Dict[str, Any]]]:
+        rankings: Dict[str, List[Dict[str, Any]]] = {"top": [], "bottom": []}
+        if df is None or df.empty:
+            return rankings
+        name_col = _first_column_by_keywords(df, ["名称", "板块", "行业", "股票", "代码", "name"])
+        flow_col = _first_column_by_keywords(df, ["主力净流入", "净流入", "净额", "资金流入", "flow"])
+        if name_col is None or flow_col is None:
+            return rankings
+        work_df = df[[name_col, flow_col]].copy()
+        work_df[flow_col] = pd.to_numeric(work_df[flow_col], errors="coerce")
+        work_df = work_df.dropna(subset=[flow_col])
+        if work_df.empty:
+            return rankings
+        rankings["top"] = [
+            {"name": _safe_str(row[name_col]), "net_inflow": float(row[flow_col])}
+            for _, row in work_df.nlargest(top_n, flow_col).iterrows()
+        ]
+        rankings["bottom"] = [
+            {"name": _safe_str(row[name_col]), "net_inflow": float(row[flow_col])}
+            for _, row in work_df.nsmallest(top_n, flow_col).iterrows()
+        ]
+        return rankings
+
+    def _compact_northbound_history_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        series = pd.Series(row)
+        return {
+            "date": _row_date_value(series),
+            **_compact_numeric_row(
+                series,
+                {
+                    "net_inflow": ["净流入", "净买入", "当日成交净买额"],
+                    "buy_amount": ["买入", "流入"],
+                    "sell_amount": ["卖出", "流出"],
+                    "balance": ["余额"],
+                },
+            ),
+        }
+
+    def _compact_margin_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        series = pd.Series(row)
+        return {
+            "date": _row_date_value(series),
+            **_compact_numeric_row(
+                series,
+                {
+                    "financing_balance": ["融资余额"],
+                    "financing_buy_amount": ["融资买入额"],
+                    "financing_repayment_amount": ["融资偿还额"],
+                    "securities_lending_balance": ["融券余额"],
+                    "margin_balance": ["融资融券余额", "两融余额"],
+                },
+            ),
+        }
+
     def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
         """
         Return stock + sector capital flow.
@@ -436,14 +690,19 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        stock_df, stock_source, stock_errors = self._call_df_candidates([
-            ("stock_individual_fund_flow", {"stock": stock_code, "market": market}),
-            ("stock_individual_fund_flow", {"stock": stock_code}),
-            ("stock_individual_fund_flow", {"symbol": stock_code}),
-            ("stock_individual_fund_flow", {}),
-            ("stock_main_fund_flow", {"symbol": stock_code}),
-            ("stock_main_fund_flow", {}),
-        ])
+        eastmoney_unreachable_markers = [
+            "push2his.eastmoney.com",
+            "push2.eastmoney.com",
+            "NameResolutionError",
+            "Failed to resolve",
+        ]
+        stock_df, stock_source, stock_errors = self._call_df_candidates(
+            [
+                ("stock_individual_fund_flow", {"stock": stock_code, "market": market}),
+                ("stock_individual_fund_flow", {"stock": stock_code}),
+            ],
+            stop_error_keywords=eastmoney_unreachable_markers,
+        )
         result["errors"].extend(stock_errors)
         if stock_df is not None:
             row = _extract_latest_row(stock_df, stock_code)
@@ -458,11 +717,13 @@ class AkshareFundamentalAdapter:
                 }
                 result["source_chain"].append(f"capital_stock:{stock_source}")
 
-        sector_df, sector_source, sector_errors = self._call_df_candidates([
-            ("stock_sector_fund_flow_rank", {}),
-            ("stock_sector_fund_flow_summary", {}),
-        ])
-        result["errors"].extend(sector_errors)
+        sector_df = None
+        sector_source = None
+        if not any(marker in " ".join(stock_errors) for marker in eastmoney_unreachable_markers):
+            sector_df, sector_source, sector_errors = self._call_df_candidates([
+                ("stock_sector_fund_flow_rank", {}),
+            ])
+            result["errors"].extend(sector_errors)
         if sector_df is not None:
             name_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("板块", "行业", "名称", "name"))), None)
             flow_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("净流入", "主力", "flow", "净额"))), None)
@@ -479,7 +740,12 @@ class AkshareFundamentalAdapter:
                 result["source_chain"].append(f"capital_sector:{sector_source}")
 
         has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
-        result["status"] = "partial" if has_content else "not_supported"
+        if has_content:
+            result["status"] = "partial"
+        elif result["errors"]:
+            result["status"] = "failed"
+        else:
+            result["status"] = "not_supported"
         return result
 
     def get_dragon_tiger_flag(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:

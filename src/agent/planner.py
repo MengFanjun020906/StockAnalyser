@@ -29,7 +29,12 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
     "realtime_quote": ["get_realtime_quote"],
     "portfolio_context": ["get_portfolio_snapshot"],
     "news_event": ["search_comprehensive_intel", "search_stock_news"],
-    "capital_flow": ["get_capital_flow"],
+    "capital_flow": [
+        "get_capital_flow",
+        "get_market_capital_flow",
+        "get_northbound_capital_flow",
+        "get_margin_trading_summary",
+    ],
     "fundamental_analysis": ["get_stock_info"],
     "chip_distribution": ["get_chip_distribution"],
     "regime_detection": [
@@ -52,7 +57,7 @@ CAPABILITY_PURPOSES: Dict[CapabilityName, str] = {
     "realtime_quote": "确认当前价格、涨跌幅和盘中状态。",
     "portfolio_context": "读取账户、仓位、成本、浮盈亏和风险约束。",
     "news_event": "排查近期公告、新闻、风险事件和催化因素。",
-    "capital_flow": "观察资金流向是否支持当前信号。",
+    "capital_flow": "观察个股主力、市场资金、北向资金和两融环境是否支持当前信号。",
     "fundamental_analysis": "补充公司基本面和估值背景。",
     "chip_distribution": "评估筹码成本、集中度和获利盘压力。",
     "regime_detection": "用指数、板块和量价数据判断市场环境对动作的约束。",

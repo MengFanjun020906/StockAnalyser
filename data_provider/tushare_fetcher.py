@@ -1128,15 +1128,19 @@ class TushareFetcher(BaseFetcher):
             ChipDistribution 对象（最新交易日的数据），获取失败返回 None
 
         """
+        self.last_chip_distribution_error = None
         if _is_us_code(stock_code):
+            self.last_chip_distribution_error = "not_supported: US stock"
             logger.warning(f"[Tushare] TushareFetcher 不支持美股 {stock_code} 的筹码分布")
             return None
         
         if _is_etf_code(stock_code):
+            self.last_chip_distribution_error = "not_supported: ETF"
             logger.warning(f"[Tushare] TushareFetcher 不支持 ETF {stock_code} 的筹码分布")
             return None
 
         if _is_hk_market(stock_code):
+            self.last_chip_distribution_error = "not_supported: HK stock"
             logger.warning(f"[Tushare] TushareFetcher 不支持港股 {stock_code} 的筹码分布")
             return None
         
@@ -1144,6 +1148,7 @@ class TushareFetcher(BaseFetcher):
             # 19点之后才有当天数据
             start_date = self.get_trade_time(early_time='00:00', late_time='19:00') 
             if not start_date:
+                self.last_chip_distribution_error = "no trading date available for cyq_chips"
                 return None
 
             ts_code = self._convert_stock_code(stock_code)
@@ -1183,8 +1188,12 @@ class TushareFetcher(BaseFetcher):
                         f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
                         f"70%集中度={chip.concentration_70:.2%}")
                 return chip
+            self.last_chip_distribution_error = "empty result from cyq_chips"
 
         except Exception as e:
+            error_type = type(e).__name__
+            message = " ".join(str(e).strip().split())
+            self.last_chip_distribution_error = f"{error_type}:{message}"
             logger.warning(f"[Tushare] 获取筹码分布失败 {stock_code}: {e}")
             return None
 

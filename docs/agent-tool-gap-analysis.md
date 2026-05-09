@@ -146,17 +146,20 @@
 - `get_regulatory_risk_events`
 - `get_unlock_and_reduction_schedule`
 
-### 2.6 资金面：缺口中
+### 2.6 资金面：已补到 P1，仍有 P2 缺口
 
 已有能力：
 
 - `get_capital_flow` 已覆盖个股主力净流入、5/10 日流入和板块资金流。
+- `get_market_capital_flow` 已覆盖市场资金快照、个股/行业/概念资金流排名。
+- `get_northbound_capital_flow` 已覆盖北向资金摘要和近期历史。
+- `get_margin_trading_summary` 已覆盖融资融券余额、融资买入和交易所两融摘要。
 
 不足：
 
 - 当前主要针对 A 股个股，不覆盖 ETF、指数、港股、美股。
-- 缺少北向资金、融资融券余额、ETF 申赎、期权/期货持仓等风险偏好指标。
-- 工具失败时对选股质量影响很大，需要更强 fallback。
+- ETF 申赎、期权/期货持仓等风险偏好指标仍未封装。
+- 个股资金流依赖东方财富资金流接口；接口不可达时现在会快速返回真实连接错误摘要，但仍无法替代真实个股主力资金数据。
 
 影响：
 
@@ -165,9 +168,8 @@
 
 建议新增工具：
 
-- `get_market_capital_flow`
-- `get_margin_financing_snapshot`
 - `get_etf_flow_snapshot`
+- `get_derivatives_position_snapshot`
 
 ### 2.7 账户与组合：缺口中
 
@@ -485,7 +487,9 @@
 | `get_rate_fx_commodity_snapshot` | 利率、汇率、商品价格 | YfinanceFetcher + AkShare | 需要新增 symbol 列表和统一返回格式 |
 | `map_event_to_sectors` | 事件-板块映射 | 无现成数据源，需要 LLM 推理或维护映射表 | 需要新建映射表或用 LLM 实时推理 |
 | `stress_test_portfolio_by_event` | 持仓 + 事件敏感度 | PortfolioService + 板块归属 | 需要新建"事件-板块-个股"敏感度矩阵 |
-| `get_market_capital_flow` | 北向资金、融资融券 | AkShare 有 `stock_hsgt_*`（北向）和 `stock_margin_*`（融资融券）接口 | 需要封装 AkShare 接口 |
+| `get_market_capital_flow` | 市场资金快照、个股/行业/概念资金流排名 | AkShare 有 `stock_market_fund_flow`、`stock_fund_flow_*` 接口 | 已封装 |
+| `get_northbound_capital_flow` | 北向资金摘要和近期历史 | AkShare 有 `stock_hsgt_*` 接口 | 已封装 |
+| `get_margin_trading_summary` | 融资融券余额、融资买入、交易所两融摘要 | AkShare 有 `stock_margin_*` 接口 | 已封装 |
 
 ### 8.3 关键结论
 
@@ -493,7 +497,7 @@
 
 **P1 工具（跨资产风险信号）需要小幅扩展 YfinanceFetcher**——增加对商品/外汇/债券 symbol 的支持。YfinanceFetcher 已经存在且能处理任意 Yahoo Finance symbol，只需要新增一个 `get_cross_asset_quotes(symbols: list)` 方法。
 
-**P2 工具（宏观日历、资金面）需要封装 AkShare 的宏观和资金接口**——AkShare 已经是项目依赖，接口存在但未被 Agent 工具层使用。
+**P2 工具（宏观日历、ETF 申赎和衍生品持仓）仍需要封装 AkShare 的宏观和交易接口**——市场资金、北向资金和两融摘要已经接入 Agent 工具层。
 
 ### 8.4 YfinanceFetcher 跨资产扩展方案
 
@@ -522,8 +526,9 @@ AkShare 已有但未被 Agent 工具使用的接口：
 
 | 接口 | 用途 | 对应工具 |
 | --- | --- | --- |
-| `stock_hsgt_north_net_flow_in_em` | 北向资金净流入 | `get_market_capital_flow` |
-| `stock_margin_sse` / `stock_margin_szse` | 融资融券余额 | `get_margin_financing_snapshot` |
+| `stock_market_fund_flow` / `stock_fund_flow_*` | 市场和板块资金流 | `get_market_capital_flow` |
+| `stock_hsgt_*` | 北向资金净流入 | `get_northbound_capital_flow` |
+| `stock_margin_sse` / `stock_margin_szse` | 融资融券余额 | `get_margin_trading_summary` |
 | `macro_china_cpi` / `macro_china_pmi` | 中国宏观数据 | `get_macro_calendar` |
 | `macro_usa_cpi` / `macro_usa_nfp` | 美国宏观数据 | `get_macro_calendar` |
 | `futures_main_sina` | 商品期货主力合约 | `get_cross_asset_risk_signals` 备选 |

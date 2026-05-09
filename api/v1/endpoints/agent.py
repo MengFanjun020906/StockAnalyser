@@ -18,6 +18,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
 from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
+from src.schemas.agent_signal import TradeAction, TradePlan
 from src.services.agent_model_service import list_agent_model_deployments
 
 try:
@@ -114,6 +115,7 @@ class AgentTraceRunResponse(BaseModel):
     context_summary: Optional[Dict[str, Any]] = None
     debate: Optional[Dict[str, Any]] = None
     stock_selection: Optional[Dict[str, Any]] = None
+    risk_gate: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
 
 class SkillInfo(BaseModel):
@@ -917,6 +919,374 @@ def _tool_call_impact(status: str, limitation: str) -> str:
     return f"该工具未提供可靠证据，执行器需在最终报告中降级结论。{limitation}"
 
 
+def _build_trace_risk_gate_payload(
+    *,
+    result: Any,
+    context: Dict[str, Any],
+    tool_calls: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Build and evaluate the deterministic risk gate payload for a trace run."""
+    agent_user_context = _coerce_trace_agent_user_context(context)
+    if agent_user_context is None:
+        return None
+
+    primary_symbol = _resolve_trace_primary_symbol(context, agent_user_context)
+    if not primary_symbol:
+        return None
+
+    trade_plan = _build_trace_trade_plan(
+        result=result,
+        context=context,
+        agent_user_context=agent_user_context,
+        primary_symbol=primary_symbol,
+    )
+    if trade_plan is None:
+        return None
+
+    try:
+        from src.agent.risk_gate import QuoteState, RiskGateEvaluator, RiskGateInput
+
+        position = _find_trace_position(agent_user_context, primary_symbol)
+        account = _find_trace_account(agent_user_context, position)
+        quote = _build_trace_quote_state(primary_symbol, tool_calls, fallback_position=position)
+        gate_input = RiskGateInput(
+            plan=trade_plan,
+            quote=quote or QuoteState(symbol=primary_symbol),
+            investor=agent_user_context.investor,
+            account=account,
+            position=position,
+            data_quality=_trace_data_quality(tool_calls),
+            failed_tools=_trace_failed_tools(tool_calls),
+            l3_confidence=_extract_trace_l3_confidence(result),
+            current_total_exposure_pct=_current_total_exposure_pct(agent_user_context),
+        )
+        gate_result = RiskGateEvaluator().evaluate(gate_input)
+        return {
+            "schema_version": 1,
+            "trade_plan": trade_plan.model_dump(mode="json"),
+            "risk_gate": gate_result.model_dump(mode="json"),
+            "quote": quote.__dict__ if quote is not None else None,
+            "source": _trace_trade_plan_source(result),
+        }
+    except Exception as exc:
+        logger.warning("Agent trace risk gate build failed: %s", exc, exc_info=True)
+        return {
+            "schema_version": 1,
+            "error": str(exc),
+            "trade_plan": trade_plan.model_dump(mode="json"),
+        }
+
+
+def _coerce_trace_agent_user_context(context: Dict[str, Any]) -> Optional[AgentUserContext]:
+    try:
+        from src.agent.executor import _coerce_agent_user_context
+
+        return _coerce_agent_user_context(context.get("agent_user_context"))
+    except Exception as exc:
+        logger.debug("Agent trace risk gate context coercion failed: %s", exc)
+        return None
+
+
+def _resolve_trace_primary_symbol(context: Dict[str, Any], agent_user_context: AgentUserContext) -> Optional[str]:
+    report = agent_user_context.report
+    candidates = [
+        context.get("stock_code"),
+        report.primary_symbol,
+        *(report.target_symbols or []),
+        *((position.symbol for position in agent_user_context.positions if position.quantity > 0)),
+    ]
+    for symbol in candidates:
+        normalized = str(symbol or "").strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _build_trace_trade_plan(
+    *,
+    result: Any,
+    context: Dict[str, Any],
+    agent_user_context: AgentUserContext,
+    primary_symbol: str,
+) -> Optional[TradePlan]:
+    action = _extract_trace_action(result)
+    if action is None:
+        return None
+    position = _find_trace_position(agent_user_context, primary_symbol)
+    target_position_pct = _extract_trace_target_position_pct(result, position)
+    stop_loss_price = _extract_trace_stop_loss_price(result, position)
+    stop_loss_pct = _extract_trace_stop_loss_pct(result, agent_user_context)
+    invalidation_conditions = _extract_trace_invalidation_conditions(result)
+    if action in {"open", "add", "reduce", "sell"} and not invalidation_conditions:
+        invalidation_conditions = _fallback_invalidation_conditions(action, agent_user_context)
+
+    return TradePlan(
+        symbol=primary_symbol,
+        action=action,
+        order_type="manual",
+        target_position_pct=target_position_pct,
+        stop_loss_price=stop_loss_price,
+        stop_loss_pct=stop_loss_pct,
+        invalidation_conditions=invalidation_conditions,
+        review_triggers=_extract_trace_review_triggers(result),
+        notes="Generated from agent trace output for deterministic risk_gate evaluation.",
+        metadata={
+            "analysis_mode": agent_user_context.report.analysis_mode,
+            "intent": agent_user_context.report.intent,
+            "stock_name": context.get("stock_name"),
+        },
+    )
+
+
+def _extract_trace_action(result: Any) -> Optional[TradeAction]:
+    debate = getattr(result, "debate", None) if result is not None else None
+    candidates: List[Any] = []
+    if isinstance(debate, dict):
+        judge = debate.get("judge_decision") or {}
+        candidates.extend([
+            judge.get("final_action"),
+            judge.get("judge_action"),
+            judge.get("action"),
+        ])
+    stock_selection = getattr(result, "stock_selection", None) if result is not None else None
+    if isinstance(stock_selection, dict):
+        final_report = stock_selection.get("final_report_json") or {}
+        summary = final_report.get("summary") if isinstance(final_report, dict) else {}
+        if isinstance(summary, dict):
+            candidates.append(summary.get("final_action"))
+        selection_context = stock_selection.get("selection_context") or {}
+        if isinstance(selection_context, dict):
+            stages = selection_context.get("stages") or {}
+            judge_stage = stages.get("judge_decision") if isinstance(stages, dict) else {}
+            if isinstance(judge_stage, dict):
+                stage_summary = judge_stage.get("summary") or {}
+                if isinstance(stage_summary, dict):
+                    candidates.append(stage_summary.get("final_action"))
+
+    for candidate in candidates:
+        action = _normalize_trace_trade_action(candidate)
+        if action:
+            return action
+    return "wait"
+
+
+def _normalize_trace_trade_action(value: Any) -> Optional[TradeAction]:
+    text = str(value or "").strip().lower()
+    mapping: Dict[str, TradeAction] = {
+        "buy": "open",
+        "strong_buy": "open",
+        "open_position": "open",
+        "entry": "open",
+        "add_position": "add",
+        "increase": "add",
+        "trim": "reduce",
+        "take_profit": "reduce",
+        "clear": "sell",
+        "stop_loss": "sell",
+        "no_trade": "wait",
+        "watch": "monitor",
+        "review": "manual_review",
+    }
+    text = mapping.get(text, text)
+    allowed = {"open", "add", "reduce", "sell", "hold", "wait", "monitor", "manual_review", "reject"}
+    return text if text in allowed else None  # type: ignore[return-value]
+
+
+def _extract_trace_target_position_pct(result: Any, position: Any) -> Optional[float]:
+    debate = getattr(result, "debate", None) if result is not None else None
+    if isinstance(debate, dict):
+        judge = debate.get("judge_decision") or {}
+        for key in ("target_position_pct", "position_pct", "first_position_pct"):
+            value = _to_float(judge.get(key))
+            if value is not None:
+                return value
+    return getattr(position, "position_pct", None) if position is not None else None
+
+
+def _extract_trace_stop_loss_price(result: Any, position: Any) -> Optional[float]:
+    debate = getattr(result, "debate", None) if result is not None else None
+    if isinstance(debate, dict):
+        judge = debate.get("judge_decision") or {}
+        value = _to_float(judge.get("stop_loss_price") or judge.get("stop_loss"))
+        if value is not None:
+            return value
+    return getattr(position, "stop_loss", None) if position is not None else None
+
+
+def _extract_trace_stop_loss_pct(result: Any, agent_user_context: AgentUserContext) -> Optional[float]:
+    debate = getattr(result, "debate", None) if result is not None else None
+    if isinstance(debate, dict):
+        judge = debate.get("judge_decision") or {}
+        value = _to_float(judge.get("stop_loss_pct"))
+        if value is not None:
+            return value
+    return agent_user_context.investor.default_stop_loss_pct
+
+
+def _extract_trace_invalidation_conditions(result: Any) -> List[str]:
+    values: List[Any] = []
+    debate = getattr(result, "debate", None) if result is not None else None
+    if isinstance(debate, dict):
+        judge = debate.get("judge_decision") or {}
+        values.extend([
+            judge.get("invalidation_conditions"),
+            judge.get("failure_conditions"),
+            judge.get("risk_controls"),
+        ])
+    return _string_list(values)
+
+
+def _extract_trace_review_triggers(result: Any) -> List[str]:
+    debate = getattr(result, "debate", None) if result is not None else None
+    if not isinstance(debate, dict):
+        return []
+    judge = debate.get("judge_decision") or {}
+    return _string_list([judge.get("review_triggers"), judge.get("next_review"), judge.get("risk_controls")])
+
+
+def _fallback_invalidation_conditions(action: TradeAction, agent_user_context: AgentUserContext) -> List[str]:
+    if action in {"open", "add"} and agent_user_context.investor.default_stop_loss_pct is not None:
+        return [f"跌破默认止损 {agent_user_context.investor.default_stop_loss_pct:.2f}%"]
+    if action in {"reduce", "sell"}:
+        return ["卖出/减仓计划需结合可执行交易状态复核"]
+    return []
+
+
+def _trace_trade_plan_source(result: Any) -> str:
+    debate = getattr(result, "debate", None) if result is not None else None
+    if isinstance(debate, dict) and debate.get("judge_decision"):
+        return "debate_judge"
+    if isinstance(getattr(result, "stock_selection", None), dict):
+        return "stock_selection"
+    return "fallback_wait"
+
+
+def _find_trace_position(agent_user_context: AgentUserContext, symbol: str) -> Any:
+    normalized = symbol.strip().lower()
+    for position in agent_user_context.positions:
+        if str(position.symbol or "").strip().lower() == normalized and position.quantity > 0:
+            return position
+    return None
+
+
+def _find_trace_account(agent_user_context: AgentUserContext, position: Any) -> Any:
+    if position is not None and getattr(position, "account_id", None) is not None:
+        for account in agent_user_context.accounts:
+            if account.account_id == position.account_id:
+                return account
+    return agent_user_context.accounts[0] if agent_user_context.accounts else None
+
+
+def _current_total_exposure_pct(agent_user_context: AgentUserContext) -> Optional[float]:
+    values = [position.position_pct for position in agent_user_context.positions if position.position_pct is not None]
+    if values:
+        return float(sum(values))
+    accounts = agent_user_context.accounts
+    if len(accounts) == 1 and accounts[0].total_equity and accounts[0].total_market_value is not None:
+        return float(accounts[0].total_market_value) / float(accounts[0].total_equity) * 100.0
+    return None
+
+
+def _build_trace_quote_state(primary_symbol: str, tool_calls: List[Dict[str, Any]], *, fallback_position: Any) -> Any:
+    try:
+        from src.agent.risk_gate import QuoteState
+
+        quote_payload = _latest_tool_payload(tool_calls, "get_realtime_quote") or {}
+        last_price = _to_float(
+            quote_payload.get("price")
+            or quote_payload.get("last_price")
+            or quote_payload.get("current_price")
+            or getattr(fallback_position, "last_price", None)
+        )
+        pct_change = _to_float(
+            quote_payload.get("pct_change")
+            or quote_payload.get("change_pct")
+            or quote_payload.get("涨跌幅")
+        )
+        return QuoteState(
+            symbol=primary_symbol,
+            last_price=last_price,
+            pct_change=pct_change,
+            is_limit_up=_truthy(quote_payload.get("is_limit_up") or quote_payload.get("limit_up")),
+            is_limit_down=_truthy(quote_payload.get("is_limit_down") or quote_payload.get("limit_down")),
+            is_st=_truthy(quote_payload.get("is_st") or quote_payload.get("st")),
+            is_delisting=_truthy(quote_payload.get("is_delisting") or quote_payload.get("delisting")),
+            is_ipo_special_period=_truthy(
+                quote_payload.get("is_ipo_special_period") or quote_payload.get("ipo_special_period")
+            ),
+            market=str(quote_payload.get("market") or "cn"),
+        )
+    except Exception:
+        return None
+
+
+def _latest_tool_payload(tool_calls: List[Dict[str, Any]], tool_name: str) -> Optional[Dict[str, Any]]:
+    for call in reversed(tool_calls or []):
+        if not isinstance(call, dict) or call.get("tool") != tool_name:
+            continue
+        payload = _parse_result_preview(call.get("result_preview"))
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _trace_data_quality(tool_calls: List[Dict[str, Any]]) -> str:
+    if not tool_calls:
+        return "unknown"
+    failed = _trace_failed_tools(tool_calls)
+    if failed:
+        return "failed"
+    return "sufficient"
+
+
+def _trace_failed_tools(tool_calls: List[Dict[str, Any]]) -> List[str]:
+    failed: List[str] = []
+    for call in tool_calls or []:
+        if isinstance(call, dict) and _tool_call_status(call) != "success":
+            tool = str(call.get("tool") or "")
+            if tool and tool not in failed:
+                failed.append(tool)
+    return failed
+
+
+def _extract_trace_l3_confidence(result: Any) -> Optional[float]:
+    debate = getattr(result, "debate", None) if result is not None else None
+    if not isinstance(debate, dict):
+        return None
+    judge = debate.get("judge_decision") or {}
+    for key in ("confidence_after_debate", "confidence", "score"):
+        value = _to_float(judge.get(key))
+        if value is not None:
+            return value / 100.0 if value > 1 else value
+    return None
+
+
+def _string_list(values: List[Any]) -> List[str]:
+    result: List[str] = []
+    for value in values:
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            text = str(item or "").strip()
+            if text and text not in result:
+                result.append(text)
+    return result
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "是", "涨停", "跌停"}
+
+
 class TraceArtifactWriter:
     """Best-effort file writer for developer trace artifacts."""
 
@@ -984,6 +1354,15 @@ class TraceArtifactWriter:
         if debate is None:
             debate = _build_debate_from_trace_events(self._events)
         _write_trace_json(self.path / "debate.json", debate)
+        risk_gate = None
+        if context is not None:
+            risk_gate = _build_trace_risk_gate_payload(
+                result=result,
+                context=context,
+                tool_calls=tool_calls,
+            )
+        _write_trace_json(self.path / "risk_gate.json", risk_gate)
+        payload["risk_gate"] = risk_gate
         stock_selection = getattr(result, "stock_selection", None) if result is not None else None
         if stock_selection:
             _write_trace_json(self.path / "stock_selection.json", stock_selection)
@@ -1042,7 +1421,14 @@ def _ingest_trace_to_graphiti(
             return
 
         title = request.stock_name or context.get("stock_name") or request.message[:80]
-        trace_type = "stock_selection" if _looks_like_stock_selection_request(request.message) else "single_stock_analysis"
+        trace_type = (
+            "stock_selection"
+            if _looks_like_stock_selection_request(request.message)
+            else "single_stock_analysis"
+        )
+        normalized_tool_calls = _normalize_tool_calls_status(
+            getattr(result, "tool_calls_log", []) if result is not None else []
+        )
         market = _resolve_trace_market(context)
         service.ingest_trace_sync(
             session_id=session_id,
@@ -1052,9 +1438,14 @@ def _ingest_trace_to_graphiti(
                 "success": getattr(result, "success", False) if result is not None else False,
                 "error": getattr(result, "error", None) if result is not None else None,
                 "content": getattr(result, "content", "") if result is not None else "",
-                "tool_calls": _normalize_tool_calls_status(getattr(result, "tool_calls_log", []) if result is not None else []),
+                "tool_calls": normalized_tool_calls,
                 "debate": getattr(result, "debate", None) if result is not None else None,
                 "stock_selection": getattr(result, "stock_selection", None) if result is not None else None,
+                "risk_gate": _build_trace_risk_gate_payload(
+                    result=result,
+                    context=context,
+                    tool_calls=normalized_tool_calls,
+                ),
                 "artifact_dir": artifact_dir,
             },
             context={
@@ -1196,6 +1587,12 @@ async def run_agent_trace(request: AgentTraceRunRequest):
             logger.debug("Agent trace session cleanup skipped: %s", exc)
 
     _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
+    normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
+    risk_gate = _build_trace_risk_gate_payload(
+        result=result,
+        context=context,
+        tool_calls=normalized_tool_calls,
+    )
 
     return AgentTraceRunResponse(
         success=result.success,
@@ -1208,12 +1605,13 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         model=result.model,
         mode=request.analysis_mode,
         events=events,
-        tool_calls=_normalize_tool_calls_status(result.tool_calls_log),
+        tool_calls=normalized_tool_calls,
         planner=_build_planner_trace(context),
         agent_user_context=_serialize_agent_user_context(context.get("agent_user_context")),
         context_summary=_build_trace_context_summary(context),
         debate=result.debate,
         stock_selection=getattr(result, "stock_selection", None),
+        risk_gate=risk_gate,
         artifact_dir=str(artifact_writer.path),
     )
 
@@ -1279,6 +1677,12 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 context=context,
             )
             _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
+            normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
+            risk_gate = _build_trace_risk_gate_payload(
+                result=result,
+                context=context,
+                tool_calls=normalized_tool_calls,
+            )
             put_event({
                 "type": "done",
                 "success": result.success,
@@ -1291,12 +1695,13 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "model": result.model,
                 "mode": request.analysis_mode,
                 "events": [],
-                "tool_calls": _normalize_tool_calls_status(result.tool_calls_log),
+                "tool_calls": normalized_tool_calls,
                 "planner": _build_planner_trace(context),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "context_summary": _build_trace_context_summary(context),
                 "debate": result.debate,
                 "stock_selection": getattr(result, "stock_selection", None),
+                "risk_gate": risk_gate,
                 "artifact_dir": str(artifact_writer.path),
             })
         except Exception as exc:

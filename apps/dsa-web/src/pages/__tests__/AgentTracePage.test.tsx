@@ -174,6 +174,41 @@ describe('AgentTracePage', () => {
           accounts: [{ account_id: 7, account_name: 'A股主账户', market: 'cn', available_cash: 16982.65, total_equity: 736532.65 }],
           target_position: { symbol: '600519', quantity: 150000, avg_cost: 4.797, last_price: 5, unrealized_pnl: 30450, position_pct: 50.1 },
         },
+        risk_gate: {
+          schema_version: 1,
+          source: 'debate_judge',
+          trade_plan: {
+            symbol: '600519',
+            action: 'hold',
+            order_type: 'manual',
+            target_position_pct: 50.1,
+            invalidation_conditions: [],
+            review_triggers: ['跌破成本区复查'],
+          },
+          risk_gate: {
+            status: 'passed',
+            original_action: 'hold',
+            allowed_action: 'hold',
+            required_manual_review: false,
+            blocked_reasons: [],
+            warnings: [],
+            checks: [
+              {
+                rule_id: 'critical_data_quality',
+                passed: true,
+                severity: 'info',
+                message: '关键数据质量未标记为失败或不足。',
+              },
+            ],
+          },
+          quote: {
+            symbol: '600519',
+            last_price: 100,
+            pct_change: 1.2,
+            is_limit_up: false,
+            is_limit_down: false,
+          },
+        },
       },
     ]));
 
@@ -210,9 +245,13 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('持有，但不急着加仓')).toBeInTheDocument();
     expect(screen.getByText('Trace 已完成')).toBeInTheDocument();
     expect(screen.getByText('Debate Judge')).toBeInTheDocument();
+    expect(screen.getAllByText('Risk Gate').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('风控通过，允许动作保持为 hold。').length).toBeGreaterThan(0);
+    expect(screen.getByText('critical_data_quality')).toBeInTheDocument();
+    expect(screen.getByText('关键数据质量未标记为失败或不足。')).toBeInTheDocument();
     expect(screen.getByText('主观点支持继续持有')).toBeInTheDocument();
     expect(screen.getByText('反方提醒仓位风险')).toBeInTheDocument();
-    expect(screen.getByText('维持持有，但资金面和消息面证据不足，需要继续观察。')).toBeInTheDocument();
+    expect(screen.getAllByText('维持持有，但资金面和消息面证据不足，需要继续观察。').length).toBeGreaterThan(0);
     expect(screen.getAllByText('资金面').length).toBeGreaterThan(0);
     expect(screen.getAllByText('消息面').length).toBeGreaterThan(0);
     expect(screen.getByText('资金面证据不足')).toBeInTheDocument();
@@ -309,9 +348,75 @@ describe('AgentTracePage', () => {
     fireEvent.click(await screen.findByRole('button', { name: /运行 Trace/ }));
 
     expect((await screen.findAllByText('get_capital_flow')).length).toBeGreaterThan(0);
-    expect(screen.getByText('FAIL')).toBeInTheDocument();
+    expect(screen.getAllByText('FAIL').length).toBeGreaterThan(0);
     expect(screen.getByText('资金流工具失败，资金面证据缺失。')).toBeInTheDocument();
     expect(screen.getAllByText(/capital flow fetch failed/).length).toBeGreaterThan(0);
+  });
+
+  it('renders risk gate blocking reasons for T+1 sell attempts', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-risk-blocked',
+        content: 'A 股 T+1 不允许当日卖出。',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'deepseek',
+        model: 'deepseek/deepseek-v4-pro',
+        mode: 'planning_execute',
+        tool_calls: [],
+        planner: { intent: 'position_review' },
+        agent_user_context: { report: { analysis_mode: 'planning_execute' } },
+        context_summary: { account_count: 0, position_count: 1, accounts: [], investor: null },
+        debate: null,
+        risk_gate: {
+          schema_version: 1,
+          source: 'debate_judge',
+          trade_plan: {
+            symbol: '600519',
+            action: 'sell',
+            order_type: 'manual',
+            invalidation_conditions: ['卖出/减仓计划需结合可执行交易状态复核'],
+          },
+          risk_gate: {
+            status: 'blocked',
+            original_action: 'sell',
+            allowed_action: 'manual_review',
+            required_manual_review: true,
+            blocked_reasons: ['A 股 T+1 约束：当日买入持仓不能在当日卖出或减仓。'],
+            warnings: [],
+            checks: [
+              {
+                rule_id: 'a_share_t_plus_one',
+                passed: false,
+                severity: 'blocking',
+                message: 'A 股 T+1 约束：当日买入持仓不能在当日卖出或减仓。',
+                suggested_action: 'manual_review',
+              },
+            ],
+          },
+          quote: {
+            symbol: '600519',
+            last_price: 100,
+            is_limit_up: false,
+            is_limit_down: false,
+          },
+        },
+      },
+    ]));
+
+    render(<AgentTracePage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /运行 Trace/ }));
+
+    expect((await screen.findAllByText('Risk Gate')).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('风控阻断：原动作 sell 被改为 manual_review，失败规则 1 条。').length).toBeGreaterThan(0);
+    expect(screen.getByText('a_share_t_plus_one')).toBeInTheDocument();
+    expect(screen.getAllByText('A 股 T+1 约束：当日买入持仓不能在当日卖出或减仓。').length).toBeGreaterThan(0);
+    expect(screen.getByText('建议动作：manual_review')).toBeInTheDocument();
   });
 
   it('does not send the default stock code for stock-selection prompts', async () => {
@@ -328,7 +433,63 @@ describe('AgentTracePage', () => {
         provider: 'deepseek',
         model: 'deepseek/deepseek-v4-pro',
         mode: 'planning_execute',
-        tool_calls: [],
+        tool_calls: [
+          {
+            step: 1,
+            tool: 'discover_watchlist_candidates',
+            arguments: { market: 'cn', seed_symbols: [], limit: 8 },
+            success: true,
+            duration: 0.3,
+            result_length: 1000,
+            result_preview: '{"status":"ok","candidate_source":"multi_recall","candidates":[{"code":"301183"...[truncated 4980 chars]',
+            result_json: {
+              status: 'ok',
+              market: 'cn',
+              candidate_source: 'multi_recall',
+              candidate_count: 2,
+              candidates: [
+                {
+                  code: '600001',
+                  name: '测试一',
+                  source: 'sequoia:multi_strategy',
+                  recall_sources: ['sequoia:turtle_trade', 'akshare:industry:半导体'],
+                  matched_strategies: ['turtle_trade', 'rps_breakout'],
+                  strategy_tags: ['breakout', 'rps'],
+                  reason: '多策略共振：ma_volume, turtle_trade, rps_breakout。',
+                  signal_score: 92.5,
+                  latest_date: '2026-05-08',
+                  metrics: { turnover: 150000000, rps: 94.2 },
+                },
+                {
+                  code: '600002',
+                  name: '测试二',
+                  source: 'akshare:industry:半导体',
+                  recall_sources: ['akshare:industry:半导体'],
+                  strategy_tags: ['hot_sector'],
+                  reason: '强势板块成分股进入候选池。',
+                  signal_score: 71,
+                  latest_date: '2026-05-08',
+                  metrics: { sector_rank: 3 },
+                },
+              ],
+              discovery_steps: [
+                { source: 'sequoia', status: 'ok', count: 1, db_path: 'Sequoia-X/data/sequoia_v2.db', strategy_names: ['turtle_trade', 'rps_breakout'] },
+                { source: 'get_sector_rankings', status: 'ok', sectors: ['半导体'] },
+                { source: 'sector_constituents', sector: '半导体', status: 'ok', count: 1 },
+              ],
+              next_required_tools: ['get_realtime_quote', 'analyze_trend', 'get_capital_flow'],
+            },
+          },
+          {
+            step: 2,
+            tool: 'get_realtime_quote',
+            arguments: { stock_code: '600001' },
+            success: true,
+            duration: 0.2,
+            result_length: 20,
+            result_preview: '{"price":10}',
+          },
+        ],
         planner: { intent: 'watchlist_scan' },
         agent_user_context: { report: { intent: 'watchlist_scan' } },
         context_summary: { account_count: 0, position_count: 0, accounts: [], investor: null },
@@ -349,7 +510,41 @@ describe('AgentTracePage', () => {
             },
           },
           final_report_json: {
-            candidate_discovery: { summary: { candidate_codes: ['600001', '600002'], main_limitations: ['候选需要深度取证'] } },
+            candidate_discovery: {
+              summary: {
+                candidate_codes: ['600001', '600002'],
+                candidate_sources: ['sequoia:multi_strategy', 'akshare:industry:半导体'],
+                main_limitations: ['候选需要深度取证'],
+              },
+              full: {
+                candidates: [
+                  {
+                    code: '600001',
+                    name: '测试一',
+                    source: 'sequoia:multi_strategy',
+                    recall_sources: ['sequoia:turtle_trade', 'akshare:industry:半导体'],
+                    matched_strategies: ['turtle_trade', 'rps_breakout'],
+                    strategy_tags: ['breakout', 'rps'],
+                    reason: '多策略共振：ma_volume, turtle_trade, rps_breakout。',
+                    signal_score: 92.5,
+                    latest_date: '2026-05-08',
+                    metrics: { turnover: 150000000, rps: 94.2 },
+                  },
+                  {
+                    code: '600002',
+                    name: '测试二',
+                    source: 'akshare:industry:半导体',
+                    recall_sources: ['akshare:industry:半导体'],
+                    matched_strategies: [],
+                    strategy_tags: ['hot_sector'],
+                    reason: '强势板块成分股进入候选池。',
+                    signal_score: 71,
+                    latest_date: '2026-05-08',
+                    metrics: { sector_rank: 3 },
+                  },
+                ],
+              },
+            },
             candidate_screening: { summary: { deep_dive_targets: ['600001'], main_limitations: ['资金面待确认'] } },
             single_stock_deep_dive: { summary: { wait_targets: ['600001'], open_targets: [], reject_targets: [] } },
             portfolio_allocation: {
@@ -382,9 +577,29 @@ describe('AgentTracePage', () => {
     });
     expect(screen.getByText('选股结论')).toBeInTheDocument();
     expect(screen.getByText('Stock Selection Pipeline')).toBeInTheDocument();
-    expect(screen.getByText('hot_sector')).toBeInTheDocument();
+    expect(screen.getByText('L1 Data & Candidate Layer / 数据与候选池层')).toBeInTheDocument();
+    expect(screen.queryByText('L2 Candidate Layer / 候选池层')).not.toBeInTheDocument();
+    expect(screen.getByText('候选来源审计')).toBeInTheDocument();
+    expect(screen.getByText('召回路径')).toBeInTheDocument();
+    expect(screen.queryByText('为什么后续工具查这些股票')).not.toBeInTheDocument();
+    expect(screen.queryByText('入池候选与理由')).not.toBeInTheDocument();
+    expect(screen.getByText('Sequoia-X/data/sequoia_v2.db')).toBeInTheDocument();
+    expect(screen.getAllByText('多路召回').length).toBeGreaterThan(0);
+    expect(screen.getByText('强势板块成分股')).toBeInTheDocument();
+    expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
+    expect(screen.getByText('候选池列表')).toBeInTheDocument();
+    expect(screen.getAllByText('强势板块').length).toBeGreaterThan(0);
     expect(screen.getByText('candidate_discovery.json')).toBeInTheDocument();
     expect(screen.getAllByText('600001').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('测试一').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('92.5').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('海龟突破').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('RPS 强势突破').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('多策略共振：均线放量突破、海龟突破、RPS 强势突破。').length).toBeGreaterThan(0);
+    expect(screen.queryByText('ma_volume')).not.toBeInTheDocument();
+    expect(screen.queryByText('turtle_trade')).not.toBeInTheDocument();
+    expect(screen.queryByText('rps_breakout')).not.toBeInTheDocument();
+    expect(screen.getAllByText(/turnover/).length).toBeGreaterThan(0);
     expect(screen.getByText('回踩确认')).toBeInTheDocument();
     expect(screen.getByText('capital_flow')).toBeInTheDocument();
     expect(screen.getByText('不追高')).toBeInTheDocument();

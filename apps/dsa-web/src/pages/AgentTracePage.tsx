@@ -1,5 +1,23 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Braces, ClipboardList, History, Play, Route, Trash2, Wrench } from 'lucide-react';
+import {
+  AlertTriangle,
+  Activity,
+  BrainCircuit,
+  Braces,
+  ClipboardCheck,
+  ClipboardList,
+  Database,
+  FileText,
+  Gauge,
+  History,
+  Play,
+  Radio,
+  Route,
+  ShieldCheck,
+  Target,
+  Trash2,
+  Wrench,
+} from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
@@ -149,6 +167,7 @@ const AgentTracePage: React.FC = () => {
       context_summary: null,
       debate: null,
       stock_selection: null,
+      risk_gate: null,
       artifact_dir: null,
     });
     try {
@@ -322,6 +341,7 @@ const AgentTracePage: React.FC = () => {
           context_summary: asRecord(event.context_summary) || current.context_summary,
           debate: asRecord(event.debate) || current.debate,
           stock_selection: asRecord(event.stock_selection) || current.stock_selection,
+          risk_gate: asRecord(event.risk_gate) || current.risk_gate,
           artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : current.artifact_dir,
         };
         setHistoryItems((items) => persistTraceHistory(items, {
@@ -539,6 +559,16 @@ const AgentTracePage: React.FC = () => {
             <TraceStat label="模型" value={result.model || result.provider || '-'} />
           </section>
 
+          <LayeredTracePanel
+            result={result}
+            statusMessage={statusMessage}
+            traceStatus={traceStatus}
+            selectedEventIndex={selectedEventIndex}
+            onSelectEvent={setSelectedEventIndex}
+            selectedToolIndex={selectedToolIndex}
+            onSelectTool={setSelectedToolIndex}
+          />
+
           {plannerSummary.length ? (
             <Card title="Execution Thesis" subtitle="Auditable Reasoning" padding="md" className="rounded-lg">
               <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
@@ -550,6 +580,8 @@ const AgentTracePage: React.FC = () => {
           ) : null}
 
           <StockSelectionPanel result={result} />
+
+          <RiskGatePanel result={result} />
 
           <DebatePanel result={result} />
 
@@ -730,6 +762,125 @@ const TraceEmpty: React.FC<{ icon: React.ComponentType<{ className?: string }>; 
   </div>
 );
 
+type LayerItem = {
+  id: string;
+  title: string;
+  subtitle: string;
+  status: string;
+  statusVariant: 'success' | 'danger' | 'warning' | 'info' | 'default';
+  icon: React.ComponentType<{ className?: string }>;
+  summary: string;
+  metrics: Array<{ label: string; value: string }>;
+  details: React.ReactNode;
+  defaultOpen?: boolean;
+};
+
+type CandidatePoolRow = {
+  code: string;
+  name: string;
+  source: string;
+  recallSources: string[];
+  matchedStrategies: string[];
+  strategyTags: string[];
+  reason: string;
+  signalScore?: number;
+  latestDate: string;
+  metrics: Record<string, unknown> | null;
+};
+
+type CandidateAudit = {
+  candidateSource: string;
+  discoverySteps: Record<string, unknown>[];
+  nextRequiredTools: string[];
+  deepDiveTargets: string[];
+  toolTargetCodes: string[];
+  candidateRows: CandidatePoolRow[];
+  summary: Record<string, unknown>;
+};
+
+const LayeredTracePanel: React.FC<{
+  result: AgentTraceRunResponse;
+  statusMessage: string;
+  traceStatus: TraceStatus;
+  selectedEventIndex: number;
+  onSelectEvent: (index: number) => void;
+  selectedToolIndex: number;
+  onSelectTool: (index: number) => void;
+}> = ({
+  result,
+  statusMessage,
+  traceStatus,
+  selectedEventIndex,
+  onSelectEvent,
+  selectedToolIndex,
+  onSelectTool,
+}) => {
+  const layers = useMemo(() => buildLayerItems(result, statusMessage, traceStatus, selectedEventIndex, onSelectEvent, selectedToolIndex, onSelectTool), [
+    result,
+    statusMessage,
+    traceStatus,
+    selectedEventIndex,
+    onSelectEvent,
+    selectedToolIndex,
+    onSelectTool,
+  ]);
+
+  return (
+    <Card title="Layered Trace" subtitle="L1-L8 可折叠执行链路" padding="md" className="rounded-lg">
+      <div className="mb-4 rounded-lg border border-cyan/20 bg-cyan/10 p-3 text-sm leading-6 text-secondary-text">
+        这里展示的是 SSE 事件、Planner、工具调用、结构化阶段结果和最终裁决；不会展示模型私有推理链。你可以从 L1 到 L8 看到 prompt 输入后，系统如何取数、召回候选、补证据、形成裁决并进入风控/方案层。
+      </div>
+      <div className="space-y-3">
+        {layers.map((layer) => (
+          <LayerSection key={layer.id} layer={layer} />
+        ))}
+      </div>
+    </Card>
+  );
+};
+
+const LayerSection: React.FC<{ layer: LayerItem }> = ({ layer }) => {
+  const Icon = layer.icon;
+  return (
+    <details className="overflow-hidden rounded-lg border border-border/60 bg-base/70" open={layer.defaultOpen}>
+      <summary className="cursor-pointer list-none">
+        <div className="flex flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between">
+          <div className="flex min-w-0 items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-surface">
+              <Icon className="h-5 w-5 text-cyan" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-semibold text-foreground">{layer.title}</h2>
+                <Badge variant={layer.statusVariant}>{layer.status}</Badge>
+              </div>
+              <p className="mt-1 text-xs text-secondary-text">{layer.subtitle}</p>
+              <p className="mt-2 text-sm leading-6 text-foreground">{layer.summary}</p>
+            </div>
+          </div>
+          {layer.metrics.length ? (
+            <div className="grid min-w-[260px] grid-cols-2 gap-2">
+              {layer.metrics.slice(0, 4).map((item) => (
+                <TraceMeta key={`${layer.id}-${item.label}`} label={item.label} value={item.value} />
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </summary>
+      <div className="border-t border-border/60 p-4">
+        {layer.metrics.length > 4 ? (
+          <div className="mb-4 grid gap-2 md:grid-cols-4">
+            {layer.metrics.slice(4).map((item) => (
+              <TraceMeta key={`${layer.id}-${item.label}`} label={item.label} value={item.value} />
+            ))}
+          </div>
+        ) : null}
+        {layer.details}
+      </div>
+    </details>
+  );
+};
+
 const ContextSummaryPanel: React.FC<{ result: AgentTraceRunResponse }> = ({ result }) => {
   const summary = (result.context_summary || {}) as {
     context_error?: unknown;
@@ -797,6 +948,127 @@ const ContextSummaryPanel: React.FC<{ result: AgentTraceRunResponse }> = ({ resu
             <p className="mt-3 text-sm text-secondary-text">目标股票没有命中当前持仓。</p>
           )}
           {investor.notes ? <p className="mt-3 text-xs text-muted-text">{String(investor.notes)}</p> : null}
+        </div>
+      </div>
+    </Card>
+  );
+};
+
+const RiskGatePanel: React.FC<{ result: AgentTraceRunResponse }> = ({ result }) => {
+  const payload = asRecord(result.risk_gate);
+  if (!payload) return null;
+
+  const tradePlan = asRecord(payload.trade_plan) || {};
+  const gate = asRecord(payload.risk_gate) || {};
+  const quote = asRecord(payload.quote);
+  const status = String(gate.status || '-');
+  const statusMeta = getRiskGateStatusMeta(status);
+  const checks = toRecordList(gate.checks);
+  const failedChecks = checks.filter((check) => check.passed === false);
+  const blockedReasons = toStringList(gate.blocked_reasons);
+  const warnings = toStringList(gate.warnings);
+
+  return (
+    <Card title="Risk Gate" subtitle="Deterministic A-share Guard" padding="md" className="rounded-lg">
+      {payload.error ? (
+        <div className="mb-3 rounded-lg border border-danger/30 bg-danger/10 p-3 text-sm text-danger">
+          {String(payload.error)}
+        </div>
+      ) : null}
+
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+        <div className="rounded-lg border border-border/60 bg-base p-3 xl:col-span-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <ShieldCheck className={cn('h-5 w-5 shrink-0', statusMeta.iconClass)} />
+              <div className="min-w-0">
+                <p className="text-[11px] text-muted-text">状态</p>
+                <p className={cn('mt-1 truncate text-lg font-semibold', statusMeta.textClass)}>
+                  {statusMeta.label}
+                </p>
+              </div>
+            </div>
+            <Badge variant={statusMeta.badge}>{status || '-'}</Badge>
+          </div>
+        </div>
+        <TraceMeta label="原动作" value={String(gate.original_action || tradePlan.action || '-')} />
+        <TraceMeta label="允许动作" value={String(gate.allowed_action || '-')} />
+        <TraceMeta label="来源" value={String(payload.source || '-')} />
+        <TraceMeta label="人工确认" value={gate.required_manual_review ? '需要' : '不需要'} />
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)_minmax(0,1fr)]">
+        <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+          <TracePanelTitle icon={ClipboardList} title="TradePlan" />
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <TraceMeta label="Symbol" value={String(tradePlan.symbol || '-')} />
+            <TraceMeta label="Action" value={String(tradePlan.action || '-')} />
+            <TraceMeta label="Order" value={String(tradePlan.order_type || '-')} />
+            <TraceMeta label="目标仓位" value={formatPercent(tradePlan.target_position_pct)} />
+            <TraceMeta label="止损价" value={formatNumber(tradePlan.stop_loss_price)} />
+            <TraceMeta label="止损幅度" value={formatPercent(tradePlan.stop_loss_pct)} />
+          </div>
+          <KeyValueList label="失效条件" items={toStringList(tradePlan.invalidation_conditions)} />
+          <KeyValueList label="复查触发" items={toStringList(tradePlan.review_triggers)} />
+          {quote ? (
+            <div className="mt-3 rounded-lg border border-border/60 bg-surface p-3">
+              <p className="text-xs font-medium uppercase tracking-wide text-secondary-text">Quote</p>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <TraceMeta label="Last Price" value={formatNumber(quote.last_price)} />
+                <TraceMeta label="Pct Change" value={formatPercent(quote.pct_change)} />
+                <TraceMeta label="涨停" value={quote.is_limit_up ? '是' : '否'} />
+                <TraceMeta label="跌停" value={quote.is_limit_down ? '是' : '否'} />
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+          <TracePanelTitle icon={ShieldCheck} title="规则检查" />
+          {checks.length ? (
+            <div className="mt-3 space-y-2">
+              {checks.map((check, index) => {
+                const passed = check.passed === true;
+                const severity = String(check.severity || '-');
+                return (
+                  <div
+                    key={`${String(check.rule_id || 'rule')}-${index}`}
+                    className={cn(
+                      'rounded-lg border p-3',
+                      passed ? 'border-success/20 bg-success/5' : severity === 'blocking' ? 'border-danger/25 bg-danger/10' : 'border-warning/25 bg-warning/10',
+                    )}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-mono text-xs font-medium text-foreground">{String(check.rule_id || '-')}</span>
+                      <Badge variant={passed ? 'success' : severity === 'blocking' ? 'danger' : 'warning'}>
+                        {passed ? 'PASS' : severity}
+                      </Badge>
+                    </div>
+                    <p className="mt-2 text-sm leading-6 text-secondary-text">{String(check.message || '-')}</p>
+                    {check.suggested_action ? (
+                      <p className="mt-2 text-xs text-muted-text">建议动作：{String(check.suggested_action)}</p>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-secondary-text">没有规则检查结果。</p>
+          )}
+        </div>
+
+        <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+          <TracePanelTitle icon={AlertTriangle} title="风控结论" />
+          <div className="mt-3 rounded-lg border border-border/60 bg-surface p-3">
+            <p className="text-sm leading-6 text-foreground">
+              {buildRiskGateSummary(gate, failedChecks.length)}
+            </p>
+          </div>
+          <KeyValueList label="阻断原因" items={blockedReasons} />
+          <KeyValueList label="警告" items={warnings} />
+          {!blockedReasons.length && !warnings.length ? (
+            <p className="mt-3 text-sm text-secondary-text">未记录阻断原因或警告。</p>
+          ) : null}
         </div>
       </div>
     </Card>
@@ -1054,6 +1326,71 @@ const VERDICT_TONES: Record<string, string> = {
   insufficient_data: 'border-border bg-surface text-secondary-text',
 };
 
+const getRiskGateStatusMeta = (status: string): {
+  label: string;
+  badge: 'success' | 'danger' | 'warning' | 'info' | 'default';
+  textClass: string;
+  iconClass: string;
+} => {
+  if (status === 'passed') {
+    return {
+      label: '通过',
+      badge: 'success',
+      textClass: 'text-success',
+      iconClass: 'text-success',
+    };
+  }
+  if (status === 'blocked') {
+    return {
+      label: '阻断',
+      badge: 'danger',
+      textClass: 'text-danger',
+      iconClass: 'text-danger',
+    };
+  }
+  if (status === 'manual_review') {
+    return {
+      label: '人工确认',
+      badge: 'warning',
+      textClass: 'text-warning',
+      iconClass: 'text-warning',
+    };
+  }
+  if (status === 'downgraded') {
+    return {
+      label: '降级',
+      badge: 'warning',
+      textClass: 'text-warning',
+      iconClass: 'text-warning',
+    };
+  }
+  return {
+    label: status || '-',
+    badge: 'default',
+    textClass: 'text-secondary-text',
+    iconClass: 'text-secondary-text',
+  };
+};
+
+const buildRiskGateSummary = (gate: Record<string, unknown>, failedCount: number): string => {
+  const status = String(gate.status || '-');
+  const originalAction = String(gate.original_action || '-');
+  const allowedAction = String(gate.allowed_action || '-');
+  if (status === 'passed') {
+    return `风控通过，允许动作保持为 ${allowedAction}。`;
+  }
+  if (status === 'blocked') {
+    return `风控阻断：原动作 ${originalAction} 被改为 ${allowedAction}，失败规则 ${failedCount} 条。`;
+  }
+  if (status === 'manual_review') {
+    return `需要人工确认：原动作 ${originalAction} 不能直接执行，当前允许动作 ${allowedAction}。`;
+  }
+  if (status === 'downgraded') {
+    return `动作已降级：原动作 ${originalAction} 调整为 ${allowedAction}，失败规则 ${failedCount} 条。`;
+  }
+  return '暂无明确风控结论。';
+};
+
 const DimensionAssessmentGrid: React.FC<{ items: Record<string, unknown>[] }> = ({ items }) => (
   <div className="mt-3 grid gap-2">
     {items.map((item, index) => {
@@ -1133,6 +1470,804 @@ const SessionOutputsPanel: React.FC<{ debate: Record<string, unknown>; finalCont
   );
 };
 
+const buildLayerItems = (
+  result: AgentTraceRunResponse,
+  statusMessage: string,
+  traceStatus: TraceStatus,
+  selectedEventIndex: number,
+  onSelectEvent: (index: number) => void,
+  selectedToolIndex: number,
+  onSelectTool: (index: number) => void,
+): LayerItem[] => {
+  const planner = asRecord(result.planner) || {};
+  const stockSelection = asRecord(result.stock_selection);
+  const selectionContext = asRecord(stockSelection?.selection_context);
+  const finalReport = asRecord(stockSelection?.final_report_json);
+  const debate = asRecord(result.debate);
+  const riskPayload = asRecord(result.risk_gate);
+  const riskGate = asRecord(riskPayload?.risk_gate);
+  const tradePlan = asRecord(riskPayload?.trade_plan);
+  const selectedEvent = result.events[selectedEventIndex] || null;
+  const selectedTool = result.tool_calls[selectedToolIndex] || null;
+
+  const dataTools = result.tool_calls.filter((call) => isDataTool(call.tool));
+  const candidateTool = result.tool_calls.find((call) => call.tool === 'discover_watchlist_candidates');
+  const evidenceTools = result.tool_calls.filter((call) => !isCandidateTool(call.tool));
+  const failedTools = result.tool_calls.filter((call) => call.success === false);
+  const toolDoneEvents = result.events.filter((event) => event.type === 'tool_done');
+  const thinkingEvents = result.events.filter((event) => event.type === 'thinking' || event.type === 'generating' || String(event.type || '').startsWith('debate_'));
+
+  const candidateDiscovery = asRecord(finalReport?.candidate_discovery);
+  const discoverySummary = asRecord(candidateDiscovery?.summary) || asRecord(asRecord(asRecord(selectionContext?.stages)?.candidate_discovery)?.summary) || {};
+  const candidateRows = extractCandidateRows(finalReport, selectionContext, candidateTool, discoverySummary);
+  const candidateCodes = candidateRows.length
+    ? candidateRows.map((candidate) => candidate.code).filter(Boolean)
+    : toStringList(discoverySummary.candidate_codes);
+  const candidateAudit = buildCandidateAudit(finalReport, selectionContext, candidateTool, result.tool_calls, candidateRows, discoverySummary);
+  const candidateSources = extractCandidateSources(candidateTool?.result_preview, discoverySummary);
+  for (const candidate of candidateRows) {
+    if (candidate.source) candidateSources.push(candidate.source);
+    candidate.recallSources.forEach((source) => candidateSources.push(source));
+  }
+  const uniqueCandidateSources = uniqueStrings(candidateSources);
+  const translatedCandidateSources = translateList(uniqueCandidateSources);
+  const judgeDecision = asRecord(debate?.judge_decision);
+  const selectionJudge = asRecord(asRecord(finalReport?.judge_decision)?.summary);
+  const decisionAction = String(judgeDecision?.final_action || selectionJudge?.final_action || '-');
+  const signalSummary = buildSignalSummary(result, finalReport, debate);
+
+  return [
+    {
+      id: 'l1',
+      title: 'L1 Data & Candidate Layer / 数据与候选池层',
+      subtitle: '候选列表、召回策略、数据工具调用和结果预览',
+      status: candidateTool || candidateRows.length || dataTools.length ? 'ready' : traceStatus === 'running' ? 'waiting' : 'empty',
+      statusVariant: failedTools.some((tool) => isDataTool(tool.tool) || isCandidateTool(tool.tool)) ? 'danger' : candidateTool || candidateRows.length || dataTools.length ? 'success' : 'warning',
+      icon: Database,
+      summary: candidateRows.length
+        ? `候选池已形成 ${candidateRows.length} 只股票，并记录 ${dataTools.length} 次数据层工具调用；当前状态：${statusMessage}`
+        : dataTools.length
+          ? `已记录 ${dataTools.length} 次数据层工具调用；当前状态：${statusMessage}`
+          : '本次暂未看到候选池或数据层工具调用。',
+      metrics: [
+        { label: '候选数', value: String(candidateCodes.length || '-') },
+        { label: '召回源', value: translatedCandidateSources.length ? translatedCandidateSources.join('、') : '-' },
+        { label: '数据工具', value: String(dataTools.length) },
+        { label: '失败', value: String(dataTools.filter((tool) => !tool.success).length) },
+      ],
+      details: (
+        <div className="space-y-4">
+          <CandidateSourceAuditPanel audit={candidateAudit} />
+          <CandidatePoolTable candidates={candidateRows} fallbackCodes={candidateCodes} />
+          <div className="space-y-3 rounded-lg border border-border/60 bg-base/70 p-3">
+            <TracePanelTitle icon={Target} title="候选池设计" />
+            <p className="text-sm leading-6 text-secondary-text">
+              当前设计是多路召回 + 统一评分：用户候选优先；未提供股票时，Sequoia 策略、强势板块成分股等通道一起进入候选池，再合并去重和打分。候选只代表值得继续取证，不代表买入。
+            </p>
+            <ChipList label="候选股票" items={candidateCodes.slice(0, 16)} />
+            <ChipList label="召回来源" items={translatedCandidateSources} />
+          </div>
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.85fr)]">
+            <LayerToolList title="L1 数据工具调用" tools={dataTools} onSelectTool={onSelectTool} selectedToolIndex={selectedToolIndex} allTools={result.tool_calls} />
+            <LayerToolPreview tool={isDataTool(selectedTool?.tool || '') ? selectedTool : dataTools[0]} emptyText="本次没有数据层工具调用。" />
+          </div>
+          <details className="rounded-lg border border-border/60 bg-base/70">
+            <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-foreground">
+              原始候选工具载荷
+            </summary>
+            <div className="border-t border-border/60 p-3">
+              <LayerToolPreview tool={candidateTool} emptyText="本次没有 discover_watchlist_candidates 调用。" />
+            </div>
+          </details>
+        </div>
+      ),
+      defaultOpen: true,
+    },
+    {
+      id: 'l2',
+      title: 'L2 Evidence Layer / 证据取证层',
+      subtitle: 'SSE 流、工具调用、参数和结果预览',
+      status: result.tool_calls.length ? 'streaming' : traceStatus === 'running' ? 'waiting' : 'empty',
+      statusVariant: failedTools.length ? 'danger' : result.tool_calls.length ? 'success' : 'warning',
+      icon: Radio,
+      summary: `已记录 ${result.events.length} 个 SSE 事件、${result.tool_calls.length} 次工具调用，失败工具 ${failedTools.length} 个。`,
+      metrics: [
+        { label: 'SSE Events', value: String(result.events.length) },
+        { label: 'Tool Done', value: String(toolDoneEvents.length) },
+        { label: 'Failed', value: String(failedTools.length) },
+        { label: 'Selected', value: selectedTool?.tool || '-' },
+      ],
+      details: (
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.9fr)]">
+          <LayerToolList title="证据工具调用" tools={evidenceTools} onSelectTool={onSelectTool} selectedToolIndex={selectedToolIndex} allTools={result.tool_calls} />
+          <div className="space-y-4">
+            <LayerToolPreview tool={selectedTool} emptyText="选择一个工具查看参数和结果预览。" />
+            <LayerEventDetail event={selectedEvent} />
+          </div>
+          <div className="xl:col-span-2">
+            <LayerEventList title="实时 SSE 流" events={result.events} onSelectEvent={onSelectEvent} selectedEventIndex={selectedEventIndex} />
+          </div>
+        </div>
+      ),
+      defaultOpen: true,
+    },
+    {
+      id: 'l3',
+      title: 'L3 Signal Layer / 信号层',
+      subtitle: '把证据压缩成方向、置信度、冲突点和证据缺口',
+      status: signalSummary.status,
+      statusVariant: signalSummary.variant,
+      icon: Activity,
+      summary: signalSummary.summary,
+      metrics: signalSummary.metrics,
+      details: (
+        <div className="grid gap-4 xl:grid-cols-2">
+          <LayerSignalDimension title="信号维度" items={signalSummary.dimensions} />
+          <LayerJsonBlock title="结构化信号来源" data={signalSummary.raw} emptyText="暂无结构化信号；当前可能仍停留在证据或普通报告阶段。" />
+        </div>
+      ),
+    },
+    {
+      id: 'l4',
+      title: 'L4 Decision Layer / 决策层',
+      subtitle: 'Primary/Opposing/Judge 与最终动作',
+      status: decisionAction !== '-' ? decisionAction : 'pending',
+      statusVariant: decisionAction !== '-' ? 'success' : 'warning',
+      icon: BrainCircuit,
+      summary: String(judgeDecision?.decision_summary || selectionJudge?.decision_summary || '等待 Judge 或最终输出生成裁决。'),
+      metrics: [
+        { label: 'Intent', value: String(planner.intent || '-') },
+        { label: 'Final Action', value: decisionAction },
+        { label: 'Debate', value: debate ? String(debate.success === true ? 'success' : 'partial') : '-' },
+        { label: 'Thinking Events', value: String(thinkingEvents.length) },
+      ],
+      details: (
+        <div className="grid gap-4 xl:grid-cols-2">
+          <LayerJsonBlock title="Planner" data={planner} emptyText="等待 planner_ready SSE 事件。" />
+          <LayerJsonBlock title="Judge Decision" data={judgeDecision || selectionJudge || null} emptyText="暂无 Judge 裁决。" />
+          <LayerEventList title="模型阶段事件" events={thinkingEvents} onSelectEvent={onSelectEvent} />
+          <LayerJsonBlock title="Debate Raw" data={debate} emptyText="暂无 Debate 数据。" />
+        </div>
+      ),
+    },
+    {
+      id: 'l5',
+      title: 'L5 Risk Gate Layer / 风控闸门层',
+      subtitle: '确定性规则阻断、降级或放行',
+      status: String(riskGate?.status || 'not-run'),
+      statusVariant: getLayerStatusVariant(String(riskGate?.status || 'not-run')),
+      icon: ShieldCheck,
+      summary: riskGate ? buildRiskGateSummary(riskGate, toRecordList(riskGate.checks).filter((check) => check.passed === false).length) : '本次尚未生成 risk_gate，可能仍在执行中或当前链路未形成 TradePlan。',
+      metrics: [
+        { label: 'Status', value: String(riskGate?.status || '-') },
+        { label: 'Original', value: String(riskGate?.original_action || '-') },
+        { label: 'Allowed', value: String(riskGate?.allowed_action || '-') },
+        { label: 'Checks', value: String(toRecordList(riskGate?.checks).length) },
+      ],
+      details: (
+        <div className="grid gap-4 xl:grid-cols-2">
+          <LayerJsonBlock title="Risk Gate" data={riskGate} emptyText="暂无风控闸门结果。" />
+          <LayerJsonBlock title="Trade Plan Input" data={tradePlan} emptyText="暂无交易方案输入。" />
+        </div>
+      ),
+    },
+    {
+      id: 'l6',
+      title: 'L6 Plan Layer / 方案层',
+      subtitle: 'TradePlan、入场区间、止损和复查触发',
+      status: tradePlan ? 'available' : 'pending',
+      statusVariant: tradePlan ? 'success' : 'warning',
+      icon: ClipboardCheck,
+      summary: tradePlan ? `已生成 ${String(tradePlan.symbol || '-')} 的 ${String(tradePlan.action || '-')} 方案。` : '等待 L5 裁决和 L6 风控后形成机器可读方案。',
+      metrics: [
+        { label: 'Symbol', value: String(tradePlan?.symbol || '-') },
+        { label: 'Action', value: String(tradePlan?.action || '-') },
+        { label: 'Order', value: String(tradePlan?.order_type || '-') },
+        { label: 'Target', value: formatPercent(tradePlan?.target_position_pct) },
+      ],
+      details: <LayerJsonBlock title="TradePlan" data={tradePlan} emptyText="暂无 TradePlan。" />,
+    },
+    {
+      id: 'l7',
+      title: 'L7 Execution & Tracking Layer / 托管跟踪层',
+      subtitle: '模拟盘托管、执行状态和跟踪反馈',
+      status: 'planned',
+      statusVariant: 'info',
+      icon: Gauge,
+      summary: '当前前端只展示方案和风控结果；模拟盘托管状态机还未接入本页。',
+      metrics: [
+        { label: '托管状态', value: '未接入' },
+        { label: 'Artifact', value: result.artifact_dir ? 'ready' : '-' },
+        { label: 'Session', value: result.session_id || '-' },
+        { label: 'Mode', value: result.mode || '-' },
+      ],
+      details: (
+        <div className="space-y-3 text-sm leading-6 text-secondary-text">
+          <p>后续这里应展示方案是否已进入模拟盘、是否触发入场/止损/复查条件、当前收益回撤和偏离原因。</p>
+          <LayerJsonBlock title="Artifact Location" data={{ artifact_dir: result.artifact_dir, session_id: result.session_id }} emptyText="暂无 artifact。" />
+        </div>
+      ),
+    },
+    {
+      id: 'l8',
+      title: 'L8 Learning Layer / 复盘进化层',
+      subtitle: 'Graphiti 记忆、回测、自进化候选',
+      status: result.artifact_dir ? 'trace-saved' : 'pending',
+      statusVariant: result.artifact_dir ? 'success' : 'warning',
+      icon: FileText,
+      summary: '当前层展示 Trace 落盘与复盘入口；策略库、回测和自进化提案会在后续接入。',
+      metrics: [
+        { label: 'Trace', value: result.artifact_dir ? 'saved' : '-' },
+        { label: 'Tokens', value: String(result.total_tokens || 0) },
+        { label: 'History', value: result.session_id ? 'available' : '-' },
+        { label: 'Graphiti', value: '按后端配置' },
+      ],
+      details: (
+        <div className="grid gap-4 xl:grid-cols-2">
+          <LayerJsonBlock title="Session Summary" data={{
+            session_id: result.session_id,
+            artifact_dir: result.artifact_dir,
+            total_steps: result.total_steps,
+            total_tokens: result.total_tokens,
+            model: result.model,
+          }} emptyText="暂无 session summary。" />
+          <div className="rounded-lg border border-border/60 bg-surface p-3 text-sm leading-6 text-secondary-text">
+            复盘层后续应消费 `final.md`、`tool_calls.json`、`evidence_ledger.json`、`risk_gate.json`、`stock_selection.json` 和 Graphiti episode，形成可回测和可改进的策略经验。
+          </div>
+        </div>
+      ),
+    },
+  ];
+};
+
+const LayerJsonBlock: React.FC<{ title: string; data: unknown; emptyText: string }> = ({ title, data, emptyText }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Braces} title={title} />
+    {data ? (
+      <div className="mt-3">
+        <JsonViewer data={data as Record<string, unknown>} maxHeight="420px" />
+      </div>
+    ) : (
+      <p className="mt-3 text-sm text-secondary-text">{emptyText}</p>
+    )}
+  </div>
+);
+
+const LayerToolList: React.FC<{
+  title: string;
+  tools: AgentTraceToolCall[];
+  allTools: AgentTraceToolCall[];
+  selectedToolIndex: number;
+  onSelectTool: (index: number) => void;
+}> = ({ title, tools, allTools, selectedToolIndex, onSelectTool }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Wrench} title={title} />
+    <div className="mt-3 max-h-[360px] overflow-y-auto rounded-lg border border-border/60">
+      {tools.length ? tools.map((tool) => {
+        const globalIndex = allTools.indexOf(tool);
+        return (
+          <button
+            key={getToolCallKey(tool, globalIndex)}
+            type="button"
+            onClick={() => onSelectTool(Math.max(0, globalIndex))}
+            className={cn(
+              'grid w-full grid-cols-[48px_minmax(130px,1fr)_72px_76px] items-center gap-2 border-b border-border/40 px-3 py-2 text-left text-xs hover:bg-hover',
+              selectedToolIndex === globalIndex ? 'bg-cyan/10' : '',
+            )}
+          >
+            <span className="text-secondary-text">{tool.step}</span>
+            <span className="truncate font-medium text-foreground">{tool.tool}</span>
+            <Badge variant={tool.success ? 'success' : 'danger'}>{tool.success ? 'OK' : 'FAIL'}</Badge>
+            <span className="text-secondary-text">{formatDuration(tool.duration)}</span>
+          </button>
+        );
+      }) : (
+        <p className="p-3 text-sm text-secondary-text">暂无工具调用。</p>
+      )}
+    </div>
+  </div>
+);
+
+const LayerToolPreview: React.FC<{ tool?: AgentTraceToolCall | null; emptyText: string }> = ({ tool, emptyText }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Wrench} title="Tool Payload" />
+    {tool ? (
+      <div className="mt-3 space-y-3">
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <TraceMeta label="Tool" value={tool.tool} />
+          <TraceMeta label="Status" value={tool.success ? 'OK' : 'FAIL'} />
+          <TraceMeta label="Step" value={String(tool.step)} />
+          <TraceMeta label="Duration" value={formatDuration(tool.duration)} />
+        </div>
+        <JsonViewer data={(tool.arguments || {}) as Record<string, unknown>} maxHeight="180px" />
+        <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border/60 bg-surface p-3 text-xs leading-5 text-secondary-text">
+          {tool.result_preview || '无结果预览'}
+        </pre>
+      </div>
+    ) : (
+      <p className="mt-3 text-sm text-secondary-text">{emptyText}</p>
+    )}
+  </div>
+);
+
+const LayerEventList: React.FC<{
+  title: string;
+  events: AgentTraceRunResponse['events'];
+  selectedEventIndex?: number;
+  onSelectEvent: (index: number) => void;
+}> = ({ title, events, selectedEventIndex, onSelectEvent }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Radio} title={title} />
+    <div className="mt-3 max-h-[360px] overflow-y-auto rounded-lg border border-border/60">
+      {events.length ? events.map((event, localIndex) => (
+        <button
+          key={`${event.type}-${localIndex}-${event.step ?? ''}`}
+          type="button"
+          onClick={() => onSelectEvent(localIndex)}
+          className={cn(
+            'grid w-full grid-cols-[120px_minmax(140px,1fr)_70px] gap-2 border-b border-border/40 px-3 py-2 text-left text-xs hover:bg-hover',
+            selectedEventIndex === localIndex ? 'bg-cyan/10' : '',
+          )}
+        >
+          <span className="truncate font-medium text-foreground">{event.type}</span>
+          <span className="truncate text-secondary-text">{event.message || event.display_name || event.tool || '-'}</span>
+          <span className="text-secondary-text">#{event.step ?? '-'}</span>
+        </button>
+      )) : (
+        <p className="p-3 text-sm text-secondary-text">暂无 SSE 事件。</p>
+      )}
+    </div>
+  </div>
+);
+
+const LayerEventDetail: React.FC<{ event?: AgentTraceRunResponse['events'][number] | null }> = ({ event }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Route} title="Selected SSE Event" />
+    {event ? (
+      <div className="mt-3">
+        <JsonViewer data={event} maxHeight="320px" />
+      </div>
+    ) : (
+      <p className="mt-3 text-sm text-secondary-text">选择一个 SSE 事件查看完整载荷。</p>
+    )}
+  </div>
+);
+
+const LayerSignalDimension: React.FC<{ title: string; items: Array<{ label: string; value: string; tone?: string }> }> = ({ title, items }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Activity} title={title} />
+    {items.length ? (
+      <div className="mt-3 grid gap-2">
+        {items.map((item) => (
+          <div key={item.label} className="rounded-lg border border-border/60 bg-surface p-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm font-medium text-foreground">{item.label}</span>
+              <span className={cn('text-xs font-medium', item.tone || 'text-secondary-text')}>{item.value}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    ) : (
+      <p className="mt-3 text-sm text-secondary-text">暂无可视化信号维度。</p>
+    )}
+  </div>
+);
+
+const CandidateSourceAuditPanel: React.FC<{ audit: CandidateAudit }> = ({ audit }) => (
+  <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+    <TracePanelTitle icon={Database} title="候选来源审计" />
+    <p className="mt-3 text-sm leading-6 text-foreground">
+      {buildCandidateAuditSummary(audit)}
+    </p>
+    <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+      <TraceMeta label="候选来源模式" value={translateCandidateSource(audit.candidateSource)} />
+      <TraceMeta label="召回步骤" value={String(audit.discoverySteps.length || '-')} />
+      <TraceMeta label="候选股票" value={String(audit.candidateRows.length || '-')} />
+      <TraceMeta label="深挖目标" value={audit.deepDiveTargets.length ? audit.deepDiveTargets.join(', ') : '-'} />
+    </div>
+    <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
+      <div className="space-y-3">
+        <TracePanelTitle icon={Route} title="召回路径" />
+        {audit.discoverySteps.length ? (
+          <div className="space-y-2">
+            {audit.discoverySteps.map((step, index) => (
+              <div key={`${String(step.source || 'step')}-${index}`} className="rounded-lg border border-border/60 bg-surface p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-foreground">{translateCandidateSource(String(step.source || '-'))}</span>
+                  <Badge variant={String(step.status || '') === 'ok' ? 'success' : String(step.status || '') === 'empty' ? 'warning' : String(step.status || '') === 'failed' ? 'danger' : 'default'}>
+                    {String(step.status || '-')}
+                  </Badge>
+                </div>
+                <div className="mt-2 grid gap-2 md:grid-cols-2">
+                  {step.count != null ? <TraceMeta label="数量" value={String(step.count)} /> : null}
+                  {step.sector ? <TraceMeta label="板块" value={String(step.sector)} /> : null}
+                  {Array.isArray(step.strategy_names) && step.strategy_names.length ? (
+                    <TraceMeta label="策略" value={translateList(step.strategy_names.map(String)).join('、')} />
+                  ) : null}
+                  {Array.isArray(step.sectors) && step.sectors.length ? (
+                    <TraceMeta label="强势板块" value={step.sectors.map(String).join(', ')} />
+                  ) : null}
+                  {step.db_path ? <TraceMeta label="数据源" value={String(step.db_path)} /> : null}
+                  {step.error ? <TraceMeta label="错误" value={String(step.error)} /> : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-secondary-text">本次没有候选发现工具的召回步骤，可能是单股分析或用户直接提供了股票。</p>
+        )}
+      </div>
+    </div>
+  </div>
+);
+
+const CandidatePoolTable: React.FC<{ candidates: CandidatePoolRow[]; fallbackCodes: string[] }> = ({ candidates, fallbackCodes }) => {
+  const rows: CandidatePoolRow[] = candidates.length
+    ? candidates
+    : fallbackCodes.map((code) => ({
+      code,
+      name: '',
+      source: '',
+      recallSources: [],
+      matchedStrategies: [],
+      strategyTags: [],
+      reason: '',
+      latestDate: '',
+      metrics: null,
+    }));
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-base/70 p-3">
+      <TracePanelTitle icon={Target} title="候选池列表" />
+      <div className="mt-3 overflow-x-auto rounded-lg border border-border/60">
+        <div className="grid min-w-[980px] grid-cols-[180px_72px_190px_220px_minmax(260px,1fr)] border-b border-border/60 bg-surface px-3 py-2 text-xs font-medium text-secondary-text">
+          <span>股票代码 / 名称</span>
+          <span>分数</span>
+          <span>入池来源</span>
+          <span>策略标签</span>
+          <span>候选理由与证据</span>
+        </div>
+        {rows.length ? rows.map((candidate, index) => {
+          const strategies = uniqueStrings([...candidate.matchedStrategies, ...candidate.strategyTags]);
+          const sources = uniqueStrings([candidate.source, ...candidate.recallSources].filter(Boolean));
+          return (
+            <div
+              key={`${candidate.code}-${index}`}
+              className="grid min-w-[980px] grid-cols-[180px_72px_190px_220px_minmax(260px,1fr)] gap-3 border-b border-border/40 px-3 py-3 text-sm"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-mono font-semibold text-foreground">{candidate.code || '-'}</p>
+                <p className="mt-1 truncate text-xs text-secondary-text">{candidate.name || candidate.latestDate || '-'}</p>
+              </div>
+              <div className="text-sm font-semibold text-foreground">
+                {typeof candidate.signalScore === 'number' ? formatNumber(candidate.signalScore) : '-'}
+              </div>
+              <div className="min-w-0">
+                <MiniChipList items={sources.length ? translateList(sources) : ['-']} />
+              </div>
+              <div className="min-w-0">
+                <MiniChipList items={strategies.length ? translateList(strategies) : ['-']} />
+              </div>
+              <div className="min-w-0 space-y-2">
+                <p className="text-sm leading-6 text-foreground">{translateCandidateReason(candidate.reason) || '缺少结构化候选理由，仅保留候选代码。'}</p>
+                {candidate.metrics ? (
+                  <details className="rounded-md border border-border/60 bg-surface">
+                    <summary className="cursor-pointer px-2 py-1 text-xs font-medium text-secondary-text">
+                      证据指标
+                    </summary>
+                    <div className="border-t border-border/60 p-2">
+                      <JsonViewer data={candidate.metrics} maxHeight="220px" />
+                    </div>
+                  </details>
+                ) : null}
+              </div>
+            </div>
+          );
+        }) : (
+          <p className="p-4 text-sm text-secondary-text">本次没有形成候选池列表。</p>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const MiniChipList: React.FC<{ items: string[] }> = ({ items }) => (
+  <div className="flex flex-wrap gap-1.5">
+    {items.slice(0, 8).map((item) => (
+      <span key={item} className="max-w-full truncate rounded-md border border-border/70 bg-surface px-2 py-1 text-[11px] text-secondary-text">
+        {item}
+      </span>
+    ))}
+    {items.length > 8 ? (
+      <span className="rounded-md border border-border/70 bg-surface px-2 py-1 text-[11px] text-muted-text">
+        +{items.length - 8}
+      </span>
+    ) : null}
+  </div>
+);
+
+const isCandidateTool = (tool: string): boolean => tool === 'discover_watchlist_candidates';
+
+const isDataTool = (tool: string): boolean => (
+  tool.startsWith('get_')
+  || tool.includes('quote')
+  || tool.includes('capital')
+  || tool.includes('news')
+  || tool.includes('chip')
+  || tool.includes('history')
+) && !isCandidateTool(tool);
+
+const getToolResultPayload = (tool?: AgentTraceToolCall): Record<string, unknown> | null => {
+  const structured = asRecord(tool?.result_json);
+  if (structured) return structured;
+  return parseJsonObject(tool?.result_preview);
+};
+
+const extractCandidateSources = (preview: unknown, summary: Record<string, unknown>): string[] => {
+  const sources = new Set<string>();
+  for (const item of toStringList(summary.candidate_sources)) sources.add(item);
+  if (typeof preview === 'string') {
+    if (preview.includes('sequoia')) sources.add('sequoia');
+    if (preview.includes('sector') || preview.includes('akshare')) sources.add('sector');
+    if (preview.includes('fallback')) sources.add('fallback');
+    if (preview.includes('user_seed')) sources.add('user_seed');
+  }
+  return Array.from(sources);
+};
+
+const CANDIDATE_SOURCE_LABELS: Record<string, string> = {
+  multi_recall: '多路召回',
+  sequoia: '量化策略池',
+  'sequoia:multi_strategy': '量化多策略共振',
+  sector: '强势板块',
+  sector_constituents: '强势板块成分股',
+  get_sector_rankings: '板块强弱排名',
+  fallback: '固定兜底候选池',
+  fallback_seed_pool: '固定兜底候选池',
+  user_seed: '用户指定候选',
+  industry: '行业板块',
+  concept: '概念板块',
+};
+
+const STRATEGY_LABELS: Record<string, string> = {
+  ma_volume: '均线放量突破',
+  turtle_trade: '海龟突破',
+  high_tight_flag: '高位窄幅旗形',
+  limit_up_shakeout: '涨停后洗盘',
+  uptrend_limit_down: '上升趋势跌停错杀',
+  rps_breakout: 'RPS 强势突破',
+  '强势板块': '强势板块',
+  '海龟突破': '海龟突破',
+  ma_cross: '均线金叉',
+  volume_breakout: '放量突破',
+  breakout: '突破',
+  liquidity: '流动性达标',
+  momentum: '动量强势',
+  rps: '相对强度',
+  relative_strength: '相对强势',
+  consolidation: '高位整理',
+  volume_shrink: '缩量整理',
+  limit_up: '涨停',
+  shakeout: '洗盘',
+  support_hold: '支撑未破',
+  uptrend: '上升趋势',
+  limit_down: '跌停',
+  mean_reversion: '均值回归',
+  hot_sector: '强势板块',
+};
+
+const translateCandidateSource = (value: string): string => {
+  const text = value.trim();
+  if (!text) return '-';
+  if (CANDIDATE_SOURCE_LABELS[text]) return CANDIDATE_SOURCE_LABELS[text];
+  if (text.startsWith('sequoia:')) {
+    return `量化策略：${translateStrategyName(text.split(':').pop() || '')}`;
+  }
+  if (text.startsWith('akshare:industry:')) {
+    return `行业板块：${text.replace('akshare:industry:', '')}`;
+  }
+  if (text.startsWith('akshare:concept:')) {
+    return `概念板块：${text.replace('akshare:concept:', '')}`;
+  }
+  return text;
+};
+
+const translateStrategyName = (value: string): string => {
+  const text = value.trim();
+  return STRATEGY_LABELS[text] || text || '-';
+};
+
+const translateList = (items: string[]): string[] => uniqueStrings(items.map((item) => (
+  item.includes(':') ? translateCandidateSource(item) : translateStrategyName(item)
+)));
+
+const translateCandidateReason = (reason: string): string => {
+  const text = reason.trim();
+  if (!text) return '';
+  return text.replace(/(多策略共振|多路召回共振)：([^。]+)。?/g, (_match, label: string, raw: string) => {
+    const translated = String(raw)
+      .split(/[,，+＋]/)
+      .map((item) => translateStrategyName(item.trim()))
+      .filter(Boolean)
+      .join('、');
+    return `${label}：${translated}。`;
+  });
+};
+
+const buildCandidateAudit = (
+  finalReport: Record<string, unknown> | null,
+  selectionContext: Record<string, unknown> | null,
+  candidateTool: AgentTraceToolCall | undefined,
+  toolCalls: AgentTraceToolCall[],
+  candidateRows: CandidatePoolRow[],
+  discoverySummary: Record<string, unknown>,
+): CandidateAudit => {
+  const candidatePayload = getToolResultPayload(candidateTool);
+  const discoveryFull = asRecord(asRecord(finalReport?.candidate_discovery)?.full);
+  const stageDiscoveryFull = asRecord(asRecord(asRecord(selectionContext?.stages)?.candidate_discovery)?.full);
+  const discoverySteps = toRecordList(
+    candidatePayload?.discovery_steps
+    || discoveryFull?.discovery_steps
+    || stageDiscoveryFull?.discovery_steps,
+  );
+  const screeningSummary = asRecord(asRecord(finalReport?.candidate_screening)?.summary)
+    || asRecord(asRecord(asRecord(selectionContext?.stages)?.candidate_screening)?.summary)
+    || {};
+  const nextRequiredTools = uniqueStrings([
+    ...toStringList(candidatePayload?.next_required_tools),
+    ...toStringList(discoverySummary.next_required_tools),
+  ]);
+  const candidateCodes = uniqueStrings(candidateRows.map((row) => row.code));
+  const toolTargetCodes = uniqueStrings(
+    toolCalls
+      .map((call) => {
+        const args = asRecord(call.arguments) || {};
+        return String(args.stock_code || args.symbol || args.code || '');
+      })
+      .filter((code) => candidateCodes.includes(code)),
+  );
+
+  return {
+    candidateSource: String(candidatePayload?.candidate_source || discoverySummary.candidate_source || selectionContext?.candidate_strategy || ''),
+    discoverySteps,
+    nextRequiredTools,
+    deepDiveTargets: toStringList(screeningSummary.deep_dive_targets),
+    toolTargetCodes,
+    candidateRows,
+    summary: discoverySummary,
+  };
+};
+
+const buildCandidateAuditSummary = (audit: CandidateAudit): string => {
+  if (!audit.candidateRows.length) {
+    return '本次没有形成结构化候选池，因此后续单股工具不会有明确的候选来源解释。';
+  }
+  const sources = translateList(uniqueStrings(audit.candidateRows.flatMap((row) => [row.source, ...row.recallSources].filter(Boolean))));
+  const strategies = translateList(uniqueStrings(audit.candidateRows.flatMap((row) => [...row.matchedStrategies, ...row.strategyTags])));
+  return `这些具体股票先由 ${translateCandidateSource(audit.candidateSource) || '候选发现工具'} 生成候选池，作为本轮分析的待验证股票列表。当前候选 ${audit.candidateRows.length} 只，召回来源 ${sources.length ? sources.join('、') : '-'}，命中策略/标签 ${strategies.length ? strategies.join('、') : '-'}。`;
+};
+
+const extractCandidateRows = (
+  finalReport: Record<string, unknown> | null,
+  selectionContext: Record<string, unknown> | null,
+  candidateTool?: AgentTraceToolCall,
+  discoverySummary?: Record<string, unknown>,
+): CandidatePoolRow[] => {
+  const stageDiscovery = asRecord(asRecord(selectionContext?.stages)?.candidate_discovery);
+  const candidateSources = [
+    asRecord(asRecord(finalReport?.candidate_discovery)?.full)?.candidates,
+    asRecord(stageDiscovery?.full)?.candidates,
+    getToolResultPayload(candidateTool)?.candidates,
+  ];
+  for (const source of candidateSources) {
+    const rows = toRecordList(source).map(toCandidatePoolRow).filter((row) => row.code);
+    if (rows.length) return rows;
+  }
+
+  return toStringList(discoverySummary?.candidate_codes).map((code) => ({
+    code,
+    name: '',
+    source: '',
+    recallSources: [],
+    matchedStrategies: [],
+    strategyTags: [],
+    reason: '',
+    latestDate: '',
+    metrics: null,
+  }));
+};
+
+const toCandidatePoolRow = (item: Record<string, unknown>): CandidatePoolRow => {
+  const score = typeof item.signal_score === 'number'
+    ? item.signal_score
+    : typeof item.score === 'number'
+      ? item.score
+      : undefined;
+  return {
+    code: String(item.code || item.stock_code || item.symbol || ''),
+    name: String(item.name || item.stock_name || ''),
+    source: String(item.source || item.candidate_source || ''),
+    recallSources: uniqueStrings(toStringList(item.recall_sources || item.sources)),
+    matchedStrategies: uniqueStrings(toStringList(item.matched_strategies || item.strategies)),
+    strategyTags: uniqueStrings(toStringList(item.strategy_tags || item.tags)),
+    reason: String(item.reason || item.candidate_reason || item.entry_reason || ''),
+    signalScore: score,
+    latestDate: String(item.latest_date || item.trade_date || item.date || ''),
+    metrics: asRecord(item.metrics),
+  };
+};
+
+const parseJsonObject = (value: unknown): Record<string, unknown> | null => {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    return asRecord(JSON.parse(value));
+  } catch {
+    return null;
+  }
+};
+
+const buildSignalSummary = (
+  result: AgentTraceRunResponse,
+  finalReport: Record<string, unknown> | null,
+  debate: Record<string, unknown> | null,
+): {
+  status: string;
+  variant: 'success' | 'danger' | 'warning' | 'info' | 'default';
+  summary: string;
+  metrics: Array<{ label: string; value: string }>;
+  dimensions: Array<{ label: string; value: string; tone?: string }>;
+  raw: Record<string, unknown> | null;
+} => {
+  const judge = asRecord(debate?.judge_decision);
+  const dimensionAssessments = toRecordList(judge?.dimension_assessments);
+  const adversarial = asRecord(finalReport?.adversarial_review);
+  const adversarialSummary = asRecord(adversarial?.summary);
+  const gaps = toStringList(adversarialSummary?.top_evidence_gaps);
+  const risks = toStringList(adversarialSummary?.top_risk_points);
+  const dimensions = dimensionAssessments.map((item) => {
+    const dimension = String(item.dimension || '-');
+    const verdict = String(item.verdict || '-');
+    return {
+      label: DIMENSION_LABELS[dimension] || dimension,
+      value: `${verdict} · ${String(item.weight || '-')}`,
+      tone: verdict === 'supports_primary' ? 'text-success' : verdict === 'supports_opposing' ? 'text-danger' : verdict === 'insufficient_data' ? 'text-warning' : 'text-secondary-text',
+    };
+  });
+  if (!dimensions.length) {
+    for (const tool of result.tool_calls.slice(0, 8)) {
+      dimensions.push({
+        label: tool.tool,
+        value: tool.success ? 'evidence available' : 'evidence failed',
+        tone: tool.success ? 'text-success' : 'text-danger',
+      });
+    }
+  }
+  const raw = judge || adversarialSummary || null;
+  return {
+    status: dimensions.length ? 'available' : 'pending',
+    variant: gaps.length || result.tool_calls.some((tool) => !tool.success) ? 'warning' : dimensions.length ? 'success' : 'default',
+    summary: dimensions.length
+      ? `已形成 ${dimensions.length} 个可展示信号/证据维度；证据缺口 ${gaps.length} 个，风险点 ${risks.length} 个。`
+      : '等待证据进入结构化信号层。',
+    metrics: [
+      { label: 'Dimensions', value: String(dimensions.length) },
+      { label: 'Gaps', value: String(gaps.length) },
+      { label: 'Risks', value: String(risks.length) },
+      { label: 'Tools', value: String(result.tool_calls.length) },
+    ],
+    dimensions,
+    raw,
+  };
+};
+
+const getLayerStatusVariant = (status: string): 'success' | 'danger' | 'warning' | 'info' | 'default' => {
+  if (['passed', 'available', 'ready', 'recalled', 'streaming', 'trace-saved'].includes(status)) return 'success';
+  if (['blocked', 'failed', 'error'].includes(status)) return 'danger';
+  if (['manual_review', 'downgraded', 'pending', 'waiting', 'not-run', 'empty'].includes(status)) return 'warning';
+  if (['planned'].includes(status)) return 'info';
+  return 'default';
+};
+
 const formatNumber = (value: unknown): string => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -1176,6 +2311,8 @@ const toRecordList = (value: unknown): Record<string, unknown>[] => {
   return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
 };
 
+const uniqueStrings = (items: string[]): string[] => Array.from(new Set(items.map((item) => item.trim()).filter(Boolean)));
+
 const formatDateTime = (value: string): string => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -1213,6 +2350,7 @@ const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   context_summary: null,
   debate: null,
   stock_selection: null,
+  risk_gate: null,
   artifact_dir: null,
 });
 
@@ -1230,6 +2368,7 @@ const eventToToolCall = (event: TraceStreamEvent): AgentTraceToolCall => ({
   duration: typeof event.duration === 'number' ? event.duration : undefined,
   result_length: typeof event.result_length === 'number' ? event.result_length : undefined,
   result_preview: typeof event.result_preview === 'string' ? event.result_preview : undefined,
+  result_json: event.result_json,
   cached: typeof event.cached === 'boolean' ? event.cached : undefined,
   timeout: typeof event.timeout === 'boolean' ? event.timeout : undefined,
 });

@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 新增 Agent 工具能力缺口分析，梳理行情、技术、资金、消息、情绪、宏观和图谱工具边界，并提出市场情绪与地缘风险工具路线图。
 - [文档] 扩展 Agent 用户上下文计划，补充工具补全、连续对话、方案保存、模拟盘托管、自进化、回测、regime、策略库和量化交易长期路线图。
 - [文档] 重写 README，将首页说明收敛到当前私有分支的 agent-trace / planning_execute 主链路，并标注上游遗留能力为非当前维护重点。
+- [文档] 细化方案保存与模拟盘托管路线，补充 Agent 自出方案、虚拟下单、结果反馈、经验注入和自进化提案闭环。
+- [文档] 融合 A 股未来架构设计，重排 Agent 长期实现顺序为结构化信号协议、A 股硬风控、市场环境感知、L1/L2/L3 聚合、模拟盘质量校准和自进化闭环。
+- [新功能] 新增 Agent 结构化信号协议与独立 A 股 `risk_gate` 底座，覆盖 L1/L2/L3、TradePlan、T+1、涨跌停、特殊股票状态、止损、数据质量、仓位和现金约束。
+- [新功能] Agent Trace 接入确定性 `risk_gate`，运行结束后生成 `TradePlan`、落盘 `risk_gate.json`，并在 `/trace/run` 与 `/trace/stream` 完成载荷返回风控通过、阻断或降级结果。
+- [改进] Agent Trace 前端新增 `Risk Gate` 面板，展示风控状态、允许动作、TradePlan、行情状态、规则检查、阻断原因和警告。
+- [改进] 资金面工具扩展为个股主力资金、市场资金快照、北向资金和融资融券摘要，并同步更新 Planner、提示词和回归测试。
+- [修复] `get_capital_flow` 移除慢速全市场 fallback，保留真实东方财富连接错误摘要，避免个股资金流接口不可达时被笼统包装成 `capital_flow timeout`。
+- [修复] `get_capital_flow` 显式工具改用独立超时预算，并让 `get_chip_distribution` 返回结构化失败诊断，避免资金流/筹码工具失败时前端或模型误判为可用证据。
+- [新功能] `discover_watchlist_candidates` 接入 Sequoia 风格量化候选池，支持按均线放量、海龟突破、高窄旗形、涨停洗盘、上升趋势跌停和 RPS 突破生成结构化候选，并保留板块和固定种子降级路径。
+- [新功能] 新增 `scripts/update_sequoia_candidates.py`，可从 baostock 拉取 A 股最近 260 个交易日日线并落库到 Sequoia 候选池 SQLite，避免运行全量历史回填。
+- [改进] `discover_watchlist_candidates` 的 `auto` 模式改为多路召回 + 统一评分，同时合并 Sequoia 量化候选和强势板块成分股，避免硬策略未命中股票被粗筛阶段直接排除。
+- [文档] README 新增 `L1-L9` 系统分层命名规范，明确数据层、候选池层、证据层、信号层、决策层、风控闸门、方案层、托管跟踪层和复盘进化层的职责边界。
+- [改进] Agent Trace 页面新增 `Layered Trace` 可折叠视图，按 `L1-L9` 展示 Prompt 输入、上下文取数、候选池召回、SSE 流、工具调用、信号摘要、裁决、风控、TradePlan 和复盘入口。
+- [改进] Agent Trace 的 L2 候选池层改为候选股票列表视图，展示入池来源、策略标签、候选理由、评分和证据指标。
+- [改进] Agent Trace 的 L1 数据层收敛为数据工具调用视图，并将本地 `AGENT_MAX_STEPS` 示例提高到 20，降低复杂选股链路超步数概率。
+- [改进] Agent Trace 的 L1 数据层新增候选来源审计，直接展示候选股票如何由 Sequoia、强势板块、用户种子或 fallback 召回，以及为什么后续工具调用这些个股。
+- [改进] Agent Trace 将 L1 数据层与 L2 候选池层合并为 `L1 Data & Candidate Layer`，并为候选发现工具保留结构化 `result_json`，避免截断预览导致候选池无法展示。
+- [改进] Agent Trace 的候选池展示改用中文策略名、中文来源和中文候选理由，并移除 L1 中重复的候选说明块，提升可读性。
 
 
 
