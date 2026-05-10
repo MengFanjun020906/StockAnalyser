@@ -9,11 +9,13 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,10 @@ def _akshare_fund_flow_market(stock_code: str) -> str:
     if code.startswith(("43", "81", "82", "83", "87", "88", "92")):
         return "bj"
     return "sz"
+
+
+def _stockapi_code_flow_url() -> str:
+    return "https://www.stockapi.com.cn/v1/base/codeFlow"
 
 
 def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
@@ -679,9 +685,8 @@ class AkshareFundamentalAdapter:
 
     def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
         """
-        Return stock + sector capital flow.
+        Return stock capital flow.
         """
-        market = _akshare_fund_flow_market(stock_code)
         result: Dict[str, Any] = {
             "status": "not_supported",
             "stock_flow": {},
@@ -690,63 +695,106 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        eastmoney_unreachable_markers = [
-            "push2his.eastmoney.com",
-            "push2.eastmoney.com",
-            "NameResolutionError",
-            "Failed to resolve",
-        ]
-        stock_df, stock_source, stock_errors = self._call_df_candidates(
-            [
-                ("stock_individual_fund_flow", {"stock": stock_code, "market": market}),
-                ("stock_individual_fund_flow", {"stock": stock_code}),
-            ],
-            stop_error_keywords=eastmoney_unreachable_markers,
-        )
-        result["errors"].extend(stock_errors)
-        if stock_df is not None:
-            row = _extract_latest_row(stock_df, stock_code)
-            if row is not None:
-                net_inflow = _safe_float(_pick_by_keywords(row, ["主力净流入", "净流入", "净额"]))
-                inflow_5d = _safe_float(_pick_by_keywords(row, ["5日", "五日"]))
-                inflow_10d = _safe_float(_pick_by_keywords(row, ["10日", "十日"]))
-                result["stock_flow"] = {
-                    "main_net_inflow": net_inflow,
-                    "inflow_5d": inflow_5d,
-                    "inflow_10d": inflow_10d,
-                }
-                result["source_chain"].append(f"capital_stock:{stock_source}")
-
-        sector_df = None
-        sector_source = None
-        if not any(marker in " ".join(stock_errors) for marker in eastmoney_unreachable_markers):
-            sector_df, sector_source, sector_errors = self._call_df_candidates([
-                ("stock_sector_fund_flow_rank", {}),
-            ])
-            result["errors"].extend(sector_errors)
-        if sector_df is not None:
-            name_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("板块", "行业", "名称", "name"))), None)
-            flow_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("净流入", "主力", "flow", "净额"))), None)
-            if name_col and flow_col:
-                work_df = sector_df[[name_col, flow_col]].copy()
-                work_df[flow_col] = pd.to_numeric(work_df[flow_col], errors="coerce")
-                work_df = work_df.dropna(subset=[flow_col])
-                top_df = work_df.nlargest(top_n, flow_col)
-                bottom_df = work_df.nsmallest(top_n, flow_col)
-                result["sector_rankings"] = {
-                    "top": [{"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in top_df.iterrows()],
-                    "bottom": [{"name": _safe_str(r[name_col]), "net_inflow": float(r[flow_col])} for _, r in bottom_df.iterrows()],
-                }
-                result["source_chain"].append(f"capital_sector:{sector_source}")
-
-        has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
-        if has_content:
+        stockapi_flow, stockapi_source, stockapi_errors = self._get_stockapi_capital_flow(stock_code)
+        if stockapi_flow:
+            result["stock_flow"] = stockapi_flow
+            result["source_chain"].append(f"capital_stock:{stockapi_source}")
             result["status"] = "partial"
+            return result
+
+        result["errors"].extend(stockapi_errors)
+        if any(":not_supported:" in str(error) for error in stockapi_errors):
+            result["status"] = "not_supported"
         elif result["errors"]:
             result["status"] = "failed"
-        else:
-            result["status"] = "not_supported"
         return result
+
+    def _get_stockapi_capital_flow(self, stock_code: str) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
+        """
+        Fetch historical stock capital flow from stockapi.com.cn.
+
+        The endpoint is updated after market close and returns daily history, so it
+        is used to fill the daily fields expected by get_capital_flow without
+        touching Eastmoney individual fund-flow endpoints by default.
+        """
+        code = _normalize_code(stock_code)
+        if not re.fullmatch(r"\d{6}", code or ""):
+            return {}, None, [f"stockapi_codeFlow:not_supported:{stock_code}"]
+
+        token = os.getenv("STOCKAPI_TOKEN", "").strip()
+        today = datetime.now().date()
+        windows: List[Tuple[datetime.date, datetime.date]] = []
+        if token:
+            end_date = today
+            windows.append((end_date - timedelta(days=20), end_date))
+        else:
+            end_date = today - timedelta(days=4)
+            window_end = end_date
+            lower_bound = end_date - timedelta(days=14)
+            while window_end >= lower_bound and len(windows) < 3:
+                window_start = max(lower_bound, window_end - timedelta(days=4))
+                windows.append((window_start, window_end))
+                window_end = window_start - timedelta(days=1)
+
+        rows: List[Any] = []
+        errors: List[str] = []
+        for start_date, window_end in windows:
+            params: Dict[str, Any] = {
+                "code": code,
+                "startDate": start_date.isoformat(),
+                "endDate": window_end.isoformat(),
+                "pageNo": "1",
+                "pageSize": "20",
+            }
+            if token:
+                params["token"] = token
+
+            try:
+                response = requests.get(_stockapi_code_flow_url(), params=params, timeout=3.0)
+                response.raise_for_status()
+                payload = response.json()
+            except Exception as exc:
+                errors.append(f"stockapi_codeFlow:{type(exc).__name__}:{exc}")
+                continue
+
+            if not isinstance(payload, dict):
+                errors.append("stockapi_codeFlow:invalid_response")
+                continue
+            if payload.get("code") != 20000:
+                errors.append(f"stockapi_codeFlow:{payload.get('code')}:{payload.get('msg')}")
+                continue
+
+            data = payload.get("data")
+            if isinstance(data, list):
+                rows.extend(data)
+
+        if not rows:
+            if errors:
+                return {}, None, errors
+            return {}, None, ["stockapi_codeFlow:empty_data"]
+
+        normalized_by_date: Dict[str, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            amount = _safe_float(row.get("mainAmount"))
+            date_text = _safe_str(row.get("date"))
+            if amount is None or not date_text:
+                continue
+            normalized_by_date[date_text] = amount
+        normalized_rows = sorted(normalized_by_date.items(), key=lambda item: item[0])
+        if not normalized_rows:
+            return {}, None, ["stockapi_codeFlow:no_main_amount"]
+
+        amounts = [item[1] for item in normalized_rows]
+        latest_date, latest_main = normalized_rows[-1]
+        return {
+            "main_net_inflow": latest_main,
+            "inflow_5d": float(sum(amounts[-5:])),
+            "inflow_10d": float(sum(amounts[-10:])),
+            "latest_date": latest_date,
+            "source_update": "after_market_close",
+        }, "stockapi_codeFlow", []
 
     def get_dragon_tiger_flag(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:
         """

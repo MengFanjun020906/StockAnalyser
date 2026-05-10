@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Agent Trace 的 L1 数据层新增候选来源审计，直接展示候选股票如何由 Sequoia、强势板块、用户种子或 fallback 召回，以及为什么后续工具调用这些个股。
 - [改进] Agent Trace 将 L1 数据层与 L2 候选池层合并为 `L1 Data & Candidate Layer`，并为候选发现工具保留结构化 `result_json`，避免截断预览导致候选池无法展示。
 - [改进] Agent Trace 的候选池展示改用中文策略名、中文来源和中文候选理由，并移除 L1 中重复的候选说明块，提升可读性。
+- [文档] 同步 Agent 用户上下文计划的当前状态，补齐 `risk_gate`、Sequoia 候选池、Graphiti 最小链路和已落地阶段记录，避免旧阶段说明误导。
+- [修复] 增强 Agent Debate JSON 解析，支持从模型解释文本和多个 JSON 对象中提取最终裁决，并提高 Debate 角色输出 token 预算，减少误降级为“Debate JSON 解析失败”。
+- [改进] `get_capital_flow` 默认优先使用 StockAPI 历史资金流 `codeFlow`，不再默认调用东方财富个股资金流端点，并补充最近可用主力净流入与 5/10 日累计资金流。
+- [文档] 补充 Agent 工具缺口的数据源调研，明确 GDELT、Alpha Vantage、Trading Economics、Tushare、ACLED 等 API URL、Token 配置和推荐接入顺序。
+- [修复] Agent ReAct 循环新增渐进式工具预算护栏，达到 60%/80% 步数后提示收敛、重复工具同参数复用已有结果，并在最后一步基于现有证据强制综合，避免复杂任务直接报超步数。
+- [修复] DeepSeek 官方渠道支持在未配置 `LLM_<NAME>_API_KEY(S)` 时复用 `DEEPSEEK_API_KEY(S)`，并在 Agent 鉴权失败时明确提示应更新 DeepSeek key，避免误判为 OpenAI key 或普通 fallback 失败。
 
 
 

@@ -59,6 +59,21 @@ def _make_registry_with_echo():
     return registry
 
 
+def _make_counting_echo_registry(counter):
+    """Create an echo registry that records real handler executions."""
+    registry = ToolRegistry()
+    tool = ToolDefinition(
+        name="echo",
+        description="Echoes back the input",
+        parameters=[
+            ToolParameter(name="message", type="string", description="Message to echo"),
+        ],
+        handler=lambda message: counter.append(message) or {"echo": message},
+    )
+    registry.register(tool)
+    return registry
+
+
 def _make_mock_adapter():
     """Create a MagicMock LLMToolAdapter."""
     adapter = MagicMock()
@@ -303,6 +318,108 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("max steps", result.error.lower())
         self.assertEqual(result.total_steps, 3)
+
+    def test_final_step_forces_synthesis_after_tool_budget(self):
+        """Final step disables tools so the model can synthesize from existing evidence."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+
+        tool_response = LLMResponse(
+            content="Still gathering.",
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"message": "loop"}),
+            ],
+            usage={"total_tokens": 20},
+            provider="openai",
+        )
+        final_response = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD),
+            tool_calls=[],
+            usage={"total_tokens": 40},
+            provider="openai",
+        )
+        adapter.call_with_tools.side_effect = [tool_response, tool_response, final_response]
+
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+        result = executor.run("Analyze loop")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.total_steps, 3)
+        self.assertEqual(len(result.tool_calls_log), 2)
+        final_call_args = adapter.call_with_tools.call_args.args
+        self.assertEqual(final_call_args[1], [])
+        self.assertIn("工具预算最后一步", final_call_args[0][-1]["content"])
+
+    def test_budget_phase_warns_before_final_step(self):
+        """Conserve and critical phases warn the model before final hard stop."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+
+        tool_response = LLMResponse(
+            content="Gathering.",
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"message": "a"}),
+            ],
+            usage={"total_tokens": 10},
+            provider="openai",
+        )
+        final_response = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD),
+            tool_calls=[],
+            usage={"total_tokens": 40},
+            provider="openai",
+        )
+        adapter.call_with_tools.side_effect = [
+            tool_response,
+            tool_response,
+            tool_response,
+            tool_response,
+            final_response,
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Analyze with budget")
+
+        self.assertTrue(result.success)
+        final_messages = adapter.call_with_tools.call_args.args[0]
+        combined = "\n".join(
+            str(message.get("content", ""))
+            for message in final_messages
+            if isinstance(message, dict)
+        )
+        self.assertIn("工具节约阶段", combined)
+        self.assertIn("关键预算阶段", combined)
+
+    def test_repeated_tool_call_reuses_cached_result(self):
+        """Identical successful tool calls reuse prior results instead of re-executing."""
+        executed = []
+        registry = _make_counting_echo_registry(executed)
+        adapter = _make_mock_adapter()
+
+        repeated_tool = LLMResponse(
+            content="Again.",
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"message": "same"}),
+            ],
+            usage={"total_tokens": 10},
+            provider="openai",
+        )
+        final_response = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD),
+            tool_calls=[],
+            usage={"total_tokens": 40},
+            provider="openai",
+        )
+        adapter.call_with_tools.side_effect = [repeated_tool, repeated_tool, final_response]
+
+        executor = AgentExecutor(registry, adapter, max_steps=4)
+        result = executor.run("Analyze repeated")
+
+        self.assertTrue(result.success)
+        self.assertEqual(executed, ["same"])
+        self.assertEqual(len(result.tool_calls_log), 2)
+        self.assertFalse(result.tool_calls_log[0]["cached"])
+        self.assertTrue(result.tool_calls_log[1]["cached"])
 
     def test_tool_execution_error(self):
         """Tool raises exception — should be logged and error sent to LLM."""
@@ -899,6 +1016,21 @@ class TestDashboardParsing(unittest.TestCase):
 
     def test_parse_no_json(self):
         self.assertIsNone(parse_dashboard_json("This is just plain text with no JSON"))
+
+    def test_try_parse_json_prefers_final_balanced_object(self):
+        from src.agent.runner import try_parse_json
+
+        content = (
+            '草稿：{"winner":"primary","final_action":"hold"}\n'
+            '最终 JSON：\n'
+            '{"winner":"opposing","final_action":"wait","decision_summary":"等待确认"}'
+        )
+
+        result = try_parse_json(content)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["winner"], "opposing")
+        self.assertEqual(result["final_action"], "wait")
 
 
 # ============================================================

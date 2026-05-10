@@ -187,7 +187,7 @@ LITELLM_MODEL=ollama/qwen3:8b
   - 设置页交互与保存后提示：`apps/dsa-web/src/components/settings/__tests__/LLMChannelEditor.test.tsx`
 - 旧配置回退路径：`桌面端导出备份 -> /api/v1/system/config/import`，或手动恢复 `LLM_* / LITELLM_* / AGENT_LITELLM_MODEL / VISION_MODEL / LLM_TEMPERATURE`。
 
-> **致命避坑说明**：如果你启用了 `LLM_CHANNELS`，那么你直接写在外面的 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 将**全部失效（系统一律无视）**！二者**选其一即可**，千万不要既写了新手模式又写了渠道模式结果产生冲突。
+> **致命避坑说明**：如果你启用了 `LLM_CHANNELS`，普通外层 provider key 默认不会参与渠道路由；唯一兼容例外是 DeepSeek 官方渠道：当渠道名或协议解析为 `deepseek`，且未配置 `LLM_<NAME>_API_KEY(S)` 时，会自动复用 `DEEPSEEK_API_KEY(S)`。`OPENAI_API_KEY` 不会用于 `deepseek/*` 模型。
 > **Docker 注意**：如果你在 `docker compose environment:` 或 `docker run -e` 中显式传入 `LITELLM_MODEL`、`LLM_CHANNELS`、`LLM_DEEPSEEK_MODELS` 等变量，容器重启后这些环境变量会覆盖 Web 设置页写入的 `.env`，需要同步修改部署配置。
 
 ---

@@ -137,10 +137,14 @@ def run_adversarial_debate(
         )
         _accumulate_usage(result, primary_response)
         result.debug_outputs["primary_thesis_raw"] = primary_response.content or ""
-        result.primary_thesis = _normalize_thesis(
-            _parse_or_fallback(primary_response.content, _fallback_primary(bundle)),
-            role="primary",
+        primary_parse = _parse_or_fallback(
+            primary_response.content,
+            _fallback_primary(bundle),
+            stage="primary_thesis",
         )
+        if primary_parse.parse_error:
+            result.debug_outputs["primary_thesis_parse_error"] = primary_parse.parse_error
+        result.primary_thesis = _normalize_thesis(primary_parse.payload, role="primary")
         _emit_debate_event(
             progress_callback,
             "debate_primary_done",
@@ -156,10 +160,14 @@ def run_adversarial_debate(
         )
         _accumulate_usage(result, opposing_response)
         result.debug_outputs["opposing_thesis_raw"] = opposing_response.content or ""
-        result.opposing_thesis = _normalize_thesis(
-            _parse_or_fallback(opposing_response.content, _fallback_opposing(bundle)),
-            role="opposing",
+        opposing_parse = _parse_or_fallback(
+            opposing_response.content,
+            _fallback_opposing(bundle),
+            stage="opposing_thesis",
         )
+        if opposing_parse.parse_error:
+            result.debug_outputs["opposing_thesis_parse_error"] = opposing_parse.parse_error
+        result.opposing_thesis = _normalize_thesis(opposing_parse.payload, role="opposing")
         _emit_debate_event(
             progress_callback,
             "debate_opposing_done",
@@ -175,10 +183,14 @@ def run_adversarial_debate(
         )
         _accumulate_usage(result, judge_response)
         result.debug_outputs["judge_raw"] = judge_response.content or ""
-        judge = _parse_or_fallback(
+        judge_parse = _parse_or_fallback(
             judge_response.content,
             _fallback_judge(result.primary_thesis, result.opposing_thesis),
+            stage="judge_decision",
         )
+        if judge_parse.parse_error:
+            result.debug_outputs["judge_parse_error"] = judge_parse.parse_error
+        judge = judge_parse.payload
         result.judge_decision = _normalize_judge(judge)
         result.debate_rounds = [
             {
@@ -329,7 +341,7 @@ def _call_role_json(
             {"role": "user", "content": prompt},
         ],
         temperature=0.2,
-        max_tokens=1800,
+        max_tokens=3200,
         timeout=timeout_seconds,
     )
 
@@ -476,9 +488,26 @@ def _tool_calls_to_evidence(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, 
     return entries
 
 
-def _parse_or_fallback(content: Optional[str], fallback: Dict[str, Any]) -> Dict[str, Any]:
+@dataclass(frozen=True)
+class _ParseResult:
+    payload: Dict[str, Any]
+    parse_error: Optional[str] = None
+
+
+def _parse_or_fallback(content: Optional[str], fallback: Dict[str, Any], *, stage: str) -> _ParseResult:
     parsed = try_parse_json(content or "")
-    return parsed if isinstance(parsed, dict) else fallback
+    if isinstance(parsed, dict):
+        return _ParseResult(payload=parsed)
+    fallback_payload = dict(fallback)
+    fallback_payload.setdefault("_parse_error", {
+        "stage": stage,
+        "error": "llm_json_parse_failed",
+        "raw_excerpt": _truncate(content or "", 1000),
+    })
+    return _ParseResult(
+        payload=fallback_payload,
+        parse_error=f"llm_json_parse_failed:{stage}",
+    )
 
 
 def _normalize_thesis(value: Dict[str, Any], *, role: str) -> Dict[str, Any]:

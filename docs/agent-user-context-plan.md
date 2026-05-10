@@ -1,6 +1,6 @@
 # Agent 用户上下文与分阶段改造计划
 
-本文档记录 Agent 从“通用问股助手”升级为“账户感知交易决策助手”的分阶段设计与落地状态。第一阶段已完成契约定义；第二、三阶段已接入运行时；后续阶段按本文档继续推进。
+本文档记录 Agent 从“通用问股助手”升级为“账户感知交易决策助手”的分阶段设计、当前落地状态和后续路线图。状态口径截至 2026-05-10：早期的上下文、Planner、Trace、Debate、阶段化选股和确定性 `risk_gate` 已经进入开发调试链路；方案保存、模拟盘托管、回测/Trust Score 和真实交易仍是后续阶段。
 
 ## 当前进度概览
 
@@ -14,6 +14,9 @@
 | 调试增强 | Trace UI、SSE 和本地落盘 | 已完成 | `/agent-trace`、SSE 事件流、浏览器历史和 `data/agent_traces/` 调试产物已落地。 |
 | 第六阶段 | 对抗式 Debate Agent | 已完成（开发调试模式） | planning_execute 在工具证据形成后追加强制反向立场辩论和 Judge 裁决；`/agent-trace` 与 `debate.json` 可复盘。 |
 | 第七阶段 | 阶段化选股流水线 | 已完成（开发调试模式） | `watchlist_scan` 优先走候选发现、初筛、单股深度分析、组合配置、反方审查和 Judge 裁决；`SelectionRunContext` 以 `summary/full/full_ref` 管理上下文并落盘 `stock_selection.json`。 |
+| 第八阶段 | A 股硬风控与结构化协议 | 已完成底座 | `src/schemas/agent_signal.py` 与 `RiskGateEvaluator` 已覆盖 L1/L2/L3、TradePlan、T+1、涨跌停、特殊股票、止损、数据质量、仓位和现金约束；Trace 会落盘 `risk_gate.json`。 |
+| 候选池增强 | Sequoia 风格量化候选池 | 已完成开发链路 | `discover_watchlist_candidates` 的 `auto` 模式已合并 Sequoia 量化候选、强势板块成分股、用户种子和 fallback，并向 Trace 暴露候选来源、策略标签、评分和理由。 |
+| 知识图谱记忆 | Graphiti 最小集成 | 已完成最小链路 | 已提供可选 Neo4j/Graphiti 配置、分析结果入图和 Agent 知识图谱检索工具；仍属于增强能力，不是 planning_execute 的硬依赖。 |
 | 长期路线图 | 工具补全、连续对话、方案托管、模拟盘、自进化、回测、regime、策略库和量化交易 | 规划中 | 目标是从“账户感知分析助手”升级为“可复盘、可托管、可验证、可迭代的 A 股交易研究系统”。 |
 
 ## 背景
@@ -26,12 +29,15 @@
 - Web 持仓管理、账户、交易、现金流水和快照
 - Agent 工具 `get_portfolio_snapshot`
 - 确定性技术信号与 LLM 决策仪表盘
+- planning_execute 实验链路、确定性 Planner、Agent Trace、SSE 和本地调试产物
+- 对抗式 Debate、阶段化 `watchlist_scan` 选股流水线和 `risk_gate` 风控审计
+- Sequoia 风格量化候选池、候选来源审计和 Graphiti 知识图谱最小集成
 
-下一步希望改善三个方向：
+早期计划中的三个目标已经进入开发调试链路：
 
-1. Agent 执行改为 planning -> execute 格式。
-2. Agent 不只回答用户 prompt，而是结合用户账户类型、持仓数量、持仓成本、融资融券状态等上下文给出个性化建议。
-3. 支持多类型报告：已持仓报告和选股/入场报告采用不同分析目标和输出结构。
+1. Agent 执行已支持 planning -> execute 格式，并通过 `AGENT_ANALYSIS_MODE=planning_execute` 控制。
+2. Agent 可从 `PortfolioService` 构造 `AgentUserContext`，结合账户、持仓、成本、仓位、现金和风险偏好输出个性化建议。
+3. 报告类型已覆盖 `position_review`、`entry_analysis`、`watchlist_scan`、`risk_review` 和 `event_impact`，并在选股场景走阶段化流水线。
 
 ## 长期目标：从问答助手到 A 股交易研究系统
 
@@ -105,7 +111,7 @@ A 股硬约束必须作为确定性规则，不交给 LLM 自由判断：
 - 单股仓位、总仓位、账户现金和融资约束必须先过风控。
 - 数据缺失或关键工具失败时，交易动作必须降级为 `wait` / `monitor` / `manual_review`。
 
-建议第一版把这些规则做成独立 `risk_gate`，由后端确定性执行，LLM 只能解释不能覆盖。
+第一版已经按独立 `risk_gate` 落地，由后端确定性执行，LLM 只能解释不能覆盖。
 
 当前阶段 A 已落地为工程底座：
 
@@ -660,9 +666,9 @@ Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域�
 
 ### Capability -> Tools 映射层
 
-当前项目没有 `get_tools_for_capability` 这类函数。Agent 工具是通过 `ToolRegistry` 按工具名注册和调用的。
+当前项目已在 `src/agent/planner.py` 落地 `CAPABILITY_TOOL_MAP` 和 `get_tools_for_capability()`。Planner 先选择能力域，再按当前 `ToolRegistry` 展开为实际可调用工具；缺失工具会进入 `missing_tools`，不会被假定为可用。
 
-后续 planning-execute 可以新增一层能力域到工具列表的映射，让 Planner 先选择能力域，再由执行器展开为实际工具。建议第一版映射：
+当前映射：
 
 | Capability | Tools |
 | --- | --- |
@@ -670,10 +676,10 @@ Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域�
 | `realtime_quote` | `get_realtime_quote` |
 | `portfolio_context` | `get_portfolio_snapshot` |
 | `news_event` | `search_comprehensive_intel`, `search_stock_news` |
-| `capital_flow` | `get_capital_flow` |
+| `capital_flow` | `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary` |
 | `fundamental_analysis` | `get_stock_info` |
 | `chip_distribution` | `get_chip_distribution` |
-| `regime_detection` | `detect_market_regime`，第一版可由 `get_market_indices`, `get_sector_rankings`, `get_volume_analysis` 组合实现 |
+| `regime_detection` | `get_market_indices`, `get_sector_rankings`, `get_volume_analysis` |
 | `market_context` | `get_market_indices`, `get_sector_rankings` |
 | `backtest_memory` | `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary` |
 
@@ -830,7 +836,7 @@ PortfolioService.get_portfolio_snapshot()
 - 允许用户关闭账户上下文注入。
 - 默认保留无账户模式，不能强迫用户配置真实资产。
 
-## 后续阶段建议
+## 已落地阶段记录
 
 ### 第二阶段：Planner 外壳（已完成）
 
@@ -937,7 +943,7 @@ PortfolioService.get_portfolio_snapshot()
 | `PrimaryThesisAgent` | 基于 planner 和工具证据生成主观点、主动作、入场/持仓计划和失效条件 |
 | `AdversarialThesisAgent` | 强制站在相反方向，构造最强反证、反向动作计划和主观点失效条件 |
 | `DebateJudgeAgent` | 对双方证据和矛盾点做裁决，输出最终动作、接受/驳回的论点和风控条件 |
-| `RiskGateAgent` | 暂未单独实现；当前由 `DebateJudgeAgent` 的 risk_controls 覆盖基础风控条件 |
+| `RiskGateEvaluator` | 由后端确定性执行 A 股硬风控，消费 Debate Judge 或选股裁决生成的 `TradePlan`，输出通过、阻断、降级或人工复核结果 |
 
 当前流程：
 
@@ -949,6 +955,8 @@ AgentUserContext
   -> AdversarialThesisAgent
   -> Debate rounds
   -> DebateJudgeAgent
+  -> TradePlan draft
+  -> RiskGateEvaluator
   -> Final account-aware action plan
 ```
 
@@ -959,7 +967,9 @@ AgentUserContext
 - `src/agent/tools/market_tools.py` 提供 `discover_watchlist_candidates`，用于 watchlist_scan 在无用户候选股票代码时先生成候选池；`src/agent/stock_selection.py` 在 planning_execute 的 watchlist_scan 下优先执行阶段化选股流水线，并通过 `SelectionRunContext` 管理候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决；`src/agent/runner.py` 仍保留审计兜底，阻止空候选 watchlist_scan 直接输出最终选股结论。
 - Debate 三方共用同一份 `Shared Evidence Bundle`，包含用户问题、主报告、`AgentUserContext`、Planner 和工具 Evidence Ledger。
 - `api/v1/endpoints/agent.py` 的 Trace 响应和 SSE `done` 事件会返回 `debate` 字段，并在调试目录写入 `debate.json`。
+- Trace 结束时会构造 `TradePlan` 并调用 `RiskGateEvaluator`，将结果写入 `risk_gate.json`，同时在 `/trace/run` 响应和 `/trace/stream` 完成事件中返回。
 - `apps/dsa-web/src/pages/AgentTracePage.tsx` 新增 `Debate Judge` 模块，展示主观点、反方观点、Judge 裁决、分维度证据、采纳/驳回论点和风控条件；Judge 输出会显式区分账户风险、技术面、资金面、消息面、基本面和数据质量。
+- Agent Trace 页面新增 `Risk Gate` 面板和分层 Trace 视图，可查看候选池来源、工具证据、辩论裁决、风控规则检查和复盘入口。
 - 开发调试模式下，`debate.debug_outputs` 会保留同一 session 内的原始主报告输出、Primary Thesis 原始输出、Opposing Thesis 原始输出、Judge 原始输出和最终合并输出；这些是模型可见输出和结构化 JSON，不包含隐藏思维链。
 - SSE 事件会记录 `debate_start`、`debate_primary_done`、`debate_opposing_done` 和 `debate_judge_done`，便于在 Evidence Timeline 中定位 Debate 每一步。
 
@@ -1010,7 +1020,11 @@ AgentUserContext
 - [x] 普通单股 Agent 分析能在 `planning_execute` 模式下注入 `AgentUserContext`。
 - [x] `/agent-trace` 能展示账户上下文、Planner、SSE 事件、工具调用和最终输出。
 - [x] Trace 运行能落盘 request/context/planner/events/tool calls/evidence ledger/debate/final/todo/summary。
+- [x] 阶段化选股链路能落盘 `stock_selection.json`、`selection_context.json`、`final_report.json` 和各阶段 JSON 产物。
+- [x] Trace 运行能从 Debate Judge 或选股裁决生成 `TradePlan`，执行确定性 `risk_gate`，并落盘 `risk_gate.json`。
 - [x] README 未继续膨胀，细节保留在专题文档中。
 - [x] `entry_analysis` 专项输出规范已补齐到与 `position_review` 同等级的可执行程度，并使用可见 Planning -> Execute 格式。
 - [x] 第五阶段按开发调试模式收口；正式用户画像配置入口暂缓产品化，不作为当前阶段阻塞项。
 - [x] Debate Agent 已按“强制反向立场辩论 + Judge 最终裁决”接入 planning_execute，覆盖持仓模式和选股/入场模式。
+- [x] `discover_watchlist_candidates` 已支持 Sequoia 量化候选、强势板块、用户种子和 fallback 多路召回，并通过统一评分合并候选。
+- [x] Graphiti/Neo4j 已具备可选最小集成路径，可用于分析结果入图和 Agent 检索，但仍不是主链路硬依赖。

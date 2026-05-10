@@ -298,13 +298,15 @@ daily_stock_analysis/
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `1.5` | 可选 |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `0.8` | 可选 |
-| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；东财资金流端点常慢于基本面聚合预算 | `3.0` | 可选 |
+| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 StockAPI `codeFlow` 个股历史资金流 | `3.0` | 可选 |
+| `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 默认调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
 | `FUNDAMENTAL_RETRY_MAX` | 基本面能力重试次数（含首次） | `1` | 可选 |
 | `FUNDAMENTAL_CACHE_TTL_SECONDS` | 基本面聚合缓存 TTL（秒），短缓存减轻重复拉取 | `120` | 可选 |
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（TTL 内按时间淘汰） | `256` | 可选 |
 
 > 行为说明：
 > - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并裁剪旧数据。
+> - `get_capital_flow` 默认优先使用 StockAPI 历史资金流 `codeFlow`，用最近可用交易日 `mainAmount` 生成 `main_net_inflow`、近 5 日和近 10 日累计主力净流入；当前不再默认调用东方财富个股资金流端点。未配置 `STOCKAPI_TOKEN` 时会按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；
 > - ETF：返回可得项，缺失能力标记为 `not_supported`，整体不影响原流程；
 > - 美股/港股：返回 `not_supported` 兜底块；

@@ -1325,6 +1325,37 @@ class TestAgentConstructionChain(unittest.TestCase):
         mock_sleep.assert_not_called()
 
     @patch("src.agent.llm_adapter.Router")
+    def test_llm_adapter_adds_deepseek_auth_configuration_hint(self, _mock_router):
+        """DeepSeek auth failures should point at the DeepSeek key, not generic fallback failure."""
+        mock_cfg = SimpleNamespace(
+            agent_litellm_model="",
+            litellm_model="deepseek/deepseek-chat",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+            llm_temperature=0.7,
+            llm_models_source="legacy_env",
+            gemini_api_keys=[],
+            anthropic_api_keys=[],
+            openai_api_keys=[],
+            deepseek_api_keys=["sk-test-value"],
+            openai_base_url=None,
+        )
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        adapter = LLMToolAdapter(config=mock_cfg)
+        adapter._call_litellm_model = MagicMock(
+            side_effect=RuntimeError("Authentication Fails, Your api key: ****g0ys is invalid")
+        )
+
+        result = adapter.call_completion(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        self.assertEqual(result.provider, "error")
+        self.assertIn("DeepSeek authentication failed.", result.content)
+        self.assertIn("DEEPSEEK_API_KEY", result.content)
+        self.assertIn("OPENAI_API_KEY is not used for deepseek/* models", result.content)
+        self.assertIn("ending with g0ys", result.content)
+
+    @patch("src.agent.llm_adapter.Router")
     def test_llm_adapter_reports_missing_configuration_without_generic_none_error(self, _mock_router):
         """Missing Agent model config should return a stable, actionable error message."""
         mock_cfg = SimpleNamespace(

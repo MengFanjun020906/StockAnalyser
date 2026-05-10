@@ -177,6 +177,13 @@ def _is_non_retriable_tool_result(result: Any) -> bool:
     )
 
 
+def _is_repeatable_tool_success(result: Any) -> bool:
+    """Return True when an identical tool call can safely reuse this result."""
+    if isinstance(result, dict) and result.get("retriable") is False:
+        return True
+    return not _is_failed_tool_result(result)
+
+
 def _is_failed_tool_result(result: Any) -> bool:
     """Return True when a tool returned a structured failure payload."""
     if not isinstance(result, dict):
@@ -316,6 +323,8 @@ def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
         if snippet:
             candidates.append(snippet)
 
+    candidates.extend(_extract_balanced_json_objects(text))
+
     seen: set[str] = set()
     unique_candidates: List[str] = []
     for candidate in candidates:
@@ -343,6 +352,46 @@ def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
                 return repaired
 
     return None
+
+
+def _extract_balanced_json_objects(text: str) -> List[str]:
+    """Extract standalone balanced JSON object candidates from mixed LLM text."""
+    if not text:
+        return []
+
+    objects: List[str] = []
+    start: Optional[int] = None
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+            continue
+        if char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start:index + 1].strip())
+                start = None
+
+    # Prefer the final complete object first. LLMs often put examples or
+    # discarded drafts before the answer, then the final JSON at the end.
+    return list(reversed([item for item in objects if item]))
 
 
 # Keep private alias used internally by parse_dashboard_json
@@ -463,6 +512,67 @@ def _build_watchlist_discovery_guard_result(
     )
 
 
+def _build_finalization_guard_message(tool_calls_log: List[Dict[str, Any]]) -> str:
+    """Build the last-step instruction that stops further tool calls."""
+    successful = sum(1 for call in tool_calls_log if isinstance(call, dict) and call.get("success") is not False)
+    failed = len(tool_calls_log) - successful
+    return (
+        "[系统审计] 已到达 Agent 工具预算最后一步。"
+        "现在必须停止继续调用工具，基于已有工具结果输出最终报告。"
+        f"当前已有工具记录 {len(tool_calls_log)} 条，其中成功 {successful} 条、失败或降级 {failed} 条。"
+        "如果证据不足，请明确标注 missing_evidence / tool_failed，并给出 wait / monitor / insufficient_data "
+        "等保守结论；不要再请求任何工具。"
+    )
+
+
+def _tool_budget_phase(step: int, max_steps: int) -> str:
+    """Return the current tool-budget phase for a zero-based step index."""
+    if max_steps <= 1 or step >= max_steps - 1:
+        return "final"
+    progress = (step + 1) / max_steps
+    if progress >= 0.8:
+        return "critical"
+    if progress >= 0.6:
+        return "conserve"
+    return "normal"
+
+
+def _build_tool_budget_message(
+    *,
+    step: int,
+    max_steps: int,
+    phase: str,
+    tool_calls_log: List[Dict[str, Any]],
+) -> str:
+    """Tell the model how much tool budget remains and how to spend it."""
+    remaining_after_this = max(max_steps - step - 1, 0)
+    called_tools = [
+        str(call.get("tool"))
+        for call in tool_calls_log
+        if isinstance(call, dict) and call.get("tool")
+    ]
+    unique_tools = list(dict.fromkeys(called_tools))
+    prefix = (
+        f"[系统预算] 当前是第 {step + 1}/{max_steps} 轮，"
+        f"本轮之后还剩 {remaining_after_this} 轮。"
+        f"已调用工具 {len(tool_calls_log)} 次"
+        + (f"，涉及：{', '.join(unique_tools[-8:])}。" if unique_tools else "。")
+    )
+    if phase == "conserve":
+        return (
+            prefix
+            + "现在进入工具节约阶段。只有当新增工具会改变最终动作、补齐主维度关键缺口或验证强反证时才调用；"
+            "不要扩展辅助维度，不要重复调用同一工具同一参数。若主维度证据已足够，请直接综合。"
+        )
+    if phase == "critical":
+        return (
+            prefix
+            + "现在进入关键预算阶段。除非缺少会阻断 open/buy/sell 的硬证据，否则必须停止扩展取数并准备最终结论；"
+            "如继续调用工具，必须只调用一个最关键工具。辅助信息缺失应写入 missing_evidence，而不是继续取数。"
+        )
+    return prefix + "请继续遵守最小必要工具原则。"
+
+
 # ============================================================
 # Core loop
 # ============================================================
@@ -505,6 +615,7 @@ def run_agent_loop(
     start_time = time.time()
     tool_calls_log: List[Dict[str, Any]] = []
     non_retriable_tool_results: Dict[str, str] = {}
+    repeat_tool_results: Dict[str, str] = {}
     total_tokens = 0
     provider_used = ""
     models_used: List[str] = []
@@ -559,11 +670,40 @@ def run_agent_loop(
             )
 
         logger.info("Agent step %d/%d", step + 1, max_steps)
+        budget_phase = _tool_budget_phase(step, max_steps)
+        force_final_answer = budget_phase == "final" and bool(tool_calls_log)
+        if force_final_answer:
+            logger.warning(
+                "Agent reached final step with %d tool result(s); forcing final synthesis",
+                len(tool_calls_log),
+            )
+            messages.append({
+                "role": "user",
+                "content": _build_finalization_guard_message(tool_calls_log),
+            })
+        elif budget_phase in {"conserve", "critical"} and tool_calls_log:
+            logger.info(
+                "Agent entering %s tool-budget phase at step %d/%d",
+                budget_phase,
+                step + 1,
+                max_steps,
+            )
+            messages.append({
+                "role": "user",
+                "content": _build_tool_budget_message(
+                    step=step,
+                    max_steps=max_steps,
+                    phase=budget_phase,
+                    tool_calls_log=tool_calls_log,
+                ),
+            })
 
         # --- progress: thinking ---
         if progress_callback:
             if not tool_calls_log:
                 thinking_msg = "正在制定分析路径..."
+            elif force_final_answer:
+                thinking_msg = "工具预算即将耗尽，正在基于已有证据生成最终结论..."
             else:
                 last_tool = tool_calls_log[-1].get("tool", "")
                 label = labels.get(last_tool, last_tool)
@@ -573,7 +713,7 @@ def run_agent_loop(
         # --- LLM call ---
         response = llm_adapter.call_with_tools(
             messages,
-            tool_decls,
+            [] if force_final_answer else tool_decls,
             timeout=remaining_timeout,
         )
         provider_used = response.provider
@@ -596,6 +736,23 @@ def run_agent_loop(
                 total_tokens=total_tokens,
                 provider_used=provider_used,
                 models_used=models_used,
+                messages=messages,
+            )
+
+        if response.tool_calls and force_final_answer:
+            logger.warning("Agent requested tools during forced final synthesis at step %d", step + 1)
+            return RunLoopResult(
+                success=False,
+                content="",
+                tool_calls_log=tool_calls_log,
+                total_steps=step + 1,
+                total_tokens=total_tokens,
+                provider=provider_used,
+                models_used=models_used,
+                error=(
+                    f"Agent exceeded max steps ({max_steps}) after refusing to finalize from existing evidence. "
+                    "The runner already disabled further tool calls on the final step."
+                ),
                 messages=messages,
             )
 
@@ -639,6 +796,7 @@ def run_agent_loop(
                 progress_callback,
                 tool_calls_log,
                 non_retriable_tool_results,
+                repeat_tool_results,
                 tool_wait_timeout_seconds=effective_tool_timeout,
             )
 
@@ -745,6 +903,7 @@ def _execute_tools(
     progress_callback: Optional[Callable],
     tool_calls_log: List[Dict[str, Any]],
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
+    repeat_tool_results: Optional[Dict[str, str]] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Execute one or more tool calls, returning ordered result dicts.
@@ -764,6 +923,14 @@ def _execute_tools(
                 tc_item.arguments,
             )
             return tc_item, non_retriable_tool_results[cache_key], False, dur, True
+        if cache_key and repeat_tool_results is not None and cache_key in repeat_tool_results:
+            dur = round(time.time() - t0, 2)
+            logger.info(
+                "Tool '%s' reused cached result for repeated arguments=%s",
+                tc_item.name,
+                tc_item.arguments,
+            )
+            return tc_item, repeat_tool_results[cache_key], True, dur, True
 
         try:
             res = tool_registry.execute(tc_item.name, **tc_item.arguments)
@@ -771,6 +938,8 @@ def _execute_tools(
             ok = not _is_failed_tool_result(res)
             if cache_key and non_retriable_tool_results is not None and _is_non_retriable_tool_result(res):
                 non_retriable_tool_results[cache_key] = res_str
+            if cache_key and repeat_tool_results is not None and _is_repeatable_tool_success(res):
+                repeat_tool_results[cache_key] = res_str
         except Exception as e:
             res_str = json.dumps({"error": str(e)})
             ok = False

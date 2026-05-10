@@ -424,7 +424,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS": {
         "title": "Agent Capital Flow Timeout Seconds",
-        "description": "Timeout budget for the explicit Agent get_capital_flow tool. Keep it higher than the fundamental fetch timeout because Eastmoney fund-flow endpoints are often slower.",
+        "description": "Timeout budget for the explicit Agent get_capital_flow tool. StockAPI codeFlow is the default per-stock capital-flow source.",
         "category": "data_source",
         "data_type": "float",
         "ui_control": "number",
@@ -435,6 +435,20 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {"min": 0},
         "display_order": 24,
+    },
+    "STOCKAPI_TOKEN": {
+        "title": "StockAPI Token",
+        "description": "Optional token for stockapi.com.cn codeFlow, the default per-stock capital-flow source used by get_capital_flow. Blank uses the limited free quota, which only supports delayed history windows.",
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "password",
+        "is_sensitive": True,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 25,
     },
     "NEWS_MAX_AGE_DAYS": {
         "title": "News Max Age (Days)",
@@ -1728,7 +1742,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "AGENT_MAX_STEPS": {
         "title": "Agent Max Steps",
-        "description": f"Maximum reasoning-step limit for Agent mode. At the default ({AGENT_MAX_STEPS_DEFAULT}), each sub-agent keeps its own preset. When raised above {AGENT_MAX_STEPS_DEFAULT}, all sub-agents adopt this value. When lowered below a sub-agent's preset, that sub-agent is capped at this value.",
+        "description": f"Maximum reasoning-step limit for Agent mode. At the default ({AGENT_MAX_STEPS_DEFAULT}), each sub-agent keeps its own preset. When raised above {AGENT_MAX_STEPS_DEFAULT}, all sub-agents adopt this value. When lowered below a sub-agent's preset, that sub-agent is capped at this value. The runner adds progressive budget warnings after 60%/80% of the limit and forces final synthesis on the final step when evidence exists.",
         "category": "agent",
         "data_type": "integer",
         "ui_control": "number",

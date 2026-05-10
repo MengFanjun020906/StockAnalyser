@@ -854,7 +854,9 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
     error_summary = None
     if errors:
         joined_errors = " | ".join(str(item) for item in errors if str(item).strip())
-        if "push2his.eastmoney.com" in joined_errors or "push2.eastmoney.com" in joined_errors:
+        if "stockapi_codeFlow" in joined_errors:
+            error_summary = "StockAPI codeFlow capital-flow endpoint failed"
+        elif "push2his.eastmoney.com" in joined_errors or "push2.eastmoney.com" in joined_errors:
             error_summary = "Eastmoney capital-flow endpoint unreachable"
         elif "RemoteDisconnected" in joined_errors or "remote end closed" in joined_errors.lower():
             error_summary = "Eastmoney capital-flow endpoint disconnected"
@@ -869,6 +871,8 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
         "main_net_inflow": stock_flow.get("main_net_inflow"),
         "inflow_5d": stock_flow.get("inflow_5d"),
         "inflow_10d": stock_flow.get("inflow_10d"),
+        "latest_date": stock_flow.get("latest_date"),
+        "source_update": stock_flow.get("source_update"),
         "sector_rankings": {
             "top_inflow_sectors": sector_rankings.get("top", [])[:3],
             "top_outflow_sectors": sector_rankings.get("bottom", [])[:3],
@@ -882,8 +886,7 @@ get_capital_flow_tool = ToolDefinition(
     name="get_capital_flow",
     description=(
         "Get main-force (主力) capital flow data for an A-share stock. "
-        "Returns today's net inflow, 5-day and 10-day cumulative inflows, "
-        "and top sector-level capital flow rankings. "
+        "Returns the latest daily net inflow, 5-day and 10-day cumulative inflows. "
         "Only supported for A-share individual stocks (not ETFs, indices, HK, or US stocks)."
     ),
     parameters=[

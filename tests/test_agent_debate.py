@@ -227,3 +227,70 @@ def test_debate_watchlist_scan_runs_judge_for_stock_selection():
     assert result.judge_decision["final_action"] == "wait"
     primary_prompt = adapter.call_text.call_args_list[0].args[0][1]["content"]
     assert "候选排序" in primary_prompt
+
+
+def test_debate_judge_parses_final_json_after_explanatory_object():
+    context = AgentUserContext(
+        report=ReportContext(
+            analysis_mode="planning_execute",
+            intent="entry_analysis",
+            primary_symbol="600519",
+            target_symbols=["600519"],
+        ),
+    )
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        LLMResponse(content='{"direction":"bullish","action":"open","summary":"支持观察入场","evidence":["price=100"],"failure_conditions":["跌破止损"],"account_impact":"小仓"}'),
+        LLMResponse(content='{"direction":"neutral_bearish","action":"wait","summary":"反方主张等待","evidence":["证据不足"],"failure_conditions":["补足证据"],"primary_challenges":["资金面缺失"],"account_impact":"降低试错成本"}'),
+        LLMResponse(content=(
+            '我先给一个草稿对象：{"winner":"insufficient_data","final_action":"monitor"}\n'
+            '最终 JSON 如下：\n'
+            '```json\n'
+            '{"winner":"opposing","final_action":"wait","decision_summary":"等待资金面和消息面确认。","reason":"证据不足","reason_points":["资金面缺失"],"dimension_assessments":[{"dimension":"data_quality","verdict":"insufficient_data","weight":"high","summary":"结构化证据不足","evidence":[],"missing":["资金面"]}],"accepted_arguments":["等待"],"rejected_arguments":["立即开仓"],"risk_controls":["补齐资金面后复查"],"unresolved_conflicts":[]}\n'
+            '```'
+        )),
+    ]
+
+    result = run_adversarial_debate(
+        task="600519 适合买入吗？",
+        primary_report="主报告：可以观察。",
+        agent_user_context=context,
+        planner={"intent": "entry_analysis"},
+        tool_calls=_tool_calls(),
+        llm_adapter=adapter,
+    )
+
+    assert result.success is True
+    assert result.judge_decision["winner"] == "opposing"
+    assert result.judge_decision["final_action"] == "wait"
+    assert "judge_parse_error" not in result.debug_outputs
+
+
+def test_debate_records_parse_error_when_judge_json_unrecoverable():
+    context = AgentUserContext(
+        report=ReportContext(
+            analysis_mode="planning_execute",
+            intent="entry_analysis",
+            primary_symbol="600519",
+            target_symbols=["600519"],
+        ),
+    )
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        LLMResponse(content='{"direction":"bullish","action":"open","summary":"支持观察入场","evidence":["price=100"],"failure_conditions":["跌破止损"],"account_impact":"小仓"}'),
+        LLMResponse(content='{"direction":"neutral_bearish","action":"wait","summary":"反方主张等待","evidence":["证据不足"],"failure_conditions":["补足证据"],"primary_challenges":["资金面缺失"],"account_impact":"降低试错成本"}'),
+        LLMResponse(content="这不是 JSON，也没有完整对象。"),
+    ]
+
+    result = run_adversarial_debate(
+        task="600519 适合买入吗？",
+        primary_report="主报告：可以观察。",
+        agent_user_context=context,
+        planner={"intent": "entry_analysis"},
+        tool_calls=_tool_calls(),
+        llm_adapter=adapter,
+    )
+
+    assert result.success is True
+    assert result.judge_decision["winner"] == "insufficient_data"
+    assert result.debug_outputs["judge_parse_error"] == "llm_json_parse_failed:judge_decision"

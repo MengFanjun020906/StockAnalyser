@@ -25,6 +25,8 @@ class _DummyManagerOk:
                     "main_net_inflow": 1500000.0,
                     "inflow_5d": 8000000.0,
                     "inflow_10d": 15000000.0,
+                    "latest_date": "2026-05-08",
+                    "source_update": "after_market_close",
                 },
                 "sector_rankings": {
                     "top": [{"name": "白酒", "inflow": 5e8}, {"name": "半导体", "inflow": 3e8}],
@@ -55,7 +57,7 @@ class _DummyManagerEndpointUnreachable:
             "status": "failed",
             "data": {"stock_flow": {}, "sector_rankings": {"top": [], "bottom": []}},
             "errors": [
-                "stock_individual_fund_flow:ConnectionError:HTTPSConnectionPool(host='push2his.eastmoney.com')",
+                "stockapi_codeFlow:ConnectionError:HTTPSConnectionPool(host='www.stockapi.com.cn')",
             ],
         }
 
@@ -77,6 +79,8 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertEqual(result["main_net_inflow"], 1500000.0)
         self.assertEqual(result["inflow_5d"], 8000000.0)
         self.assertEqual(result["inflow_10d"], 15000000.0)
+        self.assertEqual(result["latest_date"], "2026-05-08")
+        self.assertEqual(result["source_update"], "after_market_close")
         self.assertIn("sector_rankings", result)
         self.assertIn("top_inflow_sectors", result["sector_rankings"])
         self.assertIn("top_outflow_sectors", result["sector_rankings"])
@@ -109,7 +113,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertIn("capital flow fetch failed", result["error"])
         self.assertIn("network timeout", result["error"])
 
-    def test_endpoint_unreachable_has_clear_error_summary(self) -> None:
+    def test_stockapi_endpoint_failure_has_clear_error_summary(self) -> None:
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=_DummyManagerEndpointUnreachable(),
@@ -118,8 +122,8 @@ class TestGetCapitalFlowContract(unittest.TestCase):
 
         self.assertEqual(result["stock_code"], "688469")
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_summary"], "Eastmoney capital-flow endpoint unreachable")
-        self.assertIn("push2his.eastmoney.com", result["errors"][0])
+        self.assertEqual(result["error_summary"], "StockAPI codeFlow capital-flow endpoint failed")
+        self.assertIn("stockapi_codeFlow", result["errors"][0])
 
 
 if __name__ == "__main__":

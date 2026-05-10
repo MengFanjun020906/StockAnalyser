@@ -150,7 +150,7 @@
 
 已有能力：
 
-- `get_capital_flow` 已覆盖个股主力净流入、5/10 日流入和板块资金流。
+- `get_capital_flow` 已覆盖个股主力净流入、5/10 日流入；当前默认使用 StockAPI 历史资金流 `codeFlow`，不再默认调用东方财富个股资金流端点。
 - `get_market_capital_flow` 已覆盖市场资金快照、个股/行业/概念资金流排名。
 - `get_northbound_capital_flow` 已覆盖北向资金摘要和近期历史。
 - `get_margin_trading_summary` 已覆盖融资融券余额、融资买入和交易所两融摘要。
@@ -159,7 +159,7 @@
 
 - 当前主要针对 A 股个股，不覆盖 ETF、指数、港股、美股。
 - ETF 申赎、期权/期货持仓等风险偏好指标仍未封装。
-- 个股资金流依赖东方财富资金流接口；接口不可达时现在会快速返回真实连接错误摘要，但仍无法替代真实个股主力资金数据。
+- 个股资金流当前依赖 StockAPI 历史资金流，盘中实时性受接口 15:30 更新节奏限制；未配置 token 时只能查滞后历史窗口且每日请求次数很少，不覆盖 ETF、指数、港股、美股。
 
 影响：
 
@@ -463,43 +463,74 @@
 
 每个建议新增的工具都需要数据支撑。下面逐一分析现有数据源能覆盖多少、缺口在哪、怎么补。
 
-### 8.1 现有数据源能力盘点
+### 8.1 推荐 API 与 Token
 
-| 数据源 | 优先级 | 覆盖范围 | 跨资产能力 |
-| --- | --- | --- | --- |
-| EfinanceFetcher | 0 | A 股行情、指数、板块 | 无 |
-| TushareFetcher | 0 | A 股行情、指数 | 无 |
-| AkshareFetcher | 1 | A 股行情、板块成分、宏观数据 | **AkShare 有商品期货、外汇、宏观经济数据接口** |
-| PytdxFetcher | 2 | A 股行情 | 无 |
-| BaostockFetcher | 3 | A 股历史 | 无 |
-| YfinanceFetcher | 4 | 美股/港股/全球指数 | **可获取 GC=F(黄金)、CL=F(原油)、^VIX、DX-Y.NYB(美元指数)、^TNX(10Y美债)** |
-| LongbridgeFetcher | 5 | 美股/港股 | 无 |
-| TickFlowFetcher | 99 | A 股指数增强 | 无 |
+| 用途 | 首选 API | URL / Endpoint | Token / 配置项 | 备注 |
+| --- | --- | --- | --- | --- |
+| 全球新闻、地缘风险、新闻密度 | GDELT DOC 2.0 | `https://api.gdeltproject.org/api/v2/doc/doc?query=...&mode=artlist&format=json&timespan=24h&maxrecords=75&sort=datedesc` | 不需要 | 适合战争、制裁、红海、台海、中东、能源冲击等关键词扫描 |
+| 新闻热度、负面情绪时间线 | GDELT DOC 2.0 Timeline | `https://api.gdeltproject.org/api/v2/doc/doc?query=...&mode=timelinevolinfo&format=json&timespan=24h`；可选 `mode=timelinetone` | 不需要 | 可为 `panic_score`、新闻密度和 tone 变化提供结构化输入 |
+| 金融新闻情绪 | Alpha Vantage News Sentiment | `https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=financial_markets,economy_macro,energy_transportation&time_from=YYYYMMDDTHHMM&sort=LATEST&limit=50&apikey=...` | `ALPHAVANTAGE_API_KEY` | 可作为 GDELT 之外的金融市场新闻情绪增强源 |
+| 跨资产风险信号 | Alpha Vantage | `https://www.alphavantage.co/query?function=WTI&interval=daily&apikey=...`；同类 `BRENT`、`TREASURY_YIELD`、`CPI`、`MARKET_STATUS` | `ALPHAVANTAGE_API_KEY` | 覆盖原油、美债收益率、CPI 和全球市场开闭状态 |
+| 跨资产实时/准实时兜底 | yfinance | 本地库调用；symbol 如 `GC=F`、`CL=F`、`^VIX`、`DX-Y.NYB`、`^TNX` | 不需要 | 仓库已有 `YfinanceFetcher`，建议新增批量跨资产 quotes 方法 |
+| 全球经济日历 | Trading Economics | `https://api.tradingeconomics.com/calendar?c=...` | `TRADING_ECONOMICS_API_KEY` | 最接近真正经济日历：国家、指标、重要性、实际值、预期值、前值 |
+| 美股新闻/经济日历备用 | Finnhub | `https://finnhub.io/api/v1/news?category=general&token=...`、`/calendar/economic`、`/company-news`、`/news-sentiment` | `FINNHUB_API_KEY` | 可选备用，适合美股和全球市场新闻 |
+| 多资产行情备用 | Twelve Data | `https://api.twelvedata.com/time_series?symbol=...&interval=1day&apikey=...` 或 `/quote` | `TWELVEDATA_API_KEY` | 可选备用，覆盖外汇、指数、商品，需确认套餐权限 |
+| A 股公告、解禁、减持、监管 | Tushare Pro | `POST http://api.tushare.pro`，body 传 `api_name/token/params/fields` | `TUSHARE_TOKEN` | 仓库已有 Tushare 配置入口，适合补结构化 A 股事件 |
+| 结构化冲突事件库 | ACLED | `https://acleddata.com/api/acled/read?_format=json&...` | `ACLED_USERNAME` / `ACLED_PASSWORD` 或 myACLED token | 可选；不是金融新闻源，适合高置信冲突事件校验 |
 
 ### 8.2 工具 → 数据源映射
 
-| 工具 | 所需数据 | 可用数据源 | 缺口 |
-| --- | --- | --- | --- |
-| `get_market_sentiment_snapshot` | 新闻标题+摘要、指数涨跌 | SearchService（新闻）+ get_market_indices（指数） | 需要新增规则打分逻辑，不需要新数据源 |
-| `scan_geopolitical_risk_news` | 地缘/战争/制裁相关新闻 | SearchService（固定关键词搜索） | 不需要新数据源，需要固定查询词库 |
-| `get_cross_asset_risk_signals` | 黄金、原油、美元、VIX、美债收益率 | **YfinanceFetcher**（^VIX 已在 US 指数列表中）；AkShare 有商品期货接口 | 需要封装 yfinance 对 GC=F/CL=F/DX-Y.NYB/^TNX 的调用；AkShare 可作为 A 股商品期货备选 |
-| `get_macro_calendar` | 经济日历、央行议息、CPI/PMI | AkShare 有 `macro_*` 系列接口 | 需要封装 AkShare 宏观接口 |
-| `get_rate_fx_commodity_snapshot` | 利率、汇率、商品价格 | YfinanceFetcher + AkShare | 需要新增 symbol 列表和统一返回格式 |
-| `map_event_to_sectors` | 事件-板块映射 | 无现成数据源，需要 LLM 推理或维护映射表 | 需要新建映射表或用 LLM 实时推理 |
-| `stress_test_portfolio_by_event` | 持仓 + 事件敏感度 | PortfolioService + 板块归属 | 需要新建"事件-板块-个股"敏感度矩阵 |
-| `get_market_capital_flow` | 市场资金快照、个股/行业/概念资金流排名 | AkShare 有 `stock_market_fund_flow`、`stock_fund_flow_*` 接口 | 已封装 |
-| `get_northbound_capital_flow` | 北向资金摘要和近期历史 | AkShare 有 `stock_hsgt_*` 接口 | 已封装 |
-| `get_margin_trading_summary` | 融资融券余额、融资买入、交易所两融摘要 | AkShare 有 `stock_margin_*` 接口 | 已封装 |
+| 工具 | 推荐 API | Endpoint / 调用方式 | 需要配置 | 落地说明 |
+| --- | --- | --- | --- | --- |
+| `get_market_sentiment_snapshot` | GDELT + Alpha Vantage + 现有 `get_market_indices` | GDELT `mode=artlist/timelinevolinfo/timelinetone`；Alpha `NEWS_SENTIMENT` | `ALPHAVANTAGE_API_KEY` 可选 | P0。GDELT 无 token 可先落地；Alpha 作为金融新闻情绪增强；指数涨跌作为失败兜底 |
+| `scan_geopolitical_risk_news` | GDELT DOC 2.0；可选 ACLED | GDELT `query=(war OR sanction OR missile OR shipping disruption...)`；ACLED `/api/acled/read` | ACLED 可选 | P0/P1。GDELT 适合实时新闻扫描；ACLED 适合结构化冲突事件复核 |
+| `get_cross_asset_risk_signals` | Alpha Vantage + yfinance | Alpha `WTI/BRENT/TREASURY_YIELD/MARKET_STATUS`；yfinance symbols `GC=F`、`CL=F`、`^VIX`、`DX-Y.NYB`、`^TNX` | `ALPHAVANTAGE_API_KEY` 可选 | P1。优先复用 yfinance，Alpha 作为可配置增强源 |
+| `get_macro_calendar` | Trading Economics；中国侧补 Tushare | Trading Economics `/calendar?c=...`；Tushare `cn_schedule` | `TRADING_ECONOMICS_API_KEY`、`TUSHARE_TOKEN` | P1/P2。用于议息、CPI、PMI、非农等事件窗口 |
+| `get_policy_event_digest` | GDELT / SearchService + 官方 RSS | GDELT 固定政策关键词；SearchService 搜索政府、央行、监管源 | 复用现有搜索 key | 国内政策没有统一稳定官方 API，第一版建议用搜索/RSS 聚合 |
+| `get_rate_fx_commodity_snapshot` | yfinance + Alpha Vantage + Twelve Data | yfinance symbols；Alpha macro/commodity；Twelve Data `/quote` | `ALPHAVANTAGE_API_KEY`、`TWELVEDATA_API_KEY` 可选 | 可与 `get_cross_asset_risk_signals` 共用底层 quote 适配 |
+| `get_company_event_timeline` | Tushare `anns_d` | `POST http://api.tushare.pro`，`api_name=anns_d` | `TUSHARE_TOKEN` | 结构化公司公告、标题、日期、PDF URL |
+| `get_regulatory_risk_events` | Tushare `stk_alert`、`stk_shock`、`pledge_stat`、`anns_d` 关键词 | `POST http://api.tushare.pro` | `TUSHARE_TOKEN` | 汇总风险提示、异常波动、质押、监管问询/处罚/诉讼类公告 |
+| `get_unlock_and_reduction_schedule` | Tushare `share_float`、`stk_holdertrade` | `POST http://api.tushare.pro` | `TUSHARE_TOKEN` | 限售解禁 + 股东增减持，是单股硬风险优先级最高的一组 |
+| `get_etf_flow_snapshot` | Tushare `fund_share`、`fund_daily`、`etf_basic`；可选 `rt_etf_sz_iopv` | `POST http://api.tushare.pro` | `TUSHARE_TOKEN`；实时接口可能需单独权限 | 基金份额变化可近似 ETF 申赎，实时 IOPV/申赎数据视权限接入 |
+| `get_derivatives_position_snapshot` | Tushare `opt_basic`、`opt_daily`、`fut_holding`、`fut_daily` | `POST http://api.tushare.pro` | `TUSHARE_TOKEN`；部分接口需积分/权限 | 期权行情、期货持仓排名和主力合约行情 |
+| `map_event_to_sectors` | 本地映射表 + LLM 解释 | 无外部 API | 不需要 | 输入来自 GDELT/情绪工具，输出受益/受损板块和置信度 |
+| `stress_test_portfolio_by_event` | 组合持仓 + 板块归属 + 事件敏感度矩阵 | 无外部 API | 不需要 | 用现有 `get_portfolio_snapshot` 和本地映射矩阵计算持仓冲击排序 |
+| `get_market_liquidity_status` | 现有 `get_market_indices` + 历史成交额 | 内部 DataFetcher / market stats | 不需要 | P2。用全市场成交额与 5/20 日均值判断流动性收缩或放大 |
 
 ### 8.3 关键结论
 
-**P0 工具（市场情绪快照 + 地缘风险扫描）不需要新数据源**——复用现有 SearchService 即可实现最小版本。
+**P0 工具（市场情绪快照 + 地缘风险扫描）可以不等 token 先做**——优先接 GDELT DOC 2.0，它不需要 token，能直接提供全球新闻列表、新闻密度和 tone 时间线。现有 SearchService 可作为中文新闻补充。
 
-**P1 工具（跨资产风险信号）需要小幅扩展 YfinanceFetcher**——增加对商品/外汇/债券 symbol 的支持。YfinanceFetcher 已经存在且能处理任意 Yahoo Finance symbol，只需要新增一个 `get_cross_asset_quotes(symbols: list)` 方法。
+**P1 工具（跨资产风险信号）先复用 yfinance，再配置 Alpha Vantage 增强**——YfinanceFetcher 已经存在且能处理任意 Yahoo Finance symbol，只需要新增一个 `get_cross_asset_quotes(symbols: list)` 方法；Alpha Vantage 可补 WTI、Brent、美债收益率、宏观指标和市场状态。
 
-**P2 工具（宏观日历、ETF 申赎和衍生品持仓）仍需要封装 AkShare 的宏观和交易接口**——市场资金、北向资金和两融摘要已经接入 Agent 工具层。
+**A 股结构化事件优先用 Tushare Pro**——公告、解禁、减持、异常波动、质押、ETF、期权、期货持仓都可以走 `POST http://api.tushare.pro`，仓库已有 `TUSHARE_TOKEN` 配置入口，适合补成稳定工具。
 
-### 8.4 YfinanceFetcher 跨资产扩展方案
+**Trading Economics 和 ACLED 属于增强源**——Trading Economics 适合做真正经济日历；ACLED 适合做结构化冲突事件校验，但不是金融新闻源，且需要单独账号/授权。
+
+### 8.4 建议新增配置项
+
+```env
+# 金融新闻情绪、跨资产、宏观指标增强源
+ALPHAVANTAGE_API_KEY=
+
+# 全球经济日历
+TRADING_ECONOMICS_API_KEY=
+
+# 美股新闻/经济日历备用源
+FINNHUB_API_KEY=
+
+# 多资产行情备用源
+TWELVEDATA_API_KEY=
+
+# 结构化冲突事件库，可选
+ACLED_USERNAME=
+ACLED_PASSWORD=
+
+# A 股结构化事件、ETF、期权、期货；仓库已有配置入口
+TUSHARE_TOKEN=
+```
+
+### 8.5 YfinanceFetcher 跨资产扩展方案
 
 YfinanceFetcher 当前只用于美股/港股个股和指数。但 yfinance 本身支持任意 Yahoo Finance symbol：
 
@@ -520,7 +551,38 @@ CROSS_ASSET_SYMBOLS = {
 
 实现成本低：在 YfinanceFetcher 中新增一个方法，批量拉取这些 symbol 的最新价格和涨跌幅即可。
 
-### 8.5 AkShare 宏观/资金接口盘点
+### 8.6 Tushare Pro A 股事件接口盘点
+
+Tushare Pro 统一 HTTP 入口：
+
+```http
+POST http://api.tushare.pro
+Content-Type: application/json
+
+{
+  "api_name": "anns_d",
+  "token": "${TUSHARE_TOKEN}",
+  "params": {"ts_code": "600519.SH", "start_date": "20260501", "end_date": "20260510"},
+  "fields": "ts_code,name,title,ann_date,url"
+}
+```
+
+| 接口 | 用途 | 对应工具 |
+| --- | --- | --- |
+| `anns_d` | 上市公司公告、标题、公告日期、PDF URL | `get_company_event_timeline`、`get_regulatory_risk_events` |
+| `share_float` | 限售股解禁明细 | `get_unlock_and_reduction_schedule` |
+| `stk_holdertrade` | 股东增减持 | `get_unlock_and_reduction_schedule` |
+| `stk_alert` | 股票风险提示 | `get_regulatory_risk_events` |
+| `stk_shock` | 异常波动公告/事件 | `get_regulatory_risk_events` |
+| `pledge_stat` / `pledge_detail` | 股权质押统计和明细 | `get_regulatory_risk_events` |
+| `fund_basic` / `etf_basic` | 基金/ETF 基础信息 | `get_etf_flow_snapshot` |
+| `fund_share` | 基金份额变化，可近似 ETF 申赎趋势 | `get_etf_flow_snapshot` |
+| `fund_daily` | 基金/ETF 日行情 | `get_etf_flow_snapshot` |
+| `opt_basic` / `opt_daily` | 期权基础信息和日行情 | `get_derivatives_position_snapshot` |
+| `fut_daily` / `fut_holding` | 期货日行情和持仓排名 | `get_derivatives_position_snapshot` |
+| `cn_schedule` | 中国宏观经济数据发布时间表 | `get_macro_calendar` |
+
+### 8.7 AkShare 宏观/资金接口盘点
 
 AkShare 已有但未被 Agent 工具使用的接口：
 
@@ -532,6 +594,28 @@ AkShare 已有但未被 Agent 工具使用的接口：
 | `macro_china_cpi` / `macro_china_pmi` | 中国宏观数据 | `get_macro_calendar` |
 | `macro_usa_cpi` / `macro_usa_nfp` | 美国宏观数据 | `get_macro_calendar` |
 | `futures_main_sina` | 商品期货主力合约 | `get_cross_asset_risk_signals` 备选 |
+
+### 8.8 推荐接入顺序
+
+1. `get_market_sentiment_snapshot`：GDELT DOC 2.0 + 现有指数数据；无 token 即可做。
+2. `scan_geopolitical_risk_news`：GDELT 固定风险关键词；ACLED 作为可选增强。
+3. `get_cross_asset_risk_signals`：先封装 yfinance 批量跨资产 quote，再接 Alpha Vantage 增强。
+4. `get_company_event_timeline` / `get_unlock_and_reduction_schedule`：用 Tushare `anns_d`、`share_float`、`stk_holdertrade` 补 A 股硬事件。
+5. `get_macro_calendar`：如果提供 `TRADING_ECONOMICS_API_KEY`，优先接 Trading Economics；否则先用 Tushare/AkShare 宏观发布时间表和宏观数据近似。
+6. `get_etf_flow_snapshot` / `get_derivatives_position_snapshot`：依赖 Tushare 权限，放在 P2。
+
+### 8.9 外部文档链接
+
+- GDELT DOC 2.0：`https://api.gdeltproject.org/api/v2/doc/doc`
+- Alpha Vantage：`https://www.alphavantage.co/documentation/`
+- Trading Economics：`https://docs.tradingeconomics.com/get_started/`
+- Finnhub：`https://finnhub.io/docs/api`
+- Twelve Data：`https://twelvedata.com/docs`
+- Tushare HTTP 调用：`https://tushare.pro/document/1?doc_id=130`
+- Tushare 公告 `anns_d`：`https://www.tushare.pro/document/2?doc_id=176`
+- Tushare 限售解禁 `share_float`：`https://tushare.pro/document/2?doc_id=160`
+- Tushare 股东增减持 `stk_holdertrade`：`https://tushare.pro/document/2?doc_id=175`
+- ACLED API：`https://acleddata.com/api-documentation/acled-endpoint`
 
 ## 9. 工具调用时机与策略
 

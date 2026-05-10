@@ -36,40 +36,99 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(_akshare_fund_flow_market("688001"), "sh")
         self.assertEqual(_akshare_fund_flow_market("BJ920748"), "bj")
 
-    def test_capital_flow_passes_market_to_akshare_individual_flow(self) -> None:
+    def test_capital_flow_does_not_fallback_to_eastmoney_when_stockapi_fails(self) -> None:
         adapter = AkshareFundamentalAdapter()
-        seen = []
 
-        def _fake_call_df_candidates(candidates, **_kwargs):
-            seen.append(candidates)
-            if len(seen) == 1:
-                return pd.DataFrame({"股票代码": ["300456"], "主力净流入": [123.0]}), "stock_individual_fund_flow", []
-            return None, None, []
-
-        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+        with patch.object(adapter, "_get_stockapi_capital_flow", return_value=({}, None, ["stockapi_codeFlow:failed"])), \
+                patch.object(adapter, "_call_df_candidates") as mock_akshare:
             result = adapter.get_capital_flow("300456")
 
-        self.assertEqual(result["stock_flow"]["main_net_inflow"], 123.0)
-        self.assertEqual(seen[0][0], ("stock_individual_fund_flow", {"stock": "300456", "market": "sz"}))
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stock_flow"], {})
+        self.assertEqual(result["errors"], ["stockapi_codeFlow:failed"])
+        mock_akshare.assert_not_called()
 
-    def test_capital_flow_failure_preserves_connection_error_and_skips_slow_fallbacks(self) -> None:
+    def test_capital_flow_not_supported_for_non_a_share_without_eastmoney(self) -> None:
         adapter = AkshareFundamentalAdapter()
-        seen = []
 
-        def _fake_call_df_candidates(candidates, **_kwargs):
-            seen.append(candidates)
-            return None, None, ["stock_individual_fund_flow:ConnectionError:Failed to resolve push2his.eastmoney.com"]
+        with patch.object(
+            adapter,
+            "_get_stockapi_capital_flow",
+            return_value=({}, None, ["stockapi_codeFlow:not_supported:HK.00700"]),
+        ), patch.object(adapter, "_call_df_candidates") as mock_akshare:
+            result = adapter.get_capital_flow("HK.00700")
 
-        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
-            result = adapter.get_capital_flow("688469")
+        self.assertEqual(result["status"], "not_supported")
+        self.assertEqual(result["stock_flow"], {})
+        self.assertEqual(result["errors"], ["stockapi_codeFlow:not_supported:HK.00700"])
+        mock_akshare.assert_not_called()
+
+    def test_capital_flow_prefers_stockapi_code_flow(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        stockapi_payload = {
+            "code": 20000,
+            "msg": "success",
+            "data": [
+                {"date": "2026-05-06", "mainAmount": "100.0", "code": "600004"},
+                {"date": "2026-05-07", "mainAmount": "-20.0", "code": "600004"},
+                {"date": "2026-05-08", "mainAmount": "30.0", "code": "600004"},
+            ],
+        }
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return stockapi_payload
+
+        with patch.object(adapter, "_call_df_candidates") as mock_akshare, \
+                patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            result = adapter.get_capital_flow("600004")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 30.0)
+        self.assertEqual(result["stock_flow"]["inflow_5d"], 110.0)
+        self.assertEqual(result["stock_flow"]["inflow_10d"], 110.0)
+        self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
+        self.assertIn("capital_stock:stockapi_codeFlow", result["source_chain"])
+        self.assertEqual(result["errors"], [])
+        mock_akshare.assert_not_called()
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["code"], "600004")
+        self.assertEqual(params["pageSize"], "20")
+
+    def test_capital_flow_splits_stockapi_free_quota_windows(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 20000, "msg": "success", "data": []}
+
+        with patch.dict(os.environ, {"STOCKAPI_TOKEN": ""}, clear=False), \
+                patch("data_provider.fundamental_adapter.datetime") as mock_datetime, \
+                patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            mock_datetime.now.return_value.date.return_value = datetime(2026, 5, 10).date()
+            result = adapter.get_capital_flow("600004")
 
         self.assertEqual(result["status"], "failed")
-        self.assertIn("Failed to resolve", result["errors"][0])
-        flattened_candidates = [(name, kwargs) for batch in seen for name, kwargs in batch]
-        self.assertNotIn(("stock_main_fund_flow", {"symbol": "688469"}), flattened_candidates)
-        self.assertNotIn(("stock_main_fund_flow", {}), flattened_candidates)
-        self.assertNotIn(("stock_sector_fund_flow_rank", {}), flattened_candidates)
-        self.assertNotIn(("stock_sector_fund_flow_summary", {}), flattened_candidates)
+        self.assertEqual(result["errors"], ["stockapi_codeFlow:empty_data"])
+        self.assertEqual(mock_get.call_count, 3)
+        windows = [
+            (call.kwargs["params"]["startDate"], call.kwargs["params"]["endDate"])
+            for call in mock_get.call_args_list
+        ]
+        self.assertEqual(
+            windows,
+            [
+                ("2026-05-02", "2026-05-06"),
+                ("2026-04-27", "2026-05-01"),
+                ("2026-04-22", "2026-04-26"),
+            ],
+        )
 
     def test_market_capital_flow_normalizes_market_and_rankings(self) -> None:
         adapter = AkshareFundamentalAdapter()

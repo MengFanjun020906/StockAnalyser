@@ -264,13 +264,15 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `ENABLE_FUNDAMENTAL_PIPELINE` | Master switch for fundamental aggregation; when disabled, returns `not_supported` block only, without altering the original analysis pipeline. | `true` | Optional |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | Total latency budget for the fundamental stage (seconds) | `1.5` | Optional |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | Timeout for a single capability source call (seconds) | `0.8` | Optional |
-| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Timeout budget for explicit Agent `get_capital_flow` calls; Eastmoney fund-flow endpoints are often slower than the fundamental aggregation budget | `3.0` | Optional |
+| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Timeout budget for explicit Agent `get_capital_flow` calls; StockAPI `codeFlow` is the current default per-stock historical capital-flow source | `3.0` | Optional |
+| `STOCKAPI_TOKEN` | StockAPI historical capital-flow token. `get_capital_flow` calls `stockapi.com.cn/v1/base/codeFlow` by default; blank uses the limited free quota, which only supports delayed history windows and very few daily requests. | - | Optional |
 | `FUNDAMENTAL_RETRY_MAX` | Retry count for fundamental capabilities (including the first attempt) | `1` | Optional |
 | `FUNDAMENTAL_CACHE_TTL_SECONDS` | Fundamental aggregation cache TTL (seconds), short cache to reduce repeated API pulling. | `120` | Optional |
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | Maximum entries for fundamental cache (evicted by time within TTL) | `256` | Optional |
 
 > **Behavior Notes:**
 > - Update the Sequoia candidate DB with `python scripts/update_sequoia_candidates.py --trading-days 260`; it pulls recent A-share daily bars from baostock, writes the SQLite DB pointed to by `SEQUOIA_CANDIDATE_DB_PATH`, and prunes older rows.
+> - `get_capital_flow` uses StockAPI historical `codeFlow` by default and maps the latest available `mainAmount` plus 5-day/10-day sums into `main_net_inflow`, `inflow_5d`, and `inflow_10d`; it no longer calls Eastmoney individual fund-flow endpoints by default. Without `STOCKAPI_TOKEN`, it queries delayed history windows under the free quota and exposes the data date via `latest_date`.
 > - **A-shares**: Returns aggregated capabilities by `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards`.
 > - **ETFs**: Returns available items, marks missing capabilities as `not_supported`, and does not affect the original flow overall.
 > - **US/HK stocks**: Returns `not_supported` fallback block.

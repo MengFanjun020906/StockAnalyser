@@ -182,7 +182,7 @@ LITELLM_MODEL=ollama/qwen3:8b
 - Repository-side compatibility coverage lives in `tests/test_llm_channel_config.py`, `tests/test_market_analyzer_generate_text.py`, `tests/test_agent_pipeline.py`, and `tests/test_system_config_service.py`.
 - Minimal rollback: revert only the Kimi fixed-temperature change set; no separate `LLM_TEMPERATURE` migration is required.
 
-> **Critical Warning**: If you enable `LLM_CHANNELS`, any standard `DEEPSEEK_API_KEY` or `OPENAI_API_KEY` declared independently will be **completely ignored**. **Use only one mode** to prevent configuration conflicts.
+> **Critical Warning**: If you enable `LLM_CHANNELS`, standard provider keys declared outside the channel are not used for channel routing by default. The compatibility exception is official DeepSeek channels: when the channel name or protocol resolves to `deepseek` and `LLM_<NAME>_API_KEY(S)` is empty, the runtime reuses `DEEPSEEK_API_KEY(S)`. `OPENAI_API_KEY` is never used for `deepseek/*` models.
 > **Docker note**: If `LITELLM_MODEL`, `LLM_CHANNELS`, `LLM_DEEPSEEK_MODELS`, or related variables are explicitly passed through `docker compose environment:` or `docker run -e`, they will override the `.env` written by the Web settings page after a container restart. Update the deployment environment at the same time.
 
 ---

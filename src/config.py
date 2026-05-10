@@ -287,6 +287,24 @@ def normalize_llm_channel_model(model: str, protocol: Optional[str], base_url: O
     return f"{resolved_protocol}/{normalized_model}"
 
 
+def _env_list(name: str) -> List[str]:
+    """Read a comma-separated environment variable into non-empty values."""
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
+def _read_provider_api_keys(
+    *,
+    multi_key_env: str,
+    single_key_env: str,
+) -> List[str]:
+    """Read provider keys with *_API_KEYS taking precedence over *_API_KEY."""
+    api_keys = _env_list(multi_key_env)
+    if api_keys:
+        return api_keys
+    single_key = os.getenv(single_key_env, "").strip()
+    return [single_key] if single_key else []
+
+
 def get_configured_llm_models(model_list: List[Dict[str, Any]]) -> List[str]:
     """Return non-legacy model names declared in Router model_list order.
 
@@ -598,6 +616,7 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    stockapi_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
@@ -1083,18 +1102,16 @@ class Config:
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
-        _gemini_keys_raw = os.getenv('GEMINI_API_KEYS', '')
-        gemini_api_keys = [k.strip() for k in _gemini_keys_raw.split(',') if k.strip()]
-        _single_gemini = os.getenv('GEMINI_API_KEY', '').strip()
-        if not gemini_api_keys and _single_gemini:
-            gemini_api_keys = [_single_gemini]
+        gemini_api_keys = _read_provider_api_keys(
+            multi_key_env='GEMINI_API_KEYS',
+            single_key_env='GEMINI_API_KEY',
+        )
 
         # ANTHROPIC_API_KEYS > ANTHROPIC_API_KEY
-        _anthropic_keys_raw = os.getenv('ANTHROPIC_API_KEYS', '')
-        anthropic_api_keys = [k.strip() for k in _anthropic_keys_raw.split(',') if k.strip()]
-        _single_anthropic = os.getenv('ANTHROPIC_API_KEY', '').strip()
-        if not anthropic_api_keys and _single_anthropic:
-            anthropic_api_keys = [_single_anthropic]
+        anthropic_api_keys = _read_provider_api_keys(
+            multi_key_env='ANTHROPIC_API_KEYS',
+            single_key_env='ANTHROPIC_API_KEY',
+        )
 
         # OPENAI_API_KEYS > AIHUBMIX_KEY > OPENAI_API_KEY
         _openai_keys_raw = os.getenv('OPENAI_API_KEYS', '')
@@ -1107,12 +1124,10 @@ class Config:
                 openai_api_keys = [_fallback_key]
 
         # DEEPSEEK_API_KEYS > DEEPSEEK_API_KEY (independent from OpenAI-compatible layer)
-        _deepseek_keys_raw = os.getenv('DEEPSEEK_API_KEYS', '')
-        deepseek_api_keys = [k.strip() for k in _deepseek_keys_raw.split(',') if k.strip()]
-        if not deepseek_api_keys:
-            _single_deepseek = os.getenv('DEEPSEEK_API_KEY', '').strip()
-            if _single_deepseek:
-                deepseek_api_keys = [_single_deepseek]
+        deepseek_api_keys = _read_provider_api_keys(
+            multi_key_env='DEEPSEEK_API_KEYS',
+            single_key_env='DEEPSEEK_API_KEY',
+        )
 
         # LITELLM_MODEL: explicit config takes precedence; else infer from available keys
         litellm_model = os.getenv('LITELLM_MODEL', '').strip()
@@ -1306,6 +1321,7 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            stockapi_token=os.getenv('STOCKAPI_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
@@ -1731,6 +1747,12 @@ class Config:
             raw_models = [m.strip() for m in models_raw.split(',') if m.strip()]
             protocol = resolve_llm_channel_protocol(protocol_raw, base_url=base_url, models=raw_models, channel_name=ch_name)
             models = [normalize_llm_channel_model(m, protocol, base_url) for m in raw_models]
+
+            if not api_keys and protocol == "deepseek":
+                api_keys = _read_provider_api_keys(
+                    multi_key_env='DEEPSEEK_API_KEYS',
+                    single_key_env='DEEPSEEK_API_KEY',
+                )
 
             # Extra headers (JSON string, optional)
             extra_headers_raw = os.getenv(f'LLM_{ch_upper}_EXTRA_HEADERS', '').strip()
