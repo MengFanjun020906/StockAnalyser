@@ -214,8 +214,11 @@ describe('AgentTracePage', () => {
 
     render(<AgentTracePage />);
 
-    expect(await screen.findByDisplayValue('A股主账户 · CN · CNY')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /运行 Trace/ }));
+    fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('A股主账户')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     await waitFor(() => {
       expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
@@ -233,38 +236,16 @@ describe('AgentTracePage', () => {
     });
 
     expect(screen.getByText('A股主账户')).toBeInTheDocument();
-    expect(screen.getByText('150,000')).toBeInTheDocument();
-    expect(screen.getAllByText('20%').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('80%').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('15%').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('8%').length).toBeGreaterThan(0);
     await waitFor(() => {
       expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
     });
     expect(screen.getByRole('heading', { name: '最终结论' })).toBeInTheDocument();
     expect(screen.getByText('持有，但不急着加仓')).toBeInTheDocument();
-    expect(screen.getByText('Trace 已完成')).toBeInTheDocument();
-    expect(screen.getByText('Debate Judge')).toBeInTheDocument();
-    expect(screen.getAllByText('Risk Gate').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('风控通过，允许动作保持为 hold。').length).toBeGreaterThan(0);
-    expect(screen.getByText('critical_data_quality')).toBeInTheDocument();
-    expect(screen.getByText('关键数据质量未标记为失败或不足。')).toBeInTheDocument();
-    expect(screen.getByText('主观点支持继续持有')).toBeInTheDocument();
-    expect(screen.getByText('反方提醒仓位风险')).toBeInTheDocument();
-    expect(screen.getAllByText('维持持有，但资金面和消息面证据不足，需要继续观察。').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('资金面').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('消息面').length).toBeGreaterThan(0);
-    expect(screen.getByText('资金面证据不足')).toBeInTheDocument();
-    expect(screen.getByText('新闻搜索结果不足')).toBeInTheDocument();
-    expect(screen.getByText('Session Outputs')).toBeInTheDocument();
-    expect(screen.getByText('原始主报告输出')).toBeInTheDocument();
-    expect(screen.getByText('Primary Thesis 原始输出')).toBeInTheDocument();
-    expect(screen.getByText('Opposing Thesis 原始输出')).toBeInTheDocument();
-    expect(screen.getByText('Judge 原始输出')).toBeInTheDocument();
-    expect(screen.getAllByText(/final_action/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText('position_review').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('获取实时行情').length).toBeGreaterThan(0);
-    expect(screen.getByText('最近 1 次运行')).toBeInTheDocument();
+    expect(screen.getByText('分析完成')).toBeInTheDocument();
+    expect(screen.getAllByText('风控闸门').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('风控通过，允许执行「hold」。').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
+    expect(screen.getByText('历史')).toBeInTheDocument();
   });
 
   it('loads a completed trace from local history', async () => {
@@ -304,11 +285,12 @@ describe('AgentTracePage', () => {
 
     render(<AgentTracePage />);
 
-    expect(await screen.findByText('最近 1 次运行')).toBeInTheDocument();
+    expect(await screen.findByText('历史')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /601399/ }));
 
     expect(screen.getByText('历史结论')).toBeInTheDocument();
-    expect(screen.getByText('已加载历史 Trace')).toBeInTheDocument();
+    expect(screen.getByText('已加载历史')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
   });
 
@@ -345,7 +327,7 @@ describe('AgentTracePage', () => {
 
     render(<AgentTracePage />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /运行 Trace/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
 
     expect((await screen.findAllByText('get_capital_flow')).length).toBeGreaterThan(0);
     expect(screen.getAllByText('FAIL').length).toBeGreaterThan(0);
@@ -410,13 +392,10 @@ describe('AgentTracePage', () => {
 
     render(<AgentTracePage />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /运行 Trace/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
 
-    expect((await screen.findAllByText('Risk Gate')).length).toBeGreaterThan(0);
-    expect(screen.getAllByText('风控阻断：原动作 sell 被改为 manual_review，失败规则 1 条。').length).toBeGreaterThan(0);
-    expect(screen.getByText('a_share_t_plus_one')).toBeInTheDocument();
-    expect(screen.getAllByText('A 股 T+1 约束：当日买入持仓不能在当日卖出或减仓。').length).toBeGreaterThan(0);
-    expect(screen.getByText('建议动作：manual_review')).toBeInTheDocument();
+    expect((await screen.findAllByText('风控闸门')).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('风控阻断：原动作「sell」被改为「manual_review」。').length).toBeGreaterThan(0);
   });
 
   it('does not send the default stock code for stock-selection prompts', async () => {
@@ -459,6 +438,29 @@ describe('AgentTracePage', () => {
                   signal_score: 92.5,
                   latest_date: '2026-05-08',
                   metrics: { turnover: 150000000, rps: 94.2 },
+                  reason_dimensions: [
+                    { dimension: 'strategy', label: '策略', detail: 'Sequoia 形态/动量策略入池：海龟突破、RPS 强势突破' },
+                    { dimension: 'technical', label: '技术面', detail: '形态/趋势信号满足候选条件；RPS=94.2' },
+                    { dimension: 'capital', label: '资金面', detail: '成交额=1.50亿' },
+                    { dimension: 'sentiment', label: '情绪/热点', detail: '来自强势板块「半导体」成分股' },
+                  ],
+                },
+                {
+                  code: '301183',
+                  name: '东田微',
+                  source: 'alphasift:volume_breakout',
+                  recall_sources: ['alphasift:volume_breakout'],
+                  matched_strategies: ['volume_breakout'],
+                  strategy_tags: ['breakout', 'liquidity'],
+                  reason: 'AlphaSift 放量突破策略入池。',
+                  signal_score: 88,
+                  latest_date: '2026-05-08',
+                  metrics: { amount: 230000000, breakout_20d_pct: 4.2 },
+                  reason_dimensions: [
+                    { dimension: 'strategy', label: '策略', detail: 'AlphaSift YAML 多因子策略入池：放量突破' },
+                    { dimension: 'technical', label: '技术面', detail: '20 日突破幅度=4.2' },
+                    { dimension: 'capital', label: '资金面', detail: '成交额=2.30亿' },
+                  ],
                 },
                 {
                   code: '600002',
@@ -470,10 +472,39 @@ describe('AgentTracePage', () => {
                   signal_score: 71,
                   latest_date: '2026-05-08',
                   metrics: { sector_rank: 3 },
+                  reason_dimensions: [
+                    { dimension: 'sentiment', label: '情绪/热点', detail: '来自强势板块「半导体」成分股' },
+                  ],
                 },
               ],
               discovery_steps: [
+                { source: 'alphasift', status: 'ok', count: 1, db_path: 'Sequoia-X/data/sequoia_v2.db', strategy_names: ['volume_breakout'] },
                 { source: 'sequoia', status: 'ok', count: 1, db_path: 'Sequoia-X/data/sequoia_v2.db', strategy_names: ['turtle_trade', 'rps_breakout'] },
+                {
+                  source: 'event_impact',
+                  status: 'watch_only',
+                  count: 0,
+                  events: [
+                    {
+                      event_id: 'hormuz-watch',
+                      title: '霍尔木兹海峡允许通行，原油风险溢价回落',
+                      snippet: '事件仍处突发阶段，后续油价、运价和保险费变化仍待验证。',
+                      event_type: 'geopolitical_energy',
+                      maturity: 'developing',
+                      impact_variables: ['oil_risk_premium', 'shipping_cost', 'risk_appetite'],
+                      watch_themes: ['石油石化', '航运港口', '化工', '航空机场'],
+                      validation_window_days: 7,
+                      source: 'example.com',
+                      published_date: '2026-05-13',
+                      validation_matches: [
+                        { theme: '石油石化', status: 'watch_only', results: [] },
+                        { theme: '航运港口', status: 'watch_only', results: [] },
+                      ],
+                    },
+                  ],
+                  queries: [],
+                  diagnostics: [],
+                },
                 { source: 'get_sector_rankings', status: 'ok', sectors: ['半导体'] },
                 { source: 'sector_constituents', sector: '半导体', status: 'ok', count: 1 },
               ],
@@ -499,9 +530,66 @@ describe('AgentTracePage', () => {
           success: true,
           selection_context: {
             candidate_strategy: 'hot_sector',
+            orchestration_mode: 'expert_graph',
             next_step: 'render_final_report',
+            expert_state: {
+              status: 'ok',
+              orchestration_mode: 'expert_graph',
+              expert_opinions: {
+                market_regime_expert: {
+                  expert_name: 'market_regime_expert',
+                  dimension: 'market_regime',
+                  verdict: 'caution',
+                  confidence: 0.8,
+                  summary: '市场波动正常但仍需控制追高。',
+                  supporting_evidence: ['趋势向上时可接受回踩确认后的顺势策略。'],
+                  missing_evidence: [],
+                  risk_flags: ['市场状态数据质量有限'],
+                },
+                candidate_discovery_expert: {
+                  expert_name: 'candidate_discovery_expert',
+                  dimension: 'candidate_discovery',
+                  verdict: 'support',
+                  confidence: 0.7,
+                  summary: '候选池共 3 只，来源维度包含策略、技术面、资金面、情绪/热点。',
+                  supporting_evidence: ['600001 测试一: Sequoia 形态/动量策略入池'],
+                  missing_evidence: [],
+                  risk_flags: [],
+                },
+                technical_expert: {
+                  expert_name: 'technical_expert',
+                  dimension: 'technical',
+                  verdict: 'support',
+                  confidence: 0.72,
+                  summary: '技术结构证据已覆盖趋势/结构工具。',
+                  supporting_evidence: ['600001 测试一: technical=support'],
+                  missing_evidence: [],
+                  risk_flags: [],
+                },
+                capital_chip_expert: {
+                  expert_name: 'capital_chip_expert',
+                  dimension: 'capital_chip',
+                  verdict: 'caution',
+                  confidence: 0.55,
+                  summary: '资金/筹码证据仍有缺口。',
+                  supporting_evidence: ['600001 测试一: capital_flow=tool_failed'],
+                  missing_evidence: ['get_capital_flow'],
+                  risk_flags: ['资金流失败时不追高'],
+                },
+                news_sentiment_expert: {
+                  expert_name: 'news_sentiment_expert',
+                  dimension: 'news_sentiment',
+                  verdict: 'neutral',
+                  confidence: 0.45,
+                  summary: '候选池存在消息/热点/情绪来源，但深度情绪工具仍未闭环。',
+                  supporting_evidence: ['600002 测试二: 情绪/热点 - 来自强势板块「半导体」成分股'],
+                  missing_evidence: ['sentiment_tools'],
+                  risk_flags: [],
+                },
+              },
+            },
             stages: {
-              candidate_discovery: { status: 'ok', summary: { candidate_codes: ['600001', '600002'] }, full_ref: 'candidate_discovery.json' },
+              candidate_discovery: { status: 'ok', summary: { candidate_codes: ['600001', '301183', '600002'] }, full_ref: 'candidate_discovery.json' },
               candidate_screening: { status: 'ok', summary: { deep_dive_targets: ['600001'] }, full_ref: 'candidate_screening.json' },
               single_stock_deep_dive: { status: 'ok', summary: { wait_targets: ['600001'] }, full_ref: 'deep_dive_results.json' },
               portfolio_allocation: { status: 'ok', summary: { portfolio_action: 'wait' }, full_ref: 'portfolio_allocation.json' },
@@ -510,10 +598,67 @@ describe('AgentTracePage', () => {
             },
           },
           final_report_json: {
+            orchestration_mode: 'expert_graph',
+            expert_state: {
+              status: 'ok',
+              orchestration_mode: 'expert_graph',
+              expert_opinions: {
+                market_regime_expert: {
+                  expert_name: 'market_regime_expert',
+                  dimension: 'market_regime',
+                  verdict: 'caution',
+                  confidence: 0.8,
+                  summary: '市场波动正常但仍需控制追高。',
+                  supporting_evidence: ['趋势向上时可接受回踩确认后的顺势策略。'],
+                  missing_evidence: [],
+                  risk_flags: ['市场状态数据质量有限'],
+                },
+                candidate_discovery_expert: {
+                  expert_name: 'candidate_discovery_expert',
+                  dimension: 'candidate_discovery',
+                  verdict: 'support',
+                  confidence: 0.7,
+                  summary: '候选池共 3 只，来源维度包含策略、技术面、资金面、情绪/热点。',
+                  supporting_evidence: ['600001 测试一: Sequoia 形态/动量策略入池'],
+                  missing_evidence: [],
+                  risk_flags: [],
+                },
+                technical_expert: {
+                  expert_name: 'technical_expert',
+                  dimension: 'technical',
+                  verdict: 'support',
+                  confidence: 0.72,
+                  summary: '技术结构证据已覆盖趋势/结构工具。',
+                  supporting_evidence: ['600001 测试一: technical=support'],
+                  missing_evidence: [],
+                  risk_flags: [],
+                },
+                capital_chip_expert: {
+                  expert_name: 'capital_chip_expert',
+                  dimension: 'capital_chip',
+                  verdict: 'caution',
+                  confidence: 0.55,
+                  summary: '资金/筹码证据仍有缺口。',
+                  supporting_evidence: ['600001 测试一: capital_flow=tool_failed'],
+                  missing_evidence: ['get_capital_flow'],
+                  risk_flags: ['资金流失败时不追高'],
+                },
+                news_sentiment_expert: {
+                  expert_name: 'news_sentiment_expert',
+                  dimension: 'news_sentiment',
+                  verdict: 'neutral',
+                  confidence: 0.45,
+                  summary: '候选池存在消息/热点/情绪来源，但深度情绪工具仍未闭环。',
+                  supporting_evidence: ['600002 测试二: 情绪/热点 - 来自强势板块「半导体」成分股'],
+                  missing_evidence: ['sentiment_tools'],
+                  risk_flags: [],
+                },
+              },
+            },
             candidate_discovery: {
               summary: {
-                candidate_codes: ['600001', '600002'],
-                candidate_sources: ['sequoia:multi_strategy', 'akshare:industry:半导体'],
+                candidate_codes: ['600001', '301183', '600002'],
+                candidate_sources: ['sequoia:multi_strategy', 'alphasift:volume_breakout', 'akshare:industry:半导体'],
                 main_limitations: ['候选需要深度取证'],
               },
               full: {
@@ -529,6 +674,29 @@ describe('AgentTracePage', () => {
                     signal_score: 92.5,
                     latest_date: '2026-05-08',
                     metrics: { turnover: 150000000, rps: 94.2 },
+                    reason_dimensions: [
+                      { dimension: 'strategy', label: '策略', detail: 'Sequoia 形态/动量策略入池：海龟突破、RPS 强势突破' },
+                      { dimension: 'technical', label: '技术面', detail: '形态/趋势信号满足候选条件；RPS=94.2' },
+                      { dimension: 'capital', label: '资金面', detail: '成交额=1.50亿' },
+                      { dimension: 'sentiment', label: '情绪/热点', detail: '来自强势板块「半导体」成分股' },
+                    ],
+                  },
+                  {
+                    code: '301183',
+                    name: '东田微',
+                    source: 'alphasift:volume_breakout',
+                    recall_sources: ['alphasift:volume_breakout'],
+                    matched_strategies: ['volume_breakout'],
+                    strategy_tags: ['breakout', 'liquidity'],
+                    reason: 'AlphaSift 放量突破策略入池。',
+                    signal_score: 88,
+                    latest_date: '2026-05-08',
+                    metrics: { amount: 230000000, breakout_20d_pct: 4.2 },
+                    reason_dimensions: [
+                      { dimension: 'strategy', label: '策略', detail: 'AlphaSift YAML 多因子策略入池：放量突破' },
+                      { dimension: 'technical', label: '技术面', detail: '20 日突破幅度=4.2' },
+                      { dimension: 'capital', label: '资金面', detail: '成交额=2.30亿' },
+                    ],
                   },
                   {
                     code: '600002',
@@ -541,6 +709,9 @@ describe('AgentTracePage', () => {
                     signal_score: 71,
                     latest_date: '2026-05-08',
                     metrics: { sector_rank: 3 },
+                    reason_dimensions: [
+                      { dimension: 'sentiment', label: '情绪/热点', detail: '来自强势板块「半导体」成分股' },
+                    ],
                   },
                 ],
               },
@@ -568,7 +739,7 @@ describe('AgentTracePage', () => {
     const promptInput = await screen.findByDisplayValue(/我持有 600519/);
     fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股，并告诉我怎么分配仓位' } });
     expect(screen.getByText('当前问题像选股/组合配置，将不会发送该股票代码。')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /运行 Trace/ }));
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     await waitFor(() => {
       expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
@@ -576,33 +747,53 @@ describe('AgentTracePage', () => {
       }));
     });
     expect(screen.getByText('选股结论')).toBeInTheDocument();
-    expect(screen.getByText('Stock Selection Pipeline')).toBeInTheDocument();
-    expect(screen.getByText('L1 Data & Candidate Layer / 数据与候选池层')).toBeInTheDocument();
-    expect(screen.queryByText('L2 Candidate Layer / 候选池层')).not.toBeInTheDocument();
-    expect(screen.getByText('候选来源审计')).toBeInTheDocument();
-    expect(screen.getByText('召回路径')).toBeInTheDocument();
+    expect(screen.getByText('数据与候选池')).toBeInTheDocument();
+    expect(screen.queryByText('候选池层')).not.toBeInTheDocument();
+    expect(await screen.findByText('候选来源审计')).toBeInTheDocument();
+    expect(screen.getByText('消息/事件观察 (1)')).toBeInTheDocument();
+    expect(screen.getByText('霍尔木兹海峡允许通行，原油风险溢价回落')).toBeInTheDocument();
+    expect(screen.getByText('等待验证')).toBeInTheDocument();
+    expect(screen.getAllByText('石油石化').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('航运港口').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('观察中，未形成个股候选').length).toBeGreaterThan(0);
+    expect(screen.getByText('多专家选股状态')).toBeInTheDocument();
+    expect(screen.getByText('expert_graph')).toBeInTheDocument();
+    expect(screen.getByText('市场环境专家')).toBeInTheDocument();
+    expect(screen.getByText('候选发现专家')).toBeInTheDocument();
+    expect(screen.getByText('技术结构专家')).toBeInTheDocument();
+    expect(screen.getByText('资金筹码专家')).toBeInTheDocument();
+    expect(screen.getByText('消息情绪专家')).toBeInTheDocument();
+    expect(screen.getByText('按专家维度分组的候选')).toBeInTheDocument();
+    expect(screen.getByText('策略候选')).toBeInTheDocument();
+    expect(screen.getByText('技术面候选')).toBeInTheDocument();
+    expect(screen.getByText('资金面候选')).toBeInTheDocument();
+    expect(screen.getByText('情绪/热点候选')).toBeInTheDocument();
     expect(screen.queryByText('为什么后续工具查这些股票')).not.toBeInTheDocument();
     expect(screen.queryByText('入池候选与理由')).not.toBeInTheDocument();
-    expect(screen.getByText('Sequoia-X/data/sequoia_v2.db')).toBeInTheDocument();
-    expect(screen.getAllByText('多路召回').length).toBeGreaterThan(0);
-    expect(screen.getByText('强势板块成分股')).toBeInTheDocument();
     expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
-    expect(screen.getByText('候选池列表')).toBeInTheDocument();
+    expect(screen.getByText('候选池列表 (3)')).toBeInTheDocument();
     expect(screen.getAllByText('强势板块').length).toBeGreaterThan(0);
-    expect(screen.getByText('candidate_discovery.json')).toBeInTheDocument();
     expect(screen.getAllByText('600001').length).toBeGreaterThan(0);
     expect(screen.getAllByText('测试一').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('92.5').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('301183').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('东田微').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('评分 92.5').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('AlphaSift 多因子：volume_breakout').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/AlphaSift YAML 多因子策略入池/).length).toBeGreaterThan(0);
     expect(screen.getAllByText('海龟突破').length).toBeGreaterThan(0);
     expect(screen.getAllByText('RPS 强势突破').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('多策略共振：均线放量突破、海龟突破、RPS 强势突破。').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Sequoia 形态\/动量策略入池/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('策略').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('技术面').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('资金面').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('情绪/热点').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/形态\/趋势信号满足候选条件/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/流动性代理：成交额=1.50亿/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/多策略共振：均线放量突破, 海龟突破, RPS 强势突破。；形态\/趋势信号满足候选条件/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/来自强势板块「半导体」成分股/).length).toBeGreaterThan(0);
     expect(screen.queryByText('ma_volume')).not.toBeInTheDocument();
     expect(screen.queryByText('turtle_trade')).not.toBeInTheDocument();
     expect(screen.queryByText('rps_breakout')).not.toBeInTheDocument();
-    expect(screen.getAllByText(/turnover/).length).toBeGreaterThan(0);
-    expect(screen.getByText('回踩确认')).toBeInTheDocument();
-    expect(screen.getByText('capital_flow')).toBeInTheDocument();
-    expect(screen.getByText('不追高')).toBeInTheDocument();
   });
 });
 

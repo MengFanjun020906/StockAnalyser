@@ -512,9 +512,72 @@ analyze_pattern_tool = ToolDefinition(
 )
 
 
+def _handle_analyze_price_structure(stock_code: str, days: int = 120, swing_window: int = 3) -> dict:
+    """Run deterministic Chan + SMC price-structure analysis."""
+    from src.agent.structure import analyze_price_structure, coerce_price_bars
+    from src.services.history_loader import load_history_df
+
+    if not (stock_code and str(stock_code).strip()):
+        return {"error": "stock_code is required"}
+
+    safe_days = max(int(days or 120), 60)
+    df, source = load_history_df(stock_code, days=safe_days)
+    if df is None or df.empty:
+        return {"error": f"No historical data for price structure analysis on {stock_code}"}
+
+    rows = df.tail(safe_days).reset_index().to_dict("records")
+    bars = coerce_price_bars(rows)
+    result = analyze_price_structure(
+        bars,
+        min_bars=30,
+        chan_min_pen_span=4,
+        swing_window=max(int(swing_window or 3), 1),
+    )
+    result["code"] = stock_code
+    result["source"] = source
+    result["period_days"] = len(bars)
+    return result
+
+
+analyze_price_structure_tool = ToolDefinition(
+    name="analyze_price_structure",
+    description=(
+        "Analyze deterministic price structure using a Chan pipeline "
+        "(inclusion merge, alternating fractals, pens, centers, strength ratios, "
+        "unfinished pen) plus simplified SMC signals (swings HH/HL/LH/LL, BOS, "
+        "CHoCH, order blocks, fair value gaps). Returns structured evidence only "
+        "and does not issue buy/sell decisions."
+    ),
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code, e.g., '600519'",
+        ),
+        ToolParameter(
+            name="days",
+            type="integer",
+            description="Number of recent trading days to scan (default: 120)",
+            required=False,
+            default=120,
+        ),
+        ToolParameter(
+            name="swing_window",
+            type="integer",
+            description="Swing local-extreme radius for SMC detection (default: 3)",
+            required=False,
+            default=3,
+        ),
+    ],
+    handler=_handle_analyze_price_structure,
+    category="analysis",
+)
+
+
 ALL_ANALYSIS_TOOLS = [
     analyze_trend_tool,
     calculate_ma_tool,
     get_volume_analysis_tool,
     analyze_pattern_tool,
+    analyze_price_structure_tool,
 ]

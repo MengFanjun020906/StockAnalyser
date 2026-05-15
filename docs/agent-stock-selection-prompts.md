@@ -313,6 +313,7 @@ judge_winner = primary | opposing | mixed | insufficient_data
 1. 如果 `target_symbols` 非空，必须优先使用用户给出的股票作为候选，不得擅自替换。
 2. 如果用户给出的股票代码无法被工具确认存在，标记为 `invalid_input`，不要替用户自动换成其他股票。
 3. 如果 `target_symbols` 为空，必须按 `candidate_strategy` 生成候选：
+   - quant_momentum / auto：优先使用 `discover_watchlist_candidates` 的多路召回结果。AlphaSift YAML 候选提供可配置硬筛、因子打分和策略标签；Sequoia 量化候选提供均线放量、海龟突破、高窄旗形、涨停洗盘、上升趋势跌停错杀和 RPS 强势突破；强势板块成分股等其他召回通道也应参与统一评分。
    - hot_sector：从强势板块/主题中找流动性足够、未明显追高的成分股。优先关注最新交易日涨停，并以涨停方式突破关键技术位置的股票。关键技术位置包括前期震荡中枢上沿、箱体高点、阶段平台压力位或重要均线/趋势线压力位。该突破下方应存在相对规律的震荡、横盘或蓄势结构，不能只因为单日涨停入选。
    - value_quality：优先盈利稳定、估值不极端、现金流或 ROE 质量较好的公司。不强制要求涨停突破。
    - growth_turnaround：优先营收改善、亏损收窄、行业景气向上但价格未透支的公司。允许亏损，但必须标注亏损状态。
@@ -323,7 +324,7 @@ judge_winner = primary | opposing | mixed | insufficient_data
    - 成交额或流动性显著不足。
    - 近期开盘连续异常涨停且无法给出安全入场区间。
    - 已知重大负面事件未澄清的股票。
-5. 不得只因为板块涨幅高就直接推荐个股；必须写明候选来源和后续必查证据。
+5. 不得只因为板块涨幅高、AlphaSift 因子分高或 Sequoia 形态命中就直接推荐个股；必须写明候选来源、策略标签和后续必查证据。
 6. 如果候选发现失败，输出 `insufficient_candidates`，不要编造股票代码。
 7. 工具失败、超时或返回空数据时，写入 `tool_failures` 和 `missing_evidence`。
 
@@ -349,7 +350,7 @@ judge_winner = primary | opposing | mixed | insufficient_data
     "candidate_codes": [],
     "key_sources": [],
     "main_limitations": [],
-    "next_required_tools": ["get_realtime_quote", "analyze_trend", "get_capital_flow", "search_comprehensive_intel"]
+    "next_required_tools": ["get_realtime_quote", "analyze_trend", "analyze_price_structure", "get_capital_flow", "search_comprehensive_intel"]
   },
   "full": {
     "candidates": [

@@ -199,6 +199,45 @@ class GraphitiService:
         except Exception as exc:
             logger.warning("Graphiti trace ingestion failed for %s: %s", session_id, exc, exc_info=True)
 
+    async def ingest_market_event(
+        self,
+        *,
+        event_id: str,
+        title: str,
+        event_payload: dict[str, Any],
+        market: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        """Best-effort write of a market event / event-impact watch episode."""
+        if not self.is_available():
+            return
+        if not await self._ensure_indices():
+            return
+
+        episode_body = {
+            "event_id": event_id,
+            "title": title,
+            "event_payload": _safe_jsonable(event_payload),
+        }
+        group_id = self._resolve_group_id(market=market, user_id=user_id)
+        safe_event_id = _safe_group_token(event_id, "event")
+        episode_name = f"market_event:{safe_event_id}:{datetime.now(timezone.utc).date().isoformat()}"
+
+        try:
+            from .ontology import DEFAULT_ENTITY_TYPES
+
+            await self._client.add_episode(
+                name=episode_name,
+                episode_body=json.dumps(_safe_jsonable(episode_body), ensure_ascii=False, default=str),
+                source_description="event_impact_candidate_discovery",
+                reference_time=datetime.now(timezone.utc),
+                group_id=group_id,
+                entity_types=DEFAULT_ENTITY_TYPES,
+            )
+            logger.info("Graphiti ingested market event %s (group_id=%s)", event_id, group_id)
+        except Exception as exc:
+            logger.warning("Graphiti market event ingestion failed for %s: %s", event_id, exc, exc_info=True)
+
     def ingest_analysis_sync(self, **kwargs: Any) -> None:
         if not self.is_available():
             return
@@ -222,6 +261,19 @@ class GraphitiService:
             loop = asyncio.new_event_loop()
             try:
                 loop.run_until_complete(self.ingest_trace(**kwargs))
+            finally:
+                loop.close()
+
+    def ingest_market_event_sync(self, **kwargs: Any) -> None:
+        if not self.is_available():
+            return
+
+        try:
+            asyncio.run(self.ingest_market_event(**kwargs))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(self.ingest_market_event(**kwargs))
             finally:
                 loop.close()
 

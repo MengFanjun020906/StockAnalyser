@@ -191,6 +191,7 @@ daily_stock_analysis/
 | `LITELLM_MODEL` | 主模型，格式 `provider/model`（如 `gemini/gemini-2.5-flash`），推荐优先使用 | - | 否 |
 | `AGENT_LITELLM_MODEL` | Agent 主模型（可选）；留空继承主模型，无 provider 前缀按 `openai/<model>` 解析 | - | 否 |
 | `AGENT_ANALYSIS_MODE` | Agent 分析模式：`normal` 保持现有 ReAct 链路；`planning_execute` 启用账户感知 Planner prompt，并在可用时注入 `AgentUserContext` | `normal` | 否 |
+| `AGENT_ORCHESTRATION_MODE` | `watchlist_scan` 内部编排模式：`legacy` 保持现有阶段化选股；`expert_graph` 额外把多专家共享状态和专家意见写入 Trace | `legacy` | 否 |
 | `LITELLM_FALLBACK_MODELS` | 备选模型，逗号分隔 | - | 否 |
 | `LLM_CHANNELS` | 渠道名称列表（逗号分隔），配合 `LLM_{NAME}_*` 使用，详见 [LLM 配置指南](LLM_CONFIG_GUIDE.md) | - | 否 |
 | `LITELLM_CONFIG` | 高级模型路由 YAML 配置文件路径（高级） | - | 否 |
@@ -295,6 +296,8 @@ daily_stock_analysis/
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
 | `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia 风格量化候选池 SQLite 路径；`watchlist_scan` 候选发现会读取 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` 并运行形态策略 | `Sequoia-X/data/sequoia_v2.db` | 可选 |
+| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML 候选策略目录；`discover_watchlist_candidates` 的 `auto` 模式会优先读取启用的 YAML 策略做 L1 硬筛和因子召回 | `alphasift/alphasift/strategies` | 可选 |
+| `ALPHASIFT_CANDIDATE_DB_PATH` | AlphaSift 候选池 SQLite 路径；未配置时复用 `SEQUOIA_CANDIDATE_DB_PATH`，表结构同 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` | `SEQUOIA_CANDIDATE_DB_PATH` | 可选 |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `1.5` | 可选 |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `0.8` | 可选 |
@@ -305,6 +308,7 @@ daily_stock_analysis/
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（TTL 内按时间淘汰） | `256` | 可选 |
 
 > 行为说明：
+> - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
 > - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并裁剪旧数据。
 > - `get_capital_flow` 默认优先使用 StockAPI 历史资金流 `codeFlow`，用最近可用交易日 `mainAmount` 生成 `main_net_inflow`、近 5 日和近 10 日累计主力净流入；当前不再默认调用东方财富个股资金流端点。未配置 `STOCKAPI_TOKEN` 时会按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；

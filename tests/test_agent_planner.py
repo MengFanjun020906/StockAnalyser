@@ -25,6 +25,7 @@ def test_get_tools_for_capability_filters_missing_registry_tools():
 
     assert plan.tools == ["analyze_trend", "calculate_ma"]
     assert "get_volume_analysis" in plan.missing_tools
+    assert "analyze_price_structure" in plan.missing_tools
     assert plan.capability == "technical_analysis"
 
 
@@ -48,6 +49,21 @@ def test_get_tools_for_capability_includes_extended_capital_flow_tools():
     assert plan.missing_tools == []
 
 
+def test_get_tools_for_capability_prefers_detect_market_regime():
+    plan = get_tools_for_capability(
+        "regime_detection",
+        tool_registry=_registry(
+            "detect_market_regime",
+            "get_market_indices",
+            "get_sector_rankings",
+            "get_volume_analysis",
+        ),
+    )
+
+    assert plan.tools[0] == "detect_market_regime"
+    assert plan.missing_tools == []
+
+
 def test_build_planning_result_selects_position_review_capabilities():
     context = AgentUserContext(
         positions=[PositionContext(symbol="600519", quantity=100, avg_cost=1500)],
@@ -64,10 +80,12 @@ def test_build_planning_result_selects_position_review_capabilities():
             "get_portfolio_snapshot",
             "get_realtime_quote",
             "analyze_trend",
+            "analyze_price_structure",
             "get_capital_flow",
             "get_market_capital_flow",
             "get_northbound_capital_flow",
             "get_margin_trading_summary",
+            "detect_market_regime",
             "get_market_indices",
             "get_sector_rankings",
         ),
@@ -81,6 +99,8 @@ def test_build_planning_result_selects_position_review_capabilities():
     assert "get_portfolio_snapshot" in result.required_tools
     assert "margin_pressure" in result.risk_checks
     assert "get_market_capital_flow" in result.required_tools
+    assert "detect_market_regime" in result.required_tools
+    assert "analyze_price_structure" in result.required_tools
 
 
 def test_build_planning_result_defaults_to_entry_analysis_without_position():
@@ -111,9 +131,11 @@ def test_build_planning_result_watchlist_scan_starts_with_candidate_discovery():
 
     result = build_planning_result(
         context,
-        tool_registry=_registry("discover_watchlist_candidates", "get_realtime_quote", "analyze_trend"),
+        tool_registry=_registry("discover_watchlist_candidates", "detect_market_regime", "get_realtime_quote", "analyze_trend"),
     )
 
     assert result.intent == "watchlist_scan"
     assert result.capabilities[0] == "watchlist_discovery"
     assert result.required_tools[0] == "discover_watchlist_candidates"
+    assert "regime_detection" in result.capabilities
+    assert "detect_market_regime" in result.required_tools

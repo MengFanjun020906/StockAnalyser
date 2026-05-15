@@ -169,6 +169,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `LITELLM_MODEL` | Primary model, format `provider/model` (e.g. `gemini/gemini-2.5-flash`), recommended | - | No |
 | `AGENT_LITELLM_MODEL` | Optional Agent-only primary model; when empty it inherits the primary model, and bare names are normalized to `openai/<model>` | - | No |
 | `AGENT_ANALYSIS_MODE` | Agent analysis mode: `normal` keeps the existing ReAct flow; `planning_execute` enables the account-aware Planner prompt and injects `AgentUserContext` when available | `normal` | No |
+| `AGENT_ORCHESTRATION_MODE` | `watchlist_scan` orchestration mode: `legacy` keeps the existing staged selection flow; `expert_graph` also writes shared-state expert opinions into Trace | `legacy` | No |
 | `LITELLM_FALLBACK_MODELS` | Fallback models, comma-separated | - | No |
 | `LLM_CHANNELS` | Channel names (comma-separated), use with `LLM_{NAME}_*`, see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) | - | No |
 | `LITELLM_CONFIG` | Advanced model routing YAML path (expert use) | - | No |
@@ -261,6 +262,8 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `ENABLE_EASTMONEY_PATCH` | Eastmoney API patch: Recommended to set to `true` when Eastmoney APIs fail frequently (e.g., RemoteDisconnected, connection closed). Injects NID tokens and random User-Agents to reduce rate limiting probability. | `false` | Optional |
 | `REALTIME_SOURCE_PRIORITY` | Real-time quote source priority (comma-separated), e.g., `tencent,akshare_sina,efinance,akshare_em` | See .env.example | Optional |
 | `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia-style quantitative candidate SQLite path. `watchlist_scan` candidate discovery reads `stock_daily(symbol,date,open,high,low,close,volume,turnover)` and runs pattern strategies. | `Sequoia-X/data/sequoia_v2.db` | Optional |
+| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML candidate strategy directory. `discover_watchlist_candidates` auto mode loads enabled YAML strategies for L1 hard filtering and factor recall. | `alphasift/alphasift/strategies` | Optional |
+| `ALPHASIFT_CANDIDATE_DB_PATH` | AlphaSift candidate SQLite path. When unset, it reuses `SEQUOIA_CANDIDATE_DB_PATH`; schema is `stock_daily(symbol,date,open,high,low,close,volume,turnover)`. | `SEQUOIA_CANDIDATE_DB_PATH` | Optional |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | Master switch for fundamental aggregation; when disabled, returns `not_supported` block only, without altering the original analysis pipeline. | `true` | Optional |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | Total latency budget for the fundamental stage (seconds) | `1.5` | Optional |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | Timeout for a single capability source call (seconds) | `0.8` | Optional |
@@ -271,6 +274,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | Maximum entries for fundamental cache (evicted by time within TTL) | `256` | Optional |
 
 > **Behavior Notes:**
+> - `discover_watchlist_candidates` auto mode fills candidates in this order: AlphaSift YAML multi-factor recall, Sequoia pattern strategies, strong-sector constituents, then fixed fallback seeds. AlphaSift is integrated only as the L1 hard-filter/factor layer, without adding another LLM ranking step during candidate discovery.
 > - Update the Sequoia candidate DB with `python scripts/update_sequoia_candidates.py --trading-days 260`; it pulls recent A-share daily bars from baostock, writes the SQLite DB pointed to by `SEQUOIA_CANDIDATE_DB_PATH`, and prunes older rows.
 > - `get_capital_flow` uses StockAPI historical `codeFlow` by default and maps the latest available `mainAmount` plus 5-day/10-day sums into `main_net_inflow`, `inflow_5d`, and `inflow_10d`; it no longer calls Eastmoney individual fund-flow endpoints by default. Without `STOCKAPI_TOKEN`, it queries delayed history windows under the free quota and exposes the data date via `latest_date`.
 > - **A-shares**: Returns aggregated capabilities by `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards`.

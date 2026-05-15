@@ -358,7 +358,7 @@ Agent 模式会注册工具，供 LLM 按阶段调用。主要工具包括：
 | `get_analysis_context` | data | 获取数据库中的技术上下文 |
 | `get_stock_info` | data | 获取估值、基本面、板块等压缩上下文 |
 | `get_capital_flow` | data | 获取 A 股个股主力资金流；默认使用 StockAPI 历史资金流 `codeFlow`，显式工具使用 `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` 预算 |
-| `discover_watchlist_candidates` | market | 生成选股候选池；默认使用 Sequoia 量化策略、强势板块成分股等多路召回并统一评分，仅在无候选时使用固定种子池兜底 |
+| `discover_watchlist_candidates` | market | 生成选股候选池；默认使用 AlphaSift YAML 多因子策略、Sequoia 量化策略、强势板块成分股等多路召回并统一评分，仅在无候选时使用固定种子池兜底 |
 | `get_market_capital_flow` | data | 获取 A 股市场资金快照、个股/行业/概念资金流排名 |
 | `get_northbound_capital_flow` | data | 获取北向资金摘要和近期历史 |
 | `get_margin_trading_summary` | data | 获取融资融券余额、融资买入和交易所两融摘要 |
@@ -367,6 +367,7 @@ Agent 模式会注册工具，供 LLM 按阶段调用。主要工具包括：
 | `calculate_ma` | analysis | 计算自定义均线和乖离率 |
 | `get_volume_analysis` | analysis | 分析量价关系、放缩量、量价背离 |
 | `analyze_pattern` | analysis | 识别 K 线和形态，如十字星、吞没、双底、突破、箱体 |
+| `analyze_price_structure` | analysis | 识别 Stage3 价格结构，输出缠论包含合并、分型、笔、中枢、力度、未完成笔，以及 SMC 摆动、BOS/CHoCH、OB/FVG |
 | `search_stock_news` | search | 搜索单维最新新闻 |
 | `search_comprehensive_intel` | search | 多维情报搜索 |
 | `get_market_indices` | market | 获取主要指数 |

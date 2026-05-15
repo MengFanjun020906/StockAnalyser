@@ -20,6 +20,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 
+from src.data.stock_index_loader import get_index_stock_name
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SEQUOIA_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
@@ -232,7 +235,7 @@ def _normalize_strategy_names(strategy_names: Optional[Sequence[str]]) -> List[s
         canonical = aliases.get(name, name)
         if canonical in STRATEGY_SPECS and canonical not in result:
             result.append(canonical)
-    return result or list(STRATEGY_SPECS.keys())
+    return result
 
 
 def _run_single_symbol_strategy(strategy_name: str, symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -353,9 +356,9 @@ def _candidate_payload(
     metrics: Dict[str, Any],
 ) -> Dict[str, Any]:
     spec = STRATEGY_SPECS[strategy_name]
-    return {
+    payload = {
         "code": symbol,
-        "name": symbol,
+        "name": _display_stock_name(symbol),
         "source": f"sequoia:{strategy_name}",
         "matched_strategies": [strategy_name],
         "strategy_tags": list(spec.tags),
@@ -364,6 +367,19 @@ def _candidate_payload(
         "latest_date": _format_date(last.get("date") if hasattr(last, "get") else None),
         "metrics": _jsonable_metrics(metrics),
     }
+    payload["reason_dimensions"] = _candidate_reason_dimensions(payload)
+    return payload
+
+
+def _display_stock_name(code: Any, current_name: Any = None) -> str:
+    code_text = str(code or "").strip()
+    current_text = str(current_name or "").strip()
+    if is_meaningful_stock_name(current_text, code_text):
+        return current_text
+    for name in (STOCK_NAME_MAP.get(code_text), get_index_stock_name(code_text)):
+        if is_meaningful_stock_name(name, code_text):
+            return str(name)
+    return code_text
 
 
 def _merge_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -384,7 +400,66 @@ def _merge_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, An
         metrics = dict(current.get("metrics") or {})
         metrics[str(item.get("source") or "sequoia")] = item.get("metrics") or {}
         current["metrics"] = metrics
-    return list(by_code.values())
+    merged = list(by_code.values())
+    for item in merged:
+        item["reason_dimensions"] = _candidate_reason_dimensions(item)
+    return merged
+
+
+def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
+    strategies = _display_strategy_names(item.get("matched_strategies") or [])
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    dimensions: List[Dict[str, str]] = []
+    if strategies:
+        dimensions.append({
+            "dimension": "strategy",
+            "label": "策略",
+            "detail": f"Sequoia 形态/动量策略入池：{'、'.join(strategies)}",
+        })
+    technical_bits = []
+    for key, label in (
+        ("high_20", "20 日高点"),
+        ("volume_ratio", "量比"),
+        ("rps", "RPS"),
+        ("pct_change_120", "120 日涨幅"),
+        ("momentum_40", "40 日动量"),
+        ("range_10", "10 日区间"),
+    ):
+        value = metrics.get(key)
+        if value is not None:
+            technical_bits.append(f"{label}={value}")
+    if technical_bits:
+        dimensions.append({"dimension": "technical", "label": "技术面", "detail": "；".join(technical_bits[:3])})
+    capital_bits = []
+    for key, label in (("turnover", "成交额"), ("volume_ratio", "量比")):
+        value = metrics.get(key)
+        if value is not None:
+            capital_bits.append(f"{label}={value}")
+    if capital_bits:
+        dimensions.append({"dimension": "capital", "label": "资金面", "detail": "流动性代理：" + "；".join(capital_bits[:3])})
+    return dimensions
+
+
+def _display_strategy_names(names: Iterable[Any]) -> List[str]:
+    mapping = {
+        "ma_volume": "均线放量突破",
+        "turtle_trade": "海龟突破",
+        "high_tight_flag": "高窄旗形",
+        "limit_up_shakeout": "涨停洗盘",
+        "uptrend_limit_down": "上升趋势跌停错杀",
+        "rps_breakout": "RPS 强势突破",
+        "breakout": "突破",
+        "rps": "RPS 强势",
+        "relative_strength": "相对强势",
+        "momentum": "动量",
+        "liquidity": "流动性",
+    }
+    result: List[str] = []
+    for name in names:
+        text = mapping.get(str(name), str(name))
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _safe_ratio(numerator: Any, denominator: Any) -> float:
@@ -437,4 +512,3 @@ def _format_date(value: Any) -> Optional[str]:
         return pd.to_datetime(value).strftime("%Y-%m-%d")
     except Exception:
         return str(value)
-

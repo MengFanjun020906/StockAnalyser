@@ -80,6 +80,7 @@ ANALYSIS_DIMENSIONS = """\
    - 乖离率、支撑位、压力位
    - MACD、RSI、量价结构
    - K线形态、突破、回踩、箱体、双底等形态信号
+   - Chan/SMC 价格结构：笔、中枢、力度、未完成笔、HH/HL/LH/LL、BOS/CHoCH、OB/FVG
    - 默认采集；输出时根据用户问题决定详细程度
 
 2. 实时行情与量价（realtime_quote）
@@ -227,7 +228,7 @@ Planner 必须先选择主维度，再选择辅助维度。
 | --- | --- | --- |
 | `portfolio_context` | 已持仓、风险检查、融资融券 | 成本、仓位、现金、浮盈亏、杠杆风险 |
 | `realtime_quote` | 需要判断当前是否行动 | 当前价、涨跌幅、量价、是否跌破/突破关键位 |
-| `technical_analysis` | 需要价格计划、止损止盈、趋势判断 | 趋势、均线、支撑压力、量价结构 |
+| `technical_analysis` | 需要价格计划、止损止盈、趋势判断 | 趋势、均线、支撑压力、量价结构、缠论/SMC 结构 |
 | `news_event` | 用户问事件、异动、风险催化 | 公告、新闻、监管、减持、业绩预告 |
 | `capital_flow` | 用户问主力、短线承接、出货风险 | 主力流入流出、资金持续性 |
 | `chip_distribution` | A 股持仓成本区、套牢盘/获利盘压力 | 筹码集中度、获利比例、成本压力 |
@@ -294,12 +295,13 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 
 - `portfolio_context` -> `get_portfolio_snapshot`
 - `realtime_quote` -> `get_realtime_quote`
-- `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`
-- `news_event` -> `search_comprehensive_intel`, `search_stock_news`
+- `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure`
+- `news_event` -> `search_comprehensive_intel`, `search_stock_news`, `score_stock_news_sentiment`
 - `capital_flow` -> `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary`
 - `chip_distribution` -> `get_chip_distribution`
 - `fundamental_analysis` -> `get_stock_info`
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`
+- `regime_detection` -> `detect_market_regime`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`
 - `backtest_memory` -> `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary`
 
 ### 结构化执行计划
@@ -428,7 +430,7 @@ EXECUTE_PROTOCOL = """\
 
 当 `intent=watchlist_scan` 且 `target_symbols` 为空时：
 - 第一阶段必须调用 `discover_watchlist_candidates`。
-- 默认使用 `candidate_source=auto`，候选发现会同时汇总 Sequoia 风格量化策略池和强势板块成分股等多路召回，并做统一评分；只有多路召回均无候选时才使用固定种子池兜底。
+- 默认使用 `candidate_source=auto`，候选发现会同时汇总 AlphaSift YAML 多因子策略池、Sequoia 风格量化策略池和强势板块成分股等多路召回，并做统一评分；只有多路召回均无候选时才使用固定种子池兜底。
 - 如果候选发现返回 `status=ok/partial` 且 `candidates` 非空，必须选择主要候选继续调用单股行情、技术、消息和资金工具。
 - 如果候选发现失败或无候选，最终报告必须写“候选池不足，无法完成选股排序”，并只输出补充候选池的方法，不得给具体买入组合。
 - 不允许只基于 `get_market_indices` / `get_sector_rankings` 输出最终股票排序或仓位配置。

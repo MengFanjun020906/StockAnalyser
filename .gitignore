@@ -69,6 +69,12 @@ run.sh
 
 verify_*.py
 
+# Local reference clones and agent plugin cache
+/Sequoia-X/
+/alphasift/
+/.agents/
+/skills-lock.json
+
 # ignore Claude workspace artifacts, but keep shared repo skills versioned
 .claude/*
 !.claude/skills/

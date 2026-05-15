@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
+from src.agent.multi_expert import AgentState, ExpertOrchestrator
 from src.agent.runner import try_parse_json
 from src.agent.stock_selection_prompts import (
     STRATEGY_THRESHOLDS,
@@ -65,6 +67,9 @@ class SelectionRunContext:
     stages: Dict[str, SelectionStage] = field(default_factory=dict)
     evidence_ledger: Dict[str, Any] = field(default_factory=lambda: {"summary": {}, "full_ref": "selection_evidence_ledger.json"})
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    market_regime: Dict[str, Any] = field(default_factory=dict)
+    orchestration_mode: str = "legacy"
+    expert_state: Optional[AgentState] = None
     next_step: str = "candidate_discovery"
     total_tokens: int = 0
     models_used: List[str] = field(default_factory=list)
@@ -100,6 +105,9 @@ class SelectionRunContext:
                 for name, stage in self.stages.items()
             },
             "evidence_ledger": self.evidence_ledger,
+            "market_regime": self.market_regime,
+            "orchestration_mode": self.orchestration_mode,
+            "expert_state": self.expert_state.to_trace_dict() if self.expert_state else None,
             "next_step": self.next_step,
             "total_tokens": self.total_tokens,
             "models_used": list(dict.fromkeys(self.models_used)),
@@ -153,6 +161,7 @@ def run_stock_selection_pipeline(
     timeout_seconds: Optional[float] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     run_id: str = "selection-run",
+    orchestration_mode: Optional[str] = None,
 ) -> StockSelectionResult:
     """Run the staged stock-selection pipeline.
 
@@ -171,6 +180,7 @@ def run_stock_selection_pipeline(
         account_summary=_account_summary(agent_user_context),
         investor_profile=_investor_profile(agent_user_context),
         candidate_strategy="hot_sector",
+        orchestration_mode=_resolve_orchestration_mode(orchestration_mode),
     )
     result = StockSelectionResult(enabled=True, context=ctx)
     try:
@@ -203,9 +213,18 @@ def run_stock_selection_pipeline(
         ctx.set_stage("candidate_discovery", discovery_payload)
         _emit(progress_callback, "selection_candidate_discovery_done", payload=ctx.stages["candidate_discovery"].to_dict(include_full=False))
 
+        ctx.market_regime = _run_market_regime_tool(ctx=ctx, tool_registry=tool_registry)
+        _emit(progress_callback, "selection_market_regime_done", payload=_summarize_market_regime(ctx.market_regime))
+
         candidates = _candidate_codes(ctx.stage_full("candidate_discovery"), limit=DEFAULT_CANDIDATE_LIMIT)
         if not candidates:
             ctx.next_step = "stop_no_trade"
+            _maybe_run_expert_graph(
+                ctx=ctx,
+                task=task,
+                base_evidence={},
+                progress_callback=progress_callback,
+            )
             result.success = True
             result.final_report_json = _build_final_report_json(ctx)
             result.final_markdown = render_stock_selection_markdown(result.final_report_json)
@@ -223,6 +242,7 @@ def run_stock_selection_pipeline(
                 "investor_profile": ctx.investor_profile,
                 "candidate_pool_summary": ctx.stage_summary("candidate_discovery"),
                 "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
+                "market_regime": _summarize_market_regime(ctx.market_regime),
                 "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
                 "base_evidence": _summarize_payload(base_evidence),
             }),
@@ -251,6 +271,7 @@ def run_stock_selection_pipeline(
                     "account_summary": ctx.account_summary,
                     "investor_profile": ctx.investor_profile,
                     "screening_summary": ctx.stage_summary("candidate_screening"),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
                     "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
                     "stock_evidence": _summarize_payload(detailed_evidence, max_chars=5000),
                 }),
@@ -272,12 +293,14 @@ def run_stock_selection_pipeline(
                 "account_summary": ctx.account_summary,
                 "investor_profile": ctx.investor_profile,
                 "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                "market_regime": _summarize_market_regime(ctx.market_regime),
                 "positions": _positions_summary(agent_user_context),
                 "available_cash": ctx.account_summary.get("available_cash"),
             }),
             fallback=_fallback_portfolio_allocation(ctx),
             timeout_seconds=timeout_seconds,
         )
+        allocation_payload = _apply_market_regime_constraints(ctx, allocation_payload)
         ctx.set_stage("portfolio_allocation", allocation_payload)
         _emit(progress_callback, "selection_allocation_done", payload=ctx.stages["portfolio_allocation"].to_dict(include_full=False))
 
@@ -293,6 +316,7 @@ def run_stock_selection_pipeline(
                 "screening_summary": ctx.stage_summary("candidate_screening"),
                 "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
                 "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
+                "market_regime": _summarize_market_regime(ctx.market_regime),
                 "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
             }),
             fallback=_fallback_adversarial_review(ctx),
@@ -311,6 +335,7 @@ def run_stock_selection_pipeline(
                 "investor_profile": ctx.investor_profile,
                 "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
                 "opposing_review_summary": ctx.stage_summary("adversarial_review"),
+                "market_regime": _summarize_market_regime(ctx.market_regime),
                 "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
             }),
             fallback=_fallback_judge_decision(ctx),
@@ -319,6 +344,12 @@ def run_stock_selection_pipeline(
         ctx.set_stage("judge_decision", judge_payload)
         ctx.next_step = (judge_payload.get("summary") or {}).get("next_step") or "render_final_report"
         _emit(progress_callback, "selection_judge_done", payload=ctx.stages["judge_decision"].to_dict(include_full=False))
+        _maybe_run_expert_graph(
+            ctx=ctx,
+            task=task,
+            base_evidence=base_evidence,
+            progress_callback=progress_callback,
+        )
 
         result.success = True
         result.final_report_json = _build_final_report_json(ctx)
@@ -390,6 +421,49 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _resolve_orchestration_mode(value: Optional[str]) -> str:
+    raw = (value or os.getenv("AGENT_ORCHESTRATION_MODE") or "legacy").strip().lower()
+    return raw if raw in {"legacy", "expert_graph"} else "legacy"
+
+
+def _maybe_run_expert_graph(
+    *,
+    ctx: SelectionRunContext,
+    task: str,
+    base_evidence: Dict[str, Any],
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> None:
+    orchestrator = ExpertOrchestrator(ctx.orchestration_mode)
+    if not orchestrator.enabled:
+        return
+    candidate_pool = ctx.stage_full("candidate_discovery").get("candidates") or []
+    state = orchestrator.run_watchlist_scan(
+        task=task,
+        run_id=ctx.run_id,
+        market=ctx.market,
+        account_summary=ctx.account_summary,
+        investor_profile=ctx.investor_profile,
+        market_regime=ctx.market_regime,
+        candidate_pool=candidate_pool,
+        base_evidence=base_evidence,
+        deep_dive_stage=ctx.stages.get("single_stock_deep_dive", SelectionStage()).to_dict(include_full=True),
+        allocation_stage=ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
+        adversarial_stage=ctx.stages.get("adversarial_review", SelectionStage()).to_dict(include_full=True),
+        judge_stage=ctx.stages.get("judge_decision", SelectionStage()).to_dict(include_full=True),
+        evidence_ledger=ctx.evidence_ledger,
+    )
+    ctx.expert_state = state
+    _emit(
+        progress_callback,
+        "selection_expert_graph_done",
+        payload={
+            "orchestration_mode": ctx.orchestration_mode,
+            "expert_count": len(state.expert_opinions),
+            "experts": list(state.expert_opinions.keys()),
+        },
+    )
+
+
 def _call_stage_json(
     *,
     ctx: SelectionRunContext,
@@ -452,12 +526,35 @@ def _run_candidate_discovery_tool(
     return _execute_tool(ctx, tool_registry, "discover_watchlist_candidates", args)
 
 
+def _run_market_regime_tool(
+    *,
+    ctx: SelectionRunContext,
+    tool_registry: ToolRegistry,
+) -> Dict[str, Any]:
+    if tool_registry.get("detect_market_regime") is None:
+        return {
+            "status": "missing",
+            "tool": "detect_market_regime",
+            "data_quality": "insufficient",
+            "regime": "unknown",
+            "risk_level": "unknown",
+            "strategy_hints": ["detect_market_regime 未注册，选股按保守市场环境处理。"],
+        }
+    result = _execute_tool(
+        ctx,
+        tool_registry,
+        "detect_market_regime",
+        {"market": ctx.market, "persist": True},
+    )
+    return result if isinstance(result, dict) else {"status": "unknown", "raw": result}
+
+
 def _collect_base_evidence(
     ctx: SelectionRunContext,
     tool_registry: ToolRegistry,
     candidates: List[str],
 ) -> Dict[str, Any]:
-    evidence: Dict[str, Any] = {}
+    evidence: Dict[str, Any] = {"detect_market_regime": ctx.market_regime}
     for name, args in (
         ("get_market_indices", {"region": ctx.market}),
         ("get_sector_rankings", {"top_n": 10}),
@@ -479,6 +576,7 @@ def _collect_deep_dive_evidence(
     for tool_name, args in (
         ("get_realtime_quote", {"stock_code": code}),
         ("analyze_trend", {"stock_code": code}),
+        ("analyze_price_structure", {"stock_code": code}),
         ("get_capital_flow", {"stock_code": code}),
         ("get_stock_info", {"stock_code": code}),
         ("get_chip_distribution", {"stock_code": code}),
@@ -599,7 +697,13 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
             "candidate_codes": [str(item.get("code")) for item in candidates if isinstance(item, dict) and item.get("code")],
             "key_sources": list(dict.fromkeys(str(item.get("source") or "") for item in candidates if isinstance(item, dict)))[:5],
             "main_limitations": ["候选发现由工具结果生成，尚未完成逐只深度取证。"],
-            "next_required_tools": ["get_realtime_quote", "analyze_trend", "get_capital_flow", "search_comprehensive_intel"],
+            "next_required_tools": [
+                "get_realtime_quote",
+                "analyze_trend",
+                "analyze_price_structure",
+                "get_capital_flow",
+                "search_comprehensive_intel",
+            ],
         },
         "full": {
             "candidates": candidates,
@@ -803,6 +907,103 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
     }
 
 
+def _summarize_market_regime(regime: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(regime, dict) or not regime:
+        return {"status": "missing", "regime": "unknown", "risk_level": "unknown"}
+    return {
+        "status": regime.get("status"),
+        "regime": regime.get("regime"),
+        "risk_level": regime.get("risk_level"),
+        "volatility_bucket": regime.get("volatility_bucket"),
+        "sentiment_state": regime.get("sentiment_state"),
+        "wyckoff_phase": regime.get("wyckoff_phase"),
+        "risk_multiplier": regime.get("risk_multiplier"),
+        "strategy_hints": list(regime.get("strategy_hints") or [])[:5],
+        "data_quality": regime.get("data_quality"),
+        "conflicts": list(regime.get("conflicts") or [])[:5],
+    }
+
+
+def _apply_market_regime_constraints(
+    ctx: SelectionRunContext,
+    allocation_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    regime = ctx.market_regime if isinstance(ctx.market_regime, dict) else {}
+    regime_name = str(regime.get("regime") or "").strip().lower()
+    risk_level = str(regime.get("risk_level") or "").strip().lower()
+    volatility = str(regime.get("volatility_bucket") or "").strip().lower()
+    restrictive = (
+        regime_name in {"risk_off", "panic"}
+        or risk_level in {"high", "extreme"}
+        or volatility == "extreme"
+    )
+    high_vol = restrictive or volatility in {"high_vol", "extreme"} or risk_level == "medium_high"
+    if not high_vol:
+        return allocation_payload
+
+    payload = dict(allocation_payload or {})
+    summary = dict(payload.get("summary") or {})
+    full = dict(payload.get("full") or {})
+    positions = list(full.get("positions_plan") or [])
+    rule = _market_regime_rule_text(regime)
+
+    adjusted_positions: List[Dict[str, Any]] = []
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        plan = dict(item)
+        action = str(plan.get("action") or "").strip().lower()
+        pct = plan.get("initial_position_pct")
+        try:
+            pct_num = float(pct or 0)
+        except Exception:
+            pct_num = 0.0
+        if restrictive and action == "open":
+            plan["action"] = "wait"
+            plan["action_strength"] = "none"
+            plan["initial_position_pct"] = 0
+            plan["initial_amount"] = 0
+            plan["reason"] = f"{plan.get('reason') or ''}；{rule}".strip("；")
+        elif high_vol and action == "open":
+            capped = min(pct_num, 5.0)
+            plan["initial_position_pct"] = capped
+            if isinstance(plan.get("initial_amount"), (int, float)) and pct_num > 0:
+                plan["initial_amount"] = plan["initial_amount"] * capped / pct_num
+            plan["reason"] = f"{plan.get('reason') or ''}；{rule}".strip("；")
+        rules = list(plan.get("auto_downgrade_rules") or [])
+        if rule not in rules:
+            rules.append(rule)
+        plan["auto_downgrade_rules"] = rules
+        adjusted_positions.append(plan)
+
+    total_pct = sum(float(item.get("initial_position_pct") or 0) for item in adjusted_positions)
+    if restrictive:
+        summary["portfolio_action"] = "wait"
+        summary["recommended_position_count"] = 0
+        summary["initial_total_position_pct"] = 0
+        summary["reserved_cash_pct"] = 100
+        summary["main_constraint"] = rule
+    elif high_vol:
+        summary["initial_total_position_pct"] = total_pct
+        summary["reserved_cash_pct"] = max(0, 100 - total_pct)
+        summary["main_constraint"] = summary.get("main_constraint") or rule
+    full["positions_plan"] = adjusted_positions
+    risk_controls = list(full.get("risk_controls") or [])
+    if rule not in risk_controls:
+        risk_controls.append(rule)
+    full["risk_controls"] = risk_controls
+    full["market_regime_constraint"] = _summarize_market_regime(regime)
+    payload["summary"] = summary
+    payload["full"] = full
+    return payload
+
+
+def _market_regime_rule_text(regime: Dict[str, Any]) -> str:
+    regime_name = regime.get("regime") or "unknown"
+    volatility = regime.get("volatility_bucket") or "unknown"
+    return f"市场状态约束：regime={regime_name}, volatility={volatility}，降低主动开仓和追高权重"
+
+
 def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
     return {
         "stage": "adversarial_review",
@@ -861,6 +1062,9 @@ def _fallback_judge_decision(ctx: SelectionRunContext) -> Dict[str, Any]:
 def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
     return {
         "selection_context": ctx.to_dict(include_full=False),
+        "market_regime": ctx.market_regime,
+        "orchestration_mode": ctx.orchestration_mode,
+        "expert_state": ctx.expert_state.to_trace_dict() if ctx.expert_state else None,
         "candidate_discovery": ctx.stages.get("candidate_discovery", SelectionStage()).to_dict(include_full=True),
         "candidate_screening": ctx.stages.get("candidate_screening", SelectionStage()).to_dict(include_full=True),
         "single_stock_deep_dive": ctx.stages.get("single_stock_deep_dive", SelectionStage()).to_dict(include_full=True),
@@ -996,10 +1200,18 @@ def _tool_failures_from_evidence(evidence: Dict[str, Any]) -> List[Dict[str, Any
 
 def _dimension_summary_from_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     failures = set(_missing_from_evidence(evidence))
+    regime = evidence.get("detect_market_regime") if isinstance(evidence, dict) else {}
+    regime_summary = _summarize_market_regime(regime) if isinstance(regime, dict) else {}
     return {
         "technical": {
             "verdict": "tool_failed" if "analyze_trend" in failures else ("support" if evidence.get("analyze_trend") else "missing"),
             "summary": _truncate(json.dumps(evidence.get("analyze_trend") or {}, ensure_ascii=False, default=str), 500),
+        },
+        "price_structure": {
+            "verdict": "tool_failed" if "analyze_price_structure" in failures else (
+                "support" if evidence.get("analyze_price_structure") else "missing"
+            ),
+            "summary": _truncate(json.dumps(evidence.get("analyze_price_structure") or {}, ensure_ascii=False, default=str), 500),
         },
         "fundamental": {
             "verdict": "tool_failed" if "get_stock_info" in failures else ("neutral" if evidence.get("get_stock_info") else "missing"),
@@ -1013,7 +1225,10 @@ def _dimension_summary_from_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]
             "verdict": "tool_failed" if "get_capital_flow" in failures else ("neutral" if evidence.get("get_capital_flow") else "missing"),
             "summary": _truncate(json.dumps(evidence.get("get_capital_flow") or {}, ensure_ascii=False, default=str), 500),
         },
-        "market_sector": {"verdict": "neutral", "summary": "候选发现阶段已参考市场/板块证据。"},
+        "market_sector": {
+            "verdict": "weaken" if regime_summary.get("regime") in {"risk_off", "panic"} else "neutral",
+            "summary": _truncate(json.dumps(regime_summary or {"note": "候选发现阶段已参考市场/板块证据。"}, ensure_ascii=False, default=str), 500),
+        },
         "account_fit": {"verdict": "neutral", "summary": "组合配置阶段按账户约束处理。"},
     }
 

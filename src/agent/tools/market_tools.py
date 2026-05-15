@@ -9,12 +9,22 @@ Tools:
 """
 
 import logging
+import re
+import concurrent.futures
 from typing import Any, Dict, Iterable, List, Optional
 
+from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
+from src.agent.regime import SentimentComponents, coerce_bars, detect_market_regime
+from src.agent.sentiment.news_events import score_news_items
 from src.agent.tools.registry import ToolParameter, ToolDefinition
+from src.data.stock_index_loader import get_index_stock_name, get_stock_name_index_map
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
 logger = logging.getLogger(__name__)
+
+_SECTOR_CONSTITUENT_FETCH_TIMEOUT_S = 3.0
+_EVENT_IMPACT_MAX_CONFIRMED_THEMES = 4
 
 
 DEFAULT_WATCHLIST_SEEDS: List[Dict[str, Any]] = [
@@ -37,6 +47,18 @@ def _dedupe_candidates(candidates: Iterable[Dict[str, Any]], limit: int) -> List
     return _merge_and_score_candidates(candidates, limit=limit)
 
 
+def _resolve_candidate_name(code: str, current_name: Any = None) -> str:
+    """Resolve a readable display name without triggering realtime quote calls."""
+    code_text = str(code or "").strip()
+    current_text = str(current_name or "").strip()
+    if is_meaningful_stock_name(current_text, code_text):
+        return current_text
+    for name in (STOCK_NAME_MAP.get(code_text), get_index_stock_name(code_text)):
+        if is_meaningful_stock_name(name, code_text):
+            return str(name)
+    return code_text
+
+
 def _candidate_base_score(item: Dict[str, Any]) -> float:
     raw_score = item.get("signal_score")
     try:
@@ -52,6 +74,210 @@ def _candidate_base_score(item: Dict[str, Any]) -> float:
     return 50.0
 
 
+def _candidate_source_family(item: Dict[str, Any]) -> str:
+    sources = [str(src or "").strip() for src in item.get("recall_sources") or [] if str(src or "").strip()]
+    source = str(item.get("source") or "").strip()
+    if source:
+        sources.append(source)
+    for prefix, family in (
+        ("alphasift:", "alphasift"),
+        ("sequoia:", "sequoia"),
+        ("akshare:", "sector"),
+        ("event_impact:", "event_impact"),
+        ("news_momentum:", "news_momentum"),
+        ("news_sentiment:", "news_sentiment"),
+        ("user_seed", "user_seed"),
+        ("fallback_seed_pool", "fallback"),
+    ):
+        if any(src == prefix or src.startswith(prefix) for src in sources):
+            return family
+    return source or "unknown"
+
+
+def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Build user-facing reason buckets for why a candidate entered L1."""
+    dimensions: List[Dict[str, str]] = []
+
+    def add(dimension: str, label: str, detail: str) -> None:
+        text = str(detail or "").strip()
+        if not text:
+            return
+        key = (dimension, text)
+        if any((entry.get("dimension"), entry.get("detail")) == key for entry in dimensions):
+            return
+        dimensions.append({"dimension": dimension, "label": label, "detail": text})
+
+    source = str(item.get("source") or "").strip()
+    recall_sources = [str(src).strip() for src in item.get("recall_sources") or [] if str(src or "").strip()]
+    sources = recall_sources or ([source] if source else [])
+    strategies = [str(value).strip() for value in item.get("matched_strategies") or [] if str(value or "").strip()]
+    tags = [str(value).strip() for value in item.get("strategy_tags") or [] if str(value or "").strip()]
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+
+    strategy_labels = _display_strategy_names(strategies)
+    alphasift_sources = [src for src in sources if src.startswith("alphasift:")]
+    sequoia_sources = [src for src in sources if src.startswith("sequoia:")]
+    sector_sources = [src for src in sources if src.startswith("akshare:")]
+
+    if alphasift_sources:
+        detail = "AlphaSift YAML 多因子策略入池"
+        if strategy_labels:
+            detail += f"：{'、'.join(strategy_labels)}"
+        add("strategy", "策略", detail)
+    elif sequoia_sources:
+        detail = "Sequoia 形态/动量策略入池"
+        if strategy_labels:
+            detail += f"：{'、'.join(strategy_labels)}"
+        add("strategy", "策略", detail)
+    elif strategy_labels:
+        add("strategy", "策略", f"命中策略：{'、'.join(strategy_labels)}")
+
+    for src in sector_sources:
+        sector = src.split(":")[-1] if ":" in src else ""
+        add("sentiment", "情绪/热点", f"来自强势板块「{sector}」成分股" if sector else "来自强势板块成分股")
+
+    news_sources = [src for src in sources if src.startswith(("news_sentiment:", "news_momentum:"))]
+    if news_sources:
+        topic = str(item.get("news_topic") or item.get("hot_topic") or "").strip()
+        headline = str(item.get("news_title") or item.get("headline") or "").strip()
+        source_name = str(item.get("news_source") or "").strip()
+        published = str(item.get("published_date") or "").strip()
+        score = item.get("message_score")
+        state = str(item.get("message_state") or "").strip()
+        detail_parts = []
+        if topic:
+            detail_parts.append(f"热点主题：{topic}")
+        if headline:
+            detail_parts.append(f"新闻：{headline}")
+        if score is not None:
+            detail_parts.append(f"消息评分：{_short_metric(score)}")
+        if state:
+            detail_parts.append(f"状态：{state}")
+        if source_name:
+            detail_parts.append(f"来源：{source_name}")
+        if published:
+            detail_parts.append(f"日期：{published}")
+        label = "消息面" if any(src.startswith("news_momentum:") for src in news_sources) else "情绪/热点"
+        dimension = "message" if label == "消息面" else "sentiment"
+        add(dimension, label, "；".join(detail_parts) or "被近期公司级新闻/公告事件提及")
+
+    event_sources = [src for src in sources if src.startswith("event_impact:")]
+    if event_sources:
+        event_title = str(item.get("event_title") or "").strip()
+        theme = str(item.get("validated_theme") or "").strip()
+        validation_title = str(item.get("validation_title") or "").strip()
+        detail_parts = []
+        if event_title:
+            detail_parts.append(f"事件：{event_title}")
+        if theme:
+            detail_parts.append(f"验证主题：{theme}")
+        if validation_title:
+            detail_parts.append(f"后续事实：{validation_title}")
+        add("sentiment", "情绪/事件", "；".join(detail_parts) or "事件传导验证后的主题成分候选")
+
+    reason = str(item.get("reason") or "").strip()
+    if reason and not dimensions:
+        add("strategy", "策略", reason)
+    elif reason and "多路召回" not in reason and "多策略共振" not in reason:
+        add("technical", "技术面", _display_reason_text(reason))
+
+    technical_bits: List[str] = []
+    if any(token in tags for token in ("breakout", "volume_breakout", "rps", "relative_strength", "momentum", "ma_cross")):
+        technical_bits.append("形态/趋势信号满足候选条件")
+    for key, label in (
+        ("breakout_20d_pct", "20 日突破幅度"),
+        ("range_20d_pct", "20 日区间波动"),
+        ("pullback_to_ma20_pct", "回踩 MA20 幅度"),
+        ("consolidation_days_20d", "20 日收敛天数"),
+        ("rps", "RPS 强度"),
+    ):
+        value = metrics.get(key)
+        if value is not None:
+            technical_bits.append(f"{label}={_short_metric(value)}")
+    if technical_bits:
+        add("technical", "技术面", "；".join(technical_bits[:3]))
+
+    capital_bits: List[str] = []
+    for key, label in (
+        ("amount", "成交额"),
+        ("turnover", "成交额"),
+        ("turnover_rate", "换手率"),
+        ("volume_ratio", "量比"),
+        ("volume_ratio_20d", "20 日量比"),
+    ):
+        value = item.get(key, metrics.get(key))
+        if value is not None:
+            capital_bits.append(f"{label}={_short_metric(value)}")
+    if capital_bits:
+        add("capital", "资金面", "流动性代理：" + "；".join(capital_bits[:4]))
+
+    if source == "user_seed":
+        add("message", "消息/输入", "用户或上下文提供，优先进入候选池")
+    elif source == "fallback_seed_pool":
+        add("strategy", "策略", "固定种子池兜底，仅用于保证后续取证链路可运行")
+
+    return dimensions[:5]
+
+
+def _display_strategy_names(names: Iterable[str]) -> List[str]:
+    mapping = {
+        "ma_volume": "均线放量突破",
+        "turtle_trade": "海龟突破",
+        "high_tight_flag": "高窄旗形",
+        "limit_up_shakeout": "涨停洗盘",
+        "uptrend_limit_down": "上升趋势跌停错杀",
+        "rps_breakout": "RPS 强势突破",
+        "volume_breakout": "放量突破",
+        "capital_heat": "资金热度",
+        "quality_value": "质量价值",
+        "shrink_pullback": "缩量回踩",
+        "balanced_alpha": "均衡 Alpha",
+        "dual_low": "双低价值",
+        "momentum_quality": "动量质量",
+        "oversold_reversal": "超跌反转",
+        "hot_sector": "强势板块",
+        "breakout": "突破",
+        "rps": "RPS 强势",
+        "momentum": "动量",
+        "relative_strength": "相对强势",
+        "volume_shrink": "缩量",
+        "consolidation": "平台整理",
+        "liquidity": "流动性",
+    }
+    result: List[str] = []
+    for name in names:
+        text = mapping.get(str(name), str(name))
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _display_reason_text(reason: str) -> str:
+    text = reason
+    for raw, display in {
+        "ma_volume": "均线放量突破",
+        "turtle_trade": "海龟突破",
+        "rps_breakout": "RPS 强势突破",
+        "high_tight_flag": "高窄旗形",
+        "limit_up_shakeout": "涨停洗盘",
+        "uptrend_limit_down": "上升趋势跌停错杀",
+    }.items():
+        text = text.replace(raw, display)
+    return text
+
+
+def _short_metric(value: Any) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    if abs(number) >= 100_000_000:
+        return f"{number / 100_000_000:.2f}亿"
+    if abs(number) >= 10_000:
+        return f"{number / 10_000:.2f}万"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
 def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     by_code: Dict[str, Dict[str, Any]] = {}
     for item in candidates:
@@ -63,7 +289,7 @@ def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int
         if code not in by_code:
             payload = dict(item)
             payload["code"] = code
-            payload["name"] = str(payload.get("name") or payload.get("stock_name") or code)
+            payload["name"] = _resolve_candidate_name(code, payload.get("name") or payload.get("stock_name"))
             payload["recall_sources"] = [source]
             payload["raw_recall_count"] = 1
             payload["signal_score"] = round(base_score, 2)
@@ -71,6 +297,7 @@ def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int
             continue
 
         current = by_code[code]
+        current["name"] = _resolve_candidate_name(code, current.get("name") or item.get("name") or item.get("stock_name"))
         sources = list(current.get("recall_sources") or [])
         if source not in sources:
             sources.append(source)
@@ -108,6 +335,8 @@ def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int
             current["metrics"] = metrics
 
     merged = list(by_code.values())
+    for item in merged:
+        item["reason_dimensions"] = _candidate_reason_dimensions(item)
     merged.sort(
         key=lambda item: (
             float(item.get("signal_score") or 0),
@@ -117,7 +346,37 @@ def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int
         ),
         reverse=True,
     )
-    return merged[: max(1, limit)]
+    effective_limit = max(1, limit)
+    if effective_limit <= 1:
+        return merged[:effective_limit]
+
+    selected: List[Dict[str, Any]] = []
+    selected_codes: set[str] = set()
+
+    def append(item: Dict[str, Any]) -> None:
+        code = str(item.get("code") or "")
+        if not code or code in selected_codes or len(selected) >= effective_limit:
+            return
+        selected.append(item)
+        selected_codes.add(code)
+
+    if merged:
+        append(merged[0])
+
+    top_by_family: Dict[str, Dict[str, Any]] = {}
+    for item in merged:
+        family = _candidate_source_family(item)
+        if family not in top_by_family:
+            top_by_family[family] = item
+    for family in ("event_impact", "news_momentum", "news_sentiment", "alphasift", "sequoia", "sector", "user_seed", "fallback"):
+        item = top_by_family.get(family)
+        if item is not None:
+            append(item)
+
+    for item in merged:
+        append(item)
+
+    return selected
 
 
 def _normalize_stock_candidate(row: Dict[str, Any], *, source: str, reason: str) -> Optional[Dict[str, Any]]:
@@ -172,11 +431,25 @@ def _fetch_sector_constituents(sector_name: str, limit: int) -> List[Dict[str, A
     for source, fetcher in fetchers:
         if fetcher is None:
             continue
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            df = fetcher(symbol=sector_name)
+            future = pool.submit(fetcher, symbol=sector_name)
+            try:
+                df = future.result(timeout=_SECTOR_CONSTITUENT_FETCH_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                logger.warning(
+                    "Candidate discovery sector constituent fetch timed out for sector=%s source=%s after %.1fs",
+                    sector_name,
+                    source,
+                    _SECTOR_CONSTITUENT_FETCH_TIMEOUT_S,
+                )
+                continue
         except Exception as exc:
             logger.debug("Candidate discovery failed for sector=%s source=%s: %s", sector_name, source, exc)
             continue
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         if df is None or getattr(df, "empty", True):
             continue
         for row in df.head(limit).to_dict(orient="records"):
@@ -190,6 +463,677 @@ def _fetch_sector_constituents(sector_name: str, limit: int) -> List[Dict[str, A
         if candidates:
             break
     return candidates
+
+
+_NEWS_SENTIMENT_TOPICS = (
+    "A股 科技 商业 热点 新闻 人工智能 半导体 机器人 新能源 汽车",
+    "中国 科技 公司 最新 新闻 AI 芯片 算力 机器人",
+    "全球 科技 商业 热点 对中国上市公司影响 AI 半导体 新能源",
+)
+
+_EVENT_IMPACT_QUERIES = (
+    "全球 宏观 地缘 政策 商业 科技 突发 新闻 对市场影响",
+    "中国 美国 贸易 关税 科技 出口限制 谈判 最新进展",
+    "霍尔木兹 原油 航运 保险费 通行 能源 市场 最新进展",
+    "AI 半导体 新能源 机器人 产业政策 商业热点 最新进展",
+)
+
+_EVENT_IMPACT_RULES: List[Dict[str, Any]] = [
+    {
+        "event_type": "trade_policy",
+        "keywords": ("关税", "贸易谈判", "中美", "出口限制", "制裁", "访华"),
+        "variables": ("tariff_expectation", "export_order_visibility", "supply_chain_risk"),
+        "themes": ("出口链", "消费电子", "汽车零部件", "跨境电商", "半导体"),
+        "validation_terms": ("关税", "订单", "出口", "供应链", "板块异动", "资金流入"),
+    },
+    {
+        "event_type": "geopolitical_energy",
+        "keywords": ("霍尔木兹", "原油", "油价", "航运", "通行", "中东", "地缘"),
+        "variables": ("oil_risk_premium", "shipping_cost", "risk_appetite"),
+        "themes": ("石油石化", "航运港口", "化工", "航空机场"),
+        "validation_terms": ("油价", "运价", "保险费", "板块异动", "资金流入"),
+    },
+    {
+        "event_type": "technology_policy",
+        "keywords": ("人工智能", "AI", "芯片", "半导体", "算力", "机器人", "出口管制"),
+        "variables": ("compute_demand", "semiconductor_policy_risk", "automation_capex"),
+        "themes": ("人工智能", "半导体", "算力", "机器人", "工业自动化"),
+        "validation_terms": ("订单", "政策", "新品", "算力", "板块异动", "资金流入"),
+    },
+    {
+        "event_type": "green_industry",
+        "keywords": ("新能源", "储能", "光伏", "电池", "电动车", "碳中和"),
+        "variables": ("green_capex", "battery_demand", "export_order_visibility"),
+        "themes": ("新能源车", "储能", "光伏", "锂电池"),
+        "validation_terms": ("订单", "装机", "出口", "价格", "板块异动", "资金流入"),
+    },
+]
+
+_GENERIC_NEWS_NAME_BLOCKLIST = {
+    "中国",
+    "科技",
+    "股份",
+    "集团",
+    "证券",
+    "银行",
+    "能源",
+    "汽车",
+    "智能",
+    "半导体",
+    "机器人",
+    "人工智能",
+}
+
+
+def _build_search_service_for_candidates():
+    """Build SearchService from project config for candidate discovery."""
+    try:
+        from src.config import get_config
+        from src.search_service import SearchService
+    except Exception as exc:
+        logger.debug("News sentiment candidate search unavailable: %s", exc)
+        return None
+
+    try:
+        config = get_config()
+        return SearchService(
+            bocha_keys=getattr(config, "bocha_api_keys", []),
+            tavily_keys=getattr(config, "tavily_api_keys", []),
+            anspire_keys=getattr(config, "anspire_api_keys", []),
+            brave_keys=getattr(config, "brave_api_keys", []),
+            serpapi_keys=getattr(config, "serpapi_keys", []),
+            minimax_keys=getattr(config, "minimax_api_keys", []),
+            searxng_base_urls=getattr(config, "searxng_base_urls", []),
+            searxng_public_instances_enabled=getattr(config, "searxng_public_instances_enabled", True),
+            news_max_age_days=getattr(config, "news_max_age_days", 3),
+            news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
+        )
+    except Exception as exc:
+        logger.warning("News sentiment candidate search init failed: %s", exc)
+        return None
+
+
+def _iter_candidate_name_pairs() -> List[tuple[str, str]]:
+    """Return A-share code/name pairs for lightweight news entity matching."""
+    pairs: Dict[str, str] = {}
+    for code, name in STOCK_NAME_MAP.items():
+        code_text = str(code or "").strip()
+        if code_text.isdigit() and len(code_text) == 6 and is_meaningful_stock_name(name, code_text):
+            pairs[code_text] = str(name).strip()
+
+    for code, name in get_stock_name_index_map().items():
+        code_text = str(code or "").strip().upper()
+        if code_text.endswith((".SH", ".SZ", ".BJ")):
+            code_text = code_text.rsplit(".", 1)[0]
+        if not (code_text.isdigit() and len(code_text) == 6):
+            continue
+        if is_meaningful_stock_name(name, code_text):
+            pairs.setdefault(code_text, str(name).strip())
+
+    items = [
+        (code, name)
+        for code, name in pairs.items()
+        if len(name) >= 2 and name not in _GENERIC_NEWS_NAME_BLOCKLIST
+    ]
+    return sorted(items, key=lambda item: len(item[1]), reverse=True)
+
+
+def _match_a_share_mentions(text: str, *, max_matches: int = 5) -> List[tuple[str, str]]:
+    haystack = str(text or "")
+    if not haystack:
+        return []
+    matches: List[tuple[str, str]] = []
+    seen: set[str] = set()
+    for code, name in _iter_candidate_name_pairs():
+        if code in seen:
+            continue
+        if name and name in haystack:
+            matches.append((code, name))
+            seen.add(code)
+            if len(matches) >= max_matches:
+                break
+    for code in re.findall(r"(?<!\d)([0368]\d{5})(?!\d)", haystack):
+        if code in seen:
+            continue
+        matches.append((code, _resolve_candidate_name(code)))
+        seen.add(code)
+        if len(matches) >= max_matches:
+            break
+    return matches
+
+
+def _search_news_sentiment_candidates(limit: int) -> Dict[str, Any]:
+    service = _build_search_service_for_candidates()
+    if service is None or not getattr(service, "is_available", False):
+        return {
+            "status": "unavailable",
+            "candidates": [],
+            "queries": [],
+            "diagnostics": [{"source": "search_service", "status": "unavailable", "reason": "No search provider configured"}],
+        }
+
+    candidates: List[Dict[str, Any]] = []
+    queries: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    effective_limit = max(1, min(limit, 20))
+    for query in _NEWS_SENTIMENT_TOPICS:
+        try:
+            response = service.search_stock_news(
+                stock_code="000001",
+                stock_name="A股科技商业热点",
+                max_results=5,
+                focus_keywords=[query],
+            )
+        except Exception as exc:
+            queries.append({"query": query, "status": "failed", "error": str(exc)})
+            continue
+
+        query_step = {
+            "query": response.query,
+            "status": "ok" if response.success else "failed",
+            "provider": response.provider,
+            "count": len(response.results),
+            **({"error": response.error_message} if response.error_message else {}),
+        }
+        queries.append(query_step)
+        if not response.success:
+            continue
+
+        for result in response.results:
+            url = str(getattr(result, "url", "") or "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            text = " ".join([
+                str(getattr(result, "title", "") or ""),
+                str(getattr(result, "snippet", "") or ""),
+            ])
+            for code, name in _match_a_share_mentions(text):
+                candidates.append({
+                    "code": code,
+                    "name": name,
+                    "source": "news_sentiment:hot_news",
+                    "reason": "近期科技/商业热点新闻提及。",
+                    "signal_score": 68.0,
+                    "news_topic": query,
+                    "news_title": str(getattr(result, "title", "") or "")[:160],
+                    "news_snippet": str(getattr(result, "snippet", "") or "")[:240],
+                    "news_url": url,
+                    "news_source": str(getattr(result, "source", "") or ""),
+                    "published_date": getattr(result, "published_date", None),
+                    "strategy_tags": ["hot_news", "sentiment"],
+                    "metrics": {"news_hits": 1},
+                })
+                if len(candidates) >= effective_limit * 2:
+                    break
+            if len(candidates) >= effective_limit * 2:
+                break
+        if len(candidates) >= effective_limit:
+            break
+
+    merged = _dedupe_candidates(candidates, effective_limit)
+    status = "ok" if merged else ("empty" if any(item.get("status") == "ok" for item in queries) else "failed")
+    return {
+        "status": status,
+        "candidates": merged,
+        "queries": queries,
+        "diagnostics": [],
+    }
+
+
+def _stock_news_items_for_candidate(service: Any, code: str, name: str) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    query = f"{name} {code} 公告 业绩 订单 合作 减持 监管 问询 回购 增持 最近"
+    try:
+        try:
+            response = service.search_stock_news(
+                stock_code=code,
+                stock_name=name,
+                max_results=5,
+                focus_keywords=[query],
+                max_provider_attempts=2,
+            )
+        except TypeError as exc:
+            if "max_provider_attempts" not in str(exc):
+                raise
+            response = service.search_stock_news(
+                stock_code=code,
+                stock_name=name,
+                max_results=5,
+                focus_keywords=[query],
+            )
+    except Exception as exc:
+        return [], {"query": query, "status": "failed", "error": str(exc)}
+    items = [
+        {
+            "title": getattr(item, "title", ""),
+            "snippet": getattr(item, "snippet", ""),
+            "url": getattr(item, "url", ""),
+            "source": getattr(item, "source", ""),
+            "published_date": getattr(item, "published_date", None),
+        }
+        for item in getattr(response, "results", []) or []
+    ] if getattr(response, "success", False) else []
+    return items, {
+        "query": getattr(response, "query", query),
+        "status": "ok" if getattr(response, "success", False) else "failed",
+        "provider": getattr(response, "provider", ""),
+        "count": len(items),
+        **({"error": getattr(response, "error_message", None)} if getattr(response, "error_message", None) else {}),
+    }
+
+
+def _score_candidate_news_momentum(base_candidates: Iterable[Dict[str, Any]], *, limit: int) -> Dict[str, Any]:
+    service = _build_search_service_for_candidates()
+    if service is None or not getattr(service, "is_available", False):
+        return {
+            "status": "unavailable",
+            "candidates": [],
+            "diagnostics": [{"source": "search_service", "status": "unavailable", "reason": "No search provider configured"}],
+        }
+
+    scored_candidates: List[Dict[str, Any]] = []
+    diagnostics: List[Dict[str, Any]] = []
+    for item in list(base_candidates)[: max(1, min(12, limit * 2))]:
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        name = _resolve_candidate_name(code, item.get("name") or item.get("stock_name"))
+        news_items, diag = _stock_news_items_for_candidate(service, code, name)
+        diag["code"] = code
+        diagnostics.append(diag)
+        scored = score_news_items(news_items)
+        positive_count = int(scored.get("positive_count") or 0)
+        negative_count = int(scored.get("negative_count") or 0)
+        message_score = float(scored.get("message_score") or 0)
+        if not news_items or positive_count <= 0 or negative_count > 0 or message_score < 58:
+            continue
+        event = (scored.get("events") or [{}])[0]
+        payload = dict(item)
+        payload["code"] = code
+        payload["name"] = name
+        payload["source"] = "news_momentum:company_event"
+        payload["reason"] = "公司级新闻/公告事件形成消息面候选。"
+        payload["signal_score"] = max(float(payload.get("signal_score") or 0), min(86.0, message_score + positive_count * 3.0))
+        payload["message_score"] = int(message_score)
+        payload["message_state"] = scored.get("message_state")
+        payload["news_title"] = event.get("title")
+        payload["news_source"] = event.get("source")
+        payload["published_date"] = event.get("published_at")
+        payload["event_tags"] = scored.get("event_tags") or []
+        payload["risk_flags"] = [*(payload.get("risk_flags") or []), *(scored.get("risk_flags") or [])]
+        payload["strategy_tags"] = list(dict.fromkeys([*(payload.get("strategy_tags") or []), "news_momentum"]))
+        payload["metrics"] = {
+            **(payload.get("metrics") or {}),
+            "message_score": int(message_score),
+            "positive_news_events": positive_count,
+            "negative_news_events": negative_count,
+        }
+        scored_candidates.append(payload)
+
+    merged = _dedupe_candidates(scored_candidates, limit)
+    return {
+        "status": "ok" if merged else ("empty" if diagnostics else "failed"),
+        "candidates": merged,
+        "diagnostics": diagnostics,
+    }
+
+
+_NEWS_MOMENTUM_QUERIES = (
+    "A股 上市公司 公告 重大合同 中标 大订单 战略合作 业绩预增 回购 增持 最新",
+    "A股 公司 订单 量产 新品 客户导入 国产替代 产业链 最新",
+    "A股 上市公司 减持 问询函 处罚 立案 监管 风险 最新",
+)
+
+
+def _discover_news_momentum_candidates(
+    *,
+    limit: int,
+    seed_candidates: Optional[Iterable[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    service = _build_search_service_for_candidates()
+    if service is None or not getattr(service, "is_available", False):
+        return {
+            "status": "unavailable",
+            "candidates": [],
+            "queries": [],
+            "diagnostics": [{"source": "search_service", "status": "unavailable", "reason": "No search provider configured"}],
+        }
+
+    candidates: List[Dict[str, Any]] = []
+    queries: List[Dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for query in _NEWS_MOMENTUM_QUERIES:
+        try:
+            response = _search_general_news(service, query, max_results=6, days=3)
+        except Exception as exc:
+            queries.append({"query": query, "status": "failed", "error": str(exc), "window_days": 3})
+            continue
+        results = getattr(response, "results", []) or []
+        queries.append({
+            "query": getattr(response, "query", query),
+            "status": "ok" if getattr(response, "success", False) else "failed",
+            "provider": getattr(response, "provider", ""),
+            "count": len(results),
+            "window_days": 3,
+            **({"error": getattr(response, "error_message", None)} if getattr(response, "error_message", None) else {}),
+        })
+        if not getattr(response, "success", False):
+            continue
+        for result in results:
+            url = str(getattr(result, "url", "") or "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            news_item = {
+                "title": getattr(result, "title", ""),
+                "snippet": getattr(result, "snippet", ""),
+                "url": url,
+                "source": getattr(result, "source", ""),
+                "published_date": getattr(result, "published_date", None),
+            }
+            scored = score_news_items([news_item])
+            if int(scored.get("positive_count") or 0) <= 0:
+                continue
+            if int(scored.get("negative_count") or 0) > 0:
+                continue
+            message_score = float(scored.get("message_score") or 0)
+            if message_score < 58:
+                continue
+            event = (scored.get("events") or [{}])[0]
+            text = f"{news_item['title']} {news_item['snippet']}"
+            for code, name in _match_a_share_mentions(text, max_matches=3):
+                candidates.append({
+                    "code": code,
+                    "name": name,
+                    "source": "news_momentum:company_event",
+                    "reason": "公司级新闻/公告事件形成消息面候选。",
+                    "signal_score": min(88.0, message_score + 6.0),
+                    "message_score": int(message_score),
+                    "message_state": scored.get("message_state"),
+                    "news_topic": query,
+                    "news_title": event.get("title") or news_item["title"],
+                    "news_snippet": news_item["snippet"],
+                    "news_url": url,
+                    "news_source": news_item["source"],
+                    "published_date": event.get("published_at") or news_item["published_date"],
+                    "event_tags": scored.get("event_tags") or [],
+                    "strategy_tags": ["news_momentum"],
+                    "metrics": {
+                        "message_score": int(message_score),
+                        "positive_news_events": int(scored.get("positive_count") or 0),
+                        "negative_news_events": int(scored.get("negative_count") or 0),
+                    },
+                })
+                if len(candidates) >= limit * 2:
+                    break
+            if len(candidates) >= limit * 2:
+                break
+        if len(candidates) >= limit * 2:
+            break
+
+    seed_result = _score_candidate_news_momentum(seed_candidates or [], limit=limit)
+    candidates.extend(seed_result.get("candidates") or [])
+    merged = _dedupe_candidates(candidates, limit)
+    return {
+        "status": "ok" if merged else ("empty" if any(item.get("status") == "ok" for item in queries) else "failed"),
+        "candidates": merged,
+        "queries": queries,
+        "diagnostics": seed_result.get("diagnostics", []),
+    }
+
+
+def _search_general_news(service: Any, query: str, *, max_results: int, days: int):
+    if hasattr(service, "search_general_news"):
+        return service.search_general_news(query, max_results=max_results, days=days)
+    return service.search_stock_news(
+        stock_code="",
+        stock_name="",
+        max_results=max_results,
+        focus_keywords=[query],
+    )
+
+
+def _event_rule_for_text(text: str) -> Optional[Dict[str, Any]]:
+    haystack = str(text or "").lower()
+    best: Optional[Dict[str, Any]] = None
+    best_hits = 0
+    for rule in _EVENT_IMPACT_RULES:
+        hits = sum(1 for kw in rule["keywords"] if str(kw).lower() in haystack)
+        if hits > best_hits:
+            best = rule
+            best_hits = hits
+    return best if best_hits > 0 else None
+
+
+def _event_id_from_title(title: str) -> str:
+    text = re.sub(r"\s+", "_", str(title or "event").strip())[:80]
+    text = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]+", "", text)
+    return text or "event"
+
+
+def _event_cards_from_response(response: Any) -> List[Dict[str, Any]]:
+    cards: List[Dict[str, Any]] = []
+    for result in getattr(response, "results", []) or []:
+        title = str(getattr(result, "title", "") or "").strip()
+        snippet = str(getattr(result, "snippet", "") or "").strip()
+        text = f"{title} {snippet}"
+        rule = _event_rule_for_text(text)
+        if not title or rule is None:
+            continue
+        cards.append({
+            "event_id": _event_id_from_title(title),
+            "title": title[:180],
+            "snippet": snippet[:300],
+            "event_type": rule["event_type"],
+            "impact_variables": list(rule["variables"]),
+            "watch_themes": list(rule["themes"]),
+            "validation_terms": list(rule["validation_terms"]),
+            "source": str(getattr(result, "source", "") or ""),
+            "url": str(getattr(result, "url", "") or ""),
+            "published_date": getattr(result, "published_date", None),
+            "maturity": "breaking",
+        })
+    return cards
+
+
+_VALIDATION_NEGATION_PREFIXES = (
+    "暂无",
+    "未见",
+    "没有",
+    "无",
+    "尚无",
+    "未出现",
+    "尚未出现",
+    "未发现",
+    "尚未发现",
+    "仍待",
+    "待验证",
+)
+
+
+def _is_negated_validation_hit(text: str, term: str) -> bool:
+    """Return True when a validation keyword is only mentioned as absent/unverified."""
+    if not text or not term:
+        return False
+    term_text = str(term)
+    seen = False
+    text_value = str(text)
+    boundaries = "。！？；;!?但不过然而"
+    for match in re.finditer(re.escape(term_text), text_value):
+        seen = True
+        left = match.start()
+        while left > 0 and text_value[left - 1] not in boundaries:
+            left -= 1
+        right = match.end()
+        while right < len(text_value) and text_value[right] not in boundaries:
+            right += 1
+        clause = text_value[left:right]
+        if not any(negation in clause for negation in _VALIDATION_NEGATION_PREFIXES):
+            return False
+    return seen
+
+
+def _validation_matches_for_event(service: Any, event: Dict[str, Any], *, days: int = 7) -> List[Dict[str, Any]]:
+    matches: List[Dict[str, Any]] = []
+    for theme in event.get("watch_themes") or []:
+        terms = " OR ".join(str(term) for term in (event.get("validation_terms") or [])[:4])
+        query = f"{theme} {terms} 最新 进展 板块 异动 资金"
+        try:
+            response = _search_general_news(service, query, max_results=3, days=days)
+        except Exception as exc:
+            matches.append({"theme": theme, "query": query, "status": "failed", "error": str(exc)})
+            continue
+        results = []
+        for item in getattr(response, "results", []) or []:
+            text = f"{getattr(item, 'title', '')} {getattr(item, 'snippet', '')}"
+            hit_terms = [
+                term for term in event.get("validation_terms") or []
+                if str(term) and str(term) in text and not _is_negated_validation_hit(text, str(term))
+            ]
+            if not hit_terms:
+                continue
+            results.append({
+                "title": str(getattr(item, "title", "") or "")[:180],
+                "snippet": str(getattr(item, "snippet", "") or "")[:220],
+                "source": str(getattr(item, "source", "") or ""),
+                "url": str(getattr(item, "url", "") or ""),
+                "published_date": getattr(item, "published_date", None),
+                "hit_terms": hit_terms[:4],
+            })
+        matches.append({
+            "theme": theme,
+            "query": getattr(response, "query", query),
+            "status": "confirmed" if results else "watch_only",
+            "provider": getattr(response, "provider", ""),
+            "results": results,
+        })
+    return matches
+
+
+def _candidates_from_confirmed_themes(events: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    per_theme_limit = max(2, min(5, limit))
+    seen_themes: set[str] = set()
+    for event in events:
+        for match in event.get("validation_matches") or []:
+            if match.get("status") != "confirmed":
+                continue
+            theme = str(match.get("theme") or "").strip()
+            if not theme:
+                continue
+            if theme in seen_themes:
+                continue
+            if len(seen_themes) >= _EVENT_IMPACT_MAX_CONFIRMED_THEMES:
+                logger.info(
+                    "Event impact candidate theme cap reached (%d); remaining themes kept as watch-only context",
+                    _EVENT_IMPACT_MAX_CONFIRMED_THEMES,
+                )
+                return _dedupe_candidates(candidates, limit) if candidates else []
+            seen_themes.add(theme)
+            for item in _fetch_sector_constituents(theme, limit=per_theme_limit):
+                evidence = (match.get("results") or [{}])[0]
+                payload = dict(item)
+                payload["source"] = "event_impact:validated_theme"
+                payload["reason"] = "事件传导验证后的主题成分候选。"
+                payload["signal_score"] = max(float(payload.get("signal_score") or 0), 62.0)
+                payload["event_title"] = event.get("title")
+                payload["event_type"] = event.get("event_type")
+                payload["impact_variables"] = event.get("impact_variables") or []
+                payload["validated_theme"] = theme
+                payload["validation_title"] = evidence.get("title")
+                payload["validation_source"] = evidence.get("source")
+                payload["validation_url"] = evidence.get("url")
+                payload["strategy_tags"] = list(dict.fromkeys([*(payload.get("strategy_tags") or []), "event_impact"]))
+                payload["metrics"] = {**(payload.get("metrics") or {}), "event_validation_hits": len(match.get("results") or [])}
+                candidates.append(payload)
+                if len(candidates) >= limit * 2:
+                    break
+            if len(candidates) >= limit * 2:
+                break
+        if len(candidates) >= limit * 2:
+            break
+    return _dedupe_candidates(candidates, limit)
+
+
+def _ingest_event_watch_to_graphiti(events: List[Dict[str, Any]], *, market: str) -> None:
+    if not events:
+        return
+    try:
+        from src.config import get_config
+        config = get_config()
+        if not getattr(config, "graphiti_enabled", False):
+            return
+        from src.services.graphiti import get_graphiti_service
+        service = get_graphiti_service()
+        if not service.is_available():
+            return
+        for event in events[:8]:
+            service.ingest_market_event_sync(
+                event_id=str(event.get("event_id") or "event"),
+                title=str(event.get("title") or "market event"),
+                event_payload=event,
+                market=market,
+            )
+    except Exception as exc:
+        logger.debug("Graphiti market event ingest skipped: %s", exc)
+
+
+def _discover_event_impact_candidates(*, market: str, limit: int) -> Dict[str, Any]:
+    service = _build_search_service_for_candidates()
+    if service is None or not getattr(service, "is_available", False):
+        return {
+            "status": "unavailable",
+            "candidates": [],
+            "events": [],
+            "queries": [],
+            "diagnostics": [{"source": "search_service", "status": "unavailable", "reason": "No search provider configured"}],
+        }
+
+    queries: List[Dict[str, Any]] = []
+    events_by_id: Dict[str, Dict[str, Any]] = {}
+    for query in _EVENT_IMPACT_QUERIES:
+        try:
+            response = _search_general_news(service, query, max_results=5, days=1)
+        except Exception as exc:
+            queries.append({"query": query, "status": "failed", "error": str(exc), "window_days": 1})
+            continue
+        cards = _event_cards_from_response(response)
+        queries.append({
+            "query": getattr(response, "query", query),
+            "status": "ok" if getattr(response, "success", False) else "failed",
+            "provider": getattr(response, "provider", ""),
+            "count": len(getattr(response, "results", []) or []),
+            "event_count": len(cards),
+            "window_days": 1,
+            **({"error": getattr(response, "error_message", None)} if getattr(response, "error_message", None) else {}),
+        })
+        for card in cards:
+            events_by_id.setdefault(str(card["event_id"]), card)
+
+    events = list(events_by_id.values())[:8]
+    for event in events:
+        validation_matches = _validation_matches_for_event(service, event, days=7)
+        event["validation_window_days"] = 7
+        event["validation_matches"] = validation_matches
+        if any(match.get("status") == "confirmed" for match in validation_matches):
+            event["maturity"] = "confirmed"
+        elif validation_matches:
+            event["maturity"] = "developing"
+        else:
+            event["maturity"] = "breaking"
+
+    _ingest_event_watch_to_graphiti(events, market=market)
+    candidates = _candidates_from_confirmed_themes(events, limit)
+    status = "ok" if candidates else ("watch_only" if events else "empty")
+    return {
+        "status": status,
+        "candidates": candidates,
+        "events": events,
+        "queries": queries,
+        "diagnostics": [],
+    }
 
 
 # ============================================================
@@ -275,6 +1219,263 @@ get_sector_rankings_tool = ToolDefinition(
 
 
 # ============================================================
+# detect_market_regime
+# ============================================================
+
+def _latest_numeric(items: Iterable[Dict[str, Any]], *keys: str) -> Optional[float]:
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            if key not in item:
+                continue
+            try:
+                value = float(item.get(key))
+            except Exception:
+                continue
+            return value
+    return None
+
+
+def _pct_change(values: List[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    first = values[-2]
+    last = values[-1]
+    if not first:
+        return None
+    return max(-1.0, min(1.0, (last - first) / abs(first)))
+
+
+def _derive_market_breadth(indices: List[Dict[str, Any]]) -> Optional[float]:
+    changes: List[float] = []
+    for item in indices or []:
+        try:
+            changes.append(float(item.get("change_pct")))
+        except Exception:
+            continue
+    if not changes:
+        return None
+    positive = sum(1 for value in changes if value > 0)
+    negative = sum(1 for value in changes if value < 0)
+    total = positive + negative
+    if total <= 0:
+        return 0.0
+    return max(-1.0, min(1.0, (positive - negative) / total))
+
+
+def _derive_northbound_component(flow: Dict[str, Any]) -> Optional[float]:
+    history = flow.get("history") or []
+    values: List[float] = []
+    for row in history:
+        value = _latest_numeric([row], "net_inflow", "净买入", "northbound_net_inflow")
+        if value is not None:
+            values.append(value)
+    if values:
+        scale = max(abs(v) for v in values[-10:]) or 1.0
+        return max(-1.0, min(1.0, values[-1] / scale))
+    summary = flow.get("summary") or {}
+    value = _latest_numeric([summary], "northbound_net_inflow", "北向资金")
+    if value is None:
+        return None
+    return max(-1.0, min(1.0, value / 10_000_000_000.0))
+
+
+def _derive_margin_component(margin: Dict[str, Any]) -> Optional[float]:
+    rows = list(margin.get("sse") or []) + list(margin.get("szse") or [])
+    balances: List[float] = []
+    for row in rows:
+        value = _latest_numeric([row], "margin_balance", "融资余额")
+        if value is not None:
+            balances.append(value)
+    return _pct_change(balances[-2:]) if balances else None
+
+
+def _derive_market_flow_component(flow: Dict[str, Any]) -> Optional[float]:
+    market_flow = flow.get("market_flow") or {}
+    value = _latest_numeric([market_flow], "main_net_inflow", "主力净流入")
+    if value is None:
+        return None
+    return max(-1.0, min(1.0, value / 50_000_000_000.0))
+
+
+def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    from src.services.history_loader import load_history_df
+
+    df, source = load_history_df(index_code, days=lookback_days)
+    if df is None or df.empty:
+        return [], source
+    rows = df.tail(lookback_days).to_dict(orient="records")
+    for row in rows:
+        if "date" in row:
+            row["date"] = str(row["date"])
+    return rows, source
+
+
+def _handle_detect_market_regime(
+    market: str = "cn",
+    index_code: str = "000300",
+    lookback_days: int = 260,
+    confirmation_bars: int = 3,
+    persist: bool = True,
+) -> dict:
+    """Detect A-share market regime from OHLCV, flow, breadth and persisted state."""
+    market_key = (market or "cn").strip().lower()
+    if market_key != "cn":
+        return {
+            "status": "not_supported",
+            "market": market_key,
+            "error": "detect_market_regime currently supports China A-share market only.",
+        }
+
+    lookback = max(120, min(int(lookback_days or 260), 520))
+    history_rows, history_source = _load_market_history(index_code or "000300", lookback)
+    bars = coerce_bars(history_rows)
+    try:
+        from src.storage import get_db
+
+        db = get_db()
+        previous = db.get_market_regime_state(market_key) or {}
+    except Exception as exc:
+        logger.warning("Failed to read market regime state: %s", exc)
+        db = None
+        previous = {}
+
+    indices = []
+    sector_rankings: Dict[str, Any] = {}
+    northbound: Dict[str, Any] = {}
+    margin: Dict[str, Any] = {}
+    market_flow: Dict[str, Any] = {}
+    data_errors: List[str] = []
+
+    try:
+        indices = _handle_get_market_indices(region="cn").get("indices") or []
+    except Exception as exc:
+        data_errors.append(f"market_indices: {exc}")
+    try:
+        sector_rankings = _handle_get_sector_rankings(top_n=10)
+    except Exception as exc:
+        data_errors.append(f"sector_rankings: {exc}")
+    try:
+        from src.agent.tools.data_tools import (
+            _handle_get_market_capital_flow,
+            _handle_get_margin_trading_summary,
+            _handle_get_northbound_capital_flow,
+        )
+
+        market_flow = _handle_get_market_capital_flow(top_n=5)
+        northbound = _handle_get_northbound_capital_flow(limit=10)
+        margin = _handle_get_margin_trading_summary(limit=10)
+    except Exception as exc:
+        data_errors.append(f"capital_flow_components: {exc}")
+
+    sentiment = SentimentComponents(
+        margin_balance_change=_derive_margin_component(margin),
+        market_breadth=_derive_market_breadth(indices),
+        fear_greed_index=None,
+        northbound_flow_z=_derive_northbound_component(northbound),
+        market_flow_z=_derive_market_flow_component(market_flow),
+        raw={
+            "indices_count": len(indices),
+            "top_sectors": (sector_rankings.get("top_sectors") or sector_rankings.get("sectors") or [])[:5],
+            "component_sources": {
+                "northbound": northbound.get("source_chain"),
+                "margin": margin.get("source_chain"),
+                "market_flow": market_flow.get("source_chain"),
+            },
+        },
+    )
+
+    state = detect_market_regime(
+        bars,
+        market=market_key,
+        sentiment=sentiment,
+        previous_bucket=(previous.get("payload") or {}).get("volatility_bucket") or previous.get("volatility_bucket"),
+        previous_regime=previous.get("regime"),
+        pending_regime=previous.get("pending_regime"),
+        pending_count=int(previous.get("pending_count") or 0),
+        confirmation_bars=confirmation_bars,
+    )
+    payload = state.to_dict()
+    payload.update({
+        "status": "ok" if state.data_quality != "insufficient" else "insufficient_data",
+        "index_code": index_code,
+        "history_source": history_source,
+        "history_records": len(bars),
+        "persisted": False,
+        "data_errors": data_errors,
+        "market_context": {
+            "indices": indices,
+            "sector_rankings": {
+                "top": (sector_rankings.get("top_sectors") or sector_rankings.get("sectors") or [])[:5],
+                "bottom": (sector_rankings.get("bottom_sectors") or [])[:5],
+            },
+        },
+    })
+
+    if persist and db is not None and payload["status"] != "insufficient_data":
+        try:
+            db.save_market_regime_state(market_key, payload)
+            payload["persisted"] = True
+        except Exception as exc:
+            logger.warning("Failed to persist market regime state: %s", exc)
+            payload.setdefault("data_errors", []).append(f"persist: {exc}")
+
+    return payload
+
+
+detect_market_regime_tool = ToolDefinition(
+    name="detect_market_regime",
+    description=(
+        "Detect China A-share market regime using empirical ATR percentile, damped volatility "
+        "bucket, A-share sentiment/liquidity substitutes, Wyckoff phase, and persisted "
+        "confirmation state. Use as the default pre-check for entry, position review, and "
+        "watchlist selection."
+    ),
+    parameters=[
+        ToolParameter(
+            name="market",
+            type="string",
+            description="Market code. Currently only 'cn' is supported.",
+            required=False,
+            default="cn",
+            enum=["cn"],
+        ),
+        ToolParameter(
+            name="index_code",
+            type="string",
+            description="A-share index proxy for regime OHLCV, default CSI 300 '000300'.",
+            required=False,
+            default="000300",
+        ),
+        ToolParameter(
+            name="lookback_days",
+            type="integer",
+            description="Trading days for empirical CDF and Wyckoff analysis (default 260, max 520).",
+            required=False,
+            default=260,
+        ),
+        ToolParameter(
+            name="confirmation_bars",
+            type="integer",
+            description="Number of consecutive confirmations required before switching persisted regime.",
+            required=False,
+            default=3,
+        ),
+        ToolParameter(
+            name="persist",
+            type="boolean",
+            description="Persist the latest regime state to local SQLite for damping/confirmation.",
+            required=False,
+            default=True,
+        ),
+    ],
+    handler=_handle_detect_market_regime,
+    category="market",
+)
+
+
+# ============================================================
 # discover_watchlist_candidates
 # ============================================================
 
@@ -289,7 +1490,7 @@ def _handle_discover_watchlist_candidates(
     """Build a deterministic candidate list for watchlist_scan."""
     effective_limit = max(1, min(int(limit or 8), 20))
     source_mode = str(candidate_source or "auto").strip().lower()
-    if source_mode not in {"auto", "sequoia", "sector", "fallback"}:
+    if source_mode not in {"auto", "alphasift", "sequoia", "sector", "event_impact", "news_momentum", "news_sentiment", "fallback"}:
         source_mode = "auto"
     discovery_steps: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
@@ -317,6 +1518,7 @@ def _handle_discover_watchlist_candidates(
                 "get_volume_analysis",
                 "analyze_pattern",
                 "search_stock_news",
+                "score_stock_news_sentiment",
                 "get_capital_flow",
             ],
             "note": "后续必须对候选标的逐只调用行情、技术、消息和资金工具后才能排序。",
@@ -330,6 +1532,53 @@ def _handle_discover_watchlist_candidates(
             "candidates": [],
             "next_required_tools": [],
         }
+
+    alphasift_result: Dict[str, Any] = {}
+    if source_mode in {"auto", "alphasift"}:
+        alphasift_result = AlphaSiftCandidateProvider().discover(
+            limit=effective_limit if source_mode == "alphasift" else min(50, effective_limit * 3),
+            strategy_names=strategy_names,
+        )
+        if source_mode == "auto" and alphasift_result.get("status") == "empty" and strategy_names:
+            fallback_result = AlphaSiftCandidateProvider().discover(
+                limit=min(50, effective_limit * 3),
+                strategy_names=None,
+            )
+            if fallback_result.get("candidates"):
+                fallback_result.setdefault("diagnostics", [])
+                fallback_result["diagnostics"] = [
+                    {
+                        "source": "alphasift_strategy_filter",
+                        "status": "fallback_to_all",
+                        "requested": strategy_names,
+                        "reason": "Requested strategy names did not match AlphaSift YAML strategies in auto mode.",
+                    },
+                    *(fallback_result.get("diagnostics") or []),
+                ]
+                alphasift_result = fallback_result
+        alphasift_candidates = alphasift_result.get("candidates") or []
+        discovery_steps.append({
+            "source": "alphasift",
+            "status": alphasift_result.get("status", "failed"),
+            "count": len(alphasift_candidates),
+            "db_path": alphasift_result.get("db_path"),
+            "strategies_dir": alphasift_result.get("strategies_dir"),
+            "strategy_names": alphasift_result.get("strategy_names", []),
+            "diagnostics": alphasift_result.get("diagnostics", []),
+            **({"error": alphasift_result.get("error")} if alphasift_result.get("error") else {}),
+        })
+        candidates.extend(alphasift_candidates)
+        if source_mode == "alphasift":
+            candidates = _dedupe_candidates(candidates, effective_limit)
+            return _candidate_discovery_response(
+                status="ok" if candidates else "partial",
+                market=market,
+                candidates=candidates,
+                discovery_steps=discovery_steps,
+                fallback_used=False,
+                candidate_source="alphasift",
+                note="AlphaSift YAML 策略只生成候选池，不代表最终推荐；后续必须逐只取证后再排序和配置仓位。",
+            )
 
     sequoia_result: Dict[str, Any] = {}
     if source_mode in {"auto", "sequoia"}:
@@ -358,6 +1607,61 @@ def _handle_discover_watchlist_candidates(
                 fallback_used=False,
                 candidate_source="sequoia",
                 note="Sequoia 量化策略只生成候选池，不代表最终推荐；后续必须逐只取证后再排序和配置仓位。",
+            )
+
+    event_result: Dict[str, Any] = {}
+    if source_mode in {"auto", "event_impact", "news_sentiment"}:
+        event_result = _discover_event_impact_candidates(
+            market=market,
+            limit=effective_limit if source_mode in {"event_impact", "news_sentiment"} else min(20, effective_limit * 2),
+        )
+        event_candidates = event_result.get("candidates") or []
+        discovery_steps.append({
+            "source": "event_impact",
+            "status": event_result.get("status", "failed"),
+            "count": len(event_candidates),
+            "events": event_result.get("events", []),
+            "queries": event_result.get("queries", []),
+            "diagnostics": event_result.get("diagnostics", []),
+        })
+        candidates.extend(event_candidates)
+        if source_mode in {"event_impact", "news_sentiment"}:
+            candidates = _dedupe_candidates(candidates, effective_limit)
+            return _candidate_discovery_response(
+                status="ok" if candidates else "partial",
+                market=market,
+                candidates=candidates,
+                discovery_steps=discovery_steps,
+                fallback_used=False,
+                candidate_source="event_impact",
+                note="事件影响链先形成事件/主题观察，只有 7 日窗口内出现后续验证事实才生成个股候选；未验证事件不得直接推导个股。",
+            )
+
+    news_momentum_result: Dict[str, Any] = {}
+    if source_mode in {"auto", "news_momentum"}:
+        news_momentum_result = _discover_news_momentum_candidates(
+            limit=effective_limit if source_mode == "news_momentum" else min(20, effective_limit * 2),
+            seed_candidates=candidates,
+        )
+        news_momentum_candidates = news_momentum_result.get("candidates") or []
+        discovery_steps.append({
+            "source": "news_momentum",
+            "status": news_momentum_result.get("status", "failed"),
+            "count": len(news_momentum_candidates),
+            "queries": news_momentum_result.get("queries", []),
+            "diagnostics": news_momentum_result.get("diagnostics", []),
+        })
+        candidates.extend(news_momentum_candidates)
+        if source_mode == "news_momentum":
+            candidates = _dedupe_candidates(candidates, effective_limit)
+            return _candidate_discovery_response(
+                status="ok" if candidates else "partial",
+                market=market,
+                candidates=candidates,
+                discovery_steps=discovery_steps,
+                fallback_used=False,
+                candidate_source="news_momentum",
+                note="消息面候选只接收公司级新闻/公告硬事件；减持、监管处罚、问询等负面事件只作为风险提示，不作为买入候选。",
             )
 
     if source_mode == "fallback":
@@ -441,6 +1745,7 @@ def _candidate_discovery_response(
             "get_volume_analysis",
             "analyze_pattern",
             "search_stock_news",
+            "score_stock_news_sentiment",
             "get_capital_flow",
         ],
         "note": note,
@@ -480,15 +1785,15 @@ discover_watchlist_candidates_tool = ToolDefinition(
         ToolParameter(
             name="candidate_source",
             type="string",
-            description="Candidate source: auto, sequoia, sector, or fallback. auto tries Sequoia quantitative candidates first, then sector constituents, then fallback seeds.",
+            description="Candidate source: auto, alphasift, sequoia, sector, event_impact, news_momentum, news_sentiment, or fallback. auto tries AlphaSift YAML candidates, Sequoia quantitative candidates, event-impact candidates, company-news momentum candidates, sector constituents, and fallback seeds. news_sentiment is kept as a compatibility alias for event_impact.",
             required=False,
             default="auto",
-            enum=["auto", "sequoia", "sector", "fallback"],
+            enum=["auto", "alphasift", "sequoia", "sector", "event_impact", "news_momentum", "news_sentiment", "fallback"],
         ),
         ToolParameter(
             name="strategy_names",
             type="array",
-            description="Optional Sequoia strategy names: ma_volume, turtle_trade, high_tight_flag, limit_up_shakeout, uptrend_limit_down, rps_breakout, or all.",
+            description="Optional strategy names. AlphaSift supports volume_breakout, capital_heat, balanced_alpha, quality_value, dual_low, momentum_quality, oversold_reversal, shrink_pullback. Sequoia supports ma_volume, turtle_trade, high_tight_flag, limit_up_shakeout, uptrend_limit_down, rps_breakout, or all.",
             required=False,
             default=[],
         ),
@@ -506,6 +1811,7 @@ discover_watchlist_candidates_tool = ToolDefinition(
 
 
 ALL_MARKET_TOOLS = [
+    detect_market_regime_tool,
     get_market_indices_tool,
     get_sector_rankings_tool,
     discover_watchlist_candidates_tool,

@@ -25,6 +25,21 @@ class MarketEvent(BaseModel):
 
     title: str = Field(description="事件标题")
     event_type: str = Field(description="事件类型：policy / earnings / macro / corporate / geopolitical")
+    maturity: str = Field(default="breaking", description="事件成熟度：breaking / developing / confirmed")
+
+
+class ImpactVariable(BaseModel):
+    """事件影响变量。"""
+
+    variable_key: str = Field(description="影响变量标识，例如 tariff_expectation / oil_risk_premium")
+    direction: str = Field(description="影响方向：positive / negative / mixed / unknown")
+
+
+class ThemeWatch(BaseModel):
+    """由事件触发的主题观察。"""
+
+    theme_name: str = Field(description="主题或行业名称")
+    status: str = Field(description="状态：watch_only / developing / confirmed")
 
 
 class AnalysisConclusion(BaseModel):
@@ -39,6 +54,8 @@ DEFAULT_ENTITY_TYPES = {
     "Stock": Stock,
     "Sector": Sector,
     "MarketEvent": MarketEvent,
+    "ImpactVariable": ImpactVariable,
+    "ThemeWatch": ThemeWatch,
     "AnalysisConclusion": AnalysisConclusion,
 }
 

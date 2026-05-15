@@ -15,7 +15,8 @@
 | 第六阶段 | 对抗式 Debate Agent | 已完成（开发调试模式） | planning_execute 在工具证据形成后追加强制反向立场辩论和 Judge 裁决；`/agent-trace` 与 `debate.json` 可复盘。 |
 | 第七阶段 | 阶段化选股流水线 | 已完成（开发调试模式） | `watchlist_scan` 优先走候选发现、初筛、单股深度分析、组合配置、反方审查和 Judge 裁决；`SelectionRunContext` 以 `summary/full/full_ref` 管理上下文并落盘 `stock_selection.json`。 |
 | 第八阶段 | A 股硬风控与结构化协议 | 已完成底座 | `src/schemas/agent_signal.py` 与 `RiskGateEvaluator` 已覆盖 L1/L2/L3、TradePlan、T+1、涨跌停、特殊股票、止损、数据质量、仓位和现金约束；Trace 会落盘 `risk_gate.json`。 |
-| 候选池增强 | Sequoia 风格量化候选池 | 已完成开发链路 | `discover_watchlist_candidates` 的 `auto` 模式已合并 Sequoia 量化候选、强势板块成分股、用户种子和 fallback，并向 Trace 暴露候选来源、策略标签、评分和理由。 |
+| 候选池增强 | AlphaSift YAML + Sequoia 量化候选池 | 已完成开发链路 | `discover_watchlist_candidates` 的 `auto` 模式已合并 AlphaSift YAML 多因子候选、Sequoia 形态量化候选、强势板块成分股、用户种子和 fallback，并向 Trace 暴露候选来源、策略标签、评分和理由。 |
+| 多专家选股编排 | `watchlist_scan` 共享状态 + 专家意见 | 已完成第一阶段实验链路 | `AGENT_ORCHESTRATION_MODE=expert_graph` 会在保留原五阶段选股流水线的同时，将市场、候选、技术、资金/筹码、消息/情绪、基本面和组合风险专家意见写入 Trace；默认 `legacy` 不改变旧行为。 |
 | 知识图谱记忆 | Graphiti 最小集成 | 已完成最小链路 | 已提供可选 Neo4j/Graphiti 配置、分析结果入图和 Agent 知识图谱检索工具；仍属于增强能力，不是 planning_execute 的硬依赖。 |
 | 长期路线图 | 工具补全、连续对话、方案托管、模拟盘、自进化、回测、regime、策略库和量化交易 | 规划中 | 目标是从“账户感知分析助手”升级为“可复盘、可托管、可验证、可迭代的 A 股交易研究系统”。 |
 
@@ -31,7 +32,8 @@
 - 确定性技术信号与 LLM 决策仪表盘
 - planning_execute 实验链路、确定性 Planner、Agent Trace、SSE 和本地调试产物
 - 对抗式 Debate、阶段化 `watchlist_scan` 选股流水线和 `risk_gate` 风控审计
-- Sequoia 风格量化候选池、候选来源审计和 Graphiti 知识图谱最小集成
+- AlphaSift YAML 多因子候选池、Sequoia 风格量化候选池、候选来源审计和 Graphiti 知识图谱最小集成
+- `watchlist_scan` 实验性多专家共享状态编排，能把候选来源和技术/资金/消息/基本面/组合风险专家意见写入 Trace
 
 早期计划中的三个目标已经进入开发调试链路：
 
@@ -198,8 +200,8 @@ L3 Decision 跨类别融合：交易动作 + 综合置信度 + 风控前置条�
 | --- | --- | --- |
 | D1 | 已有均线、趋势、量能、乖离率、形态分析 | 已有，继续收敛为 L1 技术信号 |
 | D2 | Wyckoff/VSA：吸筹、拉升、派发、下跌相位 | 高，A 股散户占比高，量价博弈价值大 |
-| D3 | SMC：BOS/CHoCH、Order Block、FVG/缺口 | 中，先实现缺口和结构突破，OB 需过滤一字板 |
-| D4 | 缠论：K 线合并、分型、笔、线段、中枢、背驰 | 中后期，复杂度高但适配 A 股，可作为策略库增强 |
+| D3 | SMC：BOS/CHoCH、Order Block、FVG/缺口 | 已落地第一版，`analyze_price_structure` 输出结构证据，OB/FVG 仍需后续结合一字板和成交额过滤 |
+| D4 | 缠论：K 线合并、分型、笔、线段、中枢、背驰 | 已落地第一版到 K 线合并、分型、笔、中枢、力度和未完成笔；线段和真实 MACD 面积背驰待增强 |
 
 A 股策略库第一批只保留做多和风控策略：
 
@@ -672,14 +674,14 @@ Prompt 中已包含股票/账户领域的 `ANALYSIS_DIMENSIONS`，将能力域�
 
 | Capability | Tools |
 | --- | --- |
-| `technical_analysis` | `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern` |
+| `technical_analysis` | `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure` |
 | `realtime_quote` | `get_realtime_quote` |
 | `portfolio_context` | `get_portfolio_snapshot` |
 | `news_event` | `search_comprehensive_intel`, `search_stock_news` |
 | `capital_flow` | `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary` |
 | `fundamental_analysis` | `get_stock_info` |
 | `chip_distribution` | `get_chip_distribution` |
-| `regime_detection` | `get_market_indices`, `get_sector_rankings`, `get_volume_analysis` |
+| `regime_detection` | `detect_market_regime`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis` |
 | `market_context` | `get_market_indices`, `get_sector_rankings` |
 | `backtest_memory` | `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary` |
 
@@ -846,7 +848,7 @@ PortfolioService.get_portfolio_snapshot()
 - 输出工具执行计划。
 - 不改变现有工具实现。
 - 普通单股分析先支持 `analysis_mode=planning_execute` 实验开关。
-- 第一版 `regime_detection` 可以先复用现有指数、板块、量价和市场宽度数据生成结构化市场状态；后续再独立沉淀为 `detect_market_regime` 工具。
+- 第一版 `regime_detection` 已沉淀为 `detect_market_regime` 工具：以沪深300等 A 股指数 OHLCV 为底座，计算经验 CDF 波动分档、阻尼、Wyckoff 相位和本地 SQLite 确认状态；情绪分量先复用北向资金、两融、市场主力资金和指数宽度等 A 股替代指标。
 
 当前实现：
 
@@ -854,7 +856,7 @@ PortfolioService.get_portfolio_snapshot()
 - `build_planning_result()` 会根据 `AgentUserContext.report.intent`、`primary_symbol` 和是否已有持仓选择能力域、风险检查项和期望输出类型。
 - 映射层只展开当前 `ToolRegistry` 已注册的工具，缺失工具记录在 `missing_tools`，不假设工具一定存在。
 - `AGENT_ANALYSIS_MODE=planning_execute` 作为实验开关；默认 `normal`，不改变现有 Agent 行为。
-- 第一版 `regime_detection` 仍按计划由 `get_market_indices`、`get_sector_rankings`、`get_volume_analysis` 组合表达，暂不新增独立工具。
+- 当前 `regime_detection` 优先调用 `detect_market_regime`，并保留 `get_market_indices`、`get_sector_rankings`、`get_volume_analysis` 作为解释和交叉验证补充。`watchlist_scan` 选股流水线会在候选发现后立即读取市场状态，并将其传入初筛、深挖、组合配置、反方审查和 Judge；当状态为 `risk_off`、`panic` 或极端波动时，即使模型给出 `open`，组合配置也会被确定性降档为等待或低仓位条件计划。
 
 ### 第三阶段：持仓上下文接入（已完成）
 
@@ -1026,5 +1028,5 @@ AgentUserContext
 - [x] `entry_analysis` 专项输出规范已补齐到与 `position_review` 同等级的可执行程度，并使用可见 Planning -> Execute 格式。
 - [x] 第五阶段按开发调试模式收口；正式用户画像配置入口暂缓产品化，不作为当前阶段阻塞项。
 - [x] Debate Agent 已按“强制反向立场辩论 + Judge 最终裁决”接入 planning_execute，覆盖持仓模式和选股/入场模式。
-- [x] `discover_watchlist_candidates` 已支持 Sequoia 量化候选、强势板块、用户种子和 fallback 多路召回，并通过统一评分合并候选。
+- [x] `discover_watchlist_candidates` 已支持 AlphaSift YAML 多因子候选、Sequoia 量化候选、强势板块、用户种子和 fallback 多路召回，并通过统一评分合并候选。
 - [x] Graphiti/Neo4j 已具备可选最小集成路径，可用于分析结果入图和 Agent 检索，但仍不是主链路硬依赖。

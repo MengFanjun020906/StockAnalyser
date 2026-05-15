@@ -1830,6 +1830,23 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 60,
     },
+    "AGENT_ORCHESTRATION_MODE": {
+        "title": "Agent Orchestration Mode",
+        "description": "Experimental watchlist_scan orchestration mode. 'legacy' keeps the existing staged stock-selection pipeline; 'expert_graph' adds shared-state expert opinions into Trace while reusing the same model and tools.",
+        "category": "agent",
+        "data_type": "string",
+        "ui_control": "select",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "legacy",
+        "options": [
+            {"label": "Legacy", "value": "legacy"},
+            {"label": "Expert Graph", "value": "expert_graph"},
+        ],
+        "validation": {"enum": ["legacy", "expert_graph"]},
+        "display_order": 60,
+    },
     "AGENT_ORCHESTRATOR_MODE": {
         "title": "Orchestrator Mode",
         "description": "Pipeline mode when AGENT_ARCH=multi. 'quick' (tech→decision), 'standard' (tech→intel→decision), 'full' (tech→intel→risk→decision), 'specialist' (full + per-strategy specialist agents).",

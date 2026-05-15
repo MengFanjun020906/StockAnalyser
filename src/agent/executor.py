@@ -451,6 +451,7 @@ class AgentExecutor:
         use_legacy_default_prompt: bool = False,
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
+        orchestration_mode: str = "legacy",
     ):
         self.tool_registry = tool_registry
         self.llm_adapter = llm_adapter
@@ -459,6 +460,7 @@ class AgentExecutor:
         self.use_legacy_default_prompt = use_legacy_default_prompt
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
+        self.orchestration_mode = orchestration_mode
 
     def _build_system_prompt(
         self,
@@ -742,6 +744,7 @@ class AgentExecutor:
             timeout_seconds=self.timeout_seconds,
             progress_callback=progress_callback,
             run_id=context.get("session_id") or "selection-run",
+            orchestration_mode=self.orchestration_mode,
         )
 
     def _maybe_run_debate(

@@ -1716,9 +1716,9 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=300.0)
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
-                    event = {"type": "error", "session_id": session_id, "message": "Trace 分析超时"}
+                    event = {"type": "heartbeat", "session_id": session_id, "message": "Trace still running"}
                 yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
                 if event.get("type") in ("done", "error"):
                     break

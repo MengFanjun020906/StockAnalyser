@@ -717,6 +717,7 @@ class Config:
     agent_skill_dir: Optional[str] = None
     agent_nl_routing: bool = False  # Enable natural language routing in bot dispatcher
     agent_arch: str = "single"     # Agent architecture: 'single' (legacy) or 'multi' (orchestrator)
+    agent_orchestration_mode: str = "legacy"  # Watchlist orchestration: legacy | expert_graph
     agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
@@ -962,6 +963,7 @@ class Config:
     # --- Post-init validation ---------------------------------------------------
     _VALID_AGENT_ARCH = {"single", "multi"}
     _VALID_AGENT_ANALYSIS_MODE = {"normal", "planning_execute"}
+    _VALID_AGENT_ORCHESTRATION_MODES = {"legacy", "expert_graph"}
     _VALID_ORCHESTRATOR_MODES = {"quick", "standard", "full", "specialist"}
     _VALID_SKILL_ROUTING = {"auto", "manual"}
     _WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS = frozenset(
@@ -990,6 +992,12 @@ class Config:
                 self.agent_analysis_mode, self._VALID_AGENT_ANALYSIS_MODE,
             )
             object.__setattr__(self, "agent_analysis_mode", "normal")
+        if self.agent_orchestration_mode not in self._VALID_AGENT_ORCHESTRATION_MODES:
+            _log.warning(
+                "Invalid AGENT_ORCHESTRATION_MODE=%r, falling back to 'legacy'. Valid: %s",
+                self.agent_orchestration_mode, self._VALID_AGENT_ORCHESTRATION_MODES,
+            )
+            object.__setattr__(self, "agent_orchestration_mode", "legacy")
         if self.agent_orchestrator_mode in {"strategy", "skill"}:
             _log.info(
                 "AGENT_ORCHESTRATOR_MODE=%s is deprecated; normalizing to 'specialist'",
@@ -1406,6 +1414,7 @@ class Config:
             agent_skill_dir=os.getenv('AGENT_SKILL_DIR') or os.getenv('AGENT_STRATEGY_DIR'),
             agent_nl_routing=os.getenv('AGENT_NL_ROUTING', 'false').lower() == 'true',
             agent_arch=os.getenv('AGENT_ARCH', 'single').lower(),
+            agent_orchestration_mode=os.getenv('AGENT_ORCHESTRATION_MODE', 'legacy').strip().lower(),
             agent_orchestrator_mode=os.getenv('AGENT_ORCHESTRATOR_MODE', 'standard').lower(),
             agent_orchestrator_timeout_s=parse_env_int(
                 os.getenv('AGENT_ORCHESTRATOR_TIMEOUT_S'),

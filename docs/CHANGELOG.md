@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] `discover_watchlist_candidates` 接入 Sequoia 风格量化候选池，支持按均线放量、海龟突破、高窄旗形、涨停洗盘、上升趋势跌停和 RPS 突破生成结构化候选，并保留板块和固定种子降级路径。
 - [新功能] 新增 `scripts/update_sequoia_candidates.py`，可从 baostock 拉取 A 股最近 260 个交易日日线并落库到 Sequoia 候选池 SQLite，避免运行全量历史回填。
 - [改进] `discover_watchlist_candidates` 的 `auto` 模式改为多路召回 + 统一评分，同时合并 Sequoia 量化候选和强势板块成分股，避免硬策略未命中股票被粗筛阶段直接排除。
+- [改进] `discover_watchlist_candidates` 接入 AlphaSift YAML 策略候选召回，优先复用可配置硬筛、因子打分和策略标签，再与 Sequoia 形态策略和板块候选统一合并。
 - [文档] README 新增 `L1-L9` 系统分层命名规范，明确数据层、候选池层、证据层、信号层、决策层、风控闸门、方案层、托管跟踪层和复盘进化层的职责边界。
 - [改进] Agent Trace 页面新增 `Layered Trace` 可折叠视图，按 `L1-L9` 展示 Prompt 输入、上下文取数、候选池召回、SSE 流、工具调用、信号摘要、裁决、风控、TradePlan 和复盘入口。
 - [改进] Agent Trace 的 L2 候选池层改为候选股票列表视图，展示入池来源、策略标签、候选理由、评分和证据指标。
@@ -45,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 Agent 工具缺口的数据源调研，明确 GDELT、Alpha Vantage、Trading Economics、Tushare、ACLED 等 API URL、Token 配置和推荐接入顺序。
 - [修复] Agent ReAct 循环新增渐进式工具预算护栏，达到 60%/80% 步数后提示收敛、重复工具同参数复用已有结果，并在最后一步基于现有证据强制综合，避免复杂任务直接报超步数。
 - [修复] DeepSeek 官方渠道支持在未配置 `LLM_<NAME>_API_KEY(S)` 时复用 `DEEPSEEK_API_KEY(S)`，并在 Agent 鉴权失败时明确提示应更新 DeepSeek key，避免误判为 OpenAI key 或普通 fallback 失败。
+- [新功能] 新增 A 股 `detect_market_regime` 工具，基于经验 CDF 波动分档、阻尼、A 股情绪替代分量、Wyckoff 相位和本地 SQLite 确认状态生成结构化市场环境约束。
+- [改进] `watchlist_scan` 选股流水线接入 `detect_market_regime`，在候选初筛、单股深挖、组合配置、反方审查和 Judge 裁决中传递市场状态，并对 `risk_off`、`panic` 和极端波动环境执行确定性开仓降档。
+- [文档] 新增 A 股 Regime 状态机原理文档，说明经验 CDF 波动分档、阻尼、情绪合成、Wyckoff 相位、SQLite 持久化和选股降档机制。
+- [新功能] 新增 `analyze_price_structure` Stage3 价格结构工具，输出缠论包含合并、分型、笔、中枢、力度、未完成笔，以及 SMC 摆动、BOS/CHoCH、OB/FVG 结构证据。
+- [文档] 新增 Stage3 价格结构分析引擎原理文档，说明 Chan/SMC 结构识别边界和选股链路接入方式。
+- [文档] 重写 README 为用户视角首页，突出账户感知、候选池融合、对抗辩论、A 股风控、Regime、价格结构、长期记忆和未来闭环规划。
+- [改进] Agent Trace 的 L1 数据与候选池层改为候选卡片视图，展示股票名称、召回来源、策略标签，以及策略/技术面/资金面/情绪热点等入池理由。
+- [修复] Agent 候选池为 Sequoia/AlphaSift 本地行情候选补齐中文股票名称，并修复 auto 模式下 Sequoia 策略名导致 AlphaSift YAML 召回被误过滤为空的问题。
+- [文档] 新增 Agent 情绪面工具实施调研与闭环方案，明确 A 股情绪/消息候选的数据源、工具契约、评分、存储、候选池接入和验收标准。
+- [新功能] `watchlist_scan` 新增实验性 `AGENT_ORCHESTRATION_MODE=expert_graph`，在保留原阶段化选股流水线的同时向 Trace 输出市场、候选、技术、资金/筹码、消息/情绪、基本面和组合风险专家意见。
+- [修复] Agent Trace 多专家模式在候选池为空时仍输出专家图谱状态，并修正文案避免把缺失 `expert_state` 误提示为 legacy 链路。
+- [改进] Agent Trace 候选池归因拆分策略、技术、资金和情绪维度，避免策略候选与技术候选重复，并明确资金候选当前多为成交额/换手/量比等流动性代理。
+- [改进] `discover_watchlist_candidates` 新增 `event_impact` 事件影响链，按 1 天突发事件与 7 天验证窗口区分主题观察和已验证个股候选，并将事件 best-effort 写入 Graphiti。
+- [改进] Agent Trace 新增“消息/事件观察”区块，展示 `event_impact` 未验证事件、影响变量、观察主题和验证状态，避免 watch-only 事件在前端不可见。
+- [新功能] Agent 新增 `score_stock_news_sentiment` 个股消息评分工具，并将 `news_momentum` 公司级新闻/公告硬事件接入 `discover_watchlist_candidates`，使候选池可出现“消息面候选”。
+- [改进] `score_stock_news_sentiment` 和 `news_momentum` 的个股新闻补证默认只做前两个搜索 provider 的快速尝试，避免辅助消息面取证拖慢整轮 Trace。
+- [修复] Agent Trace SSE 长工具执行期间改为发送 heartbeat，并为候选发现板块成分接口增加短超时与事件主题取样上限，避免 `discover_watchlist_candidates` 慢接口导致前端误报 Trace 分析超时。
 
 
 

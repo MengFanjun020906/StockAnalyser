@@ -2,14 +2,16 @@
 
 > 本文基于当前 `ToolRegistry` 中已注册的 Agent 工具整理，目标是回答两个问题：现有工具在哪些维度已经够用，哪些维度会影响选股/个股分析质量，以及下一阶段应该优先补哪些工具。重点关注用户提出的“情绪面工具缺口”，例如战争新闻、地缘冲突、制裁、突发公共安全事件引发的市场恐慌。
 
+> 情绪面工具的具体实施闭环已单独展开到 [Agent 情绪面工具实施调研与闭环方案](./agent-sentiment-tool-implementation-plan.md)，包括推荐 API、工具契约、评分规则、SQLite 存储、候选池接入、Regime / Risk Gate 联动和验收标准。
+
 ## 1. 当前工具版图
 
-当前 Agent 工具大致覆盖 7 类能力，共 20 个工具：
+当前 Agent 工具大致覆盖 7 类能力，共 25 个工具：
 
 | 类别 | 已有工具 | 主要价值 |
 | --- | --- | --- |
 | 行情数据 | `get_realtime_quote`、`get_daily_history` | 获取最新价格、涨跌幅、成交量、估值字段、历史 K 线和行情时效口径 |
-| 技术分析 | `analyze_trend`、`calculate_ma`、`get_volume_analysis`、`analyze_pattern` | 趋势、均线、乖离率、MACD、RSI、量价、K 线形态、突破/箱体等 |
+| 技术分析 | `analyze_trend`、`calculate_ma`、`get_volume_analysis`、`analyze_pattern`、`analyze_price_structure` | 趋势、均线、乖离率、MACD、RSI、量价、K 线形态、突破/箱体、缠论笔/中枢/力度和 SMC 结构等 |
 | 筹码与资金 | `get_chip_distribution`、`get_capital_flow` | A 股筹码成本、获利盘、主力资金净流入、5/10 日资金持续性 |
 | 基本面与估值 | `get_stock_info` | 估值、成长、盈利、机构、龙虎榜、板块归属等紧凑上下文 |
 | 市场与选股 | `get_market_indices`、`get_sector_rankings`、`discover_watchlist_candidates` | 指数环境、板块强弱、选股候选池生成 |
@@ -103,7 +105,7 @@
 
 - `get_sector_rankings` 能看到涨跌榜。
 - `get_stock_info` 返回所属板块。
-- `discover_watchlist_candidates` 能从强势板块成分股里找候选。
+- `discover_watchlist_candidates` 能从 AlphaSift YAML 多因子策略、Sequoia 形态策略和强势板块成分股里找候选。
 
 不足：
 
@@ -350,7 +352,7 @@
 当前 `planning_prompts.py` 已经写了 `sentiment_analysis` 和 `regime_detection` 这些能力域，但实际 ToolRegistry 里没有对应的专门工具。现在的映射更偏：
 
 - `news_event` -> `search_comprehensive_intel` / `search_stock_news`
-- `regime_detection` -> `get_market_indices` / `get_sector_rankings` / 技术工具
+- `regime_detection` -> `detect_market_regime` / `get_market_indices` / `get_sector_rankings` / 技术工具
 
 问题在于：Prompt 层已经知道“需要情绪”，执行层却没有“情绪工具”。这会导致模型只能用新闻搜索临时补位，质量不稳定。
 

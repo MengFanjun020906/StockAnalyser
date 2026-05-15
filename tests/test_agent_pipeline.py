@@ -53,12 +53,14 @@ class TestAgentConfig(unittest.TestCase):
         self.assertEqual(config.agent_litellm_model, "")
         self.assertFalse(config.agent_mode)
         self.assertEqual(config.agent_analysis_mode, "normal")
+        self.assertEqual(config.agent_orchestration_mode, "legacy")
         self.assertEqual(config.agent_max_steps, AGENT_MAX_STEPS_DEFAULT)
         self.assertEqual(config.agent_skills, [])
 
     @patch.dict(os.environ, {
         'AGENT_MODE': 'true',
         'AGENT_ANALYSIS_MODE': 'planning_execute',
+        'AGENT_ORCHESTRATION_MODE': 'expert_graph',
         'AGENT_MAX_STEPS': '15',
         'AGENT_SKILLS': 'dragon_head,shrink_pullback,volume_breakout',
     }, clear=True)
@@ -69,6 +71,7 @@ class TestAgentConfig(unittest.TestCase):
         config = Config._load_from_env()
         self.assertTrue(config.agent_mode)
         self.assertEqual(config.agent_analysis_mode, "planning_execute")
+        self.assertEqual(config.agent_orchestration_mode, "expert_graph")
         self.assertEqual(config.agent_max_steps, 15)
         self.assertEqual(config.agent_skills, ['dragon_head', 'shrink_pullback', 'volume_breakout'])
 

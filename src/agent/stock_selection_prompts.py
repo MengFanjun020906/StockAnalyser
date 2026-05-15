@@ -89,14 +89,14 @@ def build_candidate_discovery_prompt(payload: Dict[str, Any]) -> str:
 1. 如果 target_symbols 非空，必须优先使用用户给出的股票作为候选，不得擅自替换。
 2. 如果用户给出的股票代码无法被工具确认存在，标记为 invalid_input，不要替用户自动换成其他股票。
 3. 如果 target_symbols 为空，必须按 candidate_strategy 生成候选：
-   - quant_momentum / auto：使用 `discover_watchlist_candidates` 的多路召回结果。Sequoia 量化候选包括均线放量、海龟突破、高窄旗形、涨停洗盘、上升趋势跌停错杀和 RPS 强势突破；强势板块成分股等其他召回通道也应参与统一评分，不能因为未命中 Sequoia 硬策略就直接排除。
+   - quant_momentum / auto：使用 `discover_watchlist_candidates` 的多路召回结果。AlphaSift YAML 候选提供可配置硬筛、因子打分和策略标签；Sequoia 量化候选包括均线放量、海龟突破、高窄旗形、涨停洗盘、上升趋势跌停错杀和 RPS 强势突破；强势板块成分股等其他召回通道也应参与统一评分，不能因为未命中某一个硬策略就直接排除。
    - hot_sector：从强势板块/主题中找流动性足够、未明显追高的成分股。优先关注最新交易日涨停，并以涨停方式突破关键技术位置的股票。关键技术位置包括前期震荡中枢上沿、箱体高点、阶段平台压力位或重要均线/趋势线压力位。该突破下方应存在相对规律的震荡、横盘或蓄势结构，不能只因为单日涨停入选。
    - value_quality：优先盈利稳定、估值不极端、现金流或 ROE 质量较好的公司。不强制要求涨停突破。
    - growth_turnaround：优先营收改善、亏损收窄、行业景气向上但价格未透支的公司。允许亏损，但必须标注亏损状态。
    - low_risk_income：优先低波动、分红稳定、估值合理、回撤较小的公司。不强制要求 3% 换手率。
    - custom：严格按用户自定义行业、风格、阈值、排除条件执行。
 4. 默认排除 ST / *ST / 重大退市风险、流动性显著不足、连续异常涨停且无法给安全入场区间、未澄清重大利空。
-5. 不得只因为板块涨幅高或 Sequoia 形态命中就直接推荐个股；必须写明候选来源、策略标签和后续必查证据。
+5. 不得只因为板块涨幅高、AlphaSift 因子分高或 Sequoia 形态命中就直接推荐个股；必须写明候选来源、策略标签和后续必查证据。
 6. 候选发现失败时输出 insufficient_candidates，不要编造股票代码。
 7. 工具失败、超时或返回空数据时，写入 tool_failures 和 missing_evidence。
 
@@ -115,7 +115,7 @@ def build_candidate_discovery_prompt(payload: Dict[str, Any]) -> str:
     "candidate_codes": [],
     "key_sources": [],
     "main_limitations": [],
-    "next_required_tools": ["get_realtime_quote", "analyze_trend", "get_capital_flow", "search_comprehensive_intel"]
+    "next_required_tools": ["get_realtime_quote", "analyze_trend", "analyze_price_structure", "get_capital_flow", "score_stock_news_sentiment", "search_comprehensive_intel"]
   }},
   "full": {{
     "candidates": [
@@ -166,6 +166,7 @@ def build_candidate_screening_prompt(payload: Dict[str, Any]) -> str:
 - 技术结构 25 分，基本面质量 20 分，板块环境 15 分，消息风险 15 分，账户适配 15 分，数据质量 10 分。
 - 任何硬性淘汰项命中时，screening_result 必须为 reject，分数不得高于 40。
 - 2 个以上核心维度为 missing / tool_failed 时，screening_result 最高只能为 monitor。
+- 如果 market_regime 为 risk_off / panic / extreme volatility，不得只因热点或涨停把候选升为 deep_dive；必须降低追高和趋势突破候选权重。
 
 {JSON_RULES}
 {COMMON_ENUMS}
@@ -284,6 +285,8 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 6. 每只股票必须给动作、首仓比例或不买原因、入场条件、加仓条件、止损条件、复查触发。
 7. 候选整体质量不足时输出本轮不建仓。
 8. 账户摘要为空或可用现金缺失时，portfolio_action 不得为 open。
+9. 如果 market_regime 为 risk_off / panic，portfolio_action 必须为 wait 或 reject；如果 volatility_bucket 为 extreme，不得主动开新仓。
+10. 如果 market_regime 为 high_volatility 或 volatility_bucket 为 high_vol / extreme，任何 open 计划首仓必须显著降档，并写入 auto_downgrade_rules。
 
 {JSON_RULES}
 {COMMON_ENUMS}

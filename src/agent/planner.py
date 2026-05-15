@@ -25,6 +25,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
         "calculate_ma",
         "get_volume_analysis",
         "analyze_pattern",
+        "analyze_price_structure",
     ],
     "realtime_quote": ["get_realtime_quote"],
     "portfolio_context": ["get_portfolio_snapshot"],
@@ -38,6 +39,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
     "fundamental_analysis": ["get_stock_info"],
     "chip_distribution": ["get_chip_distribution"],
     "regime_detection": [
+        "detect_market_regime",
         "get_market_indices",
         "get_sector_rankings",
         "get_volume_analysis",
@@ -53,7 +55,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
 
 CAPABILITY_PURPOSES: Dict[CapabilityName, str] = {
     "watchlist_discovery": "在用户未提供股票代码时生成可继续分析的候选股池。",
-    "technical_analysis": "判断趋势、均线、量价和形态是否支持行动。",
+    "technical_analysis": "判断趋势、均线、量价、K线形态、缠论和 SMC 价格结构是否支持行动。",
     "realtime_quote": "确认当前价格、涨跌幅和盘中状态。",
     "portfolio_context": "读取账户、仓位、成本、浮盈亏和风险约束。",
     "news_event": "排查近期公告、新闻、风险事件和催化因素。",
@@ -194,6 +196,7 @@ def _select_capabilities(intent: str, has_position: bool, primary_symbol: Option
     if intent == "watchlist_scan":
         return [
             "watchlist_discovery",
+            "regime_detection",
             "realtime_quote",
             "technical_analysis",
             "market_context",
