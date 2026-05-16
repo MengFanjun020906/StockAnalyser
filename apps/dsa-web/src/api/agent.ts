@@ -86,6 +86,11 @@ export interface AgentTraceRunResponse {
   stock_selection?: Record<string, unknown> | null;
   risk_gate?: Record<string, unknown> | null;
   artifact_dir?: string | null;
+  runtime_config?: Record<string, unknown> | null;
+}
+
+export interface AgentRuntimeConfigResponse {
+  runtime_config: Record<string, unknown>;
 }
 
 export interface SkillInfo {
@@ -125,6 +130,10 @@ export const agentApi = {
     const response = await apiClient.post<AgentTraceRunResponse>('/api/v1/agent/trace/run', payload, {
       timeout: 180000,
     });
+    return response.data;
+  },
+  async getRuntimeConfig(): Promise<AgentRuntimeConfigResponse> {
+    const response = await apiClient.get<AgentRuntimeConfigResponse>('/api/v1/agent/runtime-config');
     return response.data;
   },
   async traceStream(

@@ -255,10 +255,12 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | Variable | Description | Default | Required |
 |--------|------|--------|:----:|
 | `TUSHARE_TOKEN` | Tushare Pro Token | - | Optional |
+| `TUSHARE_HTTP_URL` | Tushare-compatible HTTP endpoint. Required when using a private gateway; otherwise SDK/HTTP calls use the official default endpoint. | `http://api.tushare.pro` | Optional |
 | `TICKFLOW_API_KEY` | TickFlow API key; CN market review indices prefer TickFlow when configured, and market breadth does so only when the plan supports universe queries | - | Optional |
 | `ENABLE_REALTIME_QUOTE` | Enable real-time quotes (if disabled, uses historical closing prices for analysis) | `true` | Optional |
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | Intraday real-time technicals: Calculate MA5/MA10/MA20 and bull trends using real-time prices when enabled (Issue #234); uses yesterday's close if disabled. | `true` | Optional |
 | `ENABLE_CHIP_DISTRIBUTION` | Enable chip distribution analysis (this API is unstable, recommended to disable for cloud deployment). GitHub Actions users must set `ENABLE_CHIP_DISTRIBUTION=true` in Repository Variables to enable; disabled by default in workflows. | `true` | Optional |
+| `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Per-request timeout for Agent Tushare tools, shared by basic data, chip, margin, capital-flow fallback, and sector-ranking fast paths. | `5.0` | Optional |
 | `ENABLE_EASTMONEY_PATCH` | Eastmoney API patch: Recommended to set to `true` when Eastmoney APIs fail frequently (e.g., RemoteDisconnected, connection closed). Injects NID tokens and random User-Agents to reduce rate limiting probability. | `false` | Optional |
 | `REALTIME_SOURCE_PRIORITY` | Real-time quote source priority (comma-separated), e.g., `tencent,akshare_sina,efinance,akshare_em` | See .env.example | Optional |
 | `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia-style quantitative candidate SQLite path. `watchlist_scan` candidate discovery reads `stock_daily(symbol,date,open,high,low,close,volume,turnover)` and runs pattern strategies. | `Sequoia-X/data/sequoia_v2.db` | Optional |
@@ -269,6 +271,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | Timeout for a single capability source call (seconds) | `0.8` | Optional |
 | `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Timeout budget for explicit Agent `get_capital_flow` calls; StockAPI `codeFlow` is the current default per-stock historical capital-flow source | `3.0` | Optional |
 | `STOCKAPI_TOKEN` | StockAPI historical capital-flow token. `get_capital_flow` calls `stockapi.com.cn/v1/base/codeFlow` by default; blank uses the limited free quota, which only supports delayed history windows and very few daily requests. | - | Optional |
+| `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Timeout for one Agent tool-call batch; slow tools degrade as tool failures instead of exhausting the full Trace run. | `30.0` | Optional |
 | `FUNDAMENTAL_RETRY_MAX` | Retry count for fundamental capabilities (including the first attempt) | `1` | Optional |
 | `FUNDAMENTAL_CACHE_TTL_SECONDS` | Fundamental aggregation cache TTL (seconds), short cache to reduce repeated API pulling. | `120` | Optional |
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | Maximum entries for fundamental cache (evicted by time within TTL) | `256` | Optional |

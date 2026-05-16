@@ -1147,7 +1147,7 @@ class TestBuildUserMessage(unittest.TestCase):
         registry = _make_registry_with_echo()
         adapter = _make_mock_adapter()
         adapter.call_with_tools.return_value = LLMResponse(
-            content="选股需要先按 Planner 完成工具链路。",
+            content="单股入场分析需要先按 Planner 完成工具链路。",
             tool_calls=[],
             usage={"total_tokens": 20},
             provider="openai",
@@ -1156,15 +1156,16 @@ class TestBuildUserMessage(unittest.TestCase):
         context = AgentUserContext(
             report=ReportContext(
                 analysis_mode="planning_execute",
-                intent="watchlist_scan",
-                target_symbols=["600519", "300750"],
+                intent="entry_analysis",
+                primary_symbol="600519",
+                target_symbols=["600519"],
             )
         )
 
         result = executor.chat(
-            "我现在有5w元，你帮我选一下股，并做一下持仓配置的分析",
+            "帮我分析 600519 是否适合入场",
             session_id="test-planning-chat",
-            context={"agent_user_context": context},
+            context={"stock_code": "600519", "agent_user_context": context},
         )
 
         self.assertTrue(result.success)
@@ -1174,6 +1175,48 @@ class TestBuildUserMessage(unittest.TestCase):
         self.assertIn("Execute Protocol", prompt)
         self.assertIn("AgentUserContext", user_message)
         self.assertIn("Planner 工具执行计划", user_message)
+
+    def test_watchlist_selection_partial_report_does_not_fall_back_to_react_loop(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="discover_watchlist_candidates",
+                description="Discover candidates",
+                parameters=[],
+                handler=lambda **_: {"status": "ok", "candidates": [{"code": "600519", "name": "贵州茅台"}]},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_text.side_effect = [
+            LLMResponse(
+                content='{"stage":"candidate_discovery","status":"ok","summary":{"candidate_codes":["600519"]},"full":{"candidates":[{"code":"600519","name":"贵州茅台"}]}}',
+                provider="openai",
+                model="openai/test",
+            ),
+            RuntimeError("llm provider timeout"),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+            )
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=1, orchestration_mode="expert_graph")
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="我现在有5w元，你帮我选一下股，并做一下持仓配置的分析",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("选股与持仓配置报告", result.content)
+        self.assertIsNotNone(result.stock_selection)
+        self.assertEqual(result.stock_selection["final_report_json"]["orchestration_mode"], "expert_graph")
+        self.assertIsNotNone(result.stock_selection["final_report_json"]["expert_state"])
+        self.assertFalse(adapter.call_with_tools.called)
 
     def test_watchlist_scan_without_candidates_uses_staged_selection(self):
         registry = ToolRegistry()

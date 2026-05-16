@@ -59,6 +59,14 @@ class _DummyManagerDisabled:
         }
 
 
+class _DummyManagerTimeout:
+    def _run_with_timeout(self, task, timeout_seconds, task_name):
+        return None, f"{task_name} timeout", int(float(timeout_seconds) * 1000)
+
+    def get_chip_distribution_context(self, _stock_code: str):
+        raise AssertionError("bounded wrapper should synthesize timeout before using this result")
+
+
 class TestGetChipDistributionContract(unittest.TestCase):
     def test_ok_response_shape(self) -> None:
         with patch(
@@ -76,7 +84,7 @@ class TestGetChipDistributionContract(unittest.TestCase):
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=_DummyManagerFailed(),
-        ):
+        ), patch("src.agent.tools.data_tools._query_tushare_chip_distribution", return_value={"status": "failed", "errors": [], "source_chain": []}):
             result = _handle_get_chip_distribution("688469")
 
         self.assertEqual(result["stock_code"], "688469")
@@ -90,12 +98,24 @@ class TestGetChipDistributionContract(unittest.TestCase):
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=_DummyManagerDisabled(),
-        ):
+        ), patch("src.agent.tools.data_tools._query_tushare_chip_distribution", return_value={"status": "failed", "errors": [], "source_chain": []}):
             result = _handle_get_chip_distribution("600519")
 
         self.assertEqual(result["status"], "disabled")
         self.assertIn("ENABLE_CHIP_DISTRIBUTION=false", result["errors"])
         self.assertEqual(result["source_chain"][0]["result"], "disabled")
+
+    def test_timeout_response_is_structured(self) -> None:
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerTimeout(),
+        ), patch("src.agent.tools.data_tools._query_tushare_chip_distribution", return_value={"status": "failed", "errors": [], "source_chain": []}):
+            result = _handle_get_chip_distribution("603418")
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertIn("chip_distribution timeout", result["errors"])
+        self.assertEqual(result["source_chain"][0]["result"], "timeout")
+        self.assertIsNone(result["profit_ratio"])
 
 
 if __name__ == "__main__":

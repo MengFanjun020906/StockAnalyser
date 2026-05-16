@@ -451,6 +451,7 @@ class AgentExecutor:
         use_legacy_default_prompt: bool = False,
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
+        tool_call_timeout_seconds: Optional[float] = None,
         orchestration_mode: str = "legacy",
     ):
         self.tool_registry = tool_registry
@@ -460,6 +461,7 @@ class AgentExecutor:
         self.use_legacy_default_prompt = use_legacy_default_prompt
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
+        self.tool_call_timeout_seconds = tool_call_timeout_seconds
         self.orchestration_mode = orchestration_mode
 
     def _build_system_prompt(
@@ -649,7 +651,7 @@ class AgentExecutor:
             original_task=original_task,
             progress_callback=progress_callback,
         )
-        if stock_selection and stock_selection.success:
+        if stock_selection and (stock_selection.success or stock_selection.final_report_json):
             return AgentResult(
                 success=True,
                 content=stock_selection.final_markdown,
@@ -671,6 +673,7 @@ class AgentExecutor:
             max_steps=self.max_steps,
             progress_callback=progress_callback,
             max_wall_clock_seconds=self.timeout_seconds,
+            tool_call_timeout_seconds=self.tool_call_timeout_seconds,
         )
 
         model_str = loop_result.model

@@ -56,12 +56,14 @@ class TestAgentConfig(unittest.TestCase):
         self.assertEqual(config.agent_orchestration_mode, "legacy")
         self.assertEqual(config.agent_max_steps, AGENT_MAX_STEPS_DEFAULT)
         self.assertEqual(config.agent_skills, [])
+        self.assertEqual(config.agent_tool_call_timeout_seconds, 30.0)
 
     @patch.dict(os.environ, {
         'AGENT_MODE': 'true',
         'AGENT_ANALYSIS_MODE': 'planning_execute',
         'AGENT_ORCHESTRATION_MODE': 'expert_graph',
         'AGENT_MAX_STEPS': '15',
+        'AGENT_TOOL_CALL_TIMEOUT_SECONDS': '12.5',
         'AGENT_SKILLS': 'dragon_head,shrink_pullback,volume_breakout',
     }, clear=True)
     def test_agent_config_from_env(self):
@@ -73,6 +75,7 @@ class TestAgentConfig(unittest.TestCase):
         self.assertEqual(config.agent_analysis_mode, "planning_execute")
         self.assertEqual(config.agent_orchestration_mode, "expert_graph")
         self.assertEqual(config.agent_max_steps, 15)
+        self.assertEqual(config.agent_tool_call_timeout_seconds, 12.5)
         self.assertEqual(config.agent_skills, ['dragon_head', 'shrink_pullback', 'volume_breakout'])
 
     @patch.dict(os.environ, {'AGENT_MODE': 'false'}, clear=True)
@@ -202,6 +205,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -223,6 +227,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=["wave_theory"],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -244,6 +249,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -254,6 +260,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
 
         self.assertIn("严进策略", kwargs["default_skill_policy"])
         self.assertTrue(kwargs["use_legacy_default_prompt"])
+        self.assertEqual(kwargs["tool_call_timeout_seconds"], 30)
         skill_manager.activate.assert_called_once_with(["bull_trend"])
 
     def test_explicit_empty_request_falls_back_to_primary_default_skill(self):
@@ -262,6 +269,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -283,6 +291,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -304,6 +313,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=["missing_skill"],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -325,6 +335,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -346,6 +357,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -615,6 +627,33 @@ class TestAgentResultConversion(unittest.TestCase):
             agent_result, "600519", "贵州茅台", ReportType.SIMPLE, "q-valid"
         )
         self.assertEqual(result.name, "贵州茅台")
+
+    def test_convert_overwrites_mismatched_input_and_dashboard_name_by_code(self):
+        """Code/name identity is authoritative; 301028 must not be reported as 友升股份."""
+        pipeline = self._make_pipeline()
+
+        from src.agent.executor import AgentResult
+        from src.enums import ReportType
+
+        agent_result = AgentResult(
+            success=True,
+            content="{}",
+            dashboard={
+                "stock_name": "友升股份",
+                "sentiment_score": 70,
+                "trend_prediction": "震荡",
+                "operation_advice": "观望",
+                "decision_type": "hold",
+            },
+            provider="gemini",
+        )
+
+        result = pipeline._agent_result_to_analysis_result(
+            agent_result, "301028", "友升股份", ReportType.SIMPLE, "q-name-guard"
+        )
+
+        self.assertEqual(result.code, "301028")
+        self.assertEqual(result.name, "鼎熔岩")
 
 
 # ============================================================

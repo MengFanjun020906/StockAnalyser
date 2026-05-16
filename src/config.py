@@ -616,6 +616,7 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tushare_http_url: str = "http://api.tushare.pro"
     stockapi_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
@@ -720,6 +721,13 @@ class Config:
     agent_orchestration_mode: str = "legacy"  # Watchlist orchestration: legacy | expert_graph
     agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
+    agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
+    agent_candidate_expert_timeout_seconds: float = 20.0  # Max seconds for one L1 candidate expert discovery packet
+    agent_stock_info_boards_timeout_seconds: float = 1.0  # Max seconds for optional stock board membership enrichment
+    agent_chip_distribution_timeout_seconds: float = 3.0  # Max seconds for chip distribution data-source probing
+    agent_sector_rankings_timeout_seconds: float = 3.0  # Max seconds for sector ranking data-source probing
+    agent_regime_component_timeout_seconds: float = 2.0  # Max seconds for one market-regime auxiliary component
+    agent_tushare_tool_timeout_seconds: float = 5.0  # Max seconds for one Tushare Agent tool request
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
     agent_deep_research_budget: int = 30000  # Max token budget for deep research
     agent_deep_research_timeout: int = 180  # Max seconds for /research command before returning timeout
@@ -1329,6 +1337,7 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_http_url=(os.getenv('TUSHARE_HTTP_URL') or "http://api.tushare.pro").strip(),
             stockapi_token=os.getenv('STOCKAPI_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
@@ -1421,6 +1430,48 @@ class Config:
                 600,
                 field_name='AGENT_ORCHESTRATOR_TIMEOUT_S',
                 minimum=0,
+            ),
+            agent_tool_call_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_TOOL_CALL_TIMEOUT_SECONDS'),
+                30.0,
+                field_name='AGENT_TOOL_CALL_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            agent_candidate_expert_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS'),
+                20.0,
+                field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            agent_stock_info_boards_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS'),
+                1.0,
+                field_name='AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_chip_distribution_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_sector_rankings_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_regime_component_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS'),
+                2.0,
+                field_name='AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_tushare_tool_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS'),
+                5.0,
+                field_name='AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS',
+                minimum=1.0,
             ),
             agent_risk_override=os.getenv('AGENT_RISK_OVERRIDE', 'true').lower() == 'true',
             agent_deep_research_budget=parse_env_int(

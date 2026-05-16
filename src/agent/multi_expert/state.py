@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.agent.evidence.schemas import EvidenceCard, ExpertEvidencePacket, JudgeInputPacket
+
 
 ExpertVerdict = Literal["support", "neutral", "caution", "oppose", "insufficient_data"]
 
@@ -25,6 +27,9 @@ class EvidenceBundle(BaseModel):
     candidate_pool: List[Dict[str, Any]] = Field(default_factory=list)
     base_evidence: Dict[str, Any] = Field(default_factory=dict)
     deep_dive_results: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence_cards: List[EvidenceCard] = Field(default_factory=list)
+    expert_packets: List[ExpertEvidencePacket] = Field(default_factory=list)
+    judge_input_packet: Optional[JudgeInputPacket] = None
     allocation_plan: Dict[str, Any] = Field(default_factory=dict)
     adversarial_review: Dict[str, Any] = Field(default_factory=dict)
     judge_decision: Dict[str, Any] = Field(default_factory=dict)

@@ -6,12 +6,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from src.agent.evidence import build_evidence_cards_for_stock
+from src.agent.evidence.adapter import cards_to_json
 from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
 from src.agent.multi_expert import AgentState, ExpertOrchestrator
 from src.agent.runner import try_parse_json
+from src.data.stock_index_loader import get_index_stock_name
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.agent.stock_selection_prompts import (
     STRATEGY_THRESHOLDS,
     build_adversarial_review_prompt,
@@ -70,6 +75,7 @@ class SelectionRunContext:
     market_regime: Dict[str, Any] = field(default_factory=dict)
     orchestration_mode: str = "legacy"
     expert_state: Optional[AgentState] = None
+    stock_identity_violations: List[Dict[str, Any]] = field(default_factory=list)
     next_step: str = "candidate_discovery"
     total_tokens: int = 0
     models_used: List[str] = field(default_factory=list)
@@ -108,9 +114,10 @@ class SelectionRunContext:
             "market_regime": self.market_regime,
             "orchestration_mode": self.orchestration_mode,
             "expert_state": self.expert_state.to_trace_dict() if self.expert_state else None,
+            "stock_identity_audit": _stock_identity_audit(self),
             "next_step": self.next_step,
             "total_tokens": self.total_tokens,
-            "models_used": list(dict.fromkeys(self.models_used)),
+            "models_used": _unique_text_items(self.models_used),
         }
 
 
@@ -139,7 +146,7 @@ class StockSelectionResult:
             "final_markdown": self.final_markdown,
             "tool_calls_log": self.tool_calls_log,
             "total_tokens": self.total_tokens,
-            "models_used": list(dict.fromkeys(self.models_used)),
+            "models_used": _unique_text_items(self.models_used),
             "error": self.error,
         }
 
@@ -183,6 +190,7 @@ def run_stock_selection_pipeline(
         orchestration_mode=_resolve_orchestration_mode(orchestration_mode),
     )
     result = StockSelectionResult(enabled=True, context=ctx)
+    base_evidence: Dict[str, Any] = {}
     try:
         _emit(progress_callback, "selection_start", message="开始五阶段选股流水线。")
 
@@ -210,6 +218,7 @@ def run_stock_selection_pipeline(
             timeout_seconds=timeout_seconds,
         )
         _merge_discovery_candidates(discovery_payload, discovery_seed)
+        _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
         ctx.set_stage("candidate_discovery", discovery_payload)
         _emit(progress_callback, "selection_candidate_discovery_done", payload=ctx.stages["candidate_discovery"].to_dict(include_full=False))
 
@@ -227,6 +236,7 @@ def run_stock_selection_pipeline(
             )
             result.success = True
             result.final_report_json = _build_final_report_json(ctx)
+            _enforce_report_stock_identity(ctx, result.final_report_json)
             result.final_markdown = render_stock_selection_markdown(result.final_report_json)
             _finalize_result(result)
             return result
@@ -249,6 +259,7 @@ def run_stock_selection_pipeline(
             fallback=_fallback_candidate_screening(ctx, base_evidence),
             timeout_seconds=timeout_seconds,
         )
+        _enforce_stage_stock_identity(ctx, screening_payload, "candidate_screening")
         ctx.set_stage("candidate_screening", screening_payload)
         _emit(progress_callback, "selection_candidate_screening_done", payload=ctx.stages["candidate_screening"].to_dict(include_full=False))
 
@@ -260,6 +271,13 @@ def run_stock_selection_pipeline(
         for code in deep_targets:
             detailed_evidence = _collect_deep_dive_evidence(ctx, tool_registry, code)
             stock_name = _stock_name_from_evidence(code, detailed_evidence)
+            evidence_cards = build_evidence_cards_for_stock(
+                run_id=ctx.run_id,
+                stock_code=code,
+                stock_name=stock_name,
+                market=ctx.market,
+                evidence=detailed_evidence,
+            )
             deep_payload = _call_stage_json(
                 ctx=ctx,
                 llm_adapter=llm_adapter,
@@ -278,9 +296,12 @@ def run_stock_selection_pipeline(
                 fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
                 timeout_seconds=timeout_seconds,
             )
+            _attach_evidence_cards(deep_payload, evidence_cards)
+            _enforce_stage_stock_identity(ctx, deep_payload, f"single_stock_deep_dive:{code}")
             deep_dive_outputs.append(deep_payload)
 
         deep_dive_stage = _combine_deep_dive_outputs(deep_dive_outputs)
+        _enforce_stage_stock_identity(ctx, deep_dive_stage, "single_stock_deep_dive")
         ctx.set_stage("single_stock_deep_dive", deep_dive_stage)
         _emit(progress_callback, "selection_deep_dive_done", payload=ctx.stages["single_stock_deep_dive"].to_dict(include_full=False))
 
@@ -301,6 +322,7 @@ def run_stock_selection_pipeline(
             timeout_seconds=timeout_seconds,
         )
         allocation_payload = _apply_market_regime_constraints(ctx, allocation_payload)
+        _enforce_stage_stock_identity(ctx, allocation_payload, "portfolio_allocation")
         ctx.set_stage("portfolio_allocation", allocation_payload)
         _emit(progress_callback, "selection_allocation_done", payload=ctx.stages["portfolio_allocation"].to_dict(include_full=False))
 
@@ -322,6 +344,7 @@ def run_stock_selection_pipeline(
             fallback=_fallback_adversarial_review(ctx),
             timeout_seconds=timeout_seconds,
         )
+        _enforce_stage_stock_identity(ctx, adversarial_payload, "adversarial_review")
         ctx.set_stage("adversarial_review", adversarial_payload)
         _emit(progress_callback, "selection_adversarial_done", payload=ctx.stages["adversarial_review"].to_dict(include_full=False))
 
@@ -341,6 +364,7 @@ def run_stock_selection_pipeline(
             fallback=_fallback_judge_decision(ctx),
             timeout_seconds=timeout_seconds,
         )
+        _enforce_stage_stock_identity(ctx, judge_payload, "judge_decision")
         ctx.set_stage("judge_decision", judge_payload)
         ctx.next_step = (judge_payload.get("summary") or {}).get("next_step") or "render_final_report"
         _emit(progress_callback, "selection_judge_done", payload=ctx.stages["judge_decision"].to_dict(include_full=False))
@@ -353,16 +377,23 @@ def run_stock_selection_pipeline(
 
         result.success = True
         result.final_report_json = _build_final_report_json(ctx)
+        _enforce_report_stock_identity(ctx, result.final_report_json)
         result.final_markdown = render_stock_selection_markdown(result.final_report_json)
         _finalize_result(result)
         _emit(progress_callback, "selection_done", final_action=(ctx.stage_summary("judge_decision") or {}).get("final_action"))
         return result
     except Exception as exc:
         logger.exception("Staged stock-selection pipeline failed: %s", exc)
-        result.success = False
-        result.error = str(exc)
+        _complete_failed_selection_result(
+            ctx=ctx,
+            result=result,
+            error=str(exc),
+            task=task,
+            base_evidence=base_evidence,
+            progress_callback=progress_callback,
+        )
         _finalize_result(result)
-        _emit(progress_callback, "selection_error", message=str(exc))
+        _emit(progress_callback, "selection_error", message=str(exc), payload=result.final_report_json)
         return result
 
 
@@ -460,8 +491,69 @@ def _maybe_run_expert_graph(
             "orchestration_mode": ctx.orchestration_mode,
             "expert_count": len(state.expert_opinions),
             "experts": list(state.expert_opinions.keys()),
+            "expert_state": state.to_trace_dict(),
         },
     )
+
+
+def _complete_failed_selection_result(
+    *,
+    ctx: SelectionRunContext,
+    result: StockSelectionResult,
+    error: str,
+    task: str,
+    base_evidence: Dict[str, Any],
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> None:
+    """Finalize a partial selection report instead of falling back to legacy ReAct."""
+    ctx.next_step = "stop_partial_report"
+    _ensure_failure_judge_stage(ctx, error)
+    try:
+        _maybe_run_expert_graph(
+            ctx=ctx,
+            task=task,
+            base_evidence=base_evidence,
+            progress_callback=progress_callback,
+        )
+    except Exception as expert_exc:
+        logger.exception("Expert graph failed during partial stock-selection finalization: %s", expert_exc)
+    result.success = True
+    result.error = error
+    result.final_report_json = _build_final_report_json(ctx)
+    result.final_report_json["partial_failure"] = {
+        "status": "failed_stage_degraded",
+        "error": error,
+        "next_step": ctx.next_step,
+    }
+    _enforce_report_stock_identity(ctx, result.final_report_json)
+    result.final_markdown = render_stock_selection_markdown(result.final_report_json)
+
+
+def _ensure_failure_judge_stage(ctx: SelectionRunContext, error: str) -> None:
+    if "judge_decision" not in ctx.stages:
+        ctx.set_stage("judge_decision", {
+            "stage": "judge_decision",
+            "status": "partial_failure",
+            "summary": {
+                "primary_plan_verdict": "reject",
+                "final_action": "wait",
+                "decision_summary": f"选股流水线中途失败，已保留现有候选和证据；本轮禁止直接开仓。错误：{_truncate(error, 180)}",
+                "next_step": "stop_partial_report",
+            },
+            "full": {
+                "winner": "risk_control",
+                "accepted_arguments": ["已有候选和工具证据可作为观察池"],
+                "rejected_arguments": ["在流水线失败时直接给买入结论"],
+                "required_plan_changes": ["等待缺失阶段恢复后重新运行"],
+                "risk_controls": ["本轮仅观察，不开新仓"],
+                "failure": {"error": error},
+            },
+            "full_ref": "judge_decision.json",
+        })
+    if "portfolio_allocation" not in ctx.stages:
+        ctx.set_stage("portfolio_allocation", _fallback_portfolio_allocation(ctx))
+    if "adversarial_review" not in ctx.stages:
+        ctx.set_stage("adversarial_review", _fallback_adversarial_review(ctx))
 
 
 def _call_stage_json(
@@ -510,6 +602,112 @@ def _normalize_stage_payload(payload: Dict[str, Any], *, fallback: Dict[str, Any
     normalized.setdefault("stage", fallback.get("stage"))
     normalized.setdefault("full_ref", fallback.get("full_ref"))
     return normalized
+
+
+def _normalize_stock_identity_code(raw_code: Any) -> str:
+    text = str(raw_code or "").strip().upper()
+    if not text:
+        return ""
+    if "." in text:
+        text = text.split(".", 1)[0]
+    text = re.sub(r"^(SH|SZ|BJ)", "", text)
+    if text.isdigit() and len(text) < 6:
+        text = text.zfill(6)
+    return text
+
+
+def _canonical_stock_name(code: Any, fallback_name: Any = None) -> str:
+    code_text = _normalize_stock_identity_code(code)
+    fallback_text = str(fallback_name or "").strip()
+    for name in (STOCK_NAME_MAP.get(code_text), get_index_stock_name(code_text)):
+        if is_meaningful_stock_name(name, code_text):
+            return str(name).strip()
+    if is_meaningful_stock_name(fallback_text, code_text):
+        return fallback_text
+    return code_text
+
+
+def _record_stock_identity_violation(
+    ctx: SelectionRunContext,
+    *,
+    stage_name: str,
+    path: str,
+    code: str,
+    provided_name: str,
+    canonical_name: str,
+) -> None:
+    if not provided_name or provided_name == canonical_name:
+        return
+    record = {
+        "stage": stage_name,
+        "path": path,
+        "code": code,
+        "provided_name": provided_name,
+        "canonical_name": canonical_name,
+        "resolution": "name_overwritten_by_code",
+    }
+    if record not in ctx.stock_identity_violations:
+        ctx.stock_identity_violations.append(record)
+
+
+def _enforce_stage_stock_identity(ctx: SelectionRunContext, payload: Dict[str, Any], stage_name: str) -> None:
+    _enforce_stock_identity_node(ctx, payload, stage_name=stage_name, path=stage_name)
+
+
+def _enforce_report_stock_identity(ctx: SelectionRunContext, report: Dict[str, Any]) -> None:
+    _enforce_stock_identity_node(ctx, report, stage_name="final_report", path="final_report")
+    report["stock_identity_audit"] = _stock_identity_audit(ctx)
+    selection_context = report.get("selection_context")
+    if isinstance(selection_context, dict):
+        selection_context["stock_identity_audit"] = report["stock_identity_audit"]
+
+
+def _enforce_stock_identity_node(
+    ctx: SelectionRunContext,
+    node: Any,
+    *,
+    stage_name: str,
+    path: str,
+) -> None:
+    if isinstance(node, list):
+        for idx, item in enumerate(node):
+            _enforce_stock_identity_node(ctx, item, stage_name=stage_name, path=f"{path}[{idx}]")
+        return
+    if not isinstance(node, dict):
+        return
+
+    code_key = "code" if "code" in node else ("stock_code" if "stock_code" in node else None)
+    name_key = "name" if "name" in node else ("stock_name" if "stock_name" in node else None)
+    if code_key:
+        code = _normalize_stock_identity_code(node.get(code_key))
+        if code:
+            canonical_name = _canonical_stock_name(code, node.get(name_key) if name_key else None)
+            provided_name = str(node.get(name_key) or "").strip() if name_key else ""
+            node[code_key] = code
+            if name_key:
+                if provided_name != canonical_name:
+                    _record_stock_identity_violation(
+                        ctx,
+                        stage_name=stage_name,
+                        path=path,
+                        code=code,
+                        provided_name=provided_name,
+                        canonical_name=canonical_name,
+                    )
+                node[name_key] = canonical_name
+            elif canonical_name and canonical_name != code:
+                node["name"] = canonical_name
+
+    for key, value in list(node.items()):
+        _enforce_stock_identity_node(ctx, value, stage_name=stage_name, path=f"{path}.{key}")
+
+
+def _stock_identity_audit(ctx: SelectionRunContext) -> Dict[str, Any]:
+    return {
+        "status": "corrected" if ctx.stock_identity_violations else "passed",
+        "violation_count": len(ctx.stock_identity_violations),
+        "violations": list(ctx.stock_identity_violations),
+    }
 
 
 def _run_candidate_discovery_tool(
@@ -573,17 +771,25 @@ def _collect_deep_dive_evidence(
     code: str,
 ) -> Dict[str, Any]:
     evidence: Dict[str, Any] = {}
-    for tool_name, args in (
+    base_tools = (
         ("get_realtime_quote", {"stock_code": code}),
         ("analyze_trend", {"stock_code": code}),
         ("analyze_price_structure", {"stock_code": code}),
         ("get_capital_flow", {"stock_code": code}),
         ("get_stock_info", {"stock_code": code}),
         ("get_chip_distribution", {"stock_code": code}),
-        ("search_comprehensive_intel", {"stock_code": code}),
-    ):
+    )
+    for tool_name, args in base_tools:
         if tool_registry.get(tool_name):
             evidence[tool_name] = _execute_tool(ctx, tool_registry, tool_name, args)
+    if tool_registry.get("search_comprehensive_intel"):
+        stock_name = _stock_name_from_evidence(code, evidence)
+        evidence["search_comprehensive_intel"] = _execute_tool(
+            ctx,
+            tool_registry,
+            "search_comprehensive_intel",
+            {"stock_code": code, "stock_name": stock_name},
+        )
     return evidence
 
 
@@ -1092,6 +1298,18 @@ def _combine_deep_dive_outputs(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _attach_evidence_cards(payload: Dict[str, Any], cards: List[Any]) -> None:
+    """Attach evidence cards to a deep-dive payload without changing LLM summary."""
+    if not isinstance(payload, dict) or not cards:
+        return
+    full = payload.get("full")
+    if not isinstance(full, dict):
+        full = {}
+        payload["full"] = full
+    full["evidence_cards"] = cards_to_json(cards)
+    full["evidence_card_count"] = len(cards)
+
+
 def _candidate_codes(full: Dict[str, Any], *, limit: int) -> List[str]:
     candidates = full.get("candidates") if isinstance(full, dict) else []
     codes: List[str] = []
@@ -1172,11 +1390,11 @@ def _positions_summary(context: AgentUserContext) -> List[Dict[str, Any]]:
     return [
         {
             "symbol": position.symbol,
-            "name": position.name,
+            "name": _canonical_stock_name(position.symbol, getattr(position, "name", None)),
             "quantity": position.quantity,
             "avg_cost": position.avg_cost,
             "market_value": position.market_value,
-            "weight_pct": position.weight_pct,
+            "weight_pct": position.position_pct,
         }
         for position in context.positions
     ]
@@ -1263,8 +1481,9 @@ def _accumulate_usage(ctx: SelectionRunContext, response: LLMResponse) -> None:
         ctx.total_tokens += int(usage.get("total_tokens") or 0)
     except (TypeError, ValueError):
         pass
-    if response.model:
-        ctx.models_used.append(response.model)
+    model = response.model
+    if isinstance(model, str) and model:
+        ctx.models_used.append(model)
 
 
 def _finalize_result(result: StockSelectionResult) -> None:
@@ -1272,7 +1491,15 @@ def _finalize_result(result: StockSelectionResult) -> None:
         return
     result.tool_calls_log = result.context.tool_calls
     result.total_tokens = result.context.total_tokens
-    result.models_used = list(dict.fromkeys(result.context.models_used))
+    result.models_used = _unique_text_items(result.context.models_used)
+
+
+def _unique_text_items(items: List[Any]) -> List[str]:
+    values: List[str] = []
+    for item in items:
+        if isinstance(item, str) and item and item not in values:
+            values.append(item)
+    return values
 
 
 def _emit(callback: Optional[Callable[[Dict[str, Any]], None]], event_type: str, **payload: Any) -> None:

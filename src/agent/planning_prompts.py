@@ -298,6 +298,7 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure`
 - `news_event` -> `search_comprehensive_intel`, `search_stock_news`, `score_stock_news_sentiment`
 - `capital_flow` -> `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary`
+- StockAPI 增强工具按需调用，不属于资金面默认全量必查：`get_stockapi_hot_sectors` 用于热点板块/概念资金确认；`get_stockapi_sector_constituents` 和 `get_stockapi_sector_flow_history` 仅在已有 `bkCode` 后展开；`get_stockapi_limit_up_pool` 用于涨停/短线情绪；`get_stockapi_popularity_rank` 用于人气/关注度；`get_stockapi_hot_money_activity` 用于游资或龙虎榜验证。
 - `chip_distribution` -> `get_chip_distribution`
 - `fundamental_analysis` -> `get_stock_info`
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`

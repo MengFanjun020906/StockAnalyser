@@ -122,6 +122,17 @@ class GraphitiServiceTestCase(unittest.TestCase):
         service._client.build_indices_and_constraints.assert_awaited_once()
         service._client.search_.assert_awaited_once()
 
+    def test_enabled_graphiti_disables_when_neo4j_unreachable(self):
+        with patch("src.services.graphiti.graph_service.get_config") as mock_get_config, \
+                patch("src.services.graphiti.graph_service._can_open_tcp", return_value=(False, "connection refused")):
+            cfg = mock_get_config.return_value
+            cfg.graphiti_enabled = True
+            cfg.graphiti_neo4j_uri = "bolt://localhost:7687"
+            cfg.graphiti_group_strategy = "market"
+            service = GraphitiService()
+
+        self.assertFalse(service.is_available())
+
     def test_default_entity_types_do_not_conflict_with_graphiti_reserved_fields(self):
         validate_entity_types(DEFAULT_ENTITY_TYPES)
 

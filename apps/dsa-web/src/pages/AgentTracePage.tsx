@@ -39,6 +39,7 @@ const HORIZON_OPTIONS = [
 ];
 const REPORT_INTENT_OPTIONS = [
   { value: 'auto', label: '自动识别' },
+  { value: 'watchlist_scan', label: '选股候选池' },
   { value: 'position_review', label: '持仓诊断' },
   { value: 'entry_analysis', label: '入场分析' },
   { value: 'risk_review', label: '账户风控' },
@@ -102,7 +103,7 @@ const shouldSendStockCode = (message: string, stockCode: string): boolean => {
   if (!code) return false;
   if (code !== DEFAULT_STOCK_CODE) return true;
   if (message.includes(code)) return true;
-  return !/(选股|筛选|推荐.*股|股票池|组合|配置|分配仓位|仓位分配|买什么|挑.*股)/.test(message);
+  return false;
 };
 
 const toStringList = (value: unknown): string[] => {
@@ -128,6 +129,7 @@ const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   total_steps: 0, total_tokens: 0, provider: '', model: '', mode: 'planning_execute',
   events: [], tool_calls: [], planner: null, agent_user_context: null,
   context_summary: null, debate: null, stock_selection: null, risk_gate: null, artifact_dir: null,
+  runtime_config: null,
 });
 
 const eventToToolCall = (event: TraceStreamEvent): AgentTraceToolCall => ({
@@ -148,6 +150,107 @@ const eventToTraceEvent = (event: TraceStreamEvent): AgentTraceRunResponse['even
   type: event.type || 'unknown',
   success: event.success === true ? true : event.success === false ? false : undefined,
 });
+
+const mergeSelectionProgress = (
+  stockSelection: Record<string, unknown> | null | undefined,
+  event: TraceStreamEvent,
+): Record<string, unknown> | null | undefined => {
+  const type = String(event.type || '');
+  if (type !== 'selection_expert_graph_done') return stockSelection;
+  const payload = asRecord(event.payload) || {};
+  const mode = String(payload.orchestration_mode || 'expert_graph');
+  const existing = normalizeStockSelectionPayload(stockSelection) || {};
+  const finalReport = asRecord(existing.final_report_json) || {};
+  const selectionContext = asRecord(existing.selection_context) || {};
+  return {
+    ...existing,
+    enabled: existing.enabled ?? true,
+    final_report_json: {
+      ...finalReport,
+      orchestration_mode: finalReport.orchestration_mode || mode,
+      expert_state: finalReport.expert_state || payload.expert_state || null,
+    },
+    selection_context: {
+      ...selectionContext,
+      orchestration_mode: selectionContext.orchestration_mode || mode,
+      expert_state: selectionContext.expert_state || payload.expert_state || null,
+    },
+  };
+};
+
+const looksLikeFinalReport = (value: Record<string, unknown>): boolean => (
+  Boolean(value.orchestration_mode || value.expert_state || value.selection_context || value.candidate_discovery)
+);
+
+const normalizeStockSelectionPayload = (
+  value: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null => {
+  const record = asRecord(value);
+  if (!record) return null;
+  if (asRecord(record.final_report_json)) return record;
+  if (!looksLikeFinalReport(record)) return record;
+  return {
+    enabled: record.enabled ?? true,
+    success: record.success ?? true,
+    ...record,
+    final_report_json: record,
+    selection_context: asRecord(record.selection_context) || {},
+  };
+};
+
+const getStockSelectionMode = (stockSelection: Record<string, unknown> | null): string => {
+  const normalized = normalizeStockSelectionPayload(stockSelection);
+  const finalReport = asRecord(normalized?.final_report_json) || {};
+  const selCtx = asRecord(normalized?.selection_context) || {};
+  return String(finalReport.orchestration_mode || selCtx.orchestration_mode || 'legacy');
+};
+
+const mergeStockSelectionResult = (
+  existingValue: Record<string, unknown> | null | undefined,
+  incomingValue: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null | undefined => {
+  const existing = normalizeStockSelectionPayload(existingValue);
+  const incoming = normalizeStockSelectionPayload(incomingValue);
+  if (!incoming) return existing;
+  if (!existing) return incoming;
+
+  const existingMode = getStockSelectionMode(existing);
+  const incomingMode = getStockSelectionMode(incoming);
+  const existingExpertState = extractExpertState(existing);
+  const incomingExpertState = extractExpertState(incoming);
+
+  if (existingMode === 'expert_graph' && incomingMode !== 'expert_graph' && !incomingExpertState) {
+    return {
+      ...incoming,
+      final_report_json: {
+        ...(asRecord(incoming.final_report_json) || {}),
+        orchestration_mode: 'expert_graph',
+        expert_state: existingExpertState || (asRecord(incoming.final_report_json) || {}).expert_state || null,
+      },
+      selection_context: {
+        ...(asRecord(incoming.selection_context) || {}),
+        orchestration_mode: 'expert_graph',
+        expert_state: existingExpertState || (asRecord(incoming.selection_context) || {}).expert_state || null,
+      },
+    };
+  }
+
+  if (existingMode === 'expert_graph' && incomingMode === 'expert_graph' && existingExpertState && !incomingExpertState) {
+    return {
+      ...incoming,
+      final_report_json: {
+        ...(asRecord(incoming.final_report_json) || {}),
+        expert_state: existingExpertState,
+      },
+      selection_context: {
+        ...(asRecord(incoming.selection_context) || {}),
+        expert_state: existingExpertState,
+      },
+    };
+  }
+
+  return incoming;
+};
 
 const loadTraceHistory = (): TraceHistoryItem[] => {
   try {
@@ -185,6 +288,8 @@ type DisplayCandidate = {
   name: string;
   source: string;
   recallSources: string[];
+  candidateExperts: string[];
+  candidateDimensions: string[];
   strategies: string[];
   tags: string[];
   reason: string;
@@ -198,6 +303,8 @@ type ExpertOpinionDisplay = {
   expertName: string;
   dimension: string;
   label: string;
+  role: '候选来源' | '验证专家' | '组合裁决';
+  roleDescription: string;
   verdict: string;
   confidence?: number;
   summary: string;
@@ -213,6 +320,34 @@ type CandidateDimensionGroup = {
     candidate: DisplayCandidate;
     details: string[];
   }>;
+};
+
+type CandidateExpertPacketDisplay = {
+  expert: string;
+  dimension: string;
+  label: string;
+  dimensionLabel: string;
+  status: string;
+  count: number;
+  themeCount: number;
+  freshness: string;
+  warnings: string[];
+  errors: string[];
+};
+
+type CandidateThemeDisplay = {
+  theme: string;
+  eventTitle: string;
+  status: string;
+  reason: string;
+  confidence?: number;
+};
+
+type CandidateCapacityDisplay = {
+  maxCandidatesToDeepDive?: number;
+  minPerExpert?: number;
+  maxPerExpert?: number;
+  maxThemeWatchItems?: number;
 };
 
 type EventImpactWatch = {
@@ -268,9 +403,19 @@ const SOURCE_LABEL_PREFIXES: Array<[string, string]> = [
   ['news_sentiment:', '新闻情绪热点'],
   ['akshare:industry:', '强势行业板块'],
   ['akshare:concept:', '强势概念板块'],
-  ['fallback_seed_pool', '固定种子池'],
+  ['fallback_seed_pool', '固定兜底观察池'],
   ['user_seed', '用户输入'],
 ];
+
+const CANDIDATE_EXPERT_LABELS: Record<string, string> = {
+  strategy_factor_expert: '策略多因子专家',
+  technical_candidate_expert: '技术形态专家',
+  sector_theme_expert: '板块主题专家',
+  capital_flow_expert: '资金面专家',
+  news_event_expert: '消息事件专家',
+  sentiment_theme_expert: '情绪/宏观专家',
+  fundamental_expert: '基本面专家',
+};
 
 const EXPERT_LABELS: Record<string, string> = {
   market_regime_expert: '市场环境专家',
@@ -291,16 +436,26 @@ const DIMENSION_GROUP_LABELS: Record<string, string> = {
   fundamental: '基本面候选',
   market_regime: '市场环境约束',
   portfolio_risk: '组合风控约束',
+  fallback: '兜底观察池',
   other: '其他候选',
 };
 
-const DIMENSION_GROUP_ORDER = ['strategy', 'technical', 'capital', 'sentiment', 'message', 'fundamental', 'market_regime', 'portfolio_risk', 'other'];
+const DIMENSION_GROUP_ORDER = ['strategy', 'technical', 'capital', 'sentiment', 'message', 'fundamental', 'market_regime', 'portfolio_risk', 'fallback', 'other'];
 
 const displayStrategyName = (name: string): string => STRATEGY_LABELS[name] || name;
+
+const displayCandidateExpertName = (expert: string): string => (
+  CANDIDATE_EXPERT_LABELS[expert] || expert.replace(/_/g, ' ')
+);
 
 const displaySourceName = (source: string): string => {
   if (source === 'alphasift:multi_strategy') return 'AlphaSift 多策略共振';
   if (source === 'sequoia:multi_strategy') return 'Sequoia 多策略共振';
+  if (source === 'expert_graph_discovery') return '多专家候选发现';
+  if (source === 'multi_expert_recall') return '多专家候选共振';
+  if (source.startsWith('candidate_expert:')) {
+    return displayCandidateExpertName(source.slice('candidate_expert:'.length));
+  }
   for (const [prefix, label] of SOURCE_LABEL_PREFIXES) {
     if (source === prefix || source.startsWith(prefix)) {
       const suffix = source.slice(prefix.length);
@@ -317,7 +472,25 @@ const displayReasonText = (reason: string): string => {
   Object.entries(STRATEGY_LABELS).forEach(([raw, label]) => {
     text = text.replaceAll(raw, label);
   });
+  text = text.replaceAll('market_regime', '市场环境');
+  text = text.replaceAll('technical', '技术结构');
+  text = text.replaceAll('capital_chip', '资金筹码');
+  text = text.replaceAll('news_sentiment', '消息情绪');
+  text = text.replaceAll('fundamental', '基本面');
+  text = text.replaceAll('portfolio_risk', '组合风控');
+  text = text.replaceAll('detect_market_regime/get_sector_rankings', '市场状态/板块排行工具');
+  text = text.replaceAll('analyze_trend', '趋势分析工具');
+  text = text.replaceAll('get_capital_flow', '资金流工具');
   return text;
+};
+
+const compactEvidenceText = (text: string, maxLength = 120): string => {
+  const normalized = displayReasonText(text)
+    .replace(/\s+/g, ' ')
+    .replace(/[✅⚠️]/g, '')
+    .trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}...`;
 };
 
 const STRATEGY_ONLY_TAGS = new Set(['breakout', 'rps', 'momentum', 'relative_strength', 'liquidity', 'ma_cross']);
@@ -373,6 +546,25 @@ const displayVerdict = (verdict: string): string => {
     reject: '否决',
   };
   return mapping[verdict] || verdict.replace(/_/g, ' ');
+};
+
+const getExpertRole = (expertName: string): ExpertOpinionDisplay['role'] => {
+  if (expertName === 'candidate_discovery_expert') return '候选来源';
+  if (expertName === 'portfolio_risk_expert') return '组合裁决';
+  return '验证专家';
+};
+
+const getExpertRoleDescription = (expertName: string): string => {
+  const mapping: Record<string, string> = {
+    candidate_discovery_expert: '说明这只股票为什么进入候选池，不等于推荐买入。',
+    market_regime_expert: '判断大盘环境和风险乘数，用来约束是否适合开仓。',
+    technical_expert: '验证趋势、均线、结构和价格行为是否支持候选。',
+    capital_chip_expert: '验证主力资金、筹码分布和资金一致性。',
+    news_sentiment_expert: '验证新闻、公告和事件是否构成真实催化。',
+    fundamental_expert: '验证估值、成长、财务和机构数据是否支撑。',
+    portfolio_risk_expert: '结合账户仓位、现金和风控规则给出动作约束。',
+  };
+  return mapping[expertName] || '提供该维度的支持、反证和数据缺口。';
 };
 
 const displayEventMaturity = (maturity: string): string => {
@@ -498,7 +690,9 @@ const normalizeReasonDimensions = (item: Record<string, unknown>): CandidateReas
   if (capitalBits.length) add('capital', '资金面', `流动性代理：${capitalBits.slice(0, 4).join('；')}`);
 
   if (source === 'user_seed') add('message', '消息/输入', '用户或上下文提供，优先进入候选池');
-  if (source === 'fallback_seed_pool') add('strategy', '策略', '固定种子池兜底，仅用于保证后续取证链路可运行');
+  if (source === 'fallback_seed_pool') {
+    return [{ dimension: 'fallback', label: '兜底观察', detail: '固定种子池兜底，仅用于保证后续取证链路可运行，不代表策略筛选或推荐' }];
+  }
   return result.slice(0, 5);
 };
 
@@ -507,18 +701,26 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
   if (!code) return null;
   const metrics = asRecord(item.metrics) || {};
   const score = typeof item.signal_score === 'number' ? item.signal_score : Number(item.signal_score);
+  const source = String(item.source || item.candidate_source || '');
+  const recallSources = toStringList(item.recall_sources);
+  const isFallbackSeed = source === 'fallback_seed_pool' || recallSources.includes('fallback_seed_pool');
+  const fallbackReasonDimensions: CandidateReasonDimension[] = [
+    { dimension: 'fallback', label: '兜底观察', detail: '固定种子池兜底，仅用于保证后续取证链路可运行，不代表策略筛选或推荐' },
+  ];
   return {
     code,
     name: String(item.name || item.stock_name || ''),
-    source: String(item.source || item.candidate_source || ''),
-    recallSources: toStringList(item.recall_sources),
-    strategies: toStringList(item.matched_strategies || item.strategies).map(displayStrategyName),
-    tags: toStringList(item.strategy_tags).filter((tag) => !STRATEGY_ONLY_TAGS.has(tag)).map(displayStrategyName),
+    source,
+    recallSources,
+    candidateExperts: toStringList(item.candidate_experts),
+    candidateDimensions: toStringList(item.candidate_dimensions),
+    strategies: isFallbackSeed ? [] : toStringList(item.matched_strategies || item.strategies).map(displayStrategyName),
+    tags: isFallbackSeed ? [] : toStringList(item.strategy_tags).filter((tag) => !STRATEGY_ONLY_TAGS.has(tag)).map(displayStrategyName),
     reason: displayReasonText(String(item.reason || item.candidate_reason || item.entry_reason || '')),
     score: Number.isFinite(score) ? score : undefined,
     latestDate: String(item.latest_date || item.date || ''),
     metrics,
-    reasonDimensions: normalizeReasonDimensions(item),
+    reasonDimensions: isFallbackSeed ? fallbackReasonDimensions : normalizeReasonDimensions(item),
   };
 };
 
@@ -533,6 +735,8 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     current.name = current.name || candidate.name;
     current.source = current.source || candidate.source;
     current.recallSources = Array.from(new Set([...current.recallSources, ...candidate.recallSources]));
+    current.candidateExperts = Array.from(new Set([...current.candidateExperts, ...candidate.candidateExperts]));
+    current.candidateDimensions = Array.from(new Set([...current.candidateDimensions, ...candidate.candidateDimensions]));
     current.strategies = Array.from(new Set([...current.strategies, ...candidate.strategies]));
     current.tags = Array.from(new Set([...current.tags, ...candidate.tags]));
     current.reason = current.reason || candidate.reason;
@@ -572,6 +776,70 @@ const extractDiscoverySteps = (result: AgentTraceRunResponse): Record<string, un
     .flatMap((call) => toRecordList(asRecord(call.result_json)?.discovery_steps))
 );
 
+const extractCandidateExpertPackets = (result: AgentTraceRunResponse): CandidateExpertPacketDisplay[] => {
+  const seen = new Set<string>();
+  return result.tool_calls
+    .filter((call) => call.tool === 'discover_watchlist_candidates')
+    .flatMap((call) => toRecordList(asRecord(call.result_json)?.expert_packets))
+    .map((packet) => {
+      const expert = String(packet.expert || '');
+      const dimension = String(packet.dimension || '');
+      const dataQuality = asRecord(packet.data_quality) || {};
+      return {
+        expert,
+        dimension,
+        label: displayCandidateExpertName(expert),
+        dimensionLabel: DIMENSION_GROUP_LABELS[dimension] || dimension || '候选维度',
+        status: String(packet.status || 'unknown'),
+        count: toRecordList(packet.candidates).length,
+        themeCount: toRecordList(packet.themes).length,
+        freshness: String(dataQuality.freshness || 'unknown'),
+        warnings: [...toStringList(dataQuality.warnings), ...toStringList(packet.warnings)],
+        errors: toStringList(packet.errors),
+      };
+    })
+    .filter((packet) => {
+      if (!packet.expert || seen.has(packet.expert)) return false;
+      seen.add(packet.expert);
+      return true;
+    });
+};
+
+const extractCandidateExpertThemes = (result: AgentTraceRunResponse): CandidateThemeDisplay[] => {
+  const seen = new Set<string>();
+  return result.tool_calls
+    .filter((call) => call.tool === 'discover_watchlist_candidates')
+    .flatMap((call) => toRecordList(asRecord(call.result_json)?.themes))
+    .map((theme) => ({
+      theme: String(theme.theme || ''),
+      eventTitle: String(theme.event_title || ''),
+      status: String(theme.status || 'watch'),
+      reason: String(theme.reason || ''),
+      confidence: typeof theme.confidence === 'number' ? theme.confidence : undefined,
+    }))
+    .filter((theme) => {
+      const key = `${theme.theme}|${theme.eventTitle}`;
+      if (!theme.theme || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
+const extractCandidateCapacity = (result: AgentTraceRunResponse): CandidateCapacityDisplay | null => {
+  const capacity = result.tool_calls
+    .filter((call) => call.tool === 'discover_watchlist_candidates')
+    .map((call) => asRecord(call.result_json)?.capacity)
+    .map(asRecord)
+    .find(Boolean);
+  if (!capacity) return null;
+  return {
+    maxCandidatesToDeepDive: typeof capacity.max_candidates_to_deep_dive === 'number' ? capacity.max_candidates_to_deep_dive : undefined,
+    minPerExpert: typeof capacity.min_per_expert === 'number' ? capacity.min_per_expert : undefined,
+    maxPerExpert: typeof capacity.max_per_expert === 'number' ? capacity.max_per_expert : undefined,
+    maxThemeWatchItems: typeof capacity.max_theme_watch_items === 'number' ? capacity.max_theme_watch_items : undefined,
+  };
+};
+
 const extractEventImpactWatches = (result: AgentTraceRunResponse): EventImpactWatch[] => {
   const seen = new Set<string>();
   const events: EventImpactWatch[] = [];
@@ -608,8 +876,9 @@ const extractEventImpactWatches = (result: AgentTraceRunResponse): EventImpactWa
 };
 
 const extractExpertState = (stockSelection: Record<string, unknown> | null): Record<string, unknown> | null => {
-  const finalReport = asRecord(stockSelection?.final_report_json) || {};
-  const selCtx = asRecord(stockSelection?.selection_context) || {};
+  const normalized = normalizeStockSelectionPayload(stockSelection);
+  const finalReport = asRecord(normalized?.final_report_json) || {};
+  const selCtx = asRecord(normalized?.selection_context) || {};
   return asRecord(finalReport.expert_state) || asRecord(selCtx.expert_state);
 };
 
@@ -624,20 +893,106 @@ const extractExpertOpinions = (stockSelection: Record<string, unknown> | null): 
       expertName,
       dimension,
       label: EXPERT_LABELS[expertName] || String(item.expert_name || expertName).replace(/_/g, ' '),
+      role: getExpertRole(expertName),
+      roleDescription: getExpertRoleDescription(expertName),
       verdict: String(item.verdict || 'insufficient_data'),
       confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
-      summary: String(item.summary || ''),
-      supportingEvidence: toStringList(item.supporting_evidence),
-      missingEvidence: toStringList(item.missing_evidence),
-      riskFlags: toStringList(item.risk_flags),
+      summary: compactEvidenceText(String(item.summary || ''), 180),
+      supportingEvidence: toStringList(item.supporting_evidence).map((entry) => compactEvidenceText(entry, 140)),
+      missingEvidence: toStringList(item.missing_evidence).map((entry) => compactEvidenceText(entry, 140)),
+      riskFlags: toStringList(item.risk_flags).map((entry) => compactEvidenceText(entry, 140)),
     };
   });
 };
 
+const SELECTION_STAGE_LABELS: Record<string, string> = {
+  selection_start: '选股流水线启动',
+  selection_candidate_discovery_done: '候选发现完成',
+  selection_market_regime_done: '市场环境识别完成',
+  selection_candidate_screening_done: '候选筛选完成',
+  selection_deep_dive_done: '单股深度取证完成',
+  selection_allocation_done: '组合配置完成',
+  selection_adversarial_done: '反方审查完成',
+  selection_judge_done: 'Judge 裁决完成',
+  selection_expert_graph_done: '多专家图谱生成完成',
+  selection_done: '选股流水线完成',
+  selection_error: '选股流水线失败',
+};
+
+const getLatestSelectionStage = (result: AgentTraceRunResponse): { type: string; label: string } | null => {
+  for (let index = result.events.length - 1; index >= 0; index -= 1) {
+    const type = String(result.events[index]?.type || '');
+    if (type.startsWith('selection_')) {
+      return { type, label: SELECTION_STAGE_LABELS[type] || type };
+    }
+  }
+  return null;
+};
+
 const getSelectionOrchestrationMode = (stockSelection: Record<string, unknown> | null): string => {
-  const finalReport = asRecord(stockSelection?.final_report_json) || {};
-  const selCtx = asRecord(stockSelection?.selection_context) || {};
+  const normalized = normalizeStockSelectionPayload(stockSelection);
+  const finalReport = asRecord(normalized?.final_report_json) || {};
+  const selCtx = asRecord(normalized?.selection_context) || {};
   return String(finalReport.orchestration_mode || selCtx.orchestration_mode || 'legacy');
+};
+
+const getRuntimeOrchestrationMode = (result: AgentTraceRunResponse): string => {
+  const runtimeConfig = asRecord(result.runtime_config) || {};
+  return String(runtimeConfig.agent_orchestration_mode || '');
+};
+
+const getTraceReportIntent = (result: AgentTraceRunResponse): string => {
+  const contextReport = asRecord(asRecord(result.agent_user_context)?.report);
+  const plannerIntent = asRecord(result.planner)?.intent;
+  const intentResolution = asRecord(asRecord(result.context_summary)?.intent_resolution);
+  return String(
+    contextReport?.intent
+    || intentResolution?.intent
+    || plannerIntent
+    || '',
+  );
+};
+
+const getIntentResolution = (result: AgentTraceRunResponse): Record<string, unknown> | null => (
+  asRecord(asRecord(result.context_summary)?.intent_resolution)
+);
+
+const groupExpertOpinions = (opinions: ExpertOpinionDisplay[]): Array<{
+  role: ExpertOpinionDisplay['role'];
+  title: string;
+  description: string;
+  opinions: ExpertOpinionDisplay[];
+}> => {
+  const sections: Array<{
+    role: ExpertOpinionDisplay['role'];
+    title: string;
+    description: string;
+    opinions: ExpertOpinionDisplay[];
+  }> = [
+    {
+      role: '候选来源',
+      title: '1. 候选来源',
+      description: '解释股票为什么进入候选池。这里是召回，不是买入结论。',
+      opinions: [],
+    },
+    {
+      role: '验证专家',
+      title: '2. 维度验证',
+      description: '技术、资金、市场、消息和基本面分别提供支持、反证和缺口。',
+      opinions: [],
+    },
+    {
+      role: '组合裁决',
+      title: '3. 组合与风控',
+      description: '把候选信号放到账户仓位和风控约束里，决定能不能动手。',
+      opinions: [],
+    },
+  ];
+  const byRole = new Map(sections.map((section) => [section.role, section]));
+  opinions.forEach((opinion) => {
+    byRole.get(opinion.role)?.opinions.push(opinion);
+  });
+  return sections.filter((section) => section.opinions.length > 0);
 };
 
 const buildCandidateDimensionGroups = (candidates: DisplayCandidate[]): CandidateDimensionGroup[] => {
@@ -791,6 +1146,7 @@ const AgentTracePage: React.FC = () => {
   const [statusMessage, setStatusMessage] = useState('等待运行');
   const [historyItems, setHistoryItems] = useState<TraceHistoryItem[]>([]);
   const [showConfig, setShowConfig] = useState(false);
+  const [runtimeConfig, setRuntimeConfig] = useState<Record<string, unknown> | null>(null);
 
   useEffect(() => {
     document.title = 'Agent Trace';
@@ -805,6 +1161,23 @@ const AgentTracePage: React.FC = () => {
     return () => { alive = false; };
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+    agentApi.getRuntimeConfig()
+      .then((response) => {
+        if (alive) setRuntimeConfig(asRecord(response.runtime_config));
+      })
+      .catch(() => {
+        if (alive) setRuntimeConfig(null);
+      });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!runtimeConfig) return;
+    setResult((prev) => (prev ? { ...prev, runtime_config: runtimeConfig } : prev));
+  }, [runtimeConfig]);
+
   const selectedTool = result?.tool_calls[selectedToolIndex] ?? null;
 
   const handleRun = async () => {
@@ -814,7 +1187,7 @@ const AgentTracePage: React.FC = () => {
     setStatusMessage('正在准备上下文...');
     setError(null);
     setSelectedToolIndex(0);
-    setResult(createEmptyTraceResult());
+    setResult({ ...createEmptyTraceResult(), runtime_config: runtimeConfig });
     try {
       const response = await agentApi.traceStream({
         message,
@@ -842,7 +1215,7 @@ const AgentTracePage: React.FC = () => {
   };
 
   const handleSelectHistory = (item: TraceHistoryItem) => {
-    setResult(item.result);
+    setResult({ ...item.result, runtime_config: runtimeConfig || item.result.runtime_config });
     setSelectedToolIndex(0);
     setError(null);
     setTraceStatus(item.status === 'success' ? 'done' : 'error');
@@ -893,12 +1266,18 @@ const AgentTracePage: React.FC = () => {
     const type = event.type || 'unknown';
     if (type === 'context_ready') {
       setStatusMessage('账户与持仓上下文已就绪');
-      setResult((prev) => ({ ...(prev || createEmptyTraceResult()), session_id: String(event.session_id || prev?.session_id || ''), context_summary: asRecord(event.context_summary), agent_user_context: asRecord(event.agent_user_context) }));
+      setResult((prev) => ({ ...(prev || createEmptyTraceResult()), session_id: String(event.session_id || prev?.session_id || ''), context_summary: asRecord(event.context_summary), agent_user_context: asRecord(event.agent_user_context), runtime_config: asRecord(event.runtime_config) || prev?.runtime_config || runtimeConfig }));
       return;
     }
     if (type === 'planner_ready') {
       setStatusMessage('执行计划已生成');
-      setResult((prev) => ({ ...(prev || createEmptyTraceResult()), session_id: String(event.session_id || prev?.session_id || ''), planner: asRecord(event.planner) }));
+      setResult((prev) => ({
+        ...(prev || createEmptyTraceResult()),
+        session_id: String(event.session_id || prev?.session_id || ''),
+        planner: asRecord(event.planner),
+        context_summary: asRecord(event.context_summary) || prev?.context_summary || null,
+        runtime_config: asRecord(event.runtime_config) || prev?.runtime_config || runtimeConfig,
+      }));
       return;
     }
     if (type === 'tool_start') {
@@ -930,7 +1309,14 @@ const AgentTracePage: React.FC = () => {
     }
     if (type.startsWith('selection_')) {
       setStatusMessage(type === 'selection_expert_graph_done' ? '多专家图谱已生成' : (event.message || '选股阶段更新'));
-      setResult((prev) => ({ ...(prev || createEmptyTraceResult()), events: [...(prev?.events || []), eventToTraceEvent(event)] }));
+      setResult((prev) => {
+        const cur = prev || createEmptyTraceResult();
+        return {
+          ...cur,
+          events: [...cur.events, eventToTraceEvent(event)],
+          stock_selection: mergeSelectionProgress(asRecord(cur.stock_selection), event) || cur.stock_selection,
+        };
+      });
       return;
     }
     if (type === 'done') {
@@ -951,9 +1337,10 @@ const AgentTracePage: React.FC = () => {
           agent_user_context: asRecord(event.agent_user_context) || cur.agent_user_context,
           context_summary: asRecord(event.context_summary) || cur.context_summary,
           debate: asRecord(event.debate) || cur.debate,
-          stock_selection: asRecord(event.stock_selection) || cur.stock_selection,
+          stock_selection: mergeStockSelectionResult(asRecord(cur.stock_selection), asRecord(event.stock_selection)) || cur.stock_selection,
           risk_gate: asRecord(event.risk_gate) || cur.risk_gate,
           artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : cur.artifact_dir,
+          runtime_config: asRecord(event.runtime_config) || cur.runtime_config || runtimeConfig,
         };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
@@ -985,7 +1372,7 @@ const AgentTracePage: React.FC = () => {
   const planner = useMemo(() => asRecord(result?.planner), [result?.planner]);
   const debate = useMemo(() => asRecord(result?.debate), [result?.debate]);
   const riskPayload = useMemo(() => asRecord(result?.risk_gate), [result?.risk_gate]);
-  const stockSelection = useMemo(() => asRecord(result?.stock_selection), [result?.stock_selection]);
+  const stockSelection = useMemo(() => normalizeStockSelectionPayload(asRecord(result?.stock_selection)), [result?.stock_selection]);
   const failedToolCount = useMemo(() => result?.tool_calls.filter((t) => !t.success).length ?? 0, [result]);
   const hasDiscoveryCandidates = useMemo(
     () => Boolean(result && extractDiscoveryCandidates(result, stockSelection).length),
@@ -1096,7 +1483,7 @@ const AgentTracePage: React.FC = () => {
           ) : null}
 
           {stockCode.trim() && !shouldSendStockCode(message, stockCode) ? (
-            <p className="mt-2 text-xs text-amber-600">当前问题像选股/组合配置，将不会发送该股票代码。</p>
+            <p className="mt-2 text-xs text-amber-600">默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。</p>
           ) : null}
         </div>
 
@@ -1143,9 +1530,9 @@ const AgentTracePage: React.FC = () => {
               title="数据与候选池"
               status={getLayerStatus(Boolean(result.tool_calls.length || stockSelection))}
               narrative={buildL1Narrative(result, stockSelection)}
-              defaultOpen={Boolean(stockSelection || hasDiscoveryCandidates)}
+              defaultOpen={Boolean(stockSelection || hasDiscoveryCandidates || getIntentResolution(result))}
             >
-              <L1Detail result={result} stockSelection={stockSelection} />
+              <L1Detail result={result} stockSelection={stockSelection} traceStatus={traceStatus} />
             </TimelineStep>
 
             <TimelineStep
@@ -1242,7 +1629,11 @@ const AgentTracePage: React.FC = () => {
    Layer Detail Components
    ═══════════════════════════════════════════════ */
 
-const L1Detail: React.FC<{ result: AgentTraceRunResponse; stockSelection: Record<string, unknown> | null }> = ({ result, stockSelection }) => {
+const L1Detail: React.FC<{
+  result: AgentTraceRunResponse;
+  stockSelection: Record<string, unknown> | null;
+  traceStatus: TraceStatus;
+}> = ({ result, stockSelection, traceStatus }) => {
   const selCtx = asRecord(stockSelection?.selection_context) || {};
   const stages = asRecord(selCtx.stages) || {};
   const finalReport = asRecord(stockSelection?.final_report_json) || {};
@@ -1254,9 +1645,32 @@ const L1Detail: React.FC<{ result: AgentTraceRunResponse; stockSelection: Record
   const expertState = extractExpertState(stockSelection);
   const expertOpinions = extractExpertOpinions(stockSelection);
   const orchestrationMode = getSelectionOrchestrationMode(stockSelection);
+  const runtimeOrchestrationMode = getRuntimeOrchestrationMode(result);
+  const reportIntent = getTraceReportIntent(result);
+  const isWatchlistScan = reportIntent === 'watchlist_scan' || Boolean(stockSelection);
+  const intentResolution = getIntentResolution(result);
+  const classifierConfigured = intentResolution?.classifier_configured === true;
+  const classifierSuccess = intentResolution?.classifier_success === true;
+  const classifierError = typeof intentResolution?.classifier_error === 'string' ? intentResolution.classifier_error : '';
+  const classifierModel = typeof intentResolution?.classifier_model === 'string' ? intentResolution.classifier_model : '';
+  const displayOrchestrationMode = runtimeOrchestrationMode || orchestrationMode;
+  const latestSelectionStage = getLatestSelectionStage(result);
+  const isWaitingForExpertState = (
+    isWatchlistScan
+    && displayOrchestrationMode === 'expert_graph'
+    && !expertOpinions.length
+    && traceStatus === 'running'
+  );
   const dimensionGroups = buildCandidateDimensionGroups(candidates);
+  const expertSections = groupExpertOpinions(expertOpinions);
   const hasSentimentCandidates = hasCandidateDimension(dimensionGroups, ['sentiment', 'message']);
+  const fallbackCandidates = candidates.filter((candidate) => (
+    candidate.source === 'fallback_seed_pool' || candidate.recallSources.includes('fallback_seed_pool')
+  ));
   const discoverySteps = extractDiscoverySteps(result);
+  const candidateExpertPackets = extractCandidateExpertPackets(result);
+  const candidateThemes = extractCandidateExpertThemes(result);
+  const candidateCapacity = extractCandidateCapacity(result);
   const eventWatches = extractEventImpactWatches(result);
 
   return (
@@ -1267,40 +1681,137 @@ const L1Detail: React.FC<{ result: AgentTraceRunResponse; stockSelection: Record
           <span className="text-sm font-semibold text-[#1a1a1a]">多专家选股状态</span>
           <span className={cn(
             'rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
-            orchestrationMode === 'expert_graph' ? 'bg-[#1a1a1a] text-white' : 'bg-[#f0f0ec] text-[#777]',
+            displayOrchestrationMode === 'expert_graph' ? 'bg-[#1a1a1a] text-white' : 'bg-[#f0f0ec] text-[#777]',
           )}>
-            {orchestrationMode}
+            {displayOrchestrationMode}
           </span>
+          {stockSelection && runtimeOrchestrationMode && runtimeOrchestrationMode !== orchestrationMode ? (
+            <span className="text-[11px] text-amber-700">本次选股结果仍为 {orchestrationMode}，后端配置为 {runtimeOrchestrationMode}</span>
+          ) : null}
           {expertState?.status ? <span className="text-[11px] text-[#999]">status: {String(expertState.status)}</span> : null}
         </div>
-        {expertOpinions.length ? (
-          <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-            {expertOpinions.map((opinion) => (
-              <div key={opinion.expertName} className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
-                <div className="mb-2 flex items-center gap-2">
-                  <span className="text-xs font-semibold text-[#333]">{opinion.label}</span>
-                  <span className={cn('ml-auto rounded-full px-2 py-0.5 text-[10px] font-medium', verdictTone(opinion.verdict))}>
-                    {displayVerdict(opinion.verdict)}
-                  </span>
+        {expertSections.length ? (
+          <div className="mt-3 space-y-3">
+            {expertSections.map((section) => (
+              <div key={section.role} className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
+                <div className="mb-3 flex flex-wrap items-baseline gap-2">
+                  <span className="text-xs font-semibold text-[#1a1a1a]">{section.title}</span>
+                  <span className="text-[11px] text-[#777]">{section.description}</span>
                 </div>
-                <p className="line-clamp-2 text-[12px] leading-relaxed text-[#555]">{opinion.summary || '-'}</p>
-                <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
-                  <span className="rounded-md bg-[#f5f5f0] px-2 py-0.5 text-[#777]">置信 {formatConfidence(opinion.confidence)}</span>
-                  {opinion.supportingEvidence.length ? <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-emerald-700">支持 {opinion.supportingEvidence.length}</span> : null}
-                  {opinion.missingEvidence.length ? <span className="rounded-md bg-amber-50 px-2 py-0.5 text-amber-700">缺口 {opinion.missingEvidence.length}</span> : null}
-                  {opinion.riskFlags.length ? <span className="rounded-md bg-red-50 px-2 py-0.5 text-red-700">风险 {opinion.riskFlags.length}</span> : null}
+                <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                  {section.opinions.map((opinion) => (
+                    <details key={opinion.expertName} className="group rounded-lg border border-[#eeeee9] bg-[#fbfbf8] p-3">
+                      <summary className="cursor-pointer list-none">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-semibold text-[#333]">{opinion.label}</span>
+                          <span className={cn('ml-auto rounded-full px-2 py-0.5 text-[10px] font-medium', verdictTone(opinion.verdict))}>
+                            {displayVerdict(opinion.verdict)}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-[12px] leading-relaxed text-[#555]">{opinion.summary || opinion.roleDescription}</p>
+                        <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
+                          <span className="rounded-md bg-[#f0f0ec] px-2 py-0.5 text-[#777]">置信 {formatConfidence(opinion.confidence)}</span>
+                          {opinion.supportingEvidence.length ? <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-emerald-700">支持依据 {opinion.supportingEvidence.length}</span> : null}
+                          {opinion.missingEvidence.length ? <span className="rounded-md bg-amber-50 px-2 py-0.5 text-amber-700">数据缺口 {opinion.missingEvidence.length}</span> : null}
+                          {opinion.riskFlags.length ? <span className="rounded-md bg-red-50 px-2 py-0.5 text-red-700">反证/风险 {opinion.riskFlags.length}</span> : null}
+                        </div>
+                        <p className="mt-2 text-[10px] text-[#999] group-open:hidden">展开查看依据、缺口和风险明细</p>
+                      </summary>
+                      <div className="mt-3 border-t border-[#eeeee9] pt-3 text-[11px] leading-relaxed">
+                        <p className="mb-2 text-[#777]">{opinion.roleDescription}</p>
+                        <EvidenceList title="支持依据" tone="support" items={opinion.supportingEvidence} emptyText="本专家没有给出明确支持依据。" />
+                        <EvidenceList title="数据缺口" tone="missing" items={opinion.missingEvidence} emptyText="本专家没有标记关键数据缺口。" />
+                        <EvidenceList title="反证/风险" tone="risk" items={opinion.riskFlags} emptyText="本专家没有标记明确反证或风险。" />
+                      </div>
+                    </details>
+                  ))}
                 </div>
               </div>
             ))}
           </div>
-        ) : (
+        ) : isWatchlistScan ? (
           <p className="mt-2 text-xs text-[#777]">
-            {orchestrationMode === 'expert_graph'
-              ? '多专家模式已开启，但本次 Trace 没有返回 expert_state。请重新运行选股链路，或检查后端是否已重启并生成 selection_expert_graph_done 事件。'
-              : '当前为 legacy 选股链路，尚未输出专家图谱。设置 AGENT_ORCHESTRATION_MODE=expert_graph 并重启后端后会显示专家意见。'}
+            {displayOrchestrationMode === 'expert_graph' && isWaitingForExpertState
+              ? `多专家模式已开启，选股链路正在运行，当前尚未生成 expert_state。${latestSelectionStage ? `最新阶段：${latestSelectionStage.label}；` : ''}等后端发出 selection_expert_graph_done 后会显示专家意见。`
+              : displayOrchestrationMode === 'expert_graph'
+                ? `本轮选股结束时没有返回 expert_state。${latestSelectionStage ? `最后阶段：${latestSelectionStage.label}；` : ''}请检查后端是否生成 selection_expert_graph_done 事件或是否在该阶段前超时。`
+                : '当前为 legacy 选股链路，尚未输出专家图谱。设置 AGENT_ORCHESTRATION_MODE=expert_graph 并重启后端后会显示专家意见。'}
           </p>
+        ) : (
+          <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">
+            <p>本次请求未进入选股链路，当前识别意图为 {reportIntent || '未知'}，所以不会生成 expert_state。</p>
+            {classifierConfigured ? (
+              <p className="mt-1">
+                MiMo 意图分类{classifierSuccess ? '已成功' : '未成功'}
+                {classifierModel ? `，模型 ${classifierModel}` : ''}
+                {classifierError ? `：${classifierError}` : '。'}
+              </p>
+            ) : (
+              <p className="mt-1">MiMo 意图分类器未配置；可显式选择“选股候选池”运行。</p>
+            )}
+          </div>
         )}
       </div>
+
+      {candidateExpertPackets.length ? (
+        <div className="rounded-lg border border-[#eeeee9] bg-white p-4">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <p className="text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池多专家发现</p>
+            {candidateCapacity ? (
+              <div className="ml-auto flex flex-wrap gap-1.5 text-[10px] text-[#777]">
+                {candidateCapacity.maxCandidatesToDeepDive != null ? (
+                  <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">深挖上限 {candidateCapacity.maxCandidatesToDeepDive}</span>
+                ) : null}
+                {candidateCapacity.minPerExpert != null ? (
+                  <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">专家保底 {candidateCapacity.minPerExpert}</span>
+                ) : null}
+                {candidateCapacity.maxPerExpert != null ? (
+                  <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">单专家最多 {candidateCapacity.maxPerExpert}</span>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+            {candidateExpertPackets.map((packet) => (
+              <div key={packet.expert} className={cn('rounded-lg border p-3', dimensionTone(packet.dimension))}>
+                <div className="mb-2 flex items-center gap-2">
+                  <span className="text-xs font-semibold">{packet.label}</span>
+                  <span className="ml-auto rounded-full bg-white/75 px-2 py-0.5 text-[10px] font-medium">{packet.status}</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5 text-[10px]">
+                  <span className="rounded-md bg-white/75 px-2 py-0.5">候选 {packet.count}</span>
+                  {packet.themeCount ? <span className="rounded-md bg-white/75 px-2 py-0.5">主题 {packet.themeCount}</span> : null}
+                  <span className="rounded-md bg-white/75 px-2 py-0.5">{packet.dimensionLabel}</span>
+                  {packet.freshness !== 'unknown' ? <span className="rounded-md bg-white/75 px-2 py-0.5">新鲜度 {packet.freshness}</span> : null}
+                </div>
+                {packet.warnings.length || packet.errors.length ? (
+                  <p className="mt-2 line-clamp-2 text-[10px] leading-relaxed opacity-80">
+                    {[...packet.errors, ...packet.warnings].slice(0, 2).join('；')}
+                  </p>
+                ) : null}
+              </div>
+            ))}
+          </div>
+          {candidateThemes.length ? (
+            <div className="mt-4">
+              <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-[#999]">主题观察 ({candidateThemes.length})</p>
+              <div className="grid gap-2 md:grid-cols-2">
+                {candidateThemes.slice(0, 6).map((theme) => (
+                  <div key={`${theme.theme}-${theme.eventTitle}`} className="rounded-lg border border-purple-100 bg-purple-50 px-3 py-2 text-purple-700">
+                    <div className="mb-1 flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold">{theme.theme}</span>
+                      <span className="rounded-full bg-white/75 px-2 py-0.5 text-[10px]">{displayEventMaturity(theme.status)}</span>
+                      {theme.confidence != null ? <span className="text-[10px] opacity-80">置信 {formatConfidence(theme.confidence)}</span> : null}
+                    </div>
+                    {theme.eventTitle ? <p className="text-[11px] leading-relaxed">{theme.eventTitle}</p> : null}
+                    {theme.reason ? <p className="mt-1 line-clamp-2 text-[10px] leading-relaxed opacity-80">{theme.reason}</p> : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {discoverySteps.length ? (
         <div>
@@ -1413,12 +1924,35 @@ const L1Detail: React.FC<{ result: AgentTraceRunResponse; stockSelection: Record
         </div>
       ) : null}
 
+      {fallbackCandidates.length ? (
+        <div>
+          <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-amber-700">兜底观察池 ({fallbackCandidates.length})</p>
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+            <p className="mb-2 text-[11px] leading-relaxed text-amber-800">
+              这些股票来自固定种子池，只用于真实候选召回失败时维持后续取证链路；它们不是策略、资金或消息面筛选结果，不能作为推荐依据。
+            </p>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {fallbackCandidates.slice(0, 8).map((candidate) => (
+                <div key={`fallback-${candidate.code}`} className="rounded-md bg-white/80 px-2.5 py-2">
+                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                    <span className="font-mono text-xs font-semibold text-[#1a1a1a]">{candidate.code}</span>
+                    {candidate.name ? <span className="text-xs font-medium text-[#333]">{candidate.name}</span> : null}
+                    {candidate.score != null ? <span className="text-[10px] text-[#777]">评分 {formatMetricValue(candidate.score)}</span> : null}
+                  </div>
+                  <p className="mt-1 text-[11px] leading-relaxed text-[#666]">{candidate.reason || '固定兜底观察样本'}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {candidates.length ? (
         <div>
           <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池列表 ({candidates.length})</p>
           <div className="grid gap-3">
             {candidates.map((c) => {
-              const sources = c.recallSources.length ? c.recallSources : c.source ? [c.source] : [];
+              const sources = [c.source, ...c.recallSources].filter((source, index, arr) => source && arr.indexOf(source) === index);
               const labels = [...c.strategies, ...c.tags].filter((label, index, arr) => label && arr.indexOf(label) === index);
               return (
                 <div key={c.code} className="rounded-lg border border-[#eeeee9] bg-[#fbfbf8] p-4">
@@ -1433,6 +1967,14 @@ const L1Detail: React.FC<{ result: AgentTraceRunResponse; stockSelection: Record
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {sources.map((source) => (
                         <span key={source} className="rounded-md bg-white px-2 py-0.5 text-[11px] text-[#666]">{displaySourceName(source)}</span>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  {c.candidateExperts.length ? (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {c.candidateExperts.map((expert) => (
+                        <span key={`${c.code}-${expert}`} className="rounded-md bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700">{displayCandidateExpertName(expert)}</span>
                       ))}
                     </div>
                   ) : null}
@@ -1514,6 +2056,37 @@ const L1Detail: React.FC<{ result: AgentTraceRunResponse; stockSelection: Record
           </div>
         </div>
       ) : null}
+    </div>
+  );
+};
+
+const EvidenceList: React.FC<{
+  title: string;
+  tone: 'support' | 'missing' | 'risk';
+  items: string[];
+  emptyText: string;
+}> = ({ title, tone, items, emptyText }) => {
+  const titleClass = tone === 'support'
+    ? 'text-emerald-700'
+    : tone === 'missing'
+      ? 'text-amber-700'
+      : 'text-red-700';
+  if (!items.length) {
+    return (
+      <div className="mt-2">
+        <div className={cn('text-[10px] font-semibold', titleClass)}>{title}</div>
+        <p className="mt-1 text-[#999]">{emptyText}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2">
+      <div className={cn('text-[10px] font-semibold', titleClass)}>{title}</div>
+      <ul className="mt-1 space-y-1">
+        {items.slice(0, 4).map((item, index) => (
+          <li key={`${title}-${index}`} className="rounded-md bg-white px-2 py-1 text-[#555]">{item}</li>
+        ))}
+      </ul>
     </div>
   );
 };
@@ -1718,7 +2291,8 @@ function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<
   const candidates = extractDiscoveryCandidates(result, stockSelection);
   const dataTools = result.tool_calls.filter((t) => t.tool.startsWith('get_') || t.tool.includes('quote'));
   const expertOpinions = extractExpertOpinions(stockSelection);
-  const orchestrationMode = getSelectionOrchestrationMode(stockSelection);
+  const orchestrationMode = getRuntimeOrchestrationMode(result) || getSelectionOrchestrationMode(stockSelection);
+  const reportIntent = getTraceReportIntent(result);
 
   if (candidates.length) {
     const sourceLabels = Array.from(new Set(candidates.flatMap((item) => (
@@ -1730,6 +2304,9 @@ function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<
         ? '多专家模式已开启；'
         : '';
     return `${expertText}第一阶段已生成 ${candidates.length} 只候选股票，来源包括${sourceLabels.length ? sourceLabels.join('、') : '多路召回'}；候选会按策略、技术、资金、消息/情绪等维度分组展示。`;
+  }
+  if (orchestrationMode === 'expert_graph' && reportIntent && reportIntent !== 'watchlist_scan') {
+    return `后端多专家模式已开启，但本次识别为 ${reportIntent}，未进入选股候选池链路。`;
   }
   if (dataTools.length) {
     return `调用了 ${dataTools.length} 个数据工具获取行情和基础数据。`;

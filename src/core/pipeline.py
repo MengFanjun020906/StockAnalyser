@@ -28,7 +28,8 @@ from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import GeminiAnalyzer, AnalysisResult, fill_chip_structure_if_needed, fill_price_position_if_needed
-from src.data.stock_mapping import STOCK_NAME_MAP
+from src.data.stock_index_loader import get_index_stock_name
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.notification import NotificationService, NotificationChannel
 from src.report_language import (
     get_unknown_text,
@@ -1008,8 +1009,7 @@ class StockAnalysisPipeline:
         if agent_result.success and agent_result.dashboard:
             dash = agent_result.dashboard
             ai_stock_name = str(dash.get("stock_name", "")).strip()
-            if ai_stock_name and self._is_placeholder_stock_name(stock_name, code):
-                result.name = ai_stock_name
+            result.name = self._resolve_consistent_stock_name(code, stock_name, ai_stock_name)
             result.sentiment_score = self._safe_int(dash.get("sentiment_score"), 50)
             result.trend_prediction = dash.get("trend_prediction", "Unknown" if report_language == "en" else "未知")
             raw_advice = dash.get("operation_advice", "Watch" if report_language == "en" else "观望")
@@ -1050,6 +1050,22 @@ class StockAnalysisPipeline:
                 result.error_message = "Agent failed to generate a valid decision dashboard" if report_language == "en" else "Agent 未能生成有效的决策仪表盘"
 
         return result
+
+    @staticmethod
+    def _resolve_consistent_stock_name(code: str, input_name: str, ai_stock_name: str = "") -> str:
+        """Resolve display name by code first; never trust a mismatched AI/input name."""
+        normalized_code = normalize_stock_code(code)
+        for name in (STOCK_NAME_MAP.get(normalized_code), get_index_stock_name(normalized_code)):
+            if is_meaningful_stock_name(name, normalized_code):
+                return str(name).strip()
+        if StockAnalysisPipeline._is_placeholder_stock_name(input_name, normalized_code):
+            if is_meaningful_stock_name(ai_stock_name, normalized_code):
+                return str(ai_stock_name).strip()
+        if is_meaningful_stock_name(input_name, normalized_code):
+            return str(input_name).strip()
+        if is_meaningful_stock_name(ai_stock_name, normalized_code):
+            return str(ai_stock_name).strip()
+        return input_name or normalized_code
 
     @staticmethod
     def _apply_trend_fallback(

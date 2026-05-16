@@ -10,6 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
 
+- [文档] 新增 Agent 候选池多专家架构方案，明确当前串行候选召回与真正多专家候选生成的区别，并规划 AlphaSift、Sequoia、sector、消息和资金工具的复用路径。
+- [文档] 新增 Agent 候选池策略缺口与建设路线，梳理 AlphaSift、Sequoia、资金、基本面、消息和回评闭环的待办事项。
+- [新功能] `discover_watchlist_candidates(auto)` 接入候选池多专家发现层，策略、技术、板块、消息、情绪等专家独立输出 `ExpertCandidatePacket` 后统一合并，并保留主题观察、容量控制和专家诊断。
+- [改进] Agent Trace 前端展示候选池多专家发现结果，包含各发现专家状态、候选数、主题观察、容量控制和候选来源专家标签。
+- [文档] 新增 Agent Evidence Card 协议文档，定义多专家链路中工具 raw、EvidenceCard、ExpertEvidencePacket 和 JudgeInputPacket 的压缩传递契约。
+- [新功能] 多专家选股链路新增 EvidenceCard 中间层，工具 raw 结果通过 evidence_adapter 压缩为专家证据包和 Judge 输入包，并保留 raw/full_ref 供 Trace 展开。
+- [改进] Agent Trace 选股 artifact 新增 `evidence_cards.json`、`expert_packets.json` 和 `judge_input_packet.json`，便于前端与排障工具直接读取压缩证据层。
+- [修复] `AGENT_ARCH=multi` 下的 `watchlist_scan` 重新接入阶段化选股链路，确保 `AGENT_ORCHESTRATION_MODE=expert_graph` 时前端能收到 `expert_state` 和 `selection_expert_graph_done`。
+- [修复] Agent Trace 的 MiMo 意图分类改用小米接口实际模型 id `mimo-v2.5`，提高输出 token 上限并暴露 `intent_resolution` 诊断；无显式股票代码时默认进入 `watchlist_scan` 候选池，避免“下周可入手股票”误落到非选股链路后仍显示 legacy 多专家提示。
+- [修复] L1 候选池多专家发现将单专家超时默认提高到 20 秒并修复板块成分调用参数，避免 AlphaSift/Sequoia 本地全市场策略扫描被 8 秒预算误杀后只剩消息面候选。
+- [新功能] 新增统一 Tushare 客户端配置，支持 `TUSHARE_HTTP_URL` 私有网关，并补充基础列表、低频行情、三大财报和参考事件 Agent 工具。
+- [修复] `get_chip_distribution`、`get_capital_flow`、`get_sector_rankings` 优先使用 Tushare 私有网关快路径，避免慢速 AkShare/Eastmoney 链路导致 Agent 工具超时，并保留旧数据源诊断兜底。
+- [修复] Agent 慢数据工具补齐内部超时与 source_chain 诊断，`get_stock_info`、`get_chip_distribution`、`get_sector_rankings` 和 `detect_market_regime` 不再被单一三方源拖到外层 30 秒超时。
+- [改进] StockAPI `codeFlow` 在最近窗口为空时继续回查更早窗口，并将空数据与端点失败区分展示，便于判断是否需要补数据权限。
+- [新功能] Agent 新增 StockAPI 涨停股池、热点板块、板块成分资金、板块资金历史、股票人气和游资活动工具，补强资金面、情绪面和短线候选发现证据。
+- [修复] StockAPI 增强工具改为按需调用，不再并入资金面默认全量工具计划，并新增 Agent 单批工具调用超时以避免慢接口拖垮整轮 Trace。
+- [修复] `get_capital_flow` 调用 StockAPI `codeFlow` 时按 15:30 更新时间选择查询日期，15:30 前默认查前一天，避免当天数据未更新时报 `60047`。
+- [修复] StockAPI 请求层新增串行限流、`88888` 退避重试和人气榜短缓存，避免 `get_stockapi_popularity_rank` 在多工具并发时因 StockAPI 不支持并发请求而失败。
+- [修复] `get_stockapi_hot_sectors` 在 StockAPI 热点板块接口返回 `60050` 权限/参数错误时降级到 AKShare 行业板块排行，并保留原始错误诊断，避免板块热度证据直接为空。
+- [修复] `get_stockapi_hot_money_activity` 的 rank 模式在 StockAPI 游资排行接口返回 `60050` 时降级到 AKShare 龙虎榜个股代理数据，并明确标记降级来源和代理类型。
+- [修复] 选股流水线新增股票代码/名称一致性硬校验，阶段间传递和最终报告按代码覆盖错误名称并输出 `stock_identity_audit`，避免如 `301028` 被写成“友升股份”的错配进入报告。
+- [修复] Agent Trace 返回非敏感运行配置，新增 `/api/v1/agent/runtime-config` 诊断接口，并让前端优先展示后端实际 `AGENT_ORCHESTRATION_MODE`，避免历史选股结果或旧字段导致多专家模式误显示为 legacy。
+- [修复] Agent Trace 前端收到 `selection_expert_graph_done` 后立即同步本次选股状态为 `expert_graph`，避免最终载荷不完整或历史状态残留时误提示“本次选股结果仍为 legacy”。
+- [修复] `selection_expert_graph_done` 事件直接携带 `expert_state`，且 Agent Trace 前端合并最终载荷时不再让过期 legacy 结果覆盖已生成的专家图谱。
+- [改进] Agent Trace 将 `fallback_seed_pool` 固定种子候选单独展示为“兜底观察池”，避免误归入策略候选并误导为真实策略筛选结果。
+- [修复] `discover_watchlist_candidates` 的 `sector` 模式在板块成分接口超时或为空时先回退到本地 AlphaSift/Sequoia 候选，并在 Trace 中输出板块接口诊断，避免直接展示固定种子池。
+- [修复] 选股流水线在账户持仓上下文存在时不再访问不存在的 `PositionContext.name/weight_pct` 字段，深度取证搜索工具补齐 `stock_name` 参数，并在阶段失败时保留 `expert_graph` 部分报告，避免 Agent Trace 退回 legacy 提示。
+- [改进] Agent Trace 意图识别接入 `XIAOMI_MIMO_URL` / `XIAOMI_MIMO_KEY` 的 MiMo-V2.5 分类器，前端不再用关键字判断是否发送默认股票代码，避免“下周可入手股票”这类自然表达被误路由到单股分析。
 - [新功能] planning_execute 的 `watchlist_scan` 接入五阶段选股流水线，按候选发现、初筛、单股深度分析、组合配置、反方审查和 Judge 裁决输出结构化 `stock_selection` 结果。
 - [新功能] 新增 Graphiti 时序知识图谱最小集成路径，支持可选 Neo4j 配置、分析结果入图和 Agent 知识图谱检索工具。
 - [改进] `test_env.py` 新增 `--graph` 检查，支持检测 Neo4j 连通性和 Graphiti embedding 模型配置。

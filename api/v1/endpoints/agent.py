@@ -6,11 +6,12 @@ Agent API endpoints.
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -50,6 +51,18 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+class TraceIntentResolution(TypedDict, total=False):
+    source: Literal["mimo", "explicit", "default"]
+    intent: ReportIntent
+    requested_intent: Optional[str]
+    stock_code_present: bool
+    classifier_configured: bool
+    classifier_model: str
+    classifier_success: bool
+    classifier_intent: Optional[ReportIntent]
+    classifier_error: Optional[str]
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -117,6 +130,7 @@ class AgentTraceRunResponse(BaseModel):
     stock_selection: Optional[Dict[str, Any]] = None
     risk_gate: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
+    runtime_config: Optional[Dict[str, Any]] = None
 
 class SkillInfo(BaseModel):
     id: str
@@ -148,6 +162,10 @@ class AgentModelsResponse(BaseModel):
     models: List[AgentModelDeployment]
 
 
+class AgentRuntimeConfigResponse(BaseModel):
+    runtime_config: Dict[str, Any]
+
+
 @router.get("/models", response_model=AgentModelsResponse)
 async def get_agent_models():
     """Get configured Agent model deployments for frontend selection."""
@@ -155,6 +173,12 @@ async def get_agent_models():
     return AgentModelsResponse(
         models=[AgentModelDeployment(**item) for item in list_agent_model_deployments(config)]
     )
+
+
+@router.get("/runtime-config", response_model=AgentRuntimeConfigResponse)
+async def get_agent_runtime_config():
+    """Return non-sensitive Agent runtime switches for frontend diagnostics."""
+    return AgentRuntimeConfigResponse(runtime_config=_build_agent_runtime_config(get_config()))
 
 
 def _build_skills_response(config) -> SkillsResponse:
@@ -368,6 +392,8 @@ def _build_trace_context(
         context["stock_name"] = request.stock_name
     context.setdefault("report_type", "detailed")
     context.setdefault("report_language", getattr(config, "report_language", "zh"))
+    intent_resolution = _resolve_trace_report_intent(request=request, stock_code=stock_code)
+    context["_trace_intent_resolution"] = intent_resolution
 
     should_inject = request.inject_portfolio_context and request.analysis_mode == "planning_execute"
     if should_inject and "agent_user_context" not in context:
@@ -396,7 +422,7 @@ def _build_trace_context(
             )
             _apply_trace_report_overrides(
                 context["agent_user_context"],
-                report_intent=request.report_intent,
+                report_intent=intent_resolution["intent"],
             )
         except Exception as exc:
             logger.warning("Agent trace portfolio context injection failed: %s", exc)
@@ -407,6 +433,7 @@ def _build_trace_context(
             request=request,
             stock_code=stock_code,
             language=context.get("report_language", "zh"),
+            intent_resolution=intent_resolution,
         )
 
     return context
@@ -417,8 +444,9 @@ def _build_minimal_trace_agent_user_context(
     request: AgentTraceRunRequest,
     stock_code: str,
     language: str,
+    intent_resolution: TraceIntentResolution,
 ) -> AgentUserContext:
-    intent = _resolve_trace_report_intent(request=request, stock_code=stock_code)
+    intent = intent_resolution["intent"]
     target_symbols = [stock_code] if stock_code else []
     context = AgentUserContext(
         report=ReportContext(
@@ -447,20 +475,78 @@ def _build_minimal_trace_agent_user_context(
     return context
 
 
-def _resolve_trace_report_intent(*, request: AgentTraceRunRequest, stock_code: str) -> ReportIntent:
-    if request.report_intent and request.report_intent != "auto":
-        if not stock_code and _looks_like_stock_selection_request(request.message):
-            return "watchlist_scan"
-        return request.report_intent
-    if _looks_like_stock_selection_request(request.message):
-        return "watchlist_scan"
-    return "entry_analysis" if stock_code else "qa"
+def _resolve_trace_report_intent(*, request: AgentTraceRunRequest, stock_code: str) -> TraceIntentResolution:
+    llm_intent, classifier_meta = _classify_trace_report_intent_with_mimo(request.message)
+    requested_intent = request.report_intent if request.report_intent != "auto" else None
+    base: TraceIntentResolution = {
+        "requested_intent": requested_intent,
+        "stock_code_present": bool(stock_code),
+        **classifier_meta,
+    }
+    if llm_intent:
+        if llm_intent == "watchlist_scan":
+            return {**base, "source": "mimo", "intent": "watchlist_scan"}
+        if not requested_intent:
+            return {**base, "source": "mimo", "intent": llm_intent}
+    if requested_intent:
+        return {**base, "source": "explicit", "intent": requested_intent}
+    return {**base, "source": "default", "intent": "entry_analysis" if stock_code else "watchlist_scan"}
 
 
-def _looks_like_stock_selection_request(message: str) -> bool:
-    import re
+def _classify_trace_report_intent_with_mimo(message: str) -> tuple[Optional[ReportIntent], Dict[str, Any]]:
+    api_base = (os.getenv("XIAOMI_MIMO_URL") or "").strip()
+    api_key = (os.getenv("XIAOMI_MIMO_KEY") or os.getenv("XIAOMI_MIMO_API_KEY") or "").strip()
+    model_name = (os.getenv("XIAOMI_MIMO_MODEL") or "mimo-v2.5").strip()
+    meta: Dict[str, Any] = {
+        "classifier_configured": bool(api_base and api_key),
+        "classifier_model": model_name,
+        "classifier_success": False,
+        "classifier_intent": None,
+        "classifier_error": None,
+    }
+    if not api_base or not api_key:
+        return None, meta
+    try:
+        import litellm
+        from src.agent.runner import try_parse_json
 
-    return bool(re.search(r"(选股|筛选|推荐.*股|股票池|组合|配置|分配仓位|仓位分配|买什么|挑.*股)", message))
+        litellm_model = model_name if "/" in model_name else f"openai/{model_name}"
+        response = litellm.completion(
+            model=litellm_model,
+            api_base=api_base.rstrip("/"),
+            api_key=api_key,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是股票分析系统的意图分类器。只输出 JSON。"
+                        "intent 必须是 watchlist_scan、entry_analysis、position_review、"
+                        "event_impact、risk_review、qa 之一。"
+                        "当用户要求从市场中挑选/筛选/推荐/配置可以买入或下周可入手的股票时，"
+                        "即使没有出现“选股”二字，也必须输出 watchlist_scan。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"message": message}, ensure_ascii=False),
+                },
+            ],
+            temperature=0,
+            max_tokens=600,
+            timeout=20,
+        )
+        content = str(response.choices[0].message.content or "")
+        parsed = try_parse_json(content) or {}
+        intent = str(parsed.get("intent") or "").strip()
+        if intent in {"watchlist_scan", "entry_analysis", "position_review", "event_impact", "risk_review", "qa"}:
+            meta["classifier_success"] = True
+            meta["classifier_intent"] = intent
+            return intent, meta  # type: ignore[return-value]
+        meta["classifier_error"] = "MiMo returned no parseable intent JSON"
+    except Exception as exc:
+        meta["classifier_error"] = str(exc)
+        logger.warning("MiMo trace intent classification failed; falling back to explicit report intent/defaults: %s", exc)
+    return None, meta
 
 
 def _serialize_agent_user_context(value: Any) -> Optional[Dict[str, Any]]:
@@ -527,9 +613,11 @@ def _apply_trace_report_overrides(
             return
     if isinstance(report, dict):
         report["intent"] = report_intent
+        report["include_watchlist_ranking"] = report_intent == "watchlist_scan"
         return
     try:
         setattr(report, "intent", report_intent)
+        setattr(report, "include_watchlist_ranking", report_intent == "watchlist_scan")
     except Exception:
         logger.debug("Agent trace report intent override skipped")
 
@@ -538,6 +626,7 @@ def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
     payload = _serialize_agent_user_context(context.get("agent_user_context"))
     summary: Dict[str, Any] = {
         "context_error": context.get("_trace_context_error"),
+        "intent_resolution": context.get("_trace_intent_resolution"),
         "stock_code": context.get("stock_code"),
         "account_count": 0,
         "position_count": 0,
@@ -603,6 +692,25 @@ def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
     )
     summary["metadata"] = payload.get("metadata") or {}
     return summary
+
+
+def _build_agent_runtime_config(config: Any) -> Dict[str, Any]:
+    """Expose non-sensitive Agent runtime switches for Trace diagnostics."""
+    return {
+        "agent_mode": bool(getattr(config, "agent_mode", False)),
+        "agent_analysis_mode": getattr(config, "agent_analysis_mode", None),
+        "agent_orchestration_mode": getattr(config, "agent_orchestration_mode", None),
+        "agent_arch": getattr(config, "agent_arch", None),
+        "agent_max_steps": getattr(config, "agent_max_steps", None),
+        "agent_orchestrator_timeout_s": getattr(config, "agent_orchestrator_timeout_s", None),
+        "agent_tool_call_timeout_seconds": getattr(config, "agent_tool_call_timeout_seconds", None),
+        "agent_candidate_expert_timeout_seconds": getattr(config, "agent_candidate_expert_timeout_seconds", None),
+        "mimo_intent_classifier_configured": bool(
+            (os.getenv("XIAOMI_MIMO_URL") or "").strip()
+            and (os.getenv("XIAOMI_MIMO_KEY") or os.getenv("XIAOMI_MIMO_API_KEY") or "").strip()
+        ),
+        "mimo_intent_classifier_model": (os.getenv("XIAOMI_MIMO_MODEL") or "mimo-v2.5").strip(),
+    }
 
 
 def _build_planner_trace(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1370,6 +1478,8 @@ class TraceArtifactWriter:
             _write_trace_json(self.path / "selection_context.json", selection_context)
             final_report_json = stock_selection.get("final_report_json") or {}
             _write_trace_json(self.path / "final_report.json", final_report_json)
+            for artifact_name, artifact_payload in _extract_evidence_artifacts(final_report_json).items():
+                _write_trace_json(self.path / f"{artifact_name}.json", artifact_payload)
             stages = (selection_context.get("stages") or {}) if isinstance(selection_context, dict) else {}
             for stage_name, stage_payload in stages.items():
                 if not isinstance(stage_payload, dict):
@@ -1393,6 +1503,20 @@ class TraceArtifactWriter:
                 context=context,
                 result=result,
             )
+
+
+def _extract_evidence_artifacts(final_report_json: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract compact multi-expert evidence artifacts from a final report."""
+    if not isinstance(final_report_json, dict):
+        return {}
+    expert_state = final_report_json.get("expert_state") if isinstance(final_report_json.get("expert_state"), dict) else {}
+    bundle = expert_state.get("evidence_bundle") if isinstance(expert_state.get("evidence_bundle"), dict) else {}
+    artifacts: Dict[str, Any] = {}
+    for key in ("evidence_cards", "expert_packets", "judge_input_packet"):
+        value = bundle.get(key)
+        if value not in (None, [], {}):
+            artifacts[key] = value
+    return artifacts
 
 
 def _jsonable_trace_context(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -1421,11 +1545,8 @@ def _ingest_trace_to_graphiti(
             return
 
         title = request.stock_name or context.get("stock_name") or request.message[:80]
-        trace_type = (
-            "stock_selection"
-            if _looks_like_stock_selection_request(request.message)
-            else "single_stock_analysis"
-        )
+        report = getattr(context.get("agent_user_context"), "report", None)
+        trace_type = "stock_selection" if getattr(report, "intent", None) == "watchlist_scan" else "single_stock_analysis"
         normalized_tool_calls = _normalize_tool_calls_status(
             getattr(result, "tool_calls_log", []) if result is not None else []
         )
@@ -1613,6 +1734,7 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         stock_selection=getattr(result, "stock_selection", None),
         risk_gate=risk_gate,
         artifact_dir=str(artifact_writer.path),
+        runtime_config=_build_agent_runtime_config(config),
     )
 
 
@@ -1663,11 +1785,14 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "session_id": session_id,
                 "context_summary": _build_trace_context_summary(context),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
+                "runtime_config": _build_agent_runtime_config(config),
             })
             put_event({
                 "type": "planner_ready",
                 "session_id": session_id,
                 "planner": _build_planner_trace(context),
+                "context_summary": _build_trace_context_summary(context),
+                "runtime_config": _build_agent_runtime_config(config),
             })
             executor = _build_executor(config, skills or None)
             result = executor.chat(
@@ -1703,6 +1828,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "stock_selection": getattr(result, "stock_selection", None),
                 "risk_gate": risk_gate,
                 "artifact_dir": str(artifact_writer.path),
+                "runtime_config": _build_agent_runtime_config(config),
             })
         except Exception as exc:
             logger.error("Agent trace stream failed: %s", exc, exc_info=True)

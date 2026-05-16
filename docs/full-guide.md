@@ -285,6 +285,7 @@ daily_stock_analysis/
 | 变量名 | 说明 | 默认值 | 必填 |
 |--------|------|--------|:----:|
 | `TUSHARE_TOKEN` | Tushare Pro Token | - | 可选 |
+| `TUSHARE_HTTP_URL` | Tushare 兼容 HTTP 入口；使用私有网关时必须配置，否则 SDK/HTTP 调用会打到官方默认地址 | `http://api.tushare.pro` | 可选 |
 | `TICKFLOW_API_KEY` | TickFlow API Key；配置后 A 股大盘复盘指数优先尝试 TickFlow，若套餐支持标的池查询则市场统计也会优先尝试 TickFlow | - | 可选 |
 | `LONGBRIDGE_APP_KEY` | [Longbridge OpenAPI](https://open.longbridge.com/) App Key；配置后美股/港股的量比、换手率、PE 等 YFinance 缺失字段会自动从长桥补充 | - | 可选 |
 | `LONGBRIDGE_APP_SECRET` | Longbridge App Secret | - | 可选 |
@@ -292,6 +293,7 @@ daily_stock_analysis/
 | `LONGBRIDGE_*`（可选） | 见官方 [环境变量](https://open.longbridge.com/zh-CN/docs/getting-started#环境变量)；另有 `LONGBRIDGE_STATIC_INFO_TTL_SECONDS` | - | 可选 |
 | `ENABLE_REALTIME_QUOTE` | 启用实时行情（关闭后使用历史收盘价分析） | `true` | 可选 |
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | 盘中实时技术面：启用时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘 | `true` | 可选 |
+| `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Agent 层单次 Tushare 工具请求超时；基础数据、筹码、两融、资金流和板块排行快路径共用 | `5.0` | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析（该接口不稳定，云端部署建议关闭）。GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
@@ -303,6 +305,7 @@ daily_stock_analysis/
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `0.8` | 可选 |
 | `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 StockAPI `codeFlow` 个股历史资金流 | `3.0` | 可选 |
 | `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 默认调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
+| `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace | `30.0` | 可选 |
 | `FUNDAMENTAL_RETRY_MAX` | 基本面能力重试次数（含首次） | `1` | 可选 |
 | `FUNDAMENTAL_CACHE_TTL_SECONDS` | 基本面聚合缓存 TTL（秒），短缓存减轻重复拉取 | `120` | 可选 |
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（TTL 内按时间淘汰） | `256` | 可选 |

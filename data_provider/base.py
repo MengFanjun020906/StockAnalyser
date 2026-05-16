@@ -1486,8 +1486,23 @@ class DataFetcherManager:
             }
 
         circuit_breaker = get_chip_circuit_breaker()
+        timeout = max(0.0, float(getattr(config, "agent_chip_distribution_timeout_seconds", 3.0)))
+        per_source_timeout = max(
+            float(getattr(config, "fundamental_fetch_timeout_seconds", 0.8)),
+            min(1.5, timeout / 2.0 if timeout > 0 else 0.0),
+        )
+        started_at = time.time()
 
         for fetcher in self._get_fetchers_snapshot():
+            remaining_timeout = max(0.0, timeout - (time.time() - started_at))
+            if remaining_timeout <= 0:
+                errors.append("chip_distribution timeout")
+                source_chain.append({
+                    "provider": "chip_distribution",
+                    "result": "timeout",
+                    "duration_ms": int(timeout * 1000),
+                })
+                break
             if not hasattr(fetcher, 'get_chip_distribution'):
                 continue
 
@@ -1504,8 +1519,23 @@ class DataFetcherManager:
 
             start = time.time()
             try:
-                chip = self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code)
-                duration_ms = int((time.time() - start) * 1000)
+                chip, call_err, duration_ms = self._run_with_timeout(
+                    lambda: self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code),
+                    min(per_source_timeout, remaining_timeout),
+                    f"{source_key}_chip",
+                )
+                if call_err:
+                    error_text = f"{source_key}:{call_err}"
+                    result_label = "timeout" if "timeout" in call_err.lower() else "failed"
+                    logger.warning(f"[筹码分布] {fetcher_name} 获取 {stock_code} 失败: {call_err}")
+                    circuit_breaker.record_failure(source_key, error_text)
+                    source_chain.append({
+                        "provider": source_key,
+                        "result": result_label,
+                        "duration_ms": duration_ms,
+                    })
+                    errors.append(error_text)
+                    continue
                 if chip is not None:
                     circuit_breaker.record_success(source_key)
                     logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})")
@@ -2590,7 +2620,8 @@ class DataFetcherManager:
             source_chain: List[Dict[str, Any]] = []
             last_error = ""
 
-            # 直接遍历管理器已经按 priority 排好序的数据源列表
+            # 直接遍历管理器已经按 priority 排好序的数据源列表。
+            # Agent 工具层会额外加短超时和诊断，不改变 manager 公共契约。
             for fetcher in self._fetchers:
                 if not hasattr(fetcher, 'get_sector_rankings'):
                     continue

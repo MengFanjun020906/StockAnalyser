@@ -4,12 +4,14 @@ import AgentTracePage from '../AgentTracePage';
 
 const mocks = vi.hoisted(() => ({
   getAccounts: vi.fn(),
+  getRuntimeConfig: vi.fn(),
   runTrace: vi.fn(),
   traceStream: vi.fn(),
 }));
 
 vi.mock('../../api/agent', () => ({
   agentApi: {
+    getRuntimeConfig: mocks.getRuntimeConfig,
     runTrace: mocks.runTrace,
     traceStream: mocks.traceStream,
   },
@@ -25,8 +27,10 @@ describe('AgentTracePage', () => {
   beforeEach(() => {
     window.localStorage.clear();
     mocks.getAccounts.mockReset();
+    mocks.getRuntimeConfig.mockReset();
     mocks.runTrace.mockReset();
     mocks.traceStream.mockReset();
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
   });
 
   it('runs a trace and renders planner, events, tools, and final output', async () => {
@@ -250,6 +254,7 @@ describe('AgentTracePage', () => {
 
   it('loads a completed trace from local history', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
     window.localStorage.setItem('dsa.agentTrace.history.v1', JSON.stringify([
       {
         id: 'trace-old',
@@ -272,6 +277,12 @@ describe('AgentTracePage', () => {
           planner: { intent: 'position_review' },
           agent_user_context: { report: { primary_symbol: '601399' } },
           debate: null,
+          stock_selection: {
+            enabled: true,
+            success: true,
+            final_report_json: { orchestration_mode: 'legacy' },
+            selection_context: { orchestration_mode: 'legacy' },
+          },
           context_summary: {
             account_count: 1,
             position_count: 1,
@@ -290,6 +301,7 @@ describe('AgentTracePage', () => {
 
     expect(screen.getByText('历史结论')).toBeInTheDocument();
     expect(screen.getByText('已加载历史')).toBeInTheDocument();
+    expect(await screen.findByText('expert_graph')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
   });
@@ -400,6 +412,7 @@ describe('AgentTracePage', () => {
 
   it('does not send the default stock code for stock-selection prompts', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
     mocks.traceStream.mockResolvedValue(makeStreamResponse([
       {
         type: 'done',
@@ -424,17 +437,20 @@ describe('AgentTracePage', () => {
             result_json: {
               status: 'ok',
               market: 'cn',
-              candidate_source: 'multi_recall',
+              candidate_source: 'expert_graph_discovery',
               candidate_count: 2,
               candidates: [
                 {
                   code: '600001',
                   name: '测试一',
-                  source: 'sequoia:multi_strategy',
+                  source: 'multi_expert_recall',
                   recall_sources: ['sequoia:turtle_trade', 'akshare:industry:半导体'],
+                  candidate_experts: ['technical_candidate_expert', 'sector_theme_expert'],
+                  candidate_dimensions: ['technical', 'sentiment'],
+                  expert_confidences: { technical_candidate_expert: 0.78, sector_theme_expert: 0.63 },
                   matched_strategies: ['turtle_trade', 'rps_breakout'],
                   strategy_tags: ['breakout', 'rps'],
-                  reason: '多策略共振：ma_volume, turtle_trade, rps_breakout。',
+                  reason: '多专家候选共振：technical、sentiment。',
                   signal_score: 92.5,
                   latest_date: '2026-05-08',
                   metrics: { turnover: 150000000, rps: 94.2 },
@@ -450,6 +466,9 @@ describe('AgentTracePage', () => {
                   name: '东田微',
                   source: 'alphasift:volume_breakout',
                   recall_sources: ['alphasift:volume_breakout'],
+                  candidate_experts: ['strategy_factor_expert'],
+                  candidate_dimensions: ['strategy'],
+                  expert_confidences: { strategy_factor_expert: 0.74 },
                   matched_strategies: ['volume_breakout'],
                   strategy_tags: ['breakout', 'liquidity'],
                   reason: 'AlphaSift 放量突破策略入池。',
@@ -467,6 +486,9 @@ describe('AgentTracePage', () => {
                   name: '测试二',
                   source: 'akshare:industry:半导体',
                   recall_sources: ['akshare:industry:半导体'],
+                  candidate_experts: ['sector_theme_expert'],
+                  candidate_dimensions: ['sentiment'],
+                  expert_confidences: { sector_theme_expert: 0.61 },
                   strategy_tags: ['hot_sector'],
                   reason: '强势板块成分股进入候选池。',
                   signal_score: 71,
@@ -477,9 +499,94 @@ describe('AgentTracePage', () => {
                   ],
                 },
               ],
+              expert_packets: [
+                {
+                  expert: 'strategy_factor_expert',
+                  dimension: 'strategy',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [{ code: '301183', name: '东田微' }],
+                  themes: [],
+                },
+                {
+                  expert: 'technical_candidate_expert',
+                  dimension: 'technical',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [{ code: '600001', name: '测试一' }],
+                  themes: [],
+                },
+                {
+                  expert: 'sector_theme_expert',
+                  dimension: 'sentiment',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [{ code: '600001', name: '测试一' }, { code: '600002', name: '测试二' }],
+                  themes: [],
+                },
+                {
+                  expert: 'news_event_expert',
+                  dimension: 'message',
+                  status: 'empty',
+                  data_quality: { freshness: 'intraday', warnings: ['近期新闻未形成可验证个股候选'] },
+                  candidates: [],
+                  themes: [],
+                },
+                {
+                  expert: 'sentiment_theme_expert',
+                  dimension: 'sentiment',
+                  status: 'partial',
+                  data_quality: { freshness: 'intraday', warnings: ['事件仍在观察期'] },
+                  candidates: [],
+                  themes: [
+                    {
+                      theme: '人工智能',
+                      event_title: 'AI 应用订单与算力投入持续升温',
+                      status: 'developing',
+                      reason: '热点仍处主题观察阶段，等待后续订单、业绩或资金流验证。',
+                      confidence: 0.58,
+                    },
+                  ],
+                },
+                {
+                  expert: 'capital_flow_expert',
+                  dimension: 'capital',
+                  status: 'empty',
+                  data_quality: { freshness: 'unknown', warnings: ['资金面全市场发现尚未接线'] },
+                  candidates: [],
+                  themes: [],
+                },
+                {
+                  expert: 'fundamental_expert',
+                  dimension: 'fundamental',
+                  status: 'empty',
+                  data_quality: { freshness: 'unknown', warnings: ['基本面全市场发现尚未接线'] },
+                  candidates: [],
+                  themes: [],
+                },
+              ],
+              themes: [
+                {
+                  theme: '人工智能',
+                  event_title: 'AI 应用订单与算力投入持续升温',
+                  status: 'developing',
+                  reason: '热点仍处主题观察阶段，等待后续订单、业绩或资金流验证。',
+                  confidence: 0.58,
+                },
+              ],
+              capacity: {
+                max_candidates_to_deep_dive: 8,
+                min_per_expert: 1,
+                max_per_expert: 4,
+                max_theme_watch_items: 8,
+              },
               discovery_steps: [
-                { source: 'alphasift', status: 'ok', count: 1, db_path: 'Sequoia-X/data/sequoia_v2.db', strategy_names: ['volume_breakout'] },
-                { source: 'sequoia', status: 'ok', count: 1, db_path: 'Sequoia-X/data/sequoia_v2.db', strategy_names: ['turtle_trade', 'rps_breakout'] },
+                { source: 'candidate_expert:strategy_factor_expert', status: 'ok', count: 1, theme_count: 0 },
+                { source: 'candidate_expert:technical_candidate_expert', status: 'ok', count: 1, theme_count: 0 },
+                { source: 'candidate_expert:sector_theme_expert', status: 'ok', count: 2, theme_count: 0 },
+                { source: 'candidate_expert:capital_flow_expert', status: 'empty', count: 0, theme_count: 0 },
+                { source: 'candidate_expert:news_event_expert', status: 'empty', count: 0, theme_count: 0 },
+                { source: 'candidate_expert:sentiment_theme_expert', status: 'partial', count: 0, theme_count: 1 },
                 {
                   source: 'event_impact',
                   status: 'watch_only',
@@ -737,8 +844,8 @@ describe('AgentTracePage', () => {
     render(<AgentTracePage />);
 
     const promptInput = await screen.findByDisplayValue(/我持有 600519/);
-    fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股，并告诉我怎么分配仓位' } });
-    expect(screen.getByText('当前问题像选股/组合配置，将不会发送该股票代码。')).toBeInTheDocument();
+    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
+    expect(screen.getByText('默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     await waitFor(() => {
@@ -752,22 +859,45 @@ describe('AgentTracePage', () => {
     expect(await screen.findByText('候选来源审计')).toBeInTheDocument();
     expect(screen.getByText('消息/事件观察 (1)')).toBeInTheDocument();
     expect(screen.getByText('霍尔木兹海峡允许通行，原油风险溢价回落')).toBeInTheDocument();
-    expect(screen.getByText('等待验证')).toBeInTheDocument();
+    expect(screen.getAllByText('等待验证').length).toBeGreaterThan(0);
     expect(screen.getAllByText('石油石化').length).toBeGreaterThan(0);
     expect(screen.getAllByText('航运港口').length).toBeGreaterThan(0);
     expect(screen.getAllByText('观察中，未形成个股候选').length).toBeGreaterThan(0);
     expect(screen.getByText('多专家选股状态')).toBeInTheDocument();
     expect(screen.getByText('expert_graph')).toBeInTheDocument();
+    expect(screen.getByText('1. 候选来源')).toBeInTheDocument();
+    expect(screen.getByText(/解释股票为什么进入候选池/)).toBeInTheDocument();
+    expect(screen.getByText('2. 维度验证')).toBeInTheDocument();
+    expect(screen.getByText(/技术、资金、市场、消息和基本面分别提供支持/)).toBeInTheDocument();
+    expect(screen.getAllByText('支持依据').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('数据缺口').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('反证/风险').length).toBeGreaterThan(0);
+    expect(screen.getByText('资金流工具')).toBeInTheDocument();
+    expect(screen.getByText('资金流失败时不追高')).toBeInTheDocument();
     expect(screen.getByText('市场环境专家')).toBeInTheDocument();
     expect(screen.getByText('候选发现专家')).toBeInTheDocument();
     expect(screen.getByText('技术结构专家')).toBeInTheDocument();
     expect(screen.getByText('资金筹码专家')).toBeInTheDocument();
     expect(screen.getByText('消息情绪专家')).toBeInTheDocument();
+    expect(screen.getByText('候选池多专家发现')).toBeInTheDocument();
+    expect(screen.getAllByText('策略多因子专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('技术形态专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('板块主题专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('资金面专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('消息事件专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('情绪/宏观专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('基本面专家').length).toBeGreaterThan(0);
+    expect(screen.getByText('深挖上限 8')).toBeInTheDocument();
+    expect(screen.getByText('专家保底 1')).toBeInTheDocument();
+    expect(screen.getByText('单专家最多 4')).toBeInTheDocument();
+    expect(screen.getByText('主题观察 (1)')).toBeInTheDocument();
+    expect(screen.getByText('人工智能')).toBeInTheDocument();
+    expect(screen.getByText('AI 应用订单与算力投入持续升温')).toBeInTheDocument();
     expect(screen.getByText('按专家维度分组的候选')).toBeInTheDocument();
-    expect(screen.getByText('策略候选')).toBeInTheDocument();
-    expect(screen.getByText('技术面候选')).toBeInTheDocument();
-    expect(screen.getByText('资金面候选')).toBeInTheDocument();
-    expect(screen.getByText('情绪/热点候选')).toBeInTheDocument();
+    expect(screen.getAllByText('策略候选').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('技术面候选').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('资金面候选').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('情绪/热点候选').length).toBeGreaterThan(0);
     expect(screen.queryByText('为什么后续工具查这些股票')).not.toBeInTheDocument();
     expect(screen.queryByText('入池候选与理由')).not.toBeInTheDocument();
     expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
@@ -778,6 +908,7 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('301183').length).toBeGreaterThan(0);
     expect(screen.getAllByText('东田微').length).toBeGreaterThan(0);
     expect(screen.getAllByText('评分 92.5').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('多专家候选共振').length).toBeGreaterThan(0);
     expect(screen.getAllByText('AlphaSift 多因子：volume_breakout').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/AlphaSift YAML 多因子策略入池/).length).toBeGreaterThan(0);
     expect(screen.getAllByText('海龟突破').length).toBeGreaterThan(0);
@@ -795,11 +926,339 @@ describe('AgentTracePage', () => {
     expect(screen.queryByText('turtle_trade')).not.toBeInTheDocument();
     expect(screen.queryByText('rps_breakout')).not.toBeInTheDocument();
   });
+
+  it('keeps expert_graph status when expert graph event arrives before incomplete final payload', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'selection_expert_graph_done',
+        payload: {
+          orchestration_mode: 'expert_graph',
+          expert_count: 7,
+          experts: ['market_regime_expert', 'candidate_discovery_expert'],
+          expert_state: {
+            status: 'completed',
+            orchestration_mode: 'expert_graph',
+            expert_opinions: {
+              market_regime_expert: {
+                expert_name: 'market_regime_expert',
+                dimension: 'market_regime',
+                verdict: 'neutral',
+                confidence: 0.66,
+                summary: '市场环境中性。',
+                supporting_evidence: ['波动正常'],
+                missing_evidence: [],
+                risk_flags: [],
+              },
+            },
+          },
+        },
+      },
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-selection-partial',
+        content: '选股结论',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'deepseek/deepseek-chat',
+        mode: 'planning_execute',
+        stock_selection: null,
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    render(<AgentTracePage />);
+
+    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('选股结论')).toBeInTheDocument();
+    expect(await screen.findByText('expert_graph')).toBeInTheDocument();
+    expect(await screen.findByText('市场环境专家')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText(/本次选股结果仍为 legacy/)).not.toBeInTheDocument();
+    });
+  });
+
+  it('keeps expert graph evidence when final payload is stale legacy', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'selection_expert_graph_done',
+        payload: {
+          orchestration_mode: 'expert_graph',
+          expert_count: 7,
+          experts: ['news_sentiment_expert'],
+          expert_state: {
+            status: 'completed',
+            orchestration_mode: 'expert_graph',
+            expert_opinions: {
+              news_sentiment_expert: {
+                expert_name: 'news_sentiment_expert',
+                dimension: 'news_sentiment',
+                verdict: 'insufficient_data',
+                confidence: 0.5,
+                summary: '消息面证据不足。',
+                supporting_evidence: [],
+                missing_evidence: ['缺少个股新闻评分'],
+                risk_flags: [],
+              },
+            },
+          },
+        },
+      },
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-selection-stale',
+        content: '选股结论',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'deepseek/deepseek-chat',
+        mode: 'planning_execute',
+        stock_selection: {
+          enabled: true,
+          success: true,
+          final_report_json: { orchestration_mode: 'legacy' },
+          selection_context: { orchestration_mode: 'legacy' },
+        },
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    render(<AgentTracePage />);
+
+    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('选股结论')).toBeInTheDocument();
+    expect(await screen.findByText('expert_graph')).toBeInTheDocument();
+    expect(await screen.findByText('消息情绪专家')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText(/本次选股结果仍为 legacy/)).not.toBeInTheDocument();
+    });
+  });
+
+  it('does not show legacy expert warning when MiMo fails but request falls back to watchlist scan', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({
+      runtime_config: {
+        agent_orchestration_mode: 'expert_graph',
+        mimo_intent_classifier_configured: true,
+        mimo_intent_classifier_model: 'mimo-v2.5',
+      },
+    });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'context_ready',
+        session_id: 'trace-intent-failed',
+        agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+        context_summary: {
+          intent_resolution: {
+            source: 'default',
+            intent: 'watchlist_scan',
+            classifier_configured: true,
+            classifier_model: 'mimo-v2.5',
+            classifier_success: false,
+            classifier_error: 'Not supported model MiMo-V2.5',
+          },
+        },
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+      { type: 'planner_ready', session_id: 'trace-intent-failed', planner: { intent: 'watchlist_scan', required_tools: [] } },
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-intent-failed',
+        content: '选股结论',
+        error: null,
+        total_steps: 0,
+        total_tokens: 0,
+        provider: 'agent',
+        model: 'mimo-v2.5',
+        mode: 'planning_execute',
+        tool_calls: [],
+        agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+        context_summary: {
+          intent_resolution: {
+            source: 'default',
+            intent: 'watchlist_scan',
+            classifier_configured: true,
+            classifier_model: 'mimo-v2.5',
+            classifier_success: false,
+            classifier_error: 'Not supported model MiMo-V2.5',
+          },
+        },
+        stock_selection: null,
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    render(<AgentTracePage />);
+
+    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText(/本轮选股结束时没有返回 expert_state/)).toBeInTheDocument();
+    expect(screen.queryByText(/本次选股结果仍为 legacy/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/本次请求未进入选股链路/)).not.toBeInTheDocument();
+  });
+
+  it('shows the running selection stage while expert_state is still pending', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeDelayedStreamResponse(
+      [
+        {
+          type: 'context_ready',
+          session_id: 'trace-selection-running',
+          agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+          context_summary: { intent_resolution: { source: 'mimo', intent: 'watchlist_scan', classifier_success: true } },
+          runtime_config: { agent_orchestration_mode: 'expert_graph' },
+        },
+        { type: 'planner_ready', session_id: 'trace-selection-running', planner: { intent: 'watchlist_scan', required_tools: [] } },
+        { type: 'selection_start', message: '开始五阶段选股流水线。' },
+        {
+          type: 'selection_candidate_discovery_done',
+          payload: { status: 'partial', summary: { candidate_codes: ['601518', '002090'] } },
+        },
+      ],
+      [
+        {
+          type: 'done',
+          success: true,
+          session_id: 'trace-selection-running',
+          content: '选股结论',
+          error: null,
+          total_steps: 0,
+          total_tokens: 0,
+          provider: 'agent',
+          model: 'mimo-v2.5',
+          mode: 'planning_execute',
+          tool_calls: [],
+          agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+          stock_selection: null,
+          runtime_config: { agent_orchestration_mode: 'expert_graph' },
+        },
+      ],
+      120,
+    ));
+
+    render(<AgentTracePage />);
+
+    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText(/选股链路正在运行/)).toBeInTheDocument();
+    expect(screen.getByText(/最新阶段：候选发现完成/)).toBeInTheDocument();
+    expect(screen.queryByText(/请重新运行选股链路/)).not.toBeInTheDocument();
+    expect(await screen.findByText(/本轮选股结束时没有返回 expert_state/)).toBeInTheDocument();
+  });
+
+  it('renders fallback seed candidates as observation pool instead of strategy candidates', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-fallback-candidates',
+        content: '选股结论',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'deepseek/deepseek-chat',
+        mode: 'planning_execute',
+        tool_calls: [
+          {
+            step: 1,
+            tool: 'discover_watchlist_candidates',
+            arguments: { market: 'cn', candidate_source: 'fallback', limit: 8 },
+            success: true,
+            duration: 0,
+            result_length: 100,
+            result_json: {
+              status: 'partial',
+              candidate_source: 'fallback',
+              fallback_used: true,
+              candidates: [
+                {
+                  code: '688981',
+                  name: '中芯国际',
+                  source: 'fallback_seed_pool',
+                  recall_sources: ['fallback_seed_pool'],
+                  reason: '半导体制造核心标的，适合承接科技板块强弱判断。',
+                  signal_score: 50,
+                  reason_dimensions: [
+                    { dimension: 'strategy', label: '策略', detail: '半导体制造核心标的，适合承接科技板块强弱判断。' },
+                    { dimension: 'strategy', label: '策略', detail: '固定种子池兜底，仅用于保证后续取证链路可运行' },
+                  ],
+                },
+              ],
+              discovery_steps: [{ source: 'fallback_seed_pool', status: 'ok', count: 1 }],
+            },
+          },
+        ],
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    render(<AgentTracePage />);
+
+    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('选股结论')).toBeInTheDocument();
+    expect(await screen.findByText('兜底观察池')).toBeInTheDocument();
+    expect(screen.getByText('兜底观察池 (1)')).toBeInTheDocument();
+    expect(screen.getByText(/不是策略、资金或消息面筛选结果/)).toBeInTheDocument();
+    expect(screen.getAllByText('688981').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('中芯国际').length).toBeGreaterThan(0);
+    expect(screen.queryByText('策略候选')).not.toBeInTheDocument();
+    expect(screen.queryByText(/固定种子池兜底，仅用于保证后续取证链路可运行$/)).not.toBeInTheDocument();
+  });
 });
 
 function makeStreamResponse(events: Array<Record<string, unknown>>): Response {
   const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
   return new Response(body, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+}
+
+function makeDelayedStreamResponse(
+  immediateEvents: Array<Record<string, unknown>>,
+  delayedEvents: Array<Record<string, unknown>>,
+  delayMs: number,
+): Response {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      immediateEvents.forEach((event) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      });
+      window.setTimeout(() => {
+        delayedEvents.forEach((event) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        });
+        controller.close();
+      }, delayMs);
+    },
+  }), {
     status: 200,
     headers: { 'Content-Type': 'text/event-stream' },
   });

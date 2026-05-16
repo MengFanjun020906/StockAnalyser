@@ -68,6 +68,7 @@ class OrchestratorResult:
     model: str = ""
     error: Optional[str] = None
     stats: Optional[AgentRunStats] = None
+    stock_selection: Optional[Dict[str, Any]] = None
 
 
 class AgentOrchestrator:
@@ -279,6 +280,14 @@ class AgentOrchestrator:
         """
         from src.agent.executor import AgentResult
 
+        stock_selection_result = self._maybe_run_stock_selection(
+            context=context,
+            original_task=task,
+            progress_callback=None,
+        )
+        if stock_selection_result is not None:
+            return stock_selection_result
+
         ctx = self._build_context(task, context)
         ctx.meta["response_mode"] = "dashboard"
         orch_result = self._execute_pipeline(ctx, parse_dashboard=True)
@@ -293,6 +302,7 @@ class AgentOrchestrator:
             provider=orch_result.provider,
             model=orch_result.model,
             error=orch_result.error,
+            stock_selection=orch_result.stock_selection,
         )
 
     def chat(
@@ -323,6 +333,21 @@ class AgentOrchestrator:
         # Persist user turn
         conversation_manager.add_message(session_id, "user", message)
 
+        stock_selection_result = self._maybe_run_stock_selection(
+            context=context,
+            original_task=message,
+            progress_callback=progress_callback,
+        )
+        if stock_selection_result is not None:
+            if stock_selection_result.success:
+                conversation_manager.add_message(session_id, "assistant", stock_selection_result.content)
+            else:
+                conversation_manager.add_message(
+                    session_id, "assistant",
+                    f"[分析失败] {stock_selection_result.error or '未知错误'}",
+                )
+            return stock_selection_result
+
         orch_result = self._execute_pipeline(
             ctx,
             parse_dashboard=False,
@@ -348,6 +373,46 @@ class AgentOrchestrator:
             provider=orch_result.provider,
             model=orch_result.model,
             error=orch_result.error,
+            stock_selection=orch_result.stock_selection,
+        )
+
+    def _maybe_run_stock_selection(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        original_task: str,
+        progress_callback: Optional[Callable],
+    ) -> Optional["AgentResult"]:
+        """Run the staged watchlist-selection pipeline before generic multi-agent analysis."""
+        from src.agent.executor import AgentResult, _coerce_agent_user_context
+        from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
+
+        context = context or {}
+        agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+        if not should_run_stock_selection(agent_user_context):
+            return None
+
+        selection = run_stock_selection_pipeline(
+            task=original_task,
+            agent_user_context=agent_user_context,
+            tool_registry=self.tool_registry,
+            llm_adapter=self.llm_adapter,
+            timeout_seconds=self._get_timeout_seconds(),
+            progress_callback=progress_callback,
+            run_id=context.get("session_id") or "selection-run",
+            orchestration_mode=getattr(self.config, "agent_orchestration_mode", "legacy"),
+        )
+        return AgentResult(
+            success=selection.success,
+            content=selection.final_markdown,
+            dashboard=None,
+            tool_calls_log=selection.tool_calls_log,
+            total_steps=len(selection.tool_calls_log),
+            total_tokens=selection.total_tokens,
+            provider="agent",
+            model=", ".join(selection.models_used),
+            error=selection.error,
+            stock_selection=selection.to_dict(),
         )
 
     # -----------------------------------------------------------------

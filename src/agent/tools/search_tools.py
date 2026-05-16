@@ -125,7 +125,9 @@ def _fetch_tushare_announcements(stock_code: str, *, lookback_hours: int) -> Lis
         "fields": "ann_date,ts_code,name,title,url",
     }
     try:
-        response = requests.post("https://api.tushare.pro", json=payload, timeout=5)
+        from data_provider.tushare_client import get_tushare_http_url
+
+        response = requests.post(get_tushare_http_url(), json=payload, timeout=5)
         response.raise_for_status()
         body = response.json()
     except Exception as exc:

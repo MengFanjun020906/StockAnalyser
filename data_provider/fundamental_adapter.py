@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
+import copy
 import re
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +21,15 @@ import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
+
+_STOCKAPI_CODE_FLOW_UPDATE_HOUR = 15
+_STOCKAPI_CODE_FLOW_UPDATE_MINUTE = 30
+_STOCKAPI_MIN_INTERVAL_SECONDS = 0.08
+_STOCKAPI_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
+_STOCKAPI_CACHE_TTL_SECONDS = 15.0
+_STOCKAPI_REQUEST_LOCK = threading.Lock()
+_STOCKAPI_RESPONSE_CACHE: Dict[Tuple[str, Tuple[Tuple[str, str], ...], bool], Tuple[float, Dict[str, Any]]] = {}
+_stockapi_last_request_at = 0.0
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "per_share": [
@@ -105,6 +117,74 @@ def _akshare_fund_flow_market(stock_code: str) -> str:
 
 def _stockapi_code_flow_url() -> str:
     return "https://www.stockapi.com.cn/v1/base/codeFlow"
+
+
+def _stockapi_default_completed_date() -> str:
+    now = datetime.now()
+    if now.hour < 16:
+        return (now.date() - timedelta(days=1)).isoformat()
+    return now.date().isoformat()
+
+
+def _stockapi_code_flow_completed_date(now: Optional[datetime] = None) -> datetime.date:
+    """StockAPI codeFlow is updated at 15:30; before that, query yesterday."""
+    current = now or datetime.now()
+    cutoff = current.replace(
+        hour=_STOCKAPI_CODE_FLOW_UPDATE_HOUR,
+        minute=_STOCKAPI_CODE_FLOW_UPDATE_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if current < cutoff:
+        return (current - timedelta(days=1)).date()
+    return current.date()
+
+
+def _stockapi_endpoint_url(path: str) -> str:
+    cleaned = _safe_str(path)
+    if cleaned.startswith("http://") or cleaned.startswith("https://"):
+        return cleaned
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
+    return "https://www.stockapi.com.cn" + cleaned
+
+
+def _stockapi_cache_key(
+    endpoint: str,
+    params: Dict[str, Any],
+    *,
+    has_token: bool,
+) -> Tuple[str, Tuple[Tuple[str, str], ...], bool]:
+    cache_params = tuple(sorted((str(key), str(value)) for key, value in params.items() if key != "token"))
+    return endpoint, cache_params, has_token
+
+
+def _stockapi_is_rate_limited(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("code") or "") == "88888"
+
+
+def _stockapi_get_cached_payload(
+    key: Tuple[str, Tuple[Tuple[str, str], ...], bool],
+    *,
+    max_age_s: float = _STOCKAPI_CACHE_TTL_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    cached = _STOCKAPI_RESPONSE_CACHE.get(key)
+    if not cached:
+        return None
+    ts, payload = cached
+    if time.monotonic() - ts > max_age_s:
+        _STOCKAPI_RESPONSE_CACHE.pop(key, None)
+        return None
+    return copy.deepcopy(payload)
+
+
+def _stockapi_set_cached_payload(
+    key: Tuple[str, Tuple[Tuple[str, str], ...], bool],
+    payload: Dict[str, Any],
+) -> None:
+    _STOCKAPI_RESPONSE_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
 
 
 def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
@@ -302,6 +382,461 @@ def _compact_numeric_row(row: pd.Series, field_map: Dict[str, List[str]]) -> Dic
 
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
+
+    def _stockapi_get_json(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: float = 3.0,
+        use_cache: bool = False,
+        cache_ttl_s: float = _STOCKAPI_CACHE_TTL_SECONDS,
+    ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        global _stockapi_last_request_at
+        request_params: Dict[str, Any] = {
+            key: value
+            for key, value in (params or {}).items()
+            if value is not None and str(value).strip() != ""
+        }
+        token = os.getenv("STOCKAPI_TOKEN", "").strip()
+        if token:
+            request_params["token"] = token
+        cache_key = _stockapi_cache_key(endpoint, request_params, has_token=bool(token))
+        if use_cache:
+            cached = _stockapi_get_cached_payload(cache_key, max_age_s=cache_ttl_s)
+            if cached is not None:
+                return cached, []
+
+        errors: List[str] = []
+        attempts = 1 + len(_STOCKAPI_RETRY_BACKOFF_SECONDS)
+        with _STOCKAPI_REQUEST_LOCK:
+            for attempt in range(attempts):
+                now = time.monotonic()
+                wait_s = _STOCKAPI_MIN_INTERVAL_SECONDS - (now - _stockapi_last_request_at)
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                try:
+                    response = requests.get(
+                        _stockapi_endpoint_url(endpoint),
+                        params=request_params,
+                        timeout=timeout,
+                    )
+                    _stockapi_last_request_at = time.monotonic()
+                    response.raise_for_status()
+                    payload = response.json()
+                except Exception as exc:
+                    return None, [f"stockapi:{endpoint}:{type(exc).__name__}:{exc}"]
+
+                if not isinstance(payload, dict):
+                    return None, [f"stockapi:{endpoint}:invalid_response"]
+                if not _stockapi_is_rate_limited(payload):
+                    if payload.get("code") == 20000 and use_cache:
+                        _stockapi_set_cached_payload(cache_key, payload)
+                    break
+                errors.append(f"stockapi:{endpoint}:88888:{payload.get('msg')}")
+                if attempt >= attempts - 1:
+                    return payload, errors
+                time.sleep(_STOCKAPI_RETRY_BACKOFF_SECONDS[attempt])
+
+        if not isinstance(payload, dict):
+            return None, [f"stockapi:{endpoint}:invalid_response"]
+        if payload.get("code") != 20000:
+            return payload, errors or [f"stockapi:{endpoint}:{payload.get('code')}:{payload.get('msg')}"]
+        return payload, []
+
+    def _stockapi_data_rows(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        use_cache: bool = False,
+        cache_ttl_s: float = _STOCKAPI_CACHE_TTL_SECONDS,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        payload, errors = self._stockapi_get_json(
+            endpoint,
+            params=params,
+            use_cache=use_cache,
+            cache_ttl_s=cache_ttl_s,
+        )
+        if errors:
+            return [], errors
+        data = (payload or {}).get("data")
+        if not isinstance(data, list):
+            return [], [f"stockapi:{endpoint}:empty_data"]
+        rows = [row for row in data if isinstance(row, dict)]
+        if not rows:
+            return [], [f"stockapi:{endpoint}:empty_data"]
+        return rows, []
+
+    def get_stockapi_limit_up_pool(self, date: Optional[str] = None, limit: int = 30) -> Dict[str, Any]:
+        """Return StockAPI limit-up pool with reasons and sealing strength."""
+        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        effective_limit = max(1, min(int(limit or 30), 100))
+        rows, errors = self._stockapi_data_rows("/v1/base/ZTPool", {"date": trade_date})
+
+        items: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            items.append({
+                "code": _safe_str(row.get("code")),
+                "name": _safe_str(row.get("name")),
+                "change_ratio": _safe_float(row.get("changeRatio")),
+                "last_price": _safe_float(row.get("lastPrice")),
+                "amount": _safe_float(row.get("amount")),
+                "turnover_ratio": _safe_float(row.get("turnoverRatio")),
+                "ceiling_amount": _safe_float(row.get("ceilingAmount")),
+                "first_ceiling_time": _safe_str(row.get("firstCeilingTime")),
+                "last_ceiling_time": _safe_str(row.get("lastCeilingTime")),
+                "bomb_num": _safe_float(row.get("bombNum")),
+                "limit_up_streak": _safe_float(row.get("lbNum")),
+                "industry": _safe_str(row.get("industry")),
+                "concepts": _safe_str(row.get("gl")),
+                "stock_reason": _safe_str(row.get("stock_reason")),
+                "plate_reason": _safe_str(row.get("plate_reason")),
+                "plate_name": _safe_str(row.get("plate_name")),
+                "time": _safe_str(row.get("time")) or trade_date,
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "date": trade_date,
+            "items": items,
+            "source_chain": ["stockapi:ZTPool"] if items else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_hot_sectors(self, date: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+        """Return StockAPI hot sectors ranked by capital inflow / strength."""
+        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        effective_limit = max(1, min(int(limit or 20), 100))
+        rows, errors = self._stockapi_data_rows("/v1/hotBkJlrDr", {"date": trade_date})
+
+        sectors: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            sectors.append({
+                "id": _safe_str(row.get("id")),
+                "bk_code": _safe_str(row.get("bkCode")),
+                "bk_name": _safe_str(row.get("bkName")),
+                "return_pct": _safe_float(row.get("qjzf")),
+                "return_diff": _safe_float(row.get("diffQjzf")),
+                "net_inflow": _safe_float(row.get("qjje")),
+                "net_inflow_diff": _safe_float(row.get("diffQjje")),
+                "inflow_days": _safe_float(row.get("jlrts")),
+                "strength": _safe_float(row.get("qiangdu")),
+                "strength_diff": _safe_float(row.get("diffQiangdu")),
+                "time": _safe_str(row.get("time")) or trade_date,
+            })
+
+        if not sectors and errors:
+            fallback_sectors, fallback_errors, fallback_source = self._fallback_hot_sectors(effective_limit)
+            if fallback_sectors:
+                return {
+                    "status": "partial",
+                    "date": trade_date,
+                    "sectors": fallback_sectors,
+                    "source_chain": [fallback_source],
+                    "errors": errors,
+                    "degraded": True,
+                    "primary_source": "stockapi:hotBkJlrDr",
+                    "fallback_source": fallback_source,
+                }
+            errors = [*errors, *fallback_errors]
+
+        return {
+            "status": "partial" if sectors else "failed",
+            "date": trade_date,
+            "sectors": sectors,
+            "source_chain": ["stockapi:hotBkJlrDr"] if sectors else [],
+            "errors": errors,
+        }
+
+    def _fallback_hot_sectors(self, limit: int) -> Tuple[List[Dict[str, Any]], List[str], str]:
+        """Fallback sector heat source when StockAPI hotBkJlrDr is unavailable."""
+        try:
+            import akshare as ak
+        except Exception as exc:
+            return [], [f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"], "akshare:stock_board_industry_name_em"
+
+        try:
+            df = ak.stock_board_industry_name_em()
+        except Exception as exc:
+            return [], [f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"], "akshare:stock_board_industry_name_em"
+        if df is None or getattr(df, "empty", True):
+            return [], ["akshare:stock_board_industry_name_em:empty_data"], "akshare:stock_board_industry_name_em"
+
+        name_col = _first_column_by_keywords(df, ["板块名称", "名称", "板块", "行业", "name"])
+        code_col = _first_column_by_keywords(df, ["板块代码", "代码", "code"])
+        change_col = _first_column_by_keywords(df, ["涨跌幅", "涨幅", "change", "pct"])
+        amount_col = _first_column_by_keywords(df, ["成交额", "金额", "amount"])
+        turnover_col = _first_column_by_keywords(df, ["换手率", "turnover"])
+        if name_col is None:
+            return [], ["akshare:stock_board_industry_name_em:missing_name_column"], "akshare:stock_board_industry_name_em"
+
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.head(max(1, limit)).iterrows():
+            if not isinstance(row, pd.Series):
+                continue
+            rows.append({
+                "id": None,
+                "bk_code": _safe_str(row.get(code_col)) if code_col else "",
+                "bk_name": _safe_str(row.get(name_col)),
+                "return_pct": _safe_float(row.get(change_col)) if change_col else None,
+                "return_diff": None,
+                "net_inflow": None,
+                "net_inflow_diff": None,
+                "inflow_days": None,
+                "strength": None,
+                "strength_diff": None,
+                "turnover_rate": _safe_float(row.get(turnover_col)) if turnover_col else None,
+                "amount": _safe_float(row.get(amount_col)) if amount_col else None,
+                "time": _stockapi_default_completed_date(),
+                "source": "akshare:stock_board_industry_name_em",
+                "fallback_reason": "StockAPI hotBkJlrDr unavailable; using sector performance ranking without StockAPI fund-flow fields.",
+            })
+        return rows, [], "akshare:stock_board_industry_name_em"
+
+    def get_stockapi_sector_constituents(
+        self,
+        bk_code: str,
+        page_no: int = 1,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
+        """Return StockAPI sector/concept constituents with per-stock money-flow fields."""
+        code = _safe_str(bk_code)
+        if not code:
+            return {
+                "status": "failed",
+                "bk_code": code,
+                "items": [],
+                "source_chain": [],
+                "errors": ["stockapi:bkList:missing_bk_code"],
+            }
+        effective_page_no = max(1, int(page_no or 1))
+        effective_page_size = max(1, min(int(page_size or 50), 100))
+        rows, errors = self._stockapi_data_rows(
+            "/v1/base/bkList",
+            {"bkCode": code, "pageNo": effective_page_no, "pageSize": effective_page_size},
+        )
+
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            items.append({
+                "code": _safe_str(row.get("f12")),
+                "name": _safe_str(row.get("f14")),
+                "last_price": _safe_float(row.get("f2")),
+                "change_ratio": _safe_float(row.get("f3")),
+                "main_net_inflow": _safe_float(row.get("f62")),
+                "main_net_inflow_pct": _safe_float(row.get("f184")),
+                "super_large_net_inflow": _safe_float(row.get("f66")),
+                "super_large_net_inflow_pct": _safe_float(row.get("f69")),
+                "large_net_inflow": _safe_float(row.get("f72")),
+                "large_net_inflow_pct": _safe_float(row.get("f75")),
+                "medium_net_inflow": _safe_float(row.get("f78")),
+                "medium_net_inflow_pct": _safe_float(row.get("f81")),
+                "small_net_inflow": _safe_float(row.get("f84")),
+                "small_net_inflow_pct": _safe_float(row.get("f87")),
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "bk_code": code,
+            "page_no": effective_page_no,
+            "page_size": effective_page_size,
+            "items": items,
+            "source_chain": ["stockapi:bkList"] if items else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_sector_flow_history(self, bk_code: str, limit: int = 10) -> Dict[str, Any]:
+        """Return StockAPI sector/concept historical capital flow."""
+        code = _safe_str(bk_code)
+        if not code:
+            return {
+                "status": "failed",
+                "bk_code": code,
+                "history": [],
+                "source_chain": [],
+                "errors": ["stockapi:bkFlowHistory:missing_bk_code"],
+            }
+        effective_limit = max(1, min(int(limit or 10), 60))
+        rows, errors = self._stockapi_data_rows("/v1/base/bkFlowHistory", {"bkCode": code})
+
+        history: List[Dict[str, Any]] = []
+        for row in rows[-effective_limit:]:
+            history.append({
+                "date": _safe_str(row.get("time")),
+                "main_amount": _safe_float(row.get("mainAmount")),
+                "main_amount_pct": _safe_float(row.get("mainAmountPercentage")),
+                "super_big_amount": _safe_float(row.get("supperBigAmount")),
+                "super_big_amount_pct": _safe_float(row.get("supperBigAmountPercentage")),
+                "big_amount": _safe_float(row.get("bigAmount")),
+                "big_amount_pct": _safe_float(row.get("bigAmountPercentage")),
+                "middle_amount": _safe_float(row.get("middleAmount")),
+                "middle_amount_pct": _safe_float(row.get("middleAmountPercentage")),
+                "small_amount": _safe_float(row.get("minAmount")),
+                "small_amount_pct": _safe_float(row.get("minAmountPercentage")),
+            })
+
+        return {
+            "status": "partial" if history else "failed",
+            "bk_code": code,
+            "history": history,
+            "source_chain": ["stockapi:bkFlowHistory"] if history else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_popularity_rank(self, limit: int = 30) -> Dict[str, Any]:
+        """Return StockAPI stock popularity ranking with AI-generated reasons."""
+        effective_limit = max(1, min(int(limit or 30), 100))
+        rows, errors = self._stockapi_data_rows(
+            "/v1/change/renQi",
+            {},
+            use_cache=True,
+            cache_ttl_s=30.0,
+        )
+
+        items: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            items.append({
+                "code": _safe_str(row.get("code")),
+                "name": _safe_str(row.get("name")),
+                "rank": _safe_float(row.get("order")),
+                "popularity": _safe_float(row.get("rate")),
+                "change_ratio": _safe_float(row.get("zf") if row.get("zf") is not None else row.get("rise_and_fall")),
+                "reason": _safe_str(row.get("analyse")),
+                "tag": row.get("tag") if isinstance(row.get("tag"), (dict, list)) else _safe_str(row.get("tag")),
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "items": items,
+            "source_chain": ["stockapi:renQi"] if items else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_hot_money_activity(
+        self,
+        stock_code: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 30,
+    ) -> Dict[str, Any]:
+        """Return StockAPI hot-money activity, per stock or rank by brokerage seat."""
+        effective_limit = max(1, min(int(limit or 30), 100))
+        end = _safe_str(end_date) or datetime.now().date().isoformat()
+        start = _safe_str(start_date) or (datetime.now().date() - timedelta(days=30)).isoformat()
+        code = _normalize_code(stock_code) if stock_code else ""
+
+        if code:
+            rows, errors = self._stockapi_data_rows(
+                "/v1/youzi/gegu",
+                {"code": code, "startDate": start, "endDate": end},
+            )
+            items: List[Dict[str, Any]] = []
+            for row in rows[:effective_limit]:
+                items.append({
+                    "date": _safe_str(row.get("rq")),
+                    "code": _safe_str(row.get("gpdm")),
+                    "name": _safe_str(row.get("gpmc")),
+                    "hot_money_name": _safe_str(row.get("yzmc")),
+                    "broker_seat": _safe_str(row.get("yyb")),
+                    "buy_amount": _safe_float(row.get("mrje")),
+                    "sell_amount": _safe_float(row.get("mcje")),
+                    "net_inflow": _safe_float(row.get("jlrje")),
+                    "list_type": _safe_str(row.get("sblx")),
+                    "concepts": _safe_str(row.get("gl")),
+                })
+            source = "stockapi:youzi/gegu"
+            return {
+                "status": "partial" if items else "failed",
+                "mode": "stock",
+                "stock_code": code,
+                "start_date": start,
+                "end_date": end,
+                "items": items,
+                "source_chain": [source] if items else [],
+                "errors": errors,
+            }
+
+        rows, errors = self._stockapi_data_rows("/v1/youziRank", {"startDate": start, "endDate": end})
+        items = []
+        for row in rows[:effective_limit]:
+            items.append({
+                "hot_money_name": _safe_str(row.get("groupIcon")),
+                "broker_seat": _safe_str(row.get("yybName")),
+                "list_count": _safe_float(row.get("num")),
+            })
+        source = "stockapi:youziRank"
+        if not items and errors:
+            fallback_items, fallback_errors, fallback_source = self._fallback_hot_money_rank(start, end, effective_limit)
+            if fallback_items:
+                return {
+                    "status": "partial",
+                    "mode": "rank",
+                    "start_date": start,
+                    "end_date": end,
+                    "items": fallback_items,
+                    "source_chain": [fallback_source],
+                    "errors": errors,
+                    "degraded": True,
+                    "primary_source": source,
+                    "fallback_source": fallback_source,
+                    "proxy_type": "dragon_tiger_stock_list",
+                }
+            errors = [*errors, *fallback_errors]
+        return {
+            "status": "partial" if items else "failed",
+            "mode": "rank",
+            "start_date": start,
+            "end_date": end,
+            "items": items,
+            "source_chain": [source] if items else [],
+            "errors": errors,
+        }
+
+    def _fallback_hot_money_rank(self, start_date: str, end_date: str, limit: int) -> Tuple[List[Dict[str, Any]], List[str], str]:
+        """Fallback to dragon-tiger stock list when StockAPI hot-money rank is unavailable."""
+        candidates = [
+            ("stock_lhb_detail_em", {"start_date": start_date.replace("-", ""), "end_date": end_date.replace("-", "")}),
+            ("stock_lhb_detail_em", {"start_date": start_date, "end_date": end_date}),
+            ("stock_lhb_stock_statistic_em", {}),
+        ]
+        df, source, errors = self._call_df_candidates(candidates)
+        fallback_source = f"akshare:{source or 'dragon_tiger'}"
+        if df is None or getattr(df, "empty", True):
+            return [], errors or [f"{fallback_source}:empty_data"], fallback_source
+
+        code_col = _first_column_by_keywords(df, ["代码", "股票代码", "证券代码", "ts_code", "code"])
+        name_col = _first_column_by_keywords(df, ["名称", "股票简称", "股票名称", "name"])
+        date_col = _first_column_by_keywords(df, ["上榜日", "交易日", "日期", "date"])
+        reason_col = _first_column_by_keywords(df, ["上榜原因", "解读", "原因", "类型"])
+        net_col = _first_column_by_keywords(df, ["龙虎榜净买额", "净买额", "净额", "net"])
+        buy_col = _first_column_by_keywords(df, ["龙虎榜买入额", "买入额", "买入", "buy"])
+        sell_col = _first_column_by_keywords(df, ["龙虎榜卖出额", "卖出额", "卖出", "sell"])
+        amount_col = _first_column_by_keywords(df, ["龙虎榜成交额", "成交额", "amount"])
+        if code_col is None and name_col is None:
+            return [], [*errors, f"{fallback_source}:missing_code_name_columns"], fallback_source
+
+        items: List[Dict[str, Any]] = []
+        for _, row in df.head(max(1, limit)).iterrows():
+            if not isinstance(row, pd.Series):
+                continue
+            items.append({
+                "date": _safe_str(row.get(date_col)) if date_col else "",
+                "code": _normalize_code(row.get(code_col)) if code_col else "",
+                "name": _safe_str(row.get(name_col)) if name_col else "",
+                "hot_money_name": "",
+                "broker_seat": "",
+                "list_count": None,
+                "reason": _safe_str(row.get(reason_col)) if reason_col else "",
+                "net_inflow": _safe_float(row.get(net_col)) if net_col else None,
+                "buy_amount": _safe_float(row.get(buy_col)) if buy_col else None,
+                "sell_amount": _safe_float(row.get(sell_col)) if sell_col else None,
+                "amount": _safe_float(row.get(amount_col)) if amount_col else None,
+                "source": fallback_source,
+                "proxy_type": "dragon_tiger_stock_list",
+                "fallback_reason": "StockAPI youziRank unavailable; using dragon-tiger listed stocks as hot-money activity proxy without brokerage-seat ranking.",
+            })
+        return items, errors, fallback_source
 
     def _call_df_candidates(
         self,
@@ -703,6 +1238,8 @@ class AkshareFundamentalAdapter:
             return result
 
         result["errors"].extend(stockapi_errors)
+        if stockapi_errors:
+            result["source_chain"].append("capital_stock:stockapi_codeFlow")
         if any(":not_supported:" in str(error) for error in stockapi_errors):
             result["status"] = "not_supported"
         elif result["errors"]:
@@ -722,13 +1259,17 @@ class AkshareFundamentalAdapter:
             return {}, None, [f"stockapi_codeFlow:not_supported:{stock_code}"]
 
         token = os.getenv("STOCKAPI_TOKEN", "").strip()
-        today = datetime.now().date()
+        latest_queryable_date = _stockapi_code_flow_completed_date()
         windows: List[Tuple[datetime.date, datetime.date]] = []
         if token:
-            end_date = today
-            windows.append((end_date - timedelta(days=20), end_date))
+            window_end = latest_queryable_date
+            lower_bound = latest_queryable_date - timedelta(days=90)
+            while window_end >= lower_bound and len(windows) < 4:
+                window_start = max(lower_bound, window_end - timedelta(days=20))
+                windows.append((window_start, window_end))
+                window_end = window_start - timedelta(days=1)
         else:
-            end_date = today - timedelta(days=4)
+            end_date = latest_queryable_date - timedelta(days=4)
             window_end = end_date
             lower_bound = end_date - timedelta(days=14)
             while window_end >= lower_bound and len(windows) < 3:
@@ -767,6 +1308,8 @@ class AkshareFundamentalAdapter:
             data = payload.get("data")
             if isinstance(data, list):
                 rows.extend(data)
+                if data:
+                    break
 
         if not rows:
             if errors:

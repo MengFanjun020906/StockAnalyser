@@ -14,7 +14,6 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 3. 使用 tenacity 实现指数退避重试
 """
 
-import json as _json
 import logging
 import re
 import time
@@ -22,7 +21,6 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
-import requests
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -32,6 +30,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS,is_bse_code, is_st_stock, is_kc_cy_stock, normalize_stock_code, _is_hk_market
+from .tushare_client import TushareHttpClient, build_tushare_http_client, build_tushare_sdk_client
 from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
 from src.config import get_config
 import os
@@ -70,44 +69,6 @@ def _is_us_code(stock_code: str) -> bool:
     """
     code = stock_code.strip().upper()
     return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
-
-
-class _TushareHttpClient:
-    """Lightweight Tushare Pro client that does not require the tushare SDK."""
-
-    def __init__(self, token: str, timeout: int = 30, api_url: str = "http://api.tushare.pro") -> None:
-        self._token = token
-        self._timeout = timeout
-        self._api_url = api_url
-
-    def query(self, api_name: str, fields: str = "", **kwargs) -> pd.DataFrame:
-        req_params = {
-            "api_name": api_name,
-            "token": self._token,
-            "params": kwargs,
-            "fields": fields,
-        }
-        res = requests.post(self._api_url, json=req_params, timeout=self._timeout)
-        if res.status_code != 200:
-            raise Exception(f"Tushare API HTTP {res.status_code}")
-
-        result = _json.loads(res.text)
-        if result.get("code") != 0:
-            raise Exception(result.get("msg") or f"Tushare API error code {result.get('code')}")
-
-        data = result.get("data") or {}
-        columns = data.get("fields") or []
-        items = data.get("items") or []
-        return pd.DataFrame(items, columns=columns)
-
-    def __getattr__(self, api_name: str):
-        if api_name.startswith("_"):
-            raise AttributeError(api_name)
-
-        def caller(**kwargs) -> pd.DataFrame:
-            return self.query(api_name, **kwargs)
-
-        return caller
 
 
 class TushareFetcher(BaseFetcher):
@@ -171,15 +132,15 @@ class TushareFetcher(BaseFetcher):
             logger.error(f"Tushare API 初始化失败: {e}")
             self._api = None
 
-    def _build_api_client(self, token: str) -> _TushareHttpClient:
+    def _build_api_client(self, token: str) -> TushareHttpClient:
         """
         Build a lightweight Tushare Pro client over direct HTTP requests.
 
         The project already normalizes all Pro calls through the same request
         contract, so we do not need the official tushare SDK during runtime.
         """
-        client = _TushareHttpClient(token=token)
-        logger.debug("Tushare API client configured for direct HTTP calls")
+        client = build_tushare_http_client(token=token)
+        logger.debug("Tushare API client configured for direct HTTP calls: %s", client.api_url)
         return client
 
     def _determine_priority(self) -> int:
@@ -1074,37 +1035,41 @@ class TushareFetcher(BaseFetcher):
             ]
             return top_sectors, bottom_sectors
 
-        # 15:30之后才有当天数据
-        start_date = self.get_trade_time(early_time='00:00', late_time='15:30')
-        if not start_date:
+        # 15:30 之后理论上有当天数据，但不同网关/接口可能延迟；
+        # 当日为空时继续回退最近交易日，避免 Agent 工具误判为板块排行不可用。
+        primary_date = self.get_trade_time(early_time='00:00', late_time='15:30')
+        if not primary_date:
             return None
+        trade_dates = self._get_trade_dates(self._get_china_now().strftime("%Y%m%d"))
+        date_candidates = [primary_date]
+        date_candidates.extend([item for item in trade_dates if item != primary_date][:3])
 
-        # 优先同花顺接口
-        logger.info("[Tushare] ts.pro_api().moneyflow_ind_ths 获取板块排行(同花顺)...")
-        try:
-            df = self._call_api_with_rate_limit("moneyflow_ind_ths", trade_date=start_date)
-            if df is not None and not df.empty:
-                change_col = 'pct_change'
-                name = 'industry'
-                if change_col in df.columns:
-                    return _get_rank_top_n(df, change_col, name, n)
-        except Exception as e:
-            logger.warning(f"[Tushare] 获取同花顺行业板块涨跌榜失败: {e} 尝试东财接口")
+        for start_date in date_candidates:
+            # 优先同花顺接口
+            logger.info("[Tushare] ts.pro_api().moneyflow_ind_ths 获取板块排行(同花顺)...")
+            try:
+                df = self._call_api_with_rate_limit("moneyflow_ind_ths", trade_date=start_date)
+                if df is not None and not df.empty:
+                    change_col = 'pct_change'
+                    name = 'industry'
+                    if change_col in df.columns:
+                        return _get_rank_top_n(df, change_col, name, n)
+            except Exception as e:
+                logger.warning(f"[Tushare] 获取同花顺行业板块涨跌榜失败: {e} 尝试东财接口")
 
-        # 同花顺接口失败，降级尝试东财接口
-        logger.info("[Tushare] ts.pro_api().moneyflow_ind_dc 获取板块排行(东财)...")
-        try:
-            df = self._call_api_with_rate_limit("moneyflow_ind_dc", trade_date=start_date)
-            if df is not None and not df.empty:
-                df = df[df['content_type'] == '行业']  # 过滤出行业板块
-                change_col = 'pct_change'
-                name = 'name'
-                if change_col in df.columns:
-                    return _get_rank_top_n(df, change_col, name, n)
-        except Exception as e:
-            logger.warning(f"[Tushare] 获取东财行业板块涨跌榜失败: {e}")
-            return None
-        
+            # 同花顺接口失败，降级尝试东财接口
+            logger.info("[Tushare] ts.pro_api().moneyflow_ind_dc 获取板块排行(东财)...")
+            try:
+                df = self._call_api_with_rate_limit("moneyflow_ind_dc", trade_date=start_date)
+                if df is not None and not df.empty:
+                    df = df[df['content_type'] == '行业']  # 过滤出行业板块
+                    change_col = 'pct_change'
+                    name = 'name'
+                    if change_col in df.columns:
+                        return _get_rank_top_n(df, change_col, name, n)
+            except Exception as e:
+                logger.warning(f"[Tushare] 获取东财行业板块涨跌榜失败: {e}")
+
         # 获取为空或者接口调用失败，返回 None
         return None
     

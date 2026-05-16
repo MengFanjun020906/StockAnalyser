@@ -414,6 +414,12 @@ def test_auto_alphasift_falls_back_to_yaml_strategies_when_requested_names_are_s
     ), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=[],
+    ), patch(
+        "src.agent.tools.market_tools._discover_event_impact_candidates",
+        return_value={"status": "empty", "candidates": [], "events": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._discover_news_momentum_candidates",
+        return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
     ):
         result = _handle_discover_watchlist_candidates(
             candidate_source="auto",
@@ -422,10 +428,78 @@ def test_auto_alphasift_falls_back_to_yaml_strategies_when_requested_names_are_s
         )
 
     assert result["status"] == "ok"
-    assert result["discovery_steps"][0]["source"] == "alphasift"
-    assert result["discovery_steps"][0]["count"] == 1
-    assert result["discovery_steps"][0]["diagnostics"][0]["status"] == "fallback_to_all"
+    assert result["candidate_source"] == "expert_graph_discovery"
+    strategy_step = next(step for step in result["discovery_steps"] if step["source"] == "candidate_expert:strategy_factor_expert")
+    assert strategy_step["count"] == 1
+    assert strategy_step["diagnostics"][0]["status"] == "fallback_to_all"
     assert result["candidates"][0]["source"] == "alphasift:unit_breakout"
+
+
+def test_discover_watchlist_candidates_auto_uses_candidate_experts(tmp_path):
+    db_path = tmp_path / "sequoia.db"
+    strategy_dir = tmp_path / "strategies"
+    _write_daily_db(db_path, _bars_for_turtle("600001") + _bars_for_alphasift_breakout("600003"))
+    _write_alphasift_strategy_dir(strategy_dir)
+
+    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}), patch(
+        "src.agent.tools.market_tools._top_sector_names",
+        return_value=["半导体"],
+    ), patch(
+        "src.agent.tools.market_tools._fetch_sector_constituents",
+        return_value=(
+            [
+                {
+                    "code": "600002",
+                    "name": "板块候选",
+                    "source": "akshare:industry:半导体",
+                    "reason": "来自强势板块。",
+                    "change_pct": 5.0,
+                }
+            ],
+            [{"source": "akshare:industry", "status": "ok", "sector": "半导体"}],
+        ),
+    ), patch(
+        "src.agent.tools.market_tools._discover_event_impact_candidates",
+        return_value={
+            "status": "empty",
+            "candidates": [],
+            "events": [
+                {
+                    "event_id": "unit_event",
+                    "title": "AI 产业事件仍待验证",
+                    "watch_themes": ["人工智能"],
+                    "maturity": "breaking",
+                }
+            ],
+            "queries": [],
+            "diagnostics": [],
+        },
+    ), patch(
+        "src.agent.tools.market_tools._discover_news_momentum_candidates",
+        return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ):
+        result = _handle_discover_watchlist_candidates(
+            candidate_source="auto",
+            strategy_names=["turtle_trade", "unit_breakout"],
+            limit=5,
+        )
+
+    assert result["status"] == "ok"
+    assert result["candidate_source"] == "expert_graph_discovery"
+    assert result["fallback_used"] is False
+    assert result["expert_packets"]
+    assert {packet["expert"] for packet in result["expert_packets"]} >= {
+        "strategy_factor_expert",
+        "technical_candidate_expert",
+        "sector_theme_expert",
+        "news_event_expert",
+        "sentiment_theme_expert",
+    }
+    assert result["themes"][0]["theme"] == "人工智能"
+    assert result["capacity"]["max_candidates_to_deep_dive"] == 5
+    assert {item["code"] for item in result["candidates"]} == {"600001", "600002", "600003"}
+    assert any(item.get("candidate_experts") for item in result["candidates"])
+    assert any(step["source"] == "candidate_expert:sector_theme_expert" for step in result["discovery_steps"])
 
 
 def test_discover_watchlist_candidates_auto_merges_sequoia_and_sector(tmp_path):
@@ -439,16 +513,25 @@ def test_discover_watchlist_candidates_auto_merges_sequoia_and_sector(tmp_path):
         return_value=["半导体"],
     ), patch(
         "src.agent.tools.market_tools._fetch_sector_constituents",
-        return_value=[
-            {
-                "code": "600002",
-                "name": "板块候选",
-                "source": "akshare:industry:半导体",
-                "reason": "来自强势板块。",
-                "change_pct": 5.0,
-            }
-        ],
-    ) as fetch_sector:
+        return_value=(
+            [
+                {
+                    "code": "600002",
+                    "name": "板块候选",
+                    "source": "akshare:industry:半导体",
+                    "reason": "来自强势板块。",
+                    "change_pct": 5.0,
+                }
+            ],
+            [{"source": "akshare:industry", "status": "ok", "sector": "半导体"}],
+        ),
+    ) as fetch_sector, patch(
+        "src.agent.tools.market_tools._discover_event_impact_candidates",
+        return_value={"status": "empty", "candidates": [], "events": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._discover_news_momentum_candidates",
+        return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ):
         result = _handle_discover_watchlist_candidates(
             candidate_source="auto",
             strategy_names=["turtle_trade", "unit_breakout"],
@@ -456,12 +539,70 @@ def test_discover_watchlist_candidates_auto_merges_sequoia_and_sector(tmp_path):
         )
 
     assert result["status"] == "ok"
-    assert result["candidate_source"] == "multi_recall"
-    assert result["discovery_steps"][0]["source"] == "alphasift"
-    assert result["discovery_steps"][1]["source"] == "sequoia"
-    assert any(step["source"] == "sector_constituents" for step in result["discovery_steps"])
+    assert result["candidate_source"] == "expert_graph_discovery"
+    assert any(step["source"] == "candidate_expert:strategy_factor_expert" for step in result["discovery_steps"])
+    assert any(step["source"] == "candidate_expert:technical_candidate_expert" for step in result["discovery_steps"])
+    assert any(step["source"] == "candidate_expert:sector_theme_expert" for step in result["discovery_steps"])
     assert fetch_sector.called
     assert {item["code"] for item in result["candidates"]} == {"600001", "600002", "600003"}
+
+
+def test_discover_watchlist_candidates_sector_uses_local_strategy_fallback_when_constituents_empty(tmp_path):
+    db_path = tmp_path / "sequoia.db"
+    strategy_dir = tmp_path / "strategies"
+    _write_daily_db(db_path, _bars_for_turtle("600001") + _bars_for_alphasift_breakout("600003"))
+    _write_alphasift_strategy_dir(strategy_dir)
+
+    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}), patch(
+        "src.agent.tools.market_tools._fetch_sector_constituents",
+        return_value=(
+            [],
+            [
+                {
+                    "source": "akshare:industry",
+                    "status": "timeout",
+                    "sector": "半导体",
+                    "timeout_s": 3.0,
+                }
+            ],
+        ),
+    ):
+        result = _handle_discover_watchlist_candidates(
+            candidate_source="sector",
+            sector_names=["半导体"],
+            strategy_names=["turtle_trade", "unit_breakout"],
+            limit=5,
+        )
+
+    assert result["status"] == "ok"
+    assert result["candidate_source"] == "sector_local_fallback"
+    assert result["fallback_used"] is False
+    assert {item["code"] for item in result["candidates"]} == {"600001", "600003"}
+    assert result["discovery_steps"][0]["source"] == "sector_constituents"
+    assert result["discovery_steps"][0]["diagnostics"][0]["status"] == "timeout"
+    assert any(step["source"] == "sector_local_fallback:alphasift" and step["count"] >= 1 for step in result["discovery_steps"])
+    assert any(step["source"] == "sector_local_fallback:sequoia" and step["count"] >= 1 for step in result["discovery_steps"])
+    assert not any(step["source"] == "fallback_seed_pool" for step in result["discovery_steps"])
+    assert all(item["source"] != "fallback_seed_pool" for item in result["candidates"])
+
+
+def test_discover_watchlist_candidates_sector_fallback_seed_only_after_local_sources_unavailable():
+    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": "/tmp/not-exists-sequoia.db", "ALPHASIFT_CANDIDATE_DB_PATH": "/tmp/not-exists-alphasift.db"}), patch(
+        "src.agent.tools.market_tools._fetch_sector_constituents",
+        return_value=([], [{"source": "akshare:industry", "status": "empty", "sector": "半导体"}]),
+    ):
+        result = _handle_discover_watchlist_candidates(
+            candidate_source="sector",
+            sector_names=["半导体"],
+            limit=2,
+        )
+
+    assert result["status"] == "partial"
+    assert result["candidate_source"] == "fallback"
+    assert result["fallback_used"] is True
+    assert any(step["source"] == "sector_local_fallback:alphasift" for step in result["discovery_steps"])
+    assert any(step["source"] == "sector_local_fallback:sequoia" for step in result["discovery_steps"])
+    assert result["candidates"][0]["source"] == "fallback_seed_pool"
 
 
 def test_discover_watchlist_candidates_keeps_source_diversity_when_limited():
@@ -525,18 +666,24 @@ def test_discover_watchlist_candidates_resolves_display_names_from_stock_index()
     assert result["candidates"][0]["name"] == "东田微"
 
 
-def test_discover_watchlist_candidates_falls_back_when_sequoia_db_missing():
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": "/tmp/not-exists-sequoia.db"}), patch(
+def test_discover_watchlist_candidates_falls_back_when_candidate_expert_sources_missing():
+    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": "/tmp/not-exists-sequoia.db", "ALPHASIFT_CANDIDATE_DB_PATH": "/tmp/not-exists-alphasift.db"}), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=[],
+    ), patch(
+        "src.agent.tools.market_tools._discover_event_impact_candidates",
+        return_value={"status": "empty", "candidates": [], "events": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._discover_news_momentum_candidates",
+        return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
     ):
         result = _handle_discover_watchlist_candidates(limit=2)
 
     assert result["status"] == "partial"
     assert result["candidate_source"] == "fallback"
     assert result["fallback_used"] is True
-    assert result["discovery_steps"][0]["source"] == "alphasift"
-    assert result["discovery_steps"][0]["status"] == "unavailable"
-    assert result["discovery_steps"][1]["source"] == "sequoia"
-    assert result["discovery_steps"][1]["status"] == "unavailable"
+    strategy_step = next(step for step in result["discovery_steps"] if step["source"] == "candidate_expert:strategy_factor_expert")
+    technical_step = next(step for step in result["discovery_steps"] if step["source"] == "candidate_expert:technical_candidate_expert")
+    assert strategy_step["status"] == "unavailable"
+    assert technical_step["status"] == "unavailable"
     assert result["candidates"][0]["source"] == "fallback_seed_pool"

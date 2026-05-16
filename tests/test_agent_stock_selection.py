@@ -15,10 +15,11 @@ except ModuleNotFoundError:
 
 from src.agent.executor import AgentExecutor
 from src.agent.llm_adapter import LLMResponse
+from src.agent.orchestrator import AgentOrchestrator
 from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
 from src.agent.multi_expert import AgentState, EvidenceBundle, ExpertOpinion
 from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolRegistry
-from src.schemas.agent_context import AccountContext, AgentUserContext, InvestorProfile, ReportContext
+from src.schemas.agent_context import AccountContext, AgentUserContext, InvestorProfile, PositionContext, ReportContext
 
 
 def _registry():
@@ -124,8 +125,11 @@ def _registry():
     registry.register(ToolDefinition(
         name="search_comprehensive_intel",
         description="intel",
-        parameters=[ToolParameter(name="stock_code", type="string", description="code")],
-        handler=lambda stock_code: {"report": f"{stock_code} 无重大利空"},
+        parameters=[
+            ToolParameter(name="stock_code", type="string", description="code"),
+            ToolParameter(name="stock_name", type="string", description="name"),
+        ],
+        handler=lambda stock_code, stock_name: {"report": f"{stock_code} {stock_name} 无重大利空"},
     ))
     return registry
 
@@ -228,6 +232,7 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
         tool_registry=_registry(),
         llm_adapter=adapter,
         run_id="test-run",
+        orchestration_mode="legacy",
     )
 
     assert result.success is True
@@ -347,9 +352,14 @@ def test_stock_selection_expert_graph_adds_expert_opinions():
     assert result.success is True
     assert result.final_report_json["orchestration_mode"] == "expert_graph"
     assert expert_state["orchestration_mode"] == "expert_graph"
+    assert expert_state["evidence_bundle"]["evidence_cards"]
+    assert expert_state["evidence_bundle"]["expert_packets"]
+    assert expert_state["evidence_bundle"]["judge_input_packet"]["decision_matrix"]
     assert "technical_expert" in expert_state["expert_opinions"]
     assert "capital_chip_expert" in expert_state["expert_opinions"]
     assert expert_state["expert_opinions"]["candidate_discovery_expert"]["candidate_impacts"][0]["name"] == "测试一"
+    deep_cards = result.final_report_json["single_stock_deep_dive"]["full"]["results"][0]["full"]["evidence_cards"]
+    assert any(card["dimension"] == "capital_flow" for card in deep_cards)
     assert result.context.expert_state is not None
 
 
@@ -415,6 +425,44 @@ def test_executor_uses_stock_selection_for_watchlist_scan():
     assert result.success is True
     assert result.stock_selection["success"] is True
     assert "选股与持仓配置报告" in result.content
+    assert not adapter.call_with_tools.called
+
+
+def test_multi_agent_orchestrator_uses_expert_graph_stock_selection_for_watchlist_scan():
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["600001"]}, "full": {"shortlist": []}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait"}, "full": {"stock": {"code": "600001", "name": "测试一"}, "missing_evidence": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+    config = MagicMock()
+    config.agent_orchestration_mode = "expert_graph"
+    config.agent_orchestrator_timeout_s = 0
+    orchestrator = AgentOrchestrator(
+        tool_registry=_registry(),
+        llm_adapter=adapter,
+        config=config,
+    )
+    events = []
+
+    result = orchestrator.chat(
+        "我现在有5w元，你帮我选股",
+        session_id="test-multi-expert-selection",
+        context={"agent_user_context": _context()},
+        progress_callback=events.append,
+    )
+
+    final_report = result.stock_selection["final_report_json"]
+    assert result.success is True
+    assert final_report["orchestration_mode"] == "expert_graph"
+    assert final_report["expert_state"]["orchestration_mode"] == "expert_graph"
+    assert "selection_expert_graph_done" in [event["type"] for event in events]
+    expert_event = next(event for event in events if event["type"] == "selection_expert_graph_done")
+    assert expert_event["payload"]["expert_state"]["orchestration_mode"] == "expert_graph"
+    assert "candidate_discovery_expert" in expert_event["payload"]["expert_state"]["expert_opinions"]
     assert not adapter.call_with_tools.called
 
 
@@ -546,3 +594,179 @@ def test_stock_selection_marks_capital_flow_with_errors_failed_even_with_data():
     capital_flow_calls = [call for call in result.tool_calls_log if call["tool"] == "get_capital_flow"]
     assert capital_flow_calls
     assert all(call["success"] is False for call in capital_flow_calls)
+
+
+def test_stock_selection_overwrites_mismatched_stock_name_by_code():
+    registry = _registry()
+    registry.register(ToolDefinition(
+        name="discover_watchlist_candidates",
+        description="discover",
+        parameters=[],
+        handler=lambda market="cn", seed_symbols=None, limit=8: {
+            "status": "ok",
+            "market": market,
+            "candidates": [{"code": "301028", "name": "友升股份", "market": "cn", "source": "test"}],
+        },
+    ))
+    registry.register(ToolDefinition(
+        name="get_realtime_quote",
+        description="quote",
+        parameters=[ToolParameter(name="stock_code", type="string", description="code")],
+        handler=lambda stock_code: {"code": stock_code, "name": "鼎熔岩", "price": 10.0},
+    ))
+    registry.register(ToolDefinition(
+        name="get_stock_info",
+        description="info",
+        parameters=[ToolParameter(name="stock_code", type="string", description="code")],
+        handler=lambda stock_code: {"code": stock_code, "name": "鼎熔岩", "belong_boards": []},
+    ))
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({
+            "stage": "candidate_discovery",
+            "status": "ok",
+            "summary": {"candidate_codes": ["301028"]},
+            "full": {"candidates": [{"code": "301028", "name": "友升股份"}]},
+        }),
+        _json_response({
+            "stage": "candidate_screening",
+            "status": "ok",
+            "summary": {"deep_dive_targets": ["301028"]},
+            "full": {"shortlist": [{"code": "301028", "name": "友升股份", "screening_result": "deep_dive"}]},
+        }),
+        _json_response({
+            "stage": "single_stock_deep_dive",
+            "status": "ok",
+            "summary": {"code": "301028", "name": "友升股份", "action_bias": "wait"},
+            "full": {"stock": {"code": "301028", "name": "友升股份"}, "missing_evidence": []},
+        }),
+        _json_response({
+            "stage": "portfolio_allocation",
+            "status": "ok",
+            "summary": {"portfolio_action": "wait", "core_reason": "等待"},
+            "full": {
+                "positions_plan": [
+                    {
+                        "rank": 1,
+                        "code": "301028",
+                        "name": "友升股份",
+                        "action": "wait",
+                        "initial_position_pct": 0,
+                        "entry_condition": "等待确认",
+                        "stop_loss_condition": "跌破支撑",
+                        "review_trigger": "次日复查",
+                    }
+                ]
+            },
+        }),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="分析 301028",
+        agent_user_context=_context(),
+        tool_registry=registry,
+        llm_adapter=adapter,
+        run_id="test-stock-identity",
+    )
+
+    report = result.final_report_json
+    assert result.success is True
+    assert report["candidate_discovery"]["full"]["candidates"][0]["name"] == "鼎熔岩"
+    assert report["candidate_screening"]["full"]["shortlist"][0]["name"] == "鼎熔岩"
+    assert report["single_stock_deep_dive"]["summary"]["results_brief"][0]["name"] == "鼎熔岩"
+    assert report["portfolio_allocation"]["full"]["positions_plan"][0]["name"] == "鼎熔岩"
+    assert "301028 鼎熔岩" in result.final_markdown
+    assert "301028 友升股份" not in result.final_markdown
+    audit = report["stock_identity_audit"]
+    assert audit["status"] == "corrected"
+    assert audit["violation_count"] >= 1
+    assert any(item["code"] == "301028" and item["provided_name"] == "友升股份" for item in audit["violations"])
+
+
+def test_stock_selection_portfolio_context_positions_do_not_require_name_field():
+    context = _context()
+    context.positions = [
+        PositionContext(symbol="600519", quantity=100, avg_cost=1500, market_value=150000, position_pct=30)
+    ]
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["600001"]}, "full": {"shortlist": []}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait"}, "full": {"stock": {"code": "600001", "name": "测试一"}, "missing_evidence": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="我现在有5w元，帮我选股",
+        agent_user_context=context,
+        tool_registry=_registry(),
+        llm_adapter=adapter,
+        run_id="test-position-context",
+        orchestration_mode="expert_graph",
+    )
+
+    assert result.success is True
+    assert result.error is None
+    assert result.final_report_json["expert_state"]["orchestration_mode"] == "expert_graph"
+
+
+def test_stock_selection_deep_dive_passes_stock_name_to_intel_tool():
+    intel_calls = []
+    registry = _registry()
+    registry.register(ToolDefinition(
+        name="search_comprehensive_intel",
+        description="intel",
+        parameters=[
+            ToolParameter(name="stock_code", type="string", description="code"),
+            ToolParameter(name="stock_name", type="string", description="name"),
+        ],
+        handler=lambda stock_code, stock_name: intel_calls.append((stock_code, stock_name)) or {"report": "ok"},
+    ))
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["600001"]}, "full": {"shortlist": []}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait"}, "full": {"stock": {"code": "600001", "name": "测试一"}, "missing_evidence": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="我现在有5w元，帮我选股",
+        agent_user_context=_context(),
+        tool_registry=registry,
+        llm_adapter=adapter,
+        run_id="test-intel-args",
+    )
+
+    assert result.success is True
+    assert intel_calls == [("600001", "600001名称")]
+
+
+def test_stock_selection_stage_failure_still_returns_expert_graph_partial_report():
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一"}]}}),
+        RuntimeError("llm provider timeout"),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="我现在有5w元，帮我选股",
+        agent_user_context=_context(),
+        tool_registry=_registry(),
+        llm_adapter=adapter,
+        run_id="test-partial-expert-graph",
+        orchestration_mode="expert_graph",
+    )
+
+    assert result.success is True
+    assert result.error == "llm provider timeout"
+    assert result.final_report_json["partial_failure"]["status"] == "failed_stage_degraded"
+    assert result.final_report_json["orchestration_mode"] == "expert_graph"
+    assert result.final_report_json["expert_state"]["orchestration_mode"] == "expert_graph"
+    assert result.final_report_json["judge_decision"]["summary"]["final_action"] == "wait"

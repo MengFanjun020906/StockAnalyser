@@ -15,6 +15,9 @@ from src.agent.multi_expert.state import AgentState, ExpertOpinion, ExpertVerdic
 
 
 def build_market_regime_expert_opinion(state: AgentState) -> ExpertOpinion:
+    packet_opinion = _opinion_from_packet(state, "market_regime_expert")
+    if packet_opinion:
+        return packet_opinion
     regime = state.evidence_bundle.market_regime or {}
     regime_name = str(regime.get("regime") or "unknown")
     risk_level = str(regime.get("risk_level") or "unknown")
@@ -84,6 +87,9 @@ def build_candidate_expert_opinion(state: AgentState) -> ExpertOpinion:
 
 
 def build_technical_expert_opinion(state: AgentState) -> ExpertOpinion:
+    packet_opinion = _opinion_from_packet(state, "technical_expert")
+    if packet_opinion:
+        return packet_opinion
     return _dimension_opinion(
         state,
         expert_name="technical_expert",
@@ -95,6 +101,9 @@ def build_technical_expert_opinion(state: AgentState) -> ExpertOpinion:
 
 
 def build_capital_expert_opinion(state: AgentState) -> ExpertOpinion:
+    packet_opinion = _opinion_from_packet(state, "capital_chip_expert")
+    if packet_opinion:
+        return packet_opinion
     return _dimension_opinion(
         state,
         expert_name="capital_chip_expert",
@@ -106,6 +115,9 @@ def build_capital_expert_opinion(state: AgentState) -> ExpertOpinion:
 
 
 def build_news_sentiment_expert_opinion(state: AgentState) -> ExpertOpinion:
+    packet_opinion = _opinion_from_packet(state, "news_sentiment_expert")
+    if packet_opinion:
+        return packet_opinion
     candidate_hits = _candidate_dimension_hits(state.evidence_bundle.candidate_pool, {"sentiment", "message", "news_event"})
     opinion = _dimension_opinion(
         state,
@@ -124,6 +136,9 @@ def build_news_sentiment_expert_opinion(state: AgentState) -> ExpertOpinion:
 
 
 def build_fundamental_expert_opinion(state: AgentState) -> ExpertOpinion:
+    packet_opinion = _opinion_from_packet(state, "fundamental_expert")
+    if packet_opinion:
+        return packet_opinion
     return _dimension_opinion(
         state,
         expert_name="fundamental_expert",
@@ -217,6 +232,40 @@ def _dimension_opinion(
         risk_flags=list(dict.fromkeys(risks))[:8],
         candidate_impacts=impacts,
         recommended_action="continue_or_wait" if verdict in {"support", "caution"} else "wait",
+    )
+
+
+def _opinion_from_packet(state: AgentState, expert_name: str) -> ExpertOpinion | None:
+    packets = state.evidence_bundle.expert_packets or []
+    packet = next((item for item in packets if item.expert == expert_name), None)
+    if packet is None:
+        return None
+    if packet.stance == "support":
+        verdict: ExpertVerdict = "support"
+    elif packet.stance == "oppose":
+        verdict = "oppose"
+    elif packet.stance == "wait_confirm":
+        verdict = "caution"
+    elif packet.stance == "invalid":
+        verdict = "insufficient_data"
+    else:
+        verdict = "neutral"
+    return ExpertOpinion(
+        expert_name=expert_name,
+        dimension=packet.dimension,
+        verdict=verdict,
+        confidence=packet.confidence,
+        summary=packet.summary,
+        supporting_evidence=packet.top_supports,
+        opposing_evidence=packet.top_risks,
+        missing_evidence=packet.missing_evidence,
+        risk_flags=packet.top_risks,
+        candidate_impacts=[{
+            "key_cards": packet.key_cards,
+            "raw_refs": packet.raw_refs,
+            "action_bias": packet.action_bias,
+        }],
+        recommended_action=packet.action_bias,
     )
 
 

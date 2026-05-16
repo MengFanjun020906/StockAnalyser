@@ -338,7 +338,17 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(payload["content"], "ok")
 
     def test_trace_run_returns_tool_log_and_progress_events(self) -> None:
-        config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
+        config = SimpleNamespace(
+            is_agent_available=lambda: True,
+            report_language="zh",
+            agent_mode=True,
+            agent_analysis_mode="planning_execute",
+            agent_orchestration_mode="expert_graph",
+            agent_arch="single",
+            agent_max_steps=20,
+            agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
+        )
         executor = MagicMock()
         executor.chat.side_effect = lambda **kwargs: (
             kwargs["progress_callback"]({"type": "tool_start", "step": 1, "tool": "get_realtime_quote"})
@@ -419,6 +429,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertEqual(payload["debate"]["judge_decision"]["final_action"], "hold")
             self.assertEqual(payload["risk_gate"]["trade_plan"]["action"], "hold")
             self.assertEqual(payload["risk_gate"]["risk_gate"]["status"], "passed")
+            self.assertEqual(payload["runtime_config"]["agent_orchestration_mode"], "expert_graph")
             with open(os.path.join(payload["artifact_dir"], "events.ndjson"), encoding="utf-8") as fh:
                 lines = [json.loads(line) for line in fh if line.strip()]
             self.assertEqual(lines[0]["type"], "tool_start")
@@ -445,6 +456,22 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertIn('result_preview={"price": 100}', todo_md)
             self.assertIn("## Execute Protocol 复核", todo_md)
 
+    def test_runtime_config_endpoint_returns_orchestration_mode(self) -> None:
+        config = SimpleNamespace(
+            agent_mode=True,
+            agent_analysis_mode="planning_execute",
+            agent_orchestration_mode="expert_graph",
+            agent_arch="react",
+            agent_max_steps=20,
+            agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
+        )
+        with patch("api.v1.endpoints.agent.get_config", return_value=config):
+            payload = asyncio.run(agent.get_agent_runtime_config()).model_dump()
+
+        self.assertEqual(payload["runtime_config"]["agent_orchestration_mode"], "expert_graph")
+        self.assertEqual(payload["runtime_config"]["agent_tool_call_timeout_seconds"], 30)
+
     def test_trace_tool_status_marks_preview_errors_failed(self) -> None:
         call = {
             "step": 1,
@@ -468,7 +495,17 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertFalse(event["success"])
 
     def test_trace_stream_emits_context_planner_tool_and_done_events(self) -> None:
-        config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
+        config = SimpleNamespace(
+            is_agent_available=lambda: True,
+            report_language="zh",
+            agent_mode=True,
+            agent_analysis_mode="planning_execute",
+            agent_orchestration_mode="expert_graph",
+            agent_arch="single",
+            agent_max_steps=20,
+            agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
+        )
         executor = MagicMock()
         executor.chat.side_effect = lambda **kwargs: (
             kwargs["progress_callback"]({
@@ -539,6 +576,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(events[-1]["content"], "stream ok")
         self.assertEqual(events[-1]["debate"]["judge_decision"]["final_action"], "hold")
         self.assertEqual(events[-1]["risk_gate"]["risk_gate"]["status"], "passed")
+        self.assertEqual(events[-1]["runtime_config"]["agent_orchestration_mode"], "expert_graph")
         self.assertTrue(events[-1]["artifact_dir"])
         tool_event = next(event for event in events if event["type"] == "tool_done")
         self.assertEqual(tool_event["display_name"], "获取实时行情")
@@ -763,7 +801,12 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(summary["target_position"]["symbol"], "600519")
         self.assertEqual(summary["target_position"]["quantity"], 150000.0)
 
-    def test_trace_context_builds_minimal_planner_context_for_stock_selection_without_portfolio(self):
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_trace_context_builds_minimal_planner_context_for_stock_selection_without_portfolio(self, mock_completion):
+        mock_completion.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"intent":"watchlist_scan"}'))]
+        )
         context = agent._build_trace_context(
             request=agent.AgentTraceRunRequest(
                 message="我现在有5w，我希望你帮我选股，并告诉我怎么分配仓位",
@@ -789,6 +832,160 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertIsNotNone(planner)
         self.assertEqual(planner["intent"], "watchlist_scan")
         self.assertIsNone(planner["primary_symbol"])
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_trace_context_forces_watchlist_scan_when_portfolio_context_is_injected(self, mock_completion) -> None:
+        mock_completion.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"intent":"watchlist_scan"}'))]
+        )
+        mock_portfolio_service = MagicMock()
+        mock_portfolio_service.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-05-15",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 7,
+                    "account_name": "A股主账户",
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 50000,
+                    "total_market_value": 0,
+                    "total_equity": 50000,
+                    "positions": [],
+                }
+            ],
+        }
+
+        with patch("src.services.portfolio_service.PortfolioService", return_value=mock_portfolio_service):
+            context = agent._build_trace_context(
+                request=agent.AgentTraceRunRequest(
+                    message="我现在有5w，我希望你帮我选股，并告诉我怎么分配仓位",
+                    account_id=7,
+                    inject_portfolio_context=True,
+                    report_intent=None,
+                    risk_preference="balanced",
+                    trading_horizon="swing",
+                ),
+                config=SimpleNamespace(report_language="zh"),
+            )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertTrue(context["agent_user_context"].report.include_watchlist_ranking)
+        planner = agent._build_planner_trace(context)
+        self.assertIsNotNone(planner)
+        self.assertEqual(planner["intent"], "watchlist_scan")
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": ""}, clear=False)
+    def test_trace_context_does_not_use_keyword_matching_when_mimo_is_unconfigured(self) -> None:
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="帮我选一下下周可以入手的股票",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertTrue(context["agent_user_context"].report.include_watchlist_ranking)
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_trace_context_uses_mimo_intent_classifier_for_natural_stock_selection_request(self, mock_completion) -> None:
+        mock_completion.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"intent":"watchlist_scan","confidence":0.96,"reason":"用户要求从市场选择下周可入手股票"}'
+                    )
+                )
+            ]
+        )
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="帮我选一下下周可以入手的股票",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertTrue(context["agent_user_context"].report.include_watchlist_ranking)
+        self.assertNotIn("stock_code", context)
+        summary = agent._build_trace_context_summary(context)
+        self.assertEqual(summary["intent_resolution"]["source"], "mimo")
+        self.assertTrue(summary["intent_resolution"]["classifier_success"])
+        self.assertEqual(summary["intent_resolution"]["classifier_model"], "mimo-v2.5")
+        mock_completion.assert_called()
+        call_kwargs = mock_completion.call_args.kwargs
+        self.assertEqual(call_kwargs["model"], "openai/mimo-v2.5")
+        self.assertEqual(call_kwargs["api_base"], "https://mimo.example/v1")
+        self.assertEqual(call_kwargs["max_tokens"], 600)
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_MODEL": "mimo-v2.5-pro", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_mimo_intent_classifier_model_is_configurable(self, mock_completion) -> None:
+        mock_completion.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"intent":"watchlist_scan"}'))]
+        )
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="帮我选一下下周可以入手的股票",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertEqual(mock_completion.call_args.kwargs["model"], "openai/mimo-v2.5-pro")
+        summary = agent._build_trace_context_summary(context)
+        self.assertEqual(summary["intent_resolution"]["classifier_model"], "mimo-v2.5-pro")
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_mimo_intent_classifier_failure_is_visible_in_context_summary(self, mock_completion) -> None:
+        mock_completion.side_effect = RuntimeError("Not supported model")
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="帮我选一下下周可以入手的股票",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        summary = agent._build_trace_context_summary(context)
+        self.assertEqual(summary["intent_resolution"]["source"], "default")
+        self.assertEqual(summary["intent_resolution"]["intent"], "watchlist_scan")
+        self.assertFalse(summary["intent_resolution"]["classifier_success"])
+        self.assertIn("Not supported model", summary["intent_resolution"]["classifier_error"])
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": "sk-api-key"}, clear=False)
+    @patch("litellm.completion")
+    def test_mimo_intent_classifier_accepts_legacy_api_key_env_name(self, mock_completion) -> None:
+        mock_completion.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"intent":"watchlist_scan"}'))]
+        )
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="帮我选一下下周可以入手的股票",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertEqual(mock_completion.call_args.kwargs["api_key"], "sk-api-key")
 class AgentModelsSourceDetectionTestCase(unittest.TestCase):
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

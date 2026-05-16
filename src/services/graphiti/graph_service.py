@@ -7,6 +7,7 @@ import asyncio
 import logging
 import json
 import re
+import socket
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from threading import Lock
@@ -50,6 +51,19 @@ def _safe_group_token(value: str | None, default: str) -> str:
     return candidate.strip("_") or default
 
 
+def _can_open_tcp(uri: str, timeout_seconds: float = 0.5) -> tuple[bool, str]:
+    match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/:]+)(?::(\d+))?", uri or "")
+    if not match:
+        return False, "invalid_uri"
+    host = match.group(1)
+    port = int(match.group(2) or 7687)
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True, ""
+    except OSError as exc:
+        return False, f"{type(exc).__name__}:{exc}"
+
+
 class GraphitiService:
     """Best-effort Graphiti facade with lazy initialization."""
 
@@ -61,6 +75,16 @@ class GraphitiService:
         self._indices_ready = False
         if not self.enabled:
             logger.info("Graphiti disabled by config")
+            return
+
+        ok, error = _can_open_tcp(self.config.graphiti_neo4j_uri)
+        if not ok:
+            self.enabled = False
+            logger.warning(
+                "Graphiti disabled because Neo4j is unreachable at %s: %s",
+                self.config.graphiti_neo4j_uri,
+                error,
+            )
             return
 
         try:

@@ -362,6 +362,12 @@ Agent 模式会注册工具，供 LLM 按阶段调用。主要工具包括：
 | `get_market_capital_flow` | data | 获取 A 股市场资金快照、个股/行业/概念资金流排名 |
 | `get_northbound_capital_flow` | data | 获取北向资金摘要和近期历史 |
 | `get_margin_trading_summary` | data | 获取融资融券余额、融资买入和交易所两融摘要 |
+| `get_stockapi_limit_up_pool` | data | 获取 StockAPI 涨停股池，返回涨停原因、连板、封单、概念和板块原因 |
+| `get_stockapi_hot_sectors` | data | 获取 StockAPI 热点板块/概念净流入、强度和趋势 |
+| `get_stockapi_sector_constituents` | data | 按 `bkCode` 获取板块/概念成分股及个股主力资金字段 |
+| `get_stockapi_sector_flow_history` | data | 按 `bkCode` 获取板块/概念历史资金流，验证资金持续性 |
+| `get_stockapi_popularity_rank` | data | 获取 StockAPI 股票人气榜和 AI 原因，用于情绪/关注度候选 |
+| `get_stockapi_hot_money_activity` | data | 获取 StockAPI 游资上榜或单股游资活动，用于短线资金确认 |
 | `get_portfolio_snapshot` | data | 获取持仓和风险摘要 |
 | `analyze_trend` | analysis | 执行确定性趋势分析 |
 | `calculate_ma` | analysis | 计算自定义均线和乖离率 |

@@ -163,3 +163,14 @@ def test_detect_market_regime_tool_uses_persisted_state_and_context():
     assert result["history_source"] == "unit"
     assert result["persisted"] is True
     assert fake_db.saved is not None
+
+
+def test_detect_market_regime_tool_returns_structured_timeout_diagnostics():
+    with patch("src.agent.tools.market_tools._run_with_timeout", return_value=(None, "market_history timeout", 10)), \
+         patch("src.storage.get_db", side_effect=RuntimeError("db unavailable")):
+        result = _handle_detect_market_regime(persist=True)
+
+    assert result["status"] == "insufficient_data"
+    assert result["history_source"] == "timeout"
+    assert any("market_history timeout" in item for item in result["data_errors"])
+    assert result["component_diagnostics"]["market_history"]["status"] == "timeout"

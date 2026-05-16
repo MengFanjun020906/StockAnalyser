@@ -11,8 +11,12 @@ Tools:
 import logging
 import re
 import concurrent.futures
-from typing import Any, Dict, Iterable, List, Optional
+import time
+from datetime import datetime, timedelta
+from threading import Thread
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from src.agent.candidate_experts import CandidateExpertOrchestrator
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 from src.agent.regime import SentimentComponents, coerce_bars, detect_market_regime
@@ -25,6 +29,222 @@ logger = logging.getLogger(__name__)
 
 _SECTOR_CONSTITUENT_FETCH_TIMEOUT_S = 3.0
 _EVENT_IMPACT_MAX_CONFIRMED_THEMES = 4
+
+
+def _run_with_timeout(
+    task: Callable[[], Any],
+    timeout_seconds: float,
+    task_name: str,
+) -> Tuple[Any, Optional[str], int]:
+    start = time.time()
+    timeout_value = max(0.0, float(timeout_seconds or 0.0))
+    if timeout_value <= 0:
+        return None, f"{task_name} timeout", 0
+
+    result_holder: Dict[str, Any] = {}
+    error_holder: Dict[str, Exception] = {}
+
+    def runner() -> None:
+        try:
+            result_holder["value"] = task()
+        except Exception as exc:
+            error_holder["value"] = exc
+
+    worker = Thread(target=runner, daemon=True, name=f"agent-market-{task_name}")
+    worker.start()
+    worker.join(timeout=timeout_value)
+    if worker.is_alive():
+        return None, f"{task_name} timeout", int(timeout_value * 1000)
+    duration_ms = int((time.time() - start) * 1000)
+    if "value" in error_holder:
+        return None, str(error_holder["value"]), duration_ms
+    return result_holder.get("value"), None, duration_ms
+
+
+def _get_agent_timeout_attr(attr_name: str, default: float) -> float:
+    try:
+        from src.config import get_config
+
+        return float(getattr(get_config(), attr_name, default))
+    except Exception:
+        return float(default)
+
+
+def _get_sector_rankings_agent_probe(manager: Any, top_n: int, timeout: float) -> tuple:
+    """Probe sector rankings with Agent-safe ordering and per-source budgets."""
+    if not hasattr(manager, "_get_fetchers_snapshot") or not hasattr(manager, "_run_with_timeout"):
+        result = manager.get_sector_rankings(n=top_n)
+        if isinstance(result, tuple) and len(result) == 2:
+            return result[0], result[1], [], ""
+        return [], [], [], "No sector ranking data available"
+
+    fetcher_order = {
+        "TushareFetcher": 0,
+        "AkshareFetcher": 1,
+        "EfinanceFetcher": 2,
+    }
+    capable_names = {"AkshareFetcher", "TushareFetcher", "EfinanceFetcher"}
+    fetchers = sorted(
+        [
+            fetcher
+            for fetcher in manager._get_fetchers_snapshot()
+            if getattr(fetcher, "name", "") in capable_names and hasattr(fetcher, "get_sector_rankings")
+        ],
+        key=lambda item: (fetcher_order.get(getattr(item, "name", ""), 99), getattr(item, "priority", 99)),
+    )
+    source_chain: List[Dict[str, Any]] = []
+    last_error = ""
+    started_at = time.time()
+    per_fetcher_timeout = max(0.5, min(float(timeout), 2.5)) if timeout > 0 else 0.0
+
+    for fetcher in fetchers:
+        if not hasattr(fetcher, "get_sector_rankings"):
+            continue
+        remaining_timeout = max(0.0, float(timeout) - (time.time() - started_at))
+        if remaining_timeout <= 0:
+            last_error = "sector_rankings timeout"
+            source_chain.append({
+                "provider": "sector_rankings",
+                "result": "timeout",
+                "duration_ms": int(float(timeout) * 1000),
+                "error": last_error,
+            })
+            break
+        data, call_err, duration_ms = manager._run_with_timeout(
+            lambda fetcher=fetcher: fetcher.get_sector_rankings(top_n),
+            min(remaining_timeout, per_fetcher_timeout),
+            f"{getattr(fetcher, 'name', 'fetcher')}_sector_rankings",
+        )
+        if call_err:
+            last_error = f"{getattr(fetcher, 'name', 'fetcher')} {call_err}"
+            source_chain.append({
+                "provider": getattr(fetcher, "name", "fetcher"),
+                "result": "timeout" if "timeout" in str(call_err).lower() else "failed",
+                "duration_ms": duration_ms,
+                "error": call_err,
+            })
+            continue
+        if isinstance(data, tuple) and len(data) == 2 and data[0] is not None and data[1] is not None:
+            source_chain.append({
+                "provider": getattr(fetcher, "name", "fetcher"),
+                "result": "ok",
+                "duration_ms": duration_ms,
+            })
+            return data[0], data[1], source_chain, ""
+        last_error = f"{getattr(fetcher, 'name', 'fetcher')}返回空结果"
+        source_chain.append({
+            "provider": getattr(fetcher, "name", "fetcher"),
+            "result": "empty",
+            "duration_ms": duration_ms,
+            "error": last_error,
+        })
+
+    return [], [], source_chain, last_error
+
+
+def _get_tushare_sector_rankings_fast(top_n: int, timeout: float) -> Optional[tuple]:
+    """Fast-path sector rankings via Tushare moneyflow industry endpoints."""
+    try:
+        from data_provider.tushare_client import get_tushare_token, query_tushare_api
+    except Exception:
+        return None
+    if not get_tushare_token():
+        return None
+
+    started_at = time.time()
+    now = datetime.now()
+    cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    end_day = now.date() if now >= cutoff else (now.date() - timedelta(days=1))
+    start_day = end_day - timedelta(days=20)
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    def remaining(default: float = 1.5) -> float:
+        return max(1.0, min(default, float(timeout) - (time.time() - started_at)))
+
+    try:
+        cal_df = query_tushare_api(
+            "trade_cal",
+            params={
+                "exchange": "SSE",
+                "start_date": start_day.strftime("%Y%m%d"),
+                "end_date": end_day.strftime("%Y%m%d"),
+            },
+            fields="cal_date,is_open",
+            timeout=int(remaining(2.0)),
+        )
+        dates = [
+            str(row.get("cal_date") or "")
+            for row in cal_df.to_dict(orient="records")
+            if str(row.get("is_open")) in {"1", "1.0", "True", "true"}
+        ]
+        dates = list(reversed([item for item in dates if item]))[:4]
+    except Exception as exc:
+        dates = [end_day.strftime("%Y%m%d")]
+        errors.append(f"tushare:trade_cal:{exc}")
+
+    def rank_rows(rows: List[Dict[str, Any]], name_key: str) -> tuple:
+        scored: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                change = float(row.get("pct_change"))
+            except Exception:
+                continue
+            name = str(row.get(name_key) or "").strip()
+            if name:
+                scored.append({"name": name, "change_pct": change})
+        scored.sort(key=lambda item: item["change_pct"], reverse=True)
+        top = scored[:top_n]
+        bottom = list(reversed(scored[-top_n:])) if scored else []
+        return top, bottom
+
+    for trade_date in dates:
+        if time.time() - started_at >= timeout:
+            break
+        for api_name, fields, name_key, filter_industry in (
+            ("moneyflow_ind_ths", "trade_date,industry,pct_change", "industry", False),
+            ("moneyflow_ind_dc", "trade_date,name,pct_change,content_type", "name", True),
+        ):
+            call_start = time.time()
+            try:
+                df = query_tushare_api(
+                    api_name,
+                    params={"trade_date": trade_date},
+                    fields=fields,
+                    timeout=int(remaining(1.5)),
+                )
+            except Exception as exc:
+                errors.append(f"tushare:{api_name}:{exc}")
+                source_chain.append({
+                    "provider": f"tushare:{api_name}",
+                    "result": "failed",
+                    "duration_ms": int((time.time() - call_start) * 1000),
+                    "error": str(exc),
+                })
+                continue
+            if filter_industry and "content_type" in df.columns:
+                df = df[df["content_type"] == "行业"]
+            if df is None or df.empty:
+                source_chain.append({
+                    "provider": f"tushare:{api_name}",
+                    "result": "empty",
+                    "duration_ms": int((time.time() - call_start) * 1000),
+                    "trade_date": trade_date,
+                })
+                continue
+            top, bottom = rank_rows(df.to_dict(orient="records"), name_key)
+            if top or bottom:
+                source_chain.append({
+                    "provider": f"tushare:{api_name}",
+                    "result": "ok",
+                    "duration_ms": int((time.time() - call_start) * 1000),
+                    "trade_date": trade_date,
+                })
+                return top, bottom, source_chain, ""
+
+    if source_chain or errors:
+        return [], [], source_chain, " | ".join(errors) or "Tushare sector rankings empty"
+    return None
 
 
 DEFAULT_WATCHLIST_SEEDS: List[Dict[str, Any]] = [
@@ -416,12 +636,67 @@ def _top_sector_names(top_n: int) -> List[str]:
     return names
 
 
-def _fetch_sector_constituents(sector_name: str, limit: int) -> List[Dict[str, Any]]:
+def _discover_local_strategy_candidates_for_sector_fallback(
+    *,
+    effective_limit: int,
+    strategy_names: Optional[List[str]],
+    reason: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Use local strategy providers when sector constituent APIs are unavailable."""
+    provider_limit = min(50, max(effective_limit * 3, effective_limit))
+    candidates: List[Dict[str, Any]] = []
+    steps: List[Dict[str, Any]] = []
+    providers: Tuple[Tuple[str, Callable[[], Dict[str, Any]]], ...] = (
+        (
+            "sector_local_fallback:alphasift",
+            lambda: AlphaSiftCandidateProvider().discover(limit=provider_limit, strategy_names=strategy_names),
+        ),
+        (
+            "sector_local_fallback:sequoia",
+            lambda: SequoiaCandidateProvider().discover(limit=provider_limit, strategy_names=strategy_names),
+        ),
+    )
+    for source, discover in providers:
+        try:
+            result = discover()
+        except Exception as exc:
+            steps.append({
+                "source": source,
+                "status": "failed",
+                "count": 0,
+                "reason": reason,
+                "error": str(exc),
+            })
+            continue
+        provider_candidates = result.get("candidates") or []
+        steps.append({
+            "source": source,
+            "status": result.get("status", "failed"),
+            "count": len(provider_candidates),
+            "reason": reason,
+            "provider": result.get("provider"),
+            "db_path": result.get("db_path"),
+            "strategy_names": result.get("strategy_names", []),
+            "diagnostics": result.get("diagnostics", []),
+            **({"error": result.get("error")} if result.get("error") else {}),
+        })
+        candidates.extend(provider_candidates)
+    return candidates, steps
+
+
+def _fetch_sector_constituents(
+    sector_name: str,
+    limit: int,
+    *,
+    include_diagnostics: bool = False,
+) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    diagnostics: List[Dict[str, Any]] = []
     try:
         import akshare as ak
     except Exception as exc:
         logger.warning("AkShare unavailable for candidate discovery: %s", exc)
-        return []
+        diagnostics.append({"source": "akshare", "status": "unavailable", "error": str(exc)})
+        return ([], diagnostics) if include_diagnostics else []
 
     fetchers = (
         ("industry", getattr(ak, "stock_board_industry_cons_em", None)),
@@ -430,14 +705,23 @@ def _fetch_sector_constituents(sector_name: str, limit: int) -> List[Dict[str, A
     candidates: List[Dict[str, Any]] = []
     for source, fetcher in fetchers:
         if fetcher is None:
+            diagnostics.append({"source": f"akshare:{source}", "status": "unavailable"})
             continue
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        call_start = time.time()
         try:
             future = pool.submit(fetcher, symbol=sector_name)
             try:
                 df = future.result(timeout=_SECTOR_CONSTITUENT_FETCH_TIMEOUT_S)
             except concurrent.futures.TimeoutError:
                 future.cancel()
+                diagnostics.append({
+                    "source": f"akshare:{source}",
+                    "status": "timeout",
+                    "sector": sector_name,
+                    "timeout_s": _SECTOR_CONSTITUENT_FETCH_TIMEOUT_S,
+                    "duration_ms": int((time.time() - call_start) * 1000),
+                })
                 logger.warning(
                     "Candidate discovery sector constituent fetch timed out for sector=%s source=%s after %.1fs",
                     sector_name,
@@ -446,11 +730,24 @@ def _fetch_sector_constituents(sector_name: str, limit: int) -> List[Dict[str, A
                 )
                 continue
         except Exception as exc:
+            diagnostics.append({
+                "source": f"akshare:{source}",
+                "status": "failed",
+                "sector": sector_name,
+                "duration_ms": int((time.time() - call_start) * 1000),
+                "error": str(exc),
+            })
             logger.debug("Candidate discovery failed for sector=%s source=%s: %s", sector_name, source, exc)
             continue
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
         if df is None or getattr(df, "empty", True):
+            diagnostics.append({
+                "source": f"akshare:{source}",
+                "status": "empty",
+                "sector": sector_name,
+                "duration_ms": int((time.time() - call_start) * 1000),
+            })
             continue
         for row in df.head(limit).to_dict(orient="records"):
             normalized = _normalize_stock_candidate(
@@ -460,9 +757,16 @@ def _fetch_sector_constituents(sector_name: str, limit: int) -> List[Dict[str, A
             )
             if normalized:
                 candidates.append(normalized)
+        diagnostics.append({
+            "source": f"akshare:{source}",
+            "status": "ok" if candidates else "empty",
+            "sector": sector_name,
+            "count": len(candidates),
+            "duration_ms": int((time.time() - call_start) * 1000),
+        })
         if candidates:
             break
-    return candidates
+    return (candidates, diagnostics) if include_diagnostics else candidates
 
 
 _NEWS_SENTIMENT_TOPICS = (
@@ -1143,12 +1447,44 @@ def _discover_event_impact_candidates(*, market: str, limit: int) -> Dict[str, A
 def _handle_get_market_indices(region: str = "cn") -> dict:
     """Get major market indices."""
     manager = _get_fetcher_manager()
-    indices = manager.get_main_indices(region=region)
+    timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 2.0)
+    indices, err, cost_ms = _run_with_timeout(
+        lambda: manager.get_main_indices(region=region),
+        timeout,
+        "market_indices",
+    )
+
+    if err:
+        return {
+            "status": "timeout" if "timeout" in str(err).lower() else "failed",
+            "region": region,
+            "indices_count": 0,
+            "indices": [],
+            "source_chain": [{
+                "provider": "market_indices",
+                "result": "timeout" if "timeout" in str(err).lower() else "failed",
+                "duration_ms": cost_ms,
+            }],
+            "errors": [str(err)],
+            "error_summary": str(err),
+        }
 
     if not indices:
-        return {"error": f"No market index data available for region '{region}'"}
+        return {
+            "status": "empty",
+            "region": region,
+            "indices_count": 0,
+            "indices": [],
+            "source_chain": [{
+                "provider": "market_indices",
+                "result": "empty",
+                "duration_ms": cost_ms,
+            }],
+            "errors": [f"No market index data available for region '{region}'"],
+        }
 
     return {
+        "status": "ok",
         "region": region,
         "indices_count": len(indices),
         "indices": indices,
@@ -1181,23 +1517,87 @@ get_market_indices_tool = ToolDefinition(
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
     manager = _get_fetcher_manager()
-    result = manager.get_sector_rankings(n=top_n)
+    timeout = _get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0)
+    fast_result = _get_tushare_sector_rankings_fast(top_n, timeout)
+    if isinstance(fast_result, tuple) and len(fast_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = fast_result
+        if top_sectors or bottom_sectors:
+            return {
+                "status": "ok",
+                "top_sectors": top_sectors or [],
+                "bottom_sectors": bottom_sectors or [],
+                "source_chain": source_chain,
+                "errors": [],
+            }
+
+    result, err, cost_ms = _run_with_timeout(
+        lambda: _get_sector_rankings_agent_probe(manager, top_n, timeout),
+        timeout,
+        "sector_rankings",
+    )
+
+    if err:
+        return {
+            "status": "timeout" if "timeout" in str(err).lower() else "failed",
+            "top_sectors": [],
+            "bottom_sectors": [],
+            "source_chain": [{
+                "provider": "sector_rankings",
+                "result": "timeout" if "timeout" in str(err).lower() else "failed",
+                "duration_ms": cost_ms,
+            }],
+            "errors": [str(err)],
+            "error_summary": str(err),
+        }
 
     if result is None:
-        return {"error": "No sector ranking data available"}
+        return {
+            "status": "empty",
+            "top_sectors": [],
+            "bottom_sectors": [],
+            "source_chain": [{"provider": "sector_rankings", "result": "empty", "duration_ms": cost_ms}],
+            "errors": ["No sector ranking data available"],
+        }
 
+    if isinstance(result, tuple) and len(result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = result
+        status = "ok" if top_sectors or bottom_sectors else "empty"
+        return {
+            "status": status,
+            "top_sectors": top_sectors or [],
+            "bottom_sectors": bottom_sectors or [],
+            "source_chain": source_chain or [{
+                "provider": "sector_rankings",
+                "result": status,
+                "duration_ms": cost_ms,
+            }],
+            "errors": [chain_error] if chain_error else [],
+        }
     # get_sector_rankings returns Tuple[List[Dict], List[Dict]]
     # (top_sectors, bottom_sectors)
     if isinstance(result, tuple) and len(result) == 2:
         top_sectors, bottom_sectors = result
         return {
+            "status": "ok" if top_sectors or bottom_sectors else "empty",
             "top_sectors": top_sectors,
             "bottom_sectors": bottom_sectors,
+            "source_chain": [{"provider": "sector_rankings", "result": "ok", "duration_ms": cost_ms}],
+            "errors": [],
         }
     elif isinstance(result, list):
-        return {"sectors": result}
+        return {
+            "status": "ok" if result else "empty",
+            "sectors": result,
+            "source_chain": [{"provider": "sector_rankings", "result": "ok", "duration_ms": cost_ms}],
+            "errors": [],
+        }
     else:
-        return {"data": str(result)}
+        return {
+            "status": "partial",
+            "data": str(result),
+            "source_chain": [{"provider": "sector_rankings", "result": "partial", "duration_ms": cost_ms}],
+            "errors": [],
+        }
 
 
 get_sector_rankings_tool = ToolDefinition(
@@ -1329,7 +1729,19 @@ def _handle_detect_market_regime(
         }
 
     lookback = max(120, min(int(lookback_days or 260), 520))
-    history_rows, history_source = _load_market_history(index_code or "000300", lookback)
+    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 2.0)
+    history_result, history_err, history_ms = _run_with_timeout(
+        lambda: _load_market_history(index_code or "000300", lookback),
+        component_timeout,
+        "market_history",
+    )
+    data_errors: List[str] = []
+    if isinstance(history_result, tuple) and len(history_result) == 2:
+        history_rows, history_source = history_result
+    else:
+        history_rows, history_source = [], "timeout" if history_err else "none"
+        if history_err:
+            data_errors.append(f"market_history: {history_err}")
     bars = coerce_bars(history_rows)
     try:
         from src.storage import get_db
@@ -1346,16 +1758,11 @@ def _handle_detect_market_regime(
     northbound: Dict[str, Any] = {}
     margin: Dict[str, Any] = {}
     market_flow: Dict[str, Any] = {}
-    data_errors: List[str] = []
 
-    try:
-        indices = _handle_get_market_indices(region="cn").get("indices") or []
-    except Exception as exc:
-        data_errors.append(f"market_indices: {exc}")
-    try:
-        sector_rankings = _handle_get_sector_rankings(top_n=10)
-    except Exception as exc:
-        data_errors.append(f"sector_rankings: {exc}")
+    component_tasks = {
+        "market_indices": lambda: _handle_get_market_indices(region="cn"),
+        "sector_rankings": lambda: _handle_get_sector_rankings(top_n=10),
+    }
     try:
         from src.agent.tools.data_tools import (
             _handle_get_market_capital_flow,
@@ -1363,11 +1770,71 @@ def _handle_detect_market_regime(
             _handle_get_northbound_capital_flow,
         )
 
-        market_flow = _handle_get_market_capital_flow(top_n=5)
-        northbound = _handle_get_northbound_capital_flow(limit=10)
-        margin = _handle_get_margin_trading_summary(limit=10)
+        component_tasks.update({
+            "market_flow": lambda: _handle_get_market_capital_flow(top_n=5),
+            "northbound": lambda: _handle_get_northbound_capital_flow(limit=10),
+            "margin": lambda: _handle_get_margin_trading_summary(limit=10),
+        })
     except Exception as exc:
-        data_errors.append(f"capital_flow_components: {exc}")
+        data_errors.append(f"capital_flow_components_import: {exc}")
+
+    component_diagnostics: Dict[str, Any] = {
+        "market_history": {
+            "status": "ok" if bars else ("timeout" if history_err else "empty"),
+            "duration_ms": history_ms,
+            "error": history_err,
+        }
+    }
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(component_tasks)))
+    try:
+        futures = {
+            pool.submit(_run_with_timeout, task, component_timeout, name): name
+            for name, task in component_tasks.items()
+        }
+        done, pending = concurrent.futures.wait(
+            futures,
+            timeout=component_timeout + 0.5,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+        for future in pending:
+            name = futures[future]
+            future.cancel()
+            component_diagnostics[name] = {
+                "status": "timeout",
+                "duration_ms": int(component_timeout * 1000),
+                "error": f"{name} timeout",
+            }
+            data_errors.append(f"{name}: {name} timeout")
+        for future in done:
+            name = futures[future]
+            try:
+                payload, err, cost_ms = future.result()
+            except Exception as exc:
+                payload, err, cost_ms = None, str(exc), 0
+            status = "ok" if err is None else ("timeout" if "timeout" in str(err).lower() else "failed")
+            component_diagnostics[name] = {"status": status, "duration_ms": cost_ms, "error": err}
+            if err:
+                data_errors.append(f"{name}: {err}")
+                continue
+            if not isinstance(payload, dict):
+                data_errors.append(f"{name}: invalid payload")
+                continue
+            payload_status = str(payload.get("status", "")).lower()
+            if payload_status in {"failed", "error", "timeout"}:
+                errors = payload.get("errors") or payload.get("error") or payload.get("error_summary")
+                data_errors.append(f"{name}: {errors}")
+            if name == "market_indices":
+                indices = payload.get("indices") or []
+            elif name == "sector_rankings":
+                sector_rankings = payload
+            elif name == "market_flow":
+                market_flow = payload
+            elif name == "northbound":
+                northbound = payload
+            elif name == "margin":
+                margin = payload
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     sentiment = SentimentComponents(
         margin_balance_change=_derive_margin_component(margin),
@@ -1404,6 +1871,7 @@ def _handle_detect_market_regime(
         "history_records": len(bars),
         "persisted": False,
         "data_errors": data_errors,
+        "component_diagnostics": component_diagnostics,
         "market_context": {
             "indices": indices,
             "sector_rankings": {
@@ -1532,6 +2000,46 @@ def _handle_discover_watchlist_candidates(
             "candidates": [],
             "next_required_tools": [],
         }
+
+    if source_mode == "auto":
+        orchestrator = CandidateExpertOrchestrator(
+            timeout_s=_get_agent_timeout_attr("agent_candidate_expert_timeout_seconds", 20.0),
+            max_candidates_to_deep_dive=effective_limit,
+        )
+        expert_result = orchestrator.discover(
+            market=market,
+            sector_names=sector_names,
+            strategy_names=strategy_names,
+            limit=effective_limit,
+            tools={
+                "top_sector_names": _top_sector_names,
+                "fetch_sector_constituents": _fetch_sector_constituents,
+                "discover_news_momentum": lambda limit, seed_candidates=None: _discover_news_momentum_candidates(
+                    limit=limit,
+                    seed_candidates=seed_candidates,
+                ),
+                "discover_event_impact": lambda market, limit: _discover_event_impact_candidates(
+                    market=market,
+                    limit=limit,
+                ),
+                "fallback": lambda limit: _dedupe_candidates(
+                    [{**item, "source": "fallback_seed_pool"} for item in DEFAULT_WATCHLIST_SEEDS],
+                    limit,
+                ),
+            },
+        )
+        return _candidate_discovery_response(
+            status=expert_result.get("status", "partial"),
+            market=market,
+            candidates=expert_result.get("candidates") or [],
+            discovery_steps=expert_result.get("discovery_steps") or [],
+            fallback_used=bool(expert_result.get("fallback_used")),
+            candidate_source=str(expert_result.get("candidate_source") or "expert_graph_discovery"),
+            note="多专家候选召回结果：各候选专家独立 discover 后合并，不代表最终推荐；后续仍需逐只深度取证、反证审查和 Judge 裁决。",
+            expert_packets=expert_result.get("expert_packets") or [],
+            themes=expert_result.get("themes") or [],
+            capacity=expert_result.get("capacity") or {},
+        )
 
     alphasift_result: Dict[str, Any] = {}
     if source_mode in {"auto", "alphasift"}:
@@ -1687,16 +2195,37 @@ def _handle_discover_watchlist_candidates(
         discovery_steps.append({"source": "get_sector_rankings", "status": "ok" if sectors else "empty", "sectors": sectors})
 
     for sector in sectors if source_mode in {"auto", "sector"} else []:
-        sector_candidates = _fetch_sector_constituents(sector, limit=effective_limit if source_mode == "sector" else min(20, effective_limit * 2))
+        sector_result = _fetch_sector_constituents(
+            sector,
+            limit=effective_limit if source_mode == "sector" else min(20, effective_limit * 2),
+            include_diagnostics=True,
+        )
+        if isinstance(sector_result, tuple):
+            sector_candidates, sector_diagnostics = sector_result
+        else:
+            sector_candidates, sector_diagnostics = sector_result, []
         discovery_steps.append({
             "source": "sector_constituents",
             "sector": sector,
             "status": "ok" if sector_candidates else "empty",
             "count": len(sector_candidates),
+            "diagnostics": sector_diagnostics,
         })
         candidates.extend(sector_candidates)
         if source_mode == "sector" and len(_dedupe_candidates(candidates, effective_limit)) >= effective_limit:
             break
+
+    sector_local_fallback_used = False
+    if source_mode == "sector" and not candidates:
+        local_candidates, local_steps = _discover_local_strategy_candidates_for_sector_fallback(
+            effective_limit=effective_limit,
+            strategy_names=strategy_names,
+            reason="sector_constituents_empty_or_timeout",
+        )
+        discovery_steps.extend(local_steps)
+        if local_candidates:
+            sector_local_fallback_used = True
+            candidates.extend(local_candidates)
 
     fallback_used = False
     if not candidates:
@@ -1708,7 +2237,11 @@ def _handle_discover_watchlist_candidates(
         discovery_steps.append({"source": "fallback_seed_pool", "status": "ok", "count": len(candidates)})
 
     candidates = _dedupe_candidates(candidates, effective_limit)
-    candidate_source = "fallback" if fallback_used else ("multi_recall" if source_mode == "auto" else "sector")
+    candidate_source = (
+        "fallback"
+        if fallback_used
+        else ("sector_local_fallback" if sector_local_fallback_used else ("multi_recall" if source_mode == "auto" else "sector"))
+    )
     return _candidate_discovery_response(
         status="partial" if fallback_used else "ok",
         market=market,
@@ -1729,8 +2262,11 @@ def _candidate_discovery_response(
     fallback_used: bool,
     candidate_source: str,
     note: str,
+    expert_packets: Optional[List[Dict[str, Any]]] = None,
+    themes: Optional[List[Dict[str, Any]]] = None,
+    capacity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         "status": status,
         "market": market,
         "candidate_source": candidate_source,
@@ -1750,6 +2286,13 @@ def _candidate_discovery_response(
         ],
         "note": note,
     }
+    if expert_packets is not None:
+        payload["expert_packets"] = expert_packets
+    if themes is not None:
+        payload["themes"] = themes
+    if capacity is not None:
+        payload["capacity"] = capacity
+    return payload
 
 
 discover_watchlist_candidates_tool = ToolDefinition(
