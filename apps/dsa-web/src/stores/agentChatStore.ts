@@ -20,6 +20,11 @@ export interface ProgressStep {
   duration?: number;
   message?: string;
   content?: string;
+  tool_calls?: unknown[];
+  total_steps?: number;
+  total_tokens?: number;
+  provider?: string;
+  model?: string;
 }
 
 export interface Message {
@@ -31,6 +36,13 @@ export interface Message {
   skillNames?: string[];
   skillName?: string;
   thinkingSteps?: ProgressStep[];
+  toolCalls?: unknown[];
+  traceMeta?: {
+    totalSteps?: number;
+    totalTokens?: number;
+    provider?: string;
+    model?: string;
+  };
 }
 
 export interface StreamMeta {
@@ -261,6 +273,13 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
       const decoder = new TextDecoder();
       let buf = '';
       let finalContent: string | null = null;
+      let finalTrace: {
+        toolCalls?: unknown[];
+        totalSteps?: number;
+        totalTokens?: number;
+        provider?: string;
+        model?: string;
+      } = {};
       const currentProgressSteps: ProgressStep[] = [];
         const processLine = (line: string) => {
           if (!line.startsWith('data: ')) return;
@@ -272,6 +291,13 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
               throw getStreamFailureError(doneEvent, '大模型调用出错，请检查 API Key 配置');
             }
             finalContent = doneEvent.content ?? '';
+            finalTrace = {
+              toolCalls: Array.isArray(event.tool_calls) ? event.tool_calls : [],
+              totalSteps: typeof event.total_steps === 'number' ? event.total_steps : undefined,
+              totalTokens: typeof event.total_tokens === 'number' ? event.total_tokens : undefined,
+              provider: typeof event.provider === 'string' ? event.provider : undefined,
+              model: typeof event.model === 'string' ? event.model : undefined,
+            };
             return;
           }
 
@@ -328,6 +354,8 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
               skillNames,
               skillName,
               thinkingSteps: [...currentProgressSteps],
+              toolCalls: finalTrace.toolCalls,
+              traceMeta: finalTrace,
             },
           ],
         }));

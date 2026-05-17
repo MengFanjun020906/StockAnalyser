@@ -162,9 +162,10 @@ def get_tool_registry():
     from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
     from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
+    from src.agent.tools.graph_tools import ALL_GRAPH_TOOLS
 
     registry = ToolRegistry()
-    for tool_fn in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS:
+    for tool_fn in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS + ALL_GRAPH_TOOLS:
         registry.register(tool_fn)
 
     _TOOL_REGISTRY = registry
@@ -327,6 +328,8 @@ def build_agent_executor(config=None, skills: Optional[List[str]] = None):
         use_legacy_default_prompt=prompt_state.use_legacy_default_prompt,
         max_steps=getattr(config, "agent_max_steps", AGENT_MAX_STEPS_DEFAULT),
         timeout_seconds=getattr(config, "agent_orchestrator_timeout_s", 0),
+        tool_call_timeout_seconds=getattr(config, "agent_tool_call_timeout_seconds", 30.0),
+        orchestration_mode=getattr(config, "agent_orchestration_mode", "legacy"),
     )
 
 

@@ -203,6 +203,47 @@ class LLMChannelConfigTestCase(unittest.TestCase):
         mock_warning.assert_not_called()
 
     @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_deepseek_channel_can_reuse_legacy_deepseek_api_key(self, _mock_parse_yaml, _mock_setup_env) -> None:
+        env = {
+            "DEEPSEEK_API_KEY": "sk-direct-value",
+            "LLM_CHANNELS": "deepseek",
+            "LLM_DEEPSEEK_PROTOCOL": "deepseek",
+            "LLM_DEEPSEEK_MODELS": "deepseek-v4-flash",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.llm_models_source, "llm_channels")
+        self.assertEqual(config.llm_channels[0]["api_keys"], ["sk-direct-value"])
+        self.assertEqual(config.llm_model_list[0]["litellm_params"]["api_key"], "sk-direct-value")
+        self.assertEqual(config.llm_model_list[0]["litellm_params"]["model"], "deepseek/deepseek-v4-flash")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_deepseek_protocol_channel_can_reuse_legacy_deepseek_api_keys(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "DEEPSEEK_API_KEYS": "sk-one,sk-two",
+            "LLM_CHANNELS": "primary",
+            "LLM_PRIMARY_PROTOCOL": "deepseek",
+            "LLM_PRIMARY_MODELS": "deepseek-v4-flash",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.llm_channels[0]["api_keys"], ["sk-one", "sk-two"])
+        self.assertEqual(
+            [entry["litellm_params"]["api_key"] for entry in config.llm_model_list],
+            ["sk-one", "sk-two"],
+        )
+
+    @patch("src.config.setup_env")
     @patch.object(
         Config,
         "_parse_litellm_yaml",

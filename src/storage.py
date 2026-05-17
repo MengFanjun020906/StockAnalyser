@@ -624,6 +624,47 @@ class LLMUsage(Base):
     called_at = Column(DateTime, default=datetime.now, index=True)
 
 
+class MarketRegimeState(Base):
+    """Persisted market-regime state for damping and confirmation."""
+
+    __tablename__ = 'market_regime_state'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    market = Column(String(16), nullable=False, index=True)
+    as_of = Column(Date, nullable=True, index=True)
+    regime = Column(String(32), nullable=False)
+    raw_regime = Column(String(32))
+    volatility_bucket = Column(String(32))
+    raw_volatility_bucket = Column(String(32))
+    pending_regime = Column(String(32))
+    pending_count = Column(Integer, nullable=False, default=0)
+    payload = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('market', name='uix_market_regime_state_market'),
+        Index('ix_market_regime_state_market_updated', 'market', 'updated_at'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        try:
+            payload = json.loads(self.payload or "{}")
+        except Exception:
+            payload = {}
+        return {
+            "market": self.market,
+            "as_of": self.as_of.isoformat() if self.as_of else None,
+            "regime": self.regime,
+            "raw_regime": self.raw_regime,
+            "volatility_bucket": self.volatility_bucket,
+            "raw_volatility_bucket": self.raw_volatility_bucket,
+            "pending_regime": self.pending_regime,
+            "pending_count": self.pending_count,
+            "payload": payload,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class DatabaseManager:
     """
     数据库管理器 - 单例模式
@@ -2045,6 +2086,79 @@ class DatabaseManager:
         )
         with self.session_scope() as session:
             session.add(row)
+
+    # ------------------------------------------------------------------
+    # Market regime state
+    # ------------------------------------------------------------------
+
+    def get_market_regime_state(self, market: str = "cn") -> Optional[Dict[str, Any]]:
+        """Return the latest persisted regime state for a market."""
+        market_key = (market or "cn").strip().lower()
+        with self.get_session() as session:
+            row = session.execute(
+                select(MarketRegimeState).where(MarketRegimeState.market == market_key)
+            ).scalar_one_or_none()
+            return row.to_dict() if row else None
+
+    def save_market_regime_state(self, market: str, payload: Dict[str, Any]) -> None:
+        """Upsert one market regime state snapshot."""
+        market_key = (market or "cn").strip().lower()
+        confirmation = payload.get("confirmation") or {}
+        as_of_raw = payload.get("as_of")
+        as_of_date = None
+        if isinstance(as_of_raw, date):
+            as_of_date = as_of_raw
+        elif isinstance(as_of_raw, str) and as_of_raw:
+            try:
+                as_of_date = datetime.strptime(as_of_raw[:10], "%Y-%m-%d").date()
+            except ValueError:
+                as_of_date = None
+        now = datetime.now()
+        row_payload = {
+            "market": market_key,
+            "as_of": as_of_date,
+            "regime": str(payload.get("regime") or "unknown"),
+            "raw_regime": str(confirmation.get("raw_regime") or payload.get("regime") or "unknown"),
+            "volatility_bucket": str(payload.get("volatility_bucket") or "unknown"),
+            "raw_volatility_bucket": str(payload.get("raw_volatility_bucket") or "unknown"),
+            "pending_regime": confirmation.get("pending_regime"),
+            "pending_count": int(confirmation.get("pending_count") or 0),
+            "payload": json.dumps(payload, ensure_ascii=False, default=str),
+            "updated_at": now,
+        }
+
+        def _write(session: Session) -> None:
+            if self._is_sqlite_engine:
+                stmt = sqlite_insert(MarketRegimeState).values(**row_payload)
+                excluded = stmt.excluded
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=['market'],
+                        set_={
+                            'as_of': excluded.as_of,
+                            'regime': excluded.regime,
+                            'raw_regime': excluded.raw_regime,
+                            'volatility_bucket': excluded.volatility_bucket,
+                            'raw_volatility_bucket': excluded.raw_volatility_bucket,
+                            'pending_regime': excluded.pending_regime,
+                            'pending_count': excluded.pending_count,
+                            'payload': excluded.payload,
+                            'updated_at': excluded.updated_at,
+                        },
+                    )
+                )
+                return
+
+            row = session.execute(
+                select(MarketRegimeState).where(MarketRegimeState.market == market_key)
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(MarketRegimeState(**row_payload))
+                return
+            for key, value in row_payload.items():
+                setattr(row, key, value)
+
+        self._run_write_transaction("market_regime_state", _write)
 
     def get_llm_usage_summary(
         self,

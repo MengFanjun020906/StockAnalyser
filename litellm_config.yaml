@@ -1,0 +1,21 @@
+model_list:
+  - model_name: aigclink-gpt55
+    litellm_params:
+      model: openai/gpt-5.5
+      api_base: os.environ/AIGCLINK_URL
+      api_key: os.environ/AIGCLINK_API_KEY
+
+  - model_name: xiaomi-mimo
+    litellm_params:
+      model: openai/mimo-v2.5-pro
+      api_base: os.environ/XIAOMI_MIMO_URL
+      api_key: os.environ/XIAOMI_MIMO_API_KEY
+
+  - model_name: deepseek/deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2

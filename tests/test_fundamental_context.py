@@ -38,6 +38,19 @@ class _DummyBoardFetcher:
         return self._boards
 
 
+class _DummyChipFetcher:
+    def __init__(self, name: str, priority: int, chip=None, error: str | None = None):
+        self.name = name
+        self.priority = priority
+        self._chip = chip
+        self._error = error
+        self.last_chip_distribution_error = None
+
+    def get_chip_distribution(self, _stock_code: str):
+        self.last_chip_distribution_error = self._error
+        return self._chip
+
+
 class TestFundamentalContext(unittest.TestCase):
     def test_non_cn_market_returns_not_supported(self) -> None:
         manager = DataFetcherManager(fetchers=[])
@@ -416,6 +429,57 @@ class TestFundamentalContext(unittest.TestCase):
                 ):
             ctx = manager.get_capital_flow_context("600519", budget_seconds=0.5)
         self.assertEqual(ctx["status"], "not_supported")
+
+    def test_capital_flow_failed_status_preserves_adapter_errors(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        with patch("src.config.get_config", return_value=cfg), \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_capital_flow",
+                    return_value={
+                        "status": "failed",
+                        "stock_flow": {},
+                        "sector_rankings": {"top": [], "bottom": []},
+                        "source_chain": [],
+                        "errors": ["stock_individual_fund_flow:ConnectionError:Failed to resolve push2his.eastmoney.com"],
+                    },
+                ):
+            ctx = manager.get_capital_flow_context("688469", budget_seconds=0.5)
+        self.assertEqual(ctx["status"], "failed")
+        self.assertIn("Failed to resolve", " ".join(ctx["errors"]))
+
+    def test_chip_distribution_context_preserves_fetcher_errors(self) -> None:
+        fetcher = _DummyChipFetcher(
+            "AkshareFetcher",
+            priority=0,
+            error="ConnectionError:RemoteDisconnected",
+        )
+        manager = DataFetcherManager(fetchers=[fetcher])
+        cfg = SimpleNamespace(enable_chip_distribution=True)
+        with patch("src.config.get_config", return_value=cfg):
+            ctx = manager.get_chip_distribution_context("688469")
+
+        self.assertEqual(ctx["status"], "failed")
+        self.assertEqual(ctx["source_chain"][0]["provider"], "akshare_chip")
+        self.assertEqual(ctx["source_chain"][0]["result"], "failed")
+        self.assertIn("RemoteDisconnected", " ".join(ctx["errors"]))
+        self.assertEqual(ctx["error_summary"], "Eastmoney chip distribution endpoint disconnected")
+
+    def test_chip_distribution_context_disabled_is_explicit(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        cfg = SimpleNamespace(enable_chip_distribution=False)
+        with patch("src.config.get_config", return_value=cfg):
+            ctx = manager.get_chip_distribution_context("600519")
+
+        self.assertEqual(ctx["status"], "disabled")
+        self.assertEqual(ctx["error_summary"], "chip distribution disabled")
+        self.assertIn("ENABLE_CHIP_DISTRIBUTION=false", ctx["errors"])
 
     def test_get_belong_boards_from_capability_probe(self) -> None:
         fetcher = _DummyBoardFetcher(

@@ -25,9 +25,10 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import Thread
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -177,15 +178,23 @@ def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
     """
     if timeout is None:
         timeout = _EF_CALL_TIMEOUT
-    # Do NOT use 'with ThreadPoolExecutor(...)' here: the context manager calls
-    # shutdown(wait=True) on __exit__, which would re-block on the hung thread.
-    executor = ThreadPoolExecutor(max_workers=1)
-    try:
-        future = executor.submit(func, *args, **kwargs)
-        return future.result(timeout=timeout)
-    finally:
-        # wait=False: calling thread returns immediately; worker cleans up later
-        executor.shutdown(wait=False)
+    result_holder = {}
+    error_holder = {}
+
+    def runner():
+        try:
+            result_holder["value"] = func(*args, **kwargs)
+        except Exception as exc:
+            error_holder["value"] = exc
+
+    worker = Thread(target=runner, daemon=True, name=f"efinance-{getattr(func, '__name__', 'call')}")
+    worker.start()
+    worker.join(timeout=max(0, float(timeout)))
+    if worker.is_alive():
+        raise FuturesTimeoutError()
+    if "value" in error_holder:
+        raise error_holder["value"]
+    return result_holder.get("value")
 
 
 def _classify_eastmoney_error(exc: Exception) -> Tuple[str, str]:

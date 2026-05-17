@@ -26,11 +26,18 @@ try:
     import litellm  # noqa: F401
 except ModuleNotFoundError:
     sys.modules["litellm"] = MagicMock()
+try:
+    import json_repair  # noqa: F401
+except ModuleNotFoundError:
+    json_repair_stub = MagicMock()
+    json_repair_stub.repair_json.side_effect = lambda content, **_kwargs: content
+    sys.modules["json_repair"] = json_repair_stub
 
 from src.agent.executor import AgentExecutor, AgentResult
 from src.agent.llm_adapter import LLMResponse, ToolCall
 from src.agent.runner import parse_dashboard_json, run_agent_loop, serialize_tool_result
 from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter
+from src.schemas.agent_context import AgentUserContext, PositionContext, ReportContext
 
 
 # ============================================================
@@ -47,6 +54,21 @@ def _make_registry_with_echo():
             ToolParameter(name="message", type="string", description="Message to echo"),
         ],
         handler=lambda message: {"echo": message},
+    )
+    registry.register(tool)
+    return registry
+
+
+def _make_counting_echo_registry(counter):
+    """Create an echo registry that records real handler executions."""
+    registry = ToolRegistry()
+    tool = ToolDefinition(
+        name="echo",
+        description="Echoes back the input",
+        parameters=[
+            ToolParameter(name="message", type="string", description="Message to echo"),
+        ],
+        handler=lambda message: counter.append(message) or {"echo": message},
     )
     registry.register(tool)
     return registry
@@ -197,6 +219,55 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertEqual(result.tool_calls_log[0]["tool"], "echo")
         self.assertTrue(result.tool_calls_log[0]["success"])
 
+    def test_candidate_discovery_keeps_structured_result_json(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="discover_watchlist_candidates",
+                description="Discover candidates",
+                parameters=[],
+                handler=lambda **_: {
+                    "status": "ok",
+                    "candidate_source": "multi_recall",
+                    "candidates": [
+                        {
+                            "code": "301183",
+                            "source": "sequoia:multi_strategy",
+                            "matched_strategies": ["ma_volume", "turtle_trade", "rps_breakout"],
+                            "reason": "多策略共振。",
+                            "signal_score": 100,
+                        }
+                    ],
+                },
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gather candidates.",
+                tool_calls=[ToolCall(id="c1", name="discover_watchlist_candidates", arguments={})],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[{"role": "user", "content": "帮我选股"}],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("result_json", result.tool_calls_log[0])
+        self.assertEqual(result.tool_calls_log[0]["result_json"]["candidates"][0]["code"], "301183")
+
     def test_multiple_tool_calls_in_one_step(self):
         """Agent requests multiple tool calls in a single response."""
         registry = _make_registry_with_echo()
@@ -248,6 +319,108 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertIn("max steps", result.error.lower())
         self.assertEqual(result.total_steps, 3)
 
+    def test_final_step_forces_synthesis_after_tool_budget(self):
+        """Final step disables tools so the model can synthesize from existing evidence."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+
+        tool_response = LLMResponse(
+            content="Still gathering.",
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"message": "loop"}),
+            ],
+            usage={"total_tokens": 20},
+            provider="openai",
+        )
+        final_response = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD),
+            tool_calls=[],
+            usage={"total_tokens": 40},
+            provider="openai",
+        )
+        adapter.call_with_tools.side_effect = [tool_response, tool_response, final_response]
+
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+        result = executor.run("Analyze loop")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.total_steps, 3)
+        self.assertEqual(len(result.tool_calls_log), 2)
+        final_call_args = adapter.call_with_tools.call_args.args
+        self.assertEqual(final_call_args[1], [])
+        self.assertIn("工具预算最后一步", final_call_args[0][-1]["content"])
+
+    def test_budget_phase_warns_before_final_step(self):
+        """Conserve and critical phases warn the model before final hard stop."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+
+        tool_response = LLMResponse(
+            content="Gathering.",
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"message": "a"}),
+            ],
+            usage={"total_tokens": 10},
+            provider="openai",
+        )
+        final_response = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD),
+            tool_calls=[],
+            usage={"total_tokens": 40},
+            provider="openai",
+        )
+        adapter.call_with_tools.side_effect = [
+            tool_response,
+            tool_response,
+            tool_response,
+            tool_response,
+            final_response,
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Analyze with budget")
+
+        self.assertTrue(result.success)
+        final_messages = adapter.call_with_tools.call_args.args[0]
+        combined = "\n".join(
+            str(message.get("content", ""))
+            for message in final_messages
+            if isinstance(message, dict)
+        )
+        self.assertIn("工具节约阶段", combined)
+        self.assertIn("关键预算阶段", combined)
+
+    def test_repeated_tool_call_reuses_cached_result(self):
+        """Identical successful tool calls reuse prior results instead of re-executing."""
+        executed = []
+        registry = _make_counting_echo_registry(executed)
+        adapter = _make_mock_adapter()
+
+        repeated_tool = LLMResponse(
+            content="Again.",
+            tool_calls=[
+                ToolCall(id="c1", name="echo", arguments={"message": "same"}),
+            ],
+            usage={"total_tokens": 10},
+            provider="openai",
+        )
+        final_response = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD),
+            tool_calls=[],
+            usage={"total_tokens": 40},
+            provider="openai",
+        )
+        adapter.call_with_tools.side_effect = [repeated_tool, repeated_tool, final_response]
+
+        executor = AgentExecutor(registry, adapter, max_steps=4)
+        result = executor.run("Analyze repeated")
+
+        self.assertTrue(result.success)
+        self.assertEqual(executed, ["same"])
+        self.assertEqual(len(result.tool_calls_log), 2)
+        self.assertFalse(result.tool_calls_log[0]["cached"])
+        self.assertTrue(result.tool_calls_log[1]["cached"])
+
     def test_tool_execution_error(self):
         """Tool raises exception — should be logged and error sent to LLM."""
         def _always_fail():
@@ -287,6 +460,182 @@ class TestAgentExecutor(unittest.TestCase):
         # The failing tool call should be logged as failure
         self.assertEqual(len(result.tool_calls_log), 1)
         self.assertFalse(result.tool_calls_log[0]["success"])
+
+    def test_structured_failed_tool_result_is_logged_as_failure(self):
+        """Tool payloads with failed status should not be marked OK in traces."""
+        def _structured_fail():
+            return {"status": "failed", "errors": ["capital_flow timeout"]}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_capital_flow",
+                description="Get capital flow",
+                parameters=[],
+                handler=_structured_fail,
+            )
+        )
+        adapter = _make_mock_adapter()
+
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="f1", name="get_capital_flow", arguments={})],
+                usage={"total_tokens": 30},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD),
+                tool_calls=[],
+                usage={"total_tokens": 50},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Test structured tool failure")
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertIn("capital_flow timeout", result.tool_calls_log[0]["result_preview"])
+
+    def test_partial_tool_result_without_usable_data_is_logged_as_failure(self):
+        """Partial payloads with only errors should not be marked OK in traces."""
+        def _partial_fail():
+            return {
+                "stock_code": "600519",
+                "status": "partial",
+                "main_net_inflow": None,
+                "inflow_5d": None,
+                "inflow_10d": None,
+                "sector_rankings": {
+                    "top_inflow_sectors": [],
+                    "top_outflow_sectors": [],
+                },
+                "errors": ["capital flow fetch failed"],
+            }
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_capital_flow",
+                description="Get capital flow",
+                parameters=[],
+                handler=_partial_fail,
+            )
+        )
+        adapter = _make_mock_adapter()
+
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="f1", name="get_capital_flow", arguments={})],
+                usage={"total_tokens": 30},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD),
+                tool_calls=[],
+                usage={"total_tokens": 50},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Test partial tool failure")
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertIn("capital flow fetch failed", result.tool_calls_log[0]["result_preview"])
+
+    def test_tool_result_with_errors_but_partial_data_is_logged_as_failure(self):
+        """Any explicit errors in tool payloads should mark the call failed."""
+        def _partial_with_errors():
+            return {
+                "stock_code": "600519",
+                "status": "partial",
+                "main_net_inflow": 123.4,
+                "inflow_5d": None,
+                "inflow_10d": None,
+                "sector_rankings": {
+                    "top_inflow_sectors": [],
+                    "top_outflow_sectors": [],
+                },
+                "errors": ["capital flow stage timeout"],
+            }
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_capital_flow",
+                description="Get capital flow",
+                parameters=[],
+                handler=_partial_with_errors,
+            )
+        )
+        adapter = _make_mock_adapter()
+
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="f1", name="get_capital_flow", arguments={})],
+                usage={"total_tokens": 30},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD),
+                tool_calls=[],
+                usage={"total_tokens": 50},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Test partial with errors")
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertFalse(result.tool_calls_log[0]["success"])
+
+    def test_not_supported_tool_result_is_not_logged_as_failure(self):
+        """Unsupported-but-valid tool payloads remain visible without being treated as crashes."""
+        def _not_supported():
+            return {"status": "not_supported", "note": "A-share only"}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_capital_flow",
+                description="Get capital flow",
+                parameters=[],
+                handler=_not_supported,
+            )
+        )
+        adapter = _make_mock_adapter()
+
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="f1", name="get_capital_flow", arguments={})],
+                usage={"total_tokens": 30},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD),
+                tool_calls=[],
+                usage={"total_tokens": 50},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Test unsupported tool result")
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertTrue(result.tool_calls_log[0]["success"])
 
     def test_unknown_tool_called(self):
         """LLM requests a tool not in the registry — should handle gracefully."""
@@ -668,6 +1017,21 @@ class TestDashboardParsing(unittest.TestCase):
     def test_parse_no_json(self):
         self.assertIsNone(parse_dashboard_json("This is just plain text with no JSON"))
 
+    def test_try_parse_json_prefers_final_balanced_object(self):
+        from src.agent.runner import try_parse_json
+
+        content = (
+            '草稿：{"winner":"primary","final_action":"hold"}\n'
+            '最终 JSON：\n'
+            '{"winner":"opposing","final_action":"wait","decision_summary":"等待确认"}'
+        )
+
+        result = try_parse_json(content)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["winner"], "opposing")
+        self.assertEqual(result["final_action"], "wait")
+
 
 # ============================================================
 # Serialization
@@ -730,6 +1094,285 @@ class TestBuildUserMessage(unittest.TestCase):
         )
         self.assertIn("股票代码: 600519", msg)
         self.assertIn("报告类型: daily", msg)
+
+    def test_message_injects_planning_context_and_plan(self):
+        context = AgentUserContext(
+            positions=[PositionContext(symbol="600519", quantity=100)],
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            ),
+        )
+
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertIn("AgentUserContext", msg)
+        self.assertIn("Planner 工具执行计划", msg)
+        self.assertIn('"intent": "position_review"', msg)
+        self.assertIn("capability -> tools", msg)
+
+    def test_run_uses_planning_system_prompt_when_context_requests_it(self):
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            )
+        )
+
+        result = executor.run(
+            "Analyze 600519",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
+        self.assertIn("Planning -> Execute", prompt)
+        self.assertIn("账户", prompt)
+
+    def test_chat_uses_planning_system_prompt_when_context_requests_it(self):
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content="单股入场分析需要先按 Planner 完成工具链路。",
+            tool_calls=[],
+            usage={"total_tokens": 20},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            )
+        )
+
+        result = executor.chat(
+            "帮我分析 600519 是否适合入场",
+            session_id="test-planning-chat",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
+        user_message = adapter.call_with_tools.call_args.args[0][-1]["content"]
+        self.assertIn("Planning -> Execute", prompt)
+        self.assertIn("Execute Protocol", prompt)
+        self.assertIn("AgentUserContext", user_message)
+        self.assertIn("Planner 工具执行计划", user_message)
+
+    def test_watchlist_selection_partial_report_does_not_fall_back_to_react_loop(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="discover_watchlist_candidates",
+                description="Discover candidates",
+                parameters=[],
+                handler=lambda **_: {"status": "ok", "candidates": [{"code": "600519", "name": "贵州茅台"}]},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_text.side_effect = [
+            LLMResponse(
+                content='{"stage":"candidate_discovery","status":"ok","summary":{"candidate_codes":["600519"]},"full":{"candidates":[{"code":"600519","name":"贵州茅台"}]}}',
+                provider="openai",
+                model="openai/test",
+            ),
+            RuntimeError("llm provider timeout"),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+            )
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=1, orchestration_mode="expert_graph")
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="我现在有5w元，你帮我选一下股，并做一下持仓配置的分析",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("选股分析报告：下周可关注候选", result.content)
+        self.assertIsNotNone(result.stock_selection)
+        self.assertEqual(result.stock_selection["final_report_json"]["orchestration_mode"], "expert_graph")
+        self.assertIsNotNone(result.stock_selection["final_report_json"]["expert_state"])
+        self.assertFalse(adapter.call_with_tools.called)
+
+    def test_watchlist_scan_without_candidates_uses_staged_selection(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="discover_watchlist_candidates",
+                description="Discover candidates",
+                parameters=[],
+                handler=lambda **_: {"status": "ok", "candidates": [{"code": "600519", "name": "贵州茅台"}]},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_text.side_effect = [
+            LLMResponse(content='{"stage":"candidate_discovery","status":"ok","summary":{"candidate_codes":["600519"]},"full":{"candidates":[{"code":"600519","name":"贵州茅台"}]}}'),
+            LLMResponse(content='{"stage":"candidate_screening","status":"ok","summary":{"deep_dive_targets":["600519"]},"full":{"shortlist":[]}}'),
+            LLMResponse(content='{"stage":"single_stock_deep_dive","status":"ok","summary":{"code":"600519","name":"贵州茅台","action_bias":"wait"},"full":{"stock":{"code":"600519","name":"贵州茅台"},"missing_evidence":[]}}'),
+            LLMResponse(content='{"stage":"portfolio_allocation","status":"ok","summary":{"portfolio_action":"wait","core_reason":"等待确认"},"full":{"positions_plan":[]}}'),
+            LLMResponse(content='{"stage":"adversarial_review","status":"ok","summary":{"opposing_summary":"反方等待"},"full":{"opposing_thesis":{}}}'),
+            LLMResponse(content='{"stage":"judge_decision","status":"ok","summary":{"primary_plan_verdict":"accept","final_action":"wait","decision_summary":"等待确认","next_step":"render_final_report"},"full":{"winner":"mixed"}}'),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+            )
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=1)
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="我现在有5w元，你帮我选一下股，并做一下持仓配置的分析",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("选股分析报告：下周可关注候选", result.content)
+        self.assertIsNotNone(result.stock_selection)
+        self.assertFalse(adapter.call_with_tools.called)
+
+    def test_planning_execute_final_content_strips_step_labels(self):
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content="第三步：证据整合与综合判断\n## 入场决策表格\n内容",
+            tool_calls=[],
+            usage={"total_tokens": 10},
+            provider="openai",
+        )
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                report_type="analysis",
+            )
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=1)
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="测试",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertNotIn("第三步：", result.content)
+        self.assertIn("## 入场决策表格", result.content)
+
+    def test_planning_execute_final_content_keeps_chapter_titles(self):
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content="第三章：长期逻辑\n内容",
+            tool_calls=[],
+            usage={"total_tokens": 10},
+            provider="openai",
+        )
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                report_type="analysis",
+            )
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=1)
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="测试",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("第三章：长期逻辑", result.content)
+
+    def test_chat_appends_debate_appendix_after_planning_execute_tools(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[ToolParameter(name="stock_code", type="string", description="Stock code")],
+                handler=lambda stock_code: {"price": 100, "stock_code": stock_code},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="checking",
+                tool_calls=[ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "600519"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+            LLMResponse(
+                content="## 最终结论\n\n持仓策略：持有。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+        ]
+        adapter.call_text.side_effect = [
+            LLMResponse(content='{"direction":"bullish","action":"hold","summary":"主观点持有","evidence":["price=100"],"failure_conditions":["跌破成本"],"account_impact":"仓位受限"}', usage={"total_tokens": 3}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"direction":"neutral_bearish","action":"reduce","summary":"反方减仓","evidence":["仓位风险"],"failure_conditions":["趋势确认"],"primary_challenges":["仓位风险"],"account_impact":"回撤风险"}', usage={"total_tokens": 4}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"winner":"primary","final_action":"hold","reason":"持有证据更强但保留风控","accepted_arguments":["price=100"],"rejected_arguments":["立即减仓"],"risk_controls":["跌破成本复查"],"unresolved_conflicts":[]}', usage={"total_tokens": 5}, provider="openai", model="openai/debate"),
+        ]
+        context = AgentUserContext(
+            positions=[PositionContext(symbol="600519", quantity=100, avg_cost=90)],
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="position_review",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            ),
+        )
+
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+        result = executor.chat(
+            "我持有 600519，适合继续拿长线吗？",
+            session_id="test-debate",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("## 对抗式辩论裁决", result.content)
+        self.assertEqual(result.debate["judge_decision"]["final_action"], "hold")
+        self.assertIn("## 最终结论", result.debate["debug_outputs"]["primary_report_raw"])
+        self.assertIn("## 对抗式辩论裁决", result.debate["debug_outputs"]["final_report_with_debate"])
+        self.assertEqual(adapter.call_text.call_count, 3)
+        self.assertEqual(result.total_tokens, 42)
 
 
 # ============================================================

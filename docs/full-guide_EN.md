@@ -168,6 +168,8 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 |--------|------|--------|:----:|
 | `LITELLM_MODEL` | Primary model, format `provider/model` (e.g. `gemini/gemini-2.5-flash`), recommended | - | No |
 | `AGENT_LITELLM_MODEL` | Optional Agent-only primary model; when empty it inherits the primary model, and bare names are normalized to `openai/<model>` | - | No |
+| `AGENT_ANALYSIS_MODE` | Agent analysis mode: `normal` keeps the existing ReAct flow; `planning_execute` enables the account-aware Planner prompt and injects `AgentUserContext` when available | `normal` | No |
+| `AGENT_ORCHESTRATION_MODE` | `watchlist_scan` orchestration mode: `legacy` keeps the existing staged selection flow; `expert_graph` also writes shared-state expert opinions into Trace | `legacy` | No |
 | `LITELLM_FALLBACK_MODELS` | Fallback models, comma-separated | - | No |
 | `LLM_CHANNELS` | Channel names (comma-separated), use with `LLM_{NAME}_*`, see [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) | - | No |
 | `LITELLM_CONFIG` | Advanced model routing YAML path (expert use) | - | No |
@@ -253,20 +255,31 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | Variable | Description | Default | Required |
 |--------|------|--------|:----:|
 | `TUSHARE_TOKEN` | Tushare Pro Token | - | Optional |
+| `TUSHARE_HTTP_URL` | Tushare-compatible HTTP endpoint. Required when using a private gateway; otherwise SDK/HTTP calls use the official default endpoint. | `http://api.tushare.pro` | Optional |
 | `TICKFLOW_API_KEY` | TickFlow API key; CN market review indices prefer TickFlow when configured, and market breadth does so only when the plan supports universe queries | - | Optional |
 | `ENABLE_REALTIME_QUOTE` | Enable real-time quotes (if disabled, uses historical closing prices for analysis) | `true` | Optional |
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | Intraday real-time technicals: Calculate MA5/MA10/MA20 and bull trends using real-time prices when enabled (Issue #234); uses yesterday's close if disabled. | `true` | Optional |
 | `ENABLE_CHIP_DISTRIBUTION` | Enable chip distribution analysis (this API is unstable, recommended to disable for cloud deployment). GitHub Actions users must set `ENABLE_CHIP_DISTRIBUTION=true` in Repository Variables to enable; disabled by default in workflows. | `true` | Optional |
+| `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Per-request timeout for Agent Tushare tools, shared by basic data, chip, margin, capital-flow fallback, and sector-ranking fast paths. | `5.0` | Optional |
 | `ENABLE_EASTMONEY_PATCH` | Eastmoney API patch: Recommended to set to `true` when Eastmoney APIs fail frequently (e.g., RemoteDisconnected, connection closed). Injects NID tokens and random User-Agents to reduce rate limiting probability. | `false` | Optional |
 | `REALTIME_SOURCE_PRIORITY` | Real-time quote source priority (comma-separated), e.g., `tencent,akshare_sina,efinance,akshare_em` | See .env.example | Optional |
+| `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia-style quantitative candidate SQLite path. `watchlist_scan` candidate discovery reads `stock_daily(symbol,date,open,high,low,close,volume,turnover)` and runs pattern strategies. | `Sequoia-X/data/sequoia_v2.db` | Optional |
+| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML candidate strategy directory. `discover_watchlist_candidates` auto mode loads enabled YAML strategies for L1 hard filtering and factor recall. | `alphasift/alphasift/strategies` | Optional |
+| `ALPHASIFT_CANDIDATE_DB_PATH` | AlphaSift candidate SQLite path. When unset, it reuses `SEQUOIA_CANDIDATE_DB_PATH`; schema is `stock_daily(symbol,date,open,high,low,close,volume,turnover)`. | `SEQUOIA_CANDIDATE_DB_PATH` | Optional |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | Master switch for fundamental aggregation; when disabled, returns `not_supported` block only, without altering the original analysis pipeline. | `true` | Optional |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | Total latency budget for the fundamental stage (seconds) | `1.5` | Optional |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | Timeout for a single capability source call (seconds) | `0.8` | Optional |
+| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Timeout budget for explicit Agent `get_capital_flow` calls; StockAPI `codeFlow` is the current default per-stock historical capital-flow source | `3.0` | Optional |
+| `STOCKAPI_TOKEN` | StockAPI historical capital-flow token. `get_capital_flow` calls `stockapi.com.cn/v1/base/codeFlow` by default; blank uses the limited free quota, which only supports delayed history windows and very few daily requests. | - | Optional |
+| `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Timeout for one Agent tool-call batch; slow tools degrade as tool failures instead of exhausting the full Trace run. | `30.0` | Optional |
 | `FUNDAMENTAL_RETRY_MAX` | Retry count for fundamental capabilities (including the first attempt) | `1` | Optional |
 | `FUNDAMENTAL_CACHE_TTL_SECONDS` | Fundamental aggregation cache TTL (seconds), short cache to reduce repeated API pulling. | `120` | Optional |
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | Maximum entries for fundamental cache (evicted by time within TTL) | `256` | Optional |
 
 > **Behavior Notes:**
+> - `discover_watchlist_candidates` auto mode fills candidates in this order: AlphaSift YAML multi-factor recall, Sequoia pattern strategies, strong-sector constituents, then fixed fallback seeds. AlphaSift is integrated only as the L1 hard-filter/factor layer, without adding another LLM ranking step during candidate discovery.
+> - Update the Sequoia candidate DB with `python scripts/update_sequoia_candidates.py --trading-days 260`; it pulls recent A-share daily bars from baostock, writes the SQLite DB pointed to by `SEQUOIA_CANDIDATE_DB_PATH`, and prunes older rows.
+> - `get_capital_flow` uses StockAPI historical `codeFlow` by default and maps the latest available `mainAmount` plus 5-day/10-day sums into `main_net_inflow`, `inflow_5d`, and `inflow_10d`; it no longer calls Eastmoney individual fund-flow endpoints by default. Without `STOCKAPI_TOKEN`, it queries delayed history windows under the free quota and exposes the data date via `latest_date`.
 > - **A-shares**: Returns aggregated capabilities by `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards`.
 > - **ETFs**: Returns available items, marks missing capabilities as `not_supported`, and does not affect the original flow overall.
 > - **US/HK stocks**: Returns `not_supported` fallback block.
@@ -878,6 +891,8 @@ FastAPI provides RESTful API service for configuration management and triggering
 
 | Command | Description |
 |------|------|
+| `./start_all.sh` | Start local Neo4j, FastAPI backend, and Vite frontend for development, defaulting to Neo4j `7687`/`7474`, backend `8000`, and frontend `5173`; set `START_NEO4J=false` to skip Neo4j |
+| `./stop_all.sh` | Stop the local backend, frontend, and Neo4j container started by `start_all.sh`; set `STOP_NEO4J=false` to keep Neo4j running |
 | `python main.py --serve` | Start API service + run full analysis once |
 | `python main.py --serve-only` | Start API service only, manually trigger analysis |
 
@@ -1006,6 +1021,24 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 - When the cache is missing or stale, the tool keeps the original data-source fetch path; successful fetches are written back to `stock_daily` on a best-effort basis, and write failures do not block the Agent response.
 - `search_stock_news` and `search_comprehensive_intel` persist successful results to `news_intel` on a best-effort basis, reusing the existing URL / fallback-key deduplication logic.
 - `get_realtime_quote` does not use `stock_daily` as a realtime-quote cache and does not write intraday quotes into the daily-bar table; realtime quote caching should use a dedicated realtime store if needed.
+- When `AGENT_ANALYSIS_MODE=planning_execute` is used for normal single-stock Agent analysis, the backend best-effort builds `AgentUserContext` from `PortfolioService.get_portfolio_snapshot()` and injects account, position, cost, exposure, and unrealized PnL context into the Planner. If context construction fails, analysis falls back to no-account context instead of failing the request.
+- `get_realtime_quote` also returns `market_session`, `query_date`, `quote_trade_date`, `price_label`, `change_pct_label`, and `freshness_note`. On closed or non-trading days, Agent reports must label price as the latest available quote as of the last trading day and label percentage change as the latest trading-day change instead of saying "today's change".
+
+### Agent Trace Debug View
+
+- The Web sidebar "Trace" page is intended for developers who need to inspect Agent execution. It runs an isolated debug request through `POST /api/v1/agent/trace/run`.
+- The Run button uses the `POST /api/v1/agent/trace/stream` SSE endpoint by default. Context, Planner, thinking updates, tool start, tool completion, and final done/error events are appended live so long-running traces are no longer a black-box wait.
+- It supports selecting a portfolio account, report intent, risk preference, trading horizon, single-position limit, total equity exposure limit, maximum drawdown, default stop loss, and investor notes. The top `Context In Use` block shows the injected account, target position, cost, weight, unrealized PnL, and profile summary so developers can confirm whether the real portfolio context was used without digging through raw JSON.
+- The latest 10 trace results are saved in the current browser's localStorage and can be reopened from `Trace History`; the backend still deletes temporary `trace-*` sessions so normal chat history stays clean.
+- Each trace also writes local backend artifacts under `data/agent_traces/<timestamp>-<session_id>/`, including `request.json`, `context.json`, `planner.json`, `events.ndjson`, `tool_calls.json`, `evidence_ledger.json`, `debate.json`, `final.md`, `todo.md`, and `summary.json`. When `watchlist_scan` uses the staged stock-selection pipeline, the trace also writes `stock_selection.json`, `selection_context.json`, `final_report.json`, and per-stage JSON artifacts for candidate discovery, screening, deep dives, allocation, adversarial review, and Judge decisions. The page status bar shows the current `Artifact` path. The directory lives under `/data/` and is ignored by Git by default.
+- The planning prompt includes a dedicated `Execute Protocol`: the executor must turn tool results into an Evidence Ledger, record failure downgrade paths, stop conditions, and final-output audit gates. `todo.md` is written with the initial plan and rewritten at the end with tool success/failure status, arguments, result previews, and execute-review state.
+- After planning_execute evidence is available, the runtime enters an adversarial Debate stage: the Primary Thesis Agent, forced-opposition Agent, and Judge Agent share the same Evidence Bundle. The Judge decides by evidence strength, account risk, data reliability, and user goals; the `Debate Judge` panel and `debate.json` help debug both position-review and entry-analysis flows. Judge output is split into a decision summary, dimension-level evidence, concise reason points, accepted/rejected arguments, and risk controls. It explicitly labels account risk, technicals, capital flow, news/events, fundamentals, and data quality; missing capital-flow or news evidence must be reported as a gap rather than being hidden behind a technical-only conclusion.
+- In developer debug mode, `Debate Judge` also shows the original primary report, raw Primary/Opposing/Judge JSON outputs, and the final merged report within the same session. These are model-visible outputs for debugging, not hidden chain-of-thought.
+- The default debug prompt is a realistic user question, such as asking whether a held stock is suitable for long-term holding, instead of an internal trace-oriented prompt.
+- The page compresses Planner data into an `Execution Thesis` summary, collapses runtime events into a clickable `Evidence Timeline`, and renders the final answer in a large Markdown report pane for easier reading.
+- For safety and explainability boundaries, it displays verifiable plan/execute facts, tool evidence, and output-supporting data, not hidden model chain-of-thought.
+- Held-position `position_review` output must include 1-3 month and 6-12 month upside/downside scenarios, reviewable price levels or conditions, layered holding strategy, add/reduce/stop-loss rules, and a review cadence.
+- No-position `entry_analysis` output uses a visible Planning -> Execute -> entry-decision format and must include a plan summary, evidence summary, entry-decision table, ideal/secondary entry zones, a no-chase line, initial position size, add conditions, stop loss, targets, reject conditions, and review triggers.
 
 ---
 

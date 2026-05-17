@@ -32,9 +32,12 @@ logger = logging.getLogger(__name__)
 
 # Tool name → friendly label for progress messages
 _THINKING_TOOL_LABELS: Dict[str, str] = {
+    "discover_watchlist_candidates": "候选股发现",
+    "detect_market_regime": "市场状态识别",
     "get_realtime_quote": "行情获取",
     "get_daily_history": "K线数据获取",
     "analyze_trend": "技术指标分析",
+    "analyze_price_structure": "价格结构分析",
     "get_chip_distribution": "筹码分布分析",
     "search_stock_news": "新闻搜索",
     "search_comprehensive_intel": "综合情报搜索",
@@ -100,6 +103,24 @@ def serialize_tool_result(result: Any) -> str:
     return str(result)
 
 
+def _preview_tool_result(result_str: str, max_chars: int = 1200) -> str:
+    """Return a bounded preview for developer traces without bloating payloads."""
+    text = result_str if isinstance(result_str, str) else str(result_str)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
+def _structured_trace_result(tool_name: str, result_str: str) -> Any:
+    """Return compact structured payloads for tools whose previews drive trace UI."""
+    if tool_name != "discover_watchlist_candidates":
+        return None
+    try:
+        return json.loads(result_str)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _normalize_tool_stock_code(value: Any) -> Any:
     """Canonicalize stock code arguments so equivalent HK variants share one cache key."""
     if not isinstance(value, str):
@@ -156,6 +177,62 @@ def _is_non_retriable_tool_result(result: Any) -> bool:
         and bool(result.get("error"))
         and result.get("retriable") is False
     )
+
+
+def _is_repeatable_tool_success(result: Any) -> bool:
+    """Return True when an identical tool call can safely reuse this result."""
+    if isinstance(result, dict) and result.get("retriable") is False:
+        return True
+    return not _is_failed_tool_result(result)
+
+
+def _is_failed_tool_result(result: Any) -> bool:
+    """Return True when a tool returned a structured failure payload."""
+    if not isinstance(result, dict):
+        return False
+
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"failed", "error", "tool_failed", "timeout"}:
+        return True
+    if status != "not_supported" and _result_has_errors(result):
+        return True
+    if result.get("timeout") is True:
+        return True
+    if result.get("success") is False:
+        return True
+    return bool(result.get("error")) and result.get("status") != "not_supported"
+
+
+def _result_has_errors(result: Dict[str, Any]) -> bool:
+    if result.get("error"):
+        return True
+    errors = result.get("errors")
+    if isinstance(errors, list):
+        return any(str(item).strip() for item in errors)
+    return bool(errors)
+
+
+def _has_effective_tool_data(result: Dict[str, Any]) -> bool:
+    """Return True when a partial payload still contains usable evidence."""
+    ignored_keys = {"status", "errors", "error", "note", "message", "stock_code", "code"}
+    for key, value in result.items():
+        if key in ignored_keys:
+            continue
+        if _contains_effective_value(value):
+            return True
+    return False
+
+
+def _contains_effective_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value == "":
+        return False
+    if isinstance(value, dict):
+        return any(_contains_effective_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_effective_value(item) for item in value)
+    return True
 
 
 def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
@@ -248,6 +325,8 @@ def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
         if snippet:
             candidates.append(snippet)
 
+    candidates.extend(_extract_balanced_json_objects(text))
+
     seen: set[str] = set()
     unique_candidates: List[str] = []
     for candidate in candidates:
@@ -275,6 +354,46 @@ def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
                 return repaired
 
     return None
+
+
+def _extract_balanced_json_objects(text: str) -> List[str]:
+    """Extract standalone balanced JSON object candidates from mixed LLM text."""
+    if not text:
+        return []
+
+    objects: List[str] = []
+    start: Optional[int] = None
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+            continue
+        if char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start:index + 1].strip())
+                start = None
+
+    # Prefer the final complete object first. LLMs often put examples or
+    # discarded drafts before the answer, then the final JSON at the end.
+    return list(reversed([item for item in objects if item]))
 
 
 # Keep private alias used internally by parse_dashboard_json
@@ -354,6 +473,108 @@ def _build_budget_guard_result(
     )
 
 
+def _is_watchlist_scan_without_candidates(messages: List[Dict[str, Any]]) -> bool:
+    """Return True when Planner says watchlist_scan but no candidate tool ran yet."""
+    combined = "\n".join(str(msg.get("content") or "") for msg in messages if isinstance(msg, dict))
+    return (
+        '"intent": "watchlist_scan"' in combined
+        and '"target_symbols": []' in combined
+        and "discover_watchlist_candidates" in combined
+        and not any(
+            isinstance(msg, dict)
+            and msg.get("role") == "tool"
+            and str(msg.get("name") or "").split(":", 1)[-1] == "discover_watchlist_candidates"
+            for msg in messages
+        )
+    )
+
+
+def _build_watchlist_discovery_guard_result(
+    *,
+    step: int,
+    tool_calls_log: List[Dict[str, Any]],
+    total_tokens: int,
+    provider_used: str,
+    models_used: List[str],
+    messages: List[Dict[str, Any]],
+) -> RunLoopResult:
+    return RunLoopResult(
+        success=False,
+        content="",
+        tool_calls_log=tool_calls_log,
+        total_steps=step,
+        total_tokens=total_tokens,
+        provider=provider_used,
+        models_used=models_used,
+        error=(
+            "watchlist_scan requires discover_watchlist_candidates before final answer "
+            "when target_symbols is empty."
+        ),
+        messages=messages,
+    )
+
+
+def _build_finalization_guard_message(tool_calls_log: List[Dict[str, Any]]) -> str:
+    """Build the last-step instruction that stops further tool calls."""
+    successful = sum(1 for call in tool_calls_log if isinstance(call, dict) and call.get("success") is not False)
+    failed = len(tool_calls_log) - successful
+    return (
+        "[系统审计] 已到达 Agent 工具预算最后一步。"
+        "现在必须停止继续调用工具，基于已有工具结果输出最终报告。"
+        f"当前已有工具记录 {len(tool_calls_log)} 条，其中成功 {successful} 条、失败或降级 {failed} 条。"
+        "如果证据不足，请明确标注 missing_evidence / tool_failed，并给出 wait / monitor / insufficient_data "
+        "等保守结论；不要再请求任何工具。"
+    )
+
+
+def _tool_budget_phase(step: int, max_steps: int) -> str:
+    """Return the current tool-budget phase for a zero-based step index."""
+    if max_steps <= 1 or step >= max_steps - 1:
+        return "final"
+    progress = (step + 1) / max_steps
+    if progress >= 0.8:
+        return "critical"
+    if progress >= 0.6:
+        return "conserve"
+    return "normal"
+
+
+def _build_tool_budget_message(
+    *,
+    step: int,
+    max_steps: int,
+    phase: str,
+    tool_calls_log: List[Dict[str, Any]],
+) -> str:
+    """Tell the model how much tool budget remains and how to spend it."""
+    remaining_after_this = max(max_steps - step - 1, 0)
+    called_tools = [
+        str(call.get("tool"))
+        for call in tool_calls_log
+        if isinstance(call, dict) and call.get("tool")
+    ]
+    unique_tools = list(dict.fromkeys(called_tools))
+    prefix = (
+        f"[系统预算] 当前是第 {step + 1}/{max_steps} 轮，"
+        f"本轮之后还剩 {remaining_after_this} 轮。"
+        f"已调用工具 {len(tool_calls_log)} 次"
+        + (f"，涉及：{', '.join(unique_tools[-8:])}。" if unique_tools else "。")
+    )
+    if phase == "conserve":
+        return (
+            prefix
+            + "现在进入工具节约阶段。只有当新增工具会改变最终动作、补齐主维度关键缺口或验证强反证时才调用；"
+            "不要扩展辅助维度，不要重复调用同一工具同一参数。若主维度证据已足够，请直接综合。"
+        )
+    if phase == "critical":
+        return (
+            prefix
+            + "现在进入关键预算阶段。除非缺少会阻断 open/buy/sell 的硬证据，否则必须停止扩展取数并准备最终结论；"
+            "如继续调用工具，必须只调用一个最关键工具。辅助信息缺失应写入 missing_evidence，而不是继续取数。"
+        )
+    return prefix + "请继续遵守最小必要工具原则。"
+
+
 # ============================================================
 # Core loop
 # ============================================================
@@ -396,6 +617,7 @@ def run_agent_loop(
     start_time = time.time()
     tool_calls_log: List[Dict[str, Any]] = []
     non_retriable_tool_results: Dict[str, str] = {}
+    repeat_tool_results: Dict[str, str] = {}
     total_tokens = 0
     provider_used = ""
     models_used: List[str] = []
@@ -450,11 +672,40 @@ def run_agent_loop(
             )
 
         logger.info("Agent step %d/%d", step + 1, max_steps)
+        budget_phase = _tool_budget_phase(step, max_steps)
+        force_final_answer = budget_phase == "final" and bool(tool_calls_log)
+        if force_final_answer:
+            logger.warning(
+                "Agent reached final step with %d tool result(s); forcing final synthesis",
+                len(tool_calls_log),
+            )
+            messages.append({
+                "role": "user",
+                "content": _build_finalization_guard_message(tool_calls_log),
+            })
+        elif budget_phase in {"conserve", "critical"} and tool_calls_log:
+            logger.info(
+                "Agent entering %s tool-budget phase at step %d/%d",
+                budget_phase,
+                step + 1,
+                max_steps,
+            )
+            messages.append({
+                "role": "user",
+                "content": _build_tool_budget_message(
+                    step=step,
+                    max_steps=max_steps,
+                    phase=budget_phase,
+                    tool_calls_log=tool_calls_log,
+                ),
+            })
 
         # --- progress: thinking ---
         if progress_callback:
             if not tool_calls_log:
                 thinking_msg = "正在制定分析路径..."
+            elif force_final_answer:
+                thinking_msg = "工具预算即将耗尽，正在基于已有证据生成最终结论..."
             else:
                 last_tool = tool_calls_log[-1].get("tool", "")
                 label = labels.get(last_tool, last_tool)
@@ -464,7 +715,7 @@ def run_agent_loop(
         # --- LLM call ---
         response = llm_adapter.call_with_tools(
             messages,
-            tool_decls,
+            [] if force_final_answer else tool_decls,
             timeout=remaining_timeout,
         )
         provider_used = response.provider
@@ -487,6 +738,23 @@ def run_agent_loop(
                 total_tokens=total_tokens,
                 provider_used=provider_used,
                 models_used=models_used,
+                messages=messages,
+            )
+
+        if response.tool_calls and force_final_answer:
+            logger.warning("Agent requested tools during forced final synthesis at step %d", step + 1)
+            return RunLoopResult(
+                success=False,
+                content="",
+                tool_calls_log=tool_calls_log,
+                total_steps=step + 1,
+                total_tokens=total_tokens,
+                provider=provider_used,
+                models_used=models_used,
+                error=(
+                    f"Agent exceeded max steps ({max_steps}) after refusing to finalize from existing evidence. "
+                    "The runner already disabled further tool calls on the final step."
+                ),
                 messages=messages,
             )
 
@@ -530,6 +798,7 @@ def run_agent_loop(
                 progress_callback,
                 tool_calls_log,
                 non_retriable_tool_results,
+                repeat_tool_results,
                 tool_wait_timeout_seconds=effective_tool_timeout,
             )
 
@@ -562,6 +831,30 @@ def run_agent_loop(
 
         else:
             # ---- final answer branch ----
+            if _is_watchlist_scan_without_candidates(messages):
+                logger.warning(
+                    "Agent tried to finish watchlist_scan before candidate discovery at step %d",
+                    step + 1,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统审计] 当前是 watchlist_scan 且 target_symbols 为空。"
+                        "必须先调用 discover_watchlist_candidates 生成候选股池，"
+                        "再对候选调用行情、技术、消息和资金工具。不得直接输出最终选股报告。"
+                    ),
+                })
+                if step + 1 >= max_steps:
+                    return _build_watchlist_discovery_guard_result(
+                        step=step + 1,
+                        tool_calls_log=tool_calls_log,
+                        total_tokens=total_tokens,
+                        provider_used=provider_used,
+                        models_used=models_used,
+                        messages=messages,
+                    )
+                continue
+
             logger.info(
                 "Agent completed in %d steps (%.1fs, %d tokens)",
                 step + 1,
@@ -612,6 +905,7 @@ def _execute_tools(
     progress_callback: Optional[Callable],
     tool_calls_log: List[Dict[str, Any]],
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
+    repeat_tool_results: Optional[Dict[str, str]] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Execute one or more tool calls, returning ordered result dicts.
@@ -631,13 +925,23 @@ def _execute_tools(
                 tc_item.arguments,
             )
             return tc_item, non_retriable_tool_results[cache_key], False, dur, True
+        if cache_key and repeat_tool_results is not None and cache_key in repeat_tool_results:
+            dur = round(time.time() - t0, 2)
+            logger.info(
+                "Tool '%s' reused cached result for repeated arguments=%s",
+                tc_item.name,
+                tc_item.arguments,
+            )
+            return tc_item, repeat_tool_results[cache_key], True, dur, True
 
         try:
             res = tool_registry.execute(tc_item.name, **tc_item.arguments)
             res_str = serialize_tool_result(res)
-            ok = True
+            ok = not _is_failed_tool_result(res)
             if cache_key and non_retriable_tool_results is not None and _is_non_retriable_tool_result(res):
                 non_retriable_tool_results[cache_key] = res_str
+            if cache_key and repeat_tool_results is not None and _is_repeatable_tool_success(res):
+                repeat_tool_results[cache_key] = res_str
         except Exception as e:
             res_str = json.dumps({"error": str(e)})
             ok = False
@@ -650,7 +954,12 @@ def _execute_tools(
     if len(tool_calls) == 1:
         tc = tool_calls[0]
         if progress_callback:
-            progress_callback({"type": "tool_start", "step": step, "tool": tc.name})
+            progress_callback({
+                "type": "tool_start",
+                "step": step,
+                "tool": tc.name,
+                "arguments": tc.arguments,
+            })
         timeout_triggered = False
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0:
             pool = ThreadPoolExecutor(max_workers=1)
@@ -675,13 +984,14 @@ def _execute_tools(
                 pool.shutdown(wait=not timeout_triggered, cancel_futures=timeout_triggered)
         else:
             _, result_str, success, dur, cached = _exec_single(tc)
-        if progress_callback:
-            progress_callback({"type": "tool_done", "step": step, "tool": tc.name, "success": success, "duration": dur})
         log_entry = {
             "step": step, "tool": tc.name, "arguments": tc.arguments,
             "success": success, "duration": dur, "result_length": len(result_str),
-            "cached": cached,
+            "cached": cached, "result_preview": _preview_tool_result(result_str),
         }
+        structured_result = _structured_trace_result(tc.name, result_str)
+        if structured_result is not None:
+            log_entry["result_json"] = structured_result
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 and not success:
             try:
                 if json.loads(result_str).get("timeout") is True:
@@ -689,11 +999,18 @@ def _execute_tools(
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         tool_calls_log.append(log_entry)
+        if progress_callback:
+            progress_callback({"type": "tool_done", **log_entry})
         results.append({"tc": tc, "result_str": result_str})
     else:
         for tc in tool_calls:
             if progress_callback:
-                progress_callback({"type": "tool_start", "step": step, "tool": tc.name})
+                progress_callback({
+                    "type": "tool_start",
+                    "step": step,
+                    "tool": tc.name,
+                    "arguments": tc.arguments,
+                })
 
         pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
         timeout_triggered = False
@@ -706,13 +1023,17 @@ def _execute_tools(
             ):
                 pending.discard(future)
                 tc_item, result_str, success, dur, cached = future.result()
-                if progress_callback:
-                    progress_callback({"type": "tool_done", "step": step, "tool": tc_item.name, "success": success, "duration": dur})
-                tool_calls_log.append({
+                log_entry = {
                     "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
                     "success": success, "duration": dur, "result_length": len(result_str),
-                    "cached": cached,
-                })
+                    "cached": cached, "result_preview": _preview_tool_result(result_str),
+                }
+                structured_result = _structured_trace_result(tc_item.name, result_str)
+                if structured_result is not None:
+                    log_entry["result_json"] = structured_result
+                tool_calls_log.append(log_entry)
+                if progress_callback:
+                    progress_callback({"type": "tool_done", **log_entry})
                 results.append({"tc": tc_item, "result_str": result_str})
         except FuturesTimeoutError:
             timeout_triggered = True
@@ -734,8 +1055,13 @@ def _execute_tools(
                             "type": "tool_done",
                             "step": step,
                             "tool": tc_item.name,
+                            "arguments": tc_item.arguments,
                             "success": False,
                             "duration": round(tool_wait_timeout_seconds or 0.0, 2),
+                            "result_length": len(result_str),
+                            "cached": False,
+                            "timeout": True,
+                            "result_preview": _preview_tool_result(result_str),
                         })
                     tool_calls_log.append({
                         "step": step,
@@ -746,6 +1072,7 @@ def _execute_tools(
                         "result_length": len(result_str),
                         "cached": False,
                         "timeout": True,
+                        "result_preview": _preview_tool_result(result_str),
                     })
                     results.append({"tc": tc_item, "result_str": result_str})
         finally:

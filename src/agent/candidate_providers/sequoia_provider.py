@@ -1,0 +1,514 @@
+# -*- coding: utf-8 -*-
+"""Sequoia-style quantitative candidate provider.
+
+This module ports the strategy rules from the local Sequoia-X reference project
+into this codebase so candidate discovery does not depend on importing a cloned
+sub-repository at runtime.  It reads an existing SQLite daily-bar cache with the
+Sequoia-X schema:
+
+    stock_daily(symbol, date, open, high, low, close, volume, turnover)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+import pandas as pd
+
+from src.data.stock_index_loader import get_index_stock_name
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SEQUOIA_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
+
+_REQUIRED_COLUMNS = {"symbol", "date", "open", "high", "low", "close", "volume", "turnover"}
+
+
+@dataclass(frozen=True)
+class SequoiaStrategySpec:
+    name: str
+    min_bars: int
+    tags: List[str]
+    reason: str
+
+
+STRATEGY_SPECS: Dict[str, SequoiaStrategySpec] = {
+    "ma_volume": SequoiaStrategySpec(
+        name="ma_volume",
+        min_bars=20,
+        tags=["ma_cross", "volume_breakout"],
+        reason="5日均线上穿20日均线，且当日成交量超过20日均量1.5倍。",
+    ),
+    "turtle_trade": SequoiaStrategySpec(
+        name="turtle_trade",
+        min_bars=21,
+        tags=["breakout", "liquidity", "momentum"],
+        reason="收盘价突破前20日高点，成交额过亿，并以实体阳线确认。",
+    ),
+    "high_tight_flag": SequoiaStrategySpec(
+        name="high_tight_flag",
+        min_bars=40,
+        tags=["momentum", "consolidation", "volume_shrink"],
+        reason="过去40日强动量上涨后，近10日高位窄幅整理并缩量。",
+    ),
+    "limit_up_shakeout": SequoiaStrategySpec(
+        name="limit_up_shakeout",
+        min_bars=3,
+        tags=["limit_up", "shakeout", "support_hold"],
+        reason="昨日涨停后今日放量收阴，但低点未跌破昨日收盘支撑。",
+    ),
+    "uptrend_limit_down": SequoiaStrategySpec(
+        name="uptrend_limit_down",
+        min_bars=60,
+        tags=["uptrend", "limit_down", "mean_reversion"],
+        reason="20日均线高于60日均线的上升趋势中，出现放量跌停错杀信号。",
+    ),
+    "rps_breakout": SequoiaStrategySpec(
+        name="rps_breakout",
+        min_bars=120,
+        tags=["rps", "relative_strength", "breakout"],
+        reason="120日相对强度位于市场前10%，且收盘价接近120日滚动高点。",
+    ),
+}
+
+
+class SequoiaCandidateProvider:
+    """Generate A-share seed candidates from a Sequoia-X style SQLite cache."""
+
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        self.db_path = str(db_path or _default_db_path())
+
+    def discover(
+        self,
+        *,
+        limit: int = 8,
+        strategy_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        effective_limit = max(1, min(int(limit or 8), 50))
+        strategies = _normalize_strategy_names(strategy_names)
+        diagnostics: List[Dict[str, Any]] = []
+
+        validation_error = self._validate_db()
+        if validation_error:
+            return {
+                "status": "unavailable",
+                "provider": "sequoia",
+                "db_path": self.db_path,
+                "candidates": [],
+                "diagnostics": [{"source": "sequoia_db", "status": "unavailable", "error": validation_error}],
+                "error": validation_error,
+            }
+
+        try:
+            bars = self._load_bars()
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            logger.warning("Sequoia candidate DB load failed: %s", message)
+            return {
+                "status": "failed",
+                "provider": "sequoia",
+                "db_path": self.db_path,
+                "candidates": [],
+                "diagnostics": [{"source": "stock_daily", "status": "failed", "error": message}],
+                "error": message,
+            }
+
+        if bars.empty:
+            return {
+                "status": "empty",
+                "provider": "sequoia",
+                "db_path": self.db_path,
+                "candidates": [],
+                "diagnostics": [{"source": "stock_daily", "status": "empty"}],
+            }
+
+        candidates: List[Dict[str, Any]] = []
+        latest_date = str(bars["date"].max())
+        for strategy_name in strategies:
+            strategy_candidates = self._run_strategy(strategy_name, bars)
+            diagnostics.append({
+                "source": f"sequoia:{strategy_name}",
+                "status": "ok",
+                "count": len(strategy_candidates),
+            })
+            candidates.extend(strategy_candidates)
+
+        merged = _merge_candidates(candidates)
+        merged.sort(
+            key=lambda item: (
+                float(item.get("signal_score") or 0),
+                len(item.get("matched_strategies") or []),
+                str(item.get("code") or ""),
+            ),
+            reverse=True,
+        )
+        selected = merged[:effective_limit]
+        return {
+            "status": "ok" if selected else "empty",
+            "provider": "sequoia",
+            "db_path": self.db_path,
+            "latest_date": latest_date,
+            "strategy_names": strategies,
+            "candidate_count": len(selected),
+            "candidates": selected,
+            "diagnostics": diagnostics,
+        }
+
+    def _validate_db(self) -> Optional[str]:
+        path = Path(self.db_path).expanduser()
+        if not path.exists():
+            return f"Sequoia candidate DB not found: {path}"
+        try:
+            with sqlite3.connect(str(path)) as conn:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='stock_daily'"
+                ).fetchone()
+                if not row:
+                    return "stock_daily table not found"
+                columns = {item[1] for item in conn.execute("PRAGMA table_info(stock_daily)").fetchall()}
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+        missing = sorted(_REQUIRED_COLUMNS - columns)
+        if missing:
+            return f"stock_daily missing columns: {', '.join(missing)}"
+        return None
+
+    def _load_bars(self) -> pd.DataFrame:
+        with sqlite3.connect(str(Path(self.db_path).expanduser())) as conn:
+            df = pd.read_sql(
+                "SELECT symbol, date, open, high, low, close, volume, turnover FROM stock_daily",
+                conn,
+            )
+        if df.empty:
+            return df
+        df["symbol"] = df["symbol"].astype(str).str.strip()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in ("open", "high", "low", "close", "volume", "turnover"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["symbol", "date", "close"])
+        df = df[df["symbol"].str.fullmatch(r"\d{6}", na=False)]
+        df = df[df["volume"].fillna(0) > 0]
+        return df.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+    def _run_strategy(self, strategy_name: str, bars: pd.DataFrame) -> List[Dict[str, Any]]:
+        if strategy_name == "rps_breakout":
+            return _run_rps_breakout(bars)
+
+        spec = STRATEGY_SPECS[strategy_name]
+        candidates: List[Dict[str, Any]] = []
+        for symbol, df in bars.groupby("symbol", sort=False):
+            if len(df) < spec.min_bars:
+                continue
+            try:
+                candidate = _run_single_symbol_strategy(strategy_name, str(symbol), df.copy())
+            except Exception as exc:
+                logger.debug("Sequoia strategy failed symbol=%s strategy=%s: %s", symbol, strategy_name, exc)
+                continue
+            if candidate:
+                candidates.append(candidate)
+        return candidates
+
+
+def _default_db_path() -> str:
+    return os.getenv("SEQUOIA_CANDIDATE_DB_PATH") or DEFAULT_SEQUOIA_DB_PATH
+
+
+def _normalize_strategy_names(strategy_names: Optional[Sequence[str]]) -> List[str]:
+    raw = [str(item).strip().lower() for item in (strategy_names or []) if str(item or "").strip()]
+    if not raw or "all" in raw:
+        return list(STRATEGY_SPECS.keys())
+    aliases = {
+        "turtle": "turtle_trade",
+        "flag": "high_tight_flag",
+        "shakeout": "limit_up_shakeout",
+        "limit_down": "uptrend_limit_down",
+        "rps": "rps_breakout",
+    }
+    result: List[str] = []
+    for name in raw:
+        canonical = aliases.get(name, name)
+        if canonical in STRATEGY_SPECS and canonical not in result:
+            result.append(canonical)
+    return result
+
+
+def _run_single_symbol_strategy(strategy_name: str, symbol: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if strategy_name == "ma_volume":
+        df["ma5"] = df["close"].rolling(5).mean()
+        df["ma20"] = df["close"].rolling(20).mean()
+        df["vol_ma20"] = df["volume"].rolling(20).mean()
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        matched = prev["ma5"] < prev["ma20"] and last["ma5"] > last["ma20"] and last["volume"] > last["vol_ma20"] * 1.5
+        score = 68 + _bounded_ratio(last["volume"], last["vol_ma20"] * 1.5, cap=20)
+        metrics = {"volume_ratio": _safe_ratio(last["volume"], last["vol_ma20"]), "ma5": last["ma5"], "ma20": last["ma20"]}
+    elif strategy_name == "turtle_trade":
+        df["high_20"] = df["high"].shift(1).rolling(20).max()
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        matched = (
+            not pd.isna(last["high_20"])
+            and last["close"] > last["high_20"]
+            and last["turnover"] > 100_000_000
+            and last["close"] > last["open"]
+            and last["close"] > prev["close"]
+        )
+        change_pct = _safe_ratio(last["close"] - prev["close"], prev["close"]) * 100
+        score = 72 + min(max(change_pct, 0), 20)
+        metrics = {"change_pct": change_pct, "high_20": last["high_20"], "turnover": last["turnover"]}
+    elif strategy_name == "high_tight_flag":
+        tail40 = df.tail(40)
+        tail10 = df.tail(10)
+        high40 = tail40["high"].max()
+        low40 = tail40["low"].min()
+        high10 = tail10["high"].max()
+        low10 = tail10["low"].min()
+        vol_ma20 = df["volume"].iloc[-21:-1].mean()
+        matched = (
+            low40 > 0
+            and low10 > 0
+            and high40 / low40 > 1.6
+            and high10 / low10 < 1.15
+            and low10 >= high40 * 0.8
+            and df["volume"].iloc[-1] < vol_ma20 * 0.6
+        )
+        score = 76 + min(max((high40 / low40 - 1.6) * 30, 0), 18)
+        metrics = {"momentum_40": _safe_ratio(high40, low40), "range_10": _safe_ratio(high10, low10), "volume_ratio": _safe_ratio(df["volume"].iloc[-1], vol_ma20)}
+    elif strategy_name == "limit_up_shakeout":
+        prev2 = df.iloc[-3]
+        prev1 = df.iloc[-2]
+        today = df.iloc[-1]
+        matched = (
+            prev1["close"] >= prev2["close"] * 1.095
+            and today["close"] < today["open"]
+            and today["volume"] > prev1["volume"] * 2.0
+            and today["low"] >= prev1["close"]
+        )
+        score = 74 + _bounded_ratio(today["volume"], prev1["volume"] * 2.0, cap=18)
+        metrics = {"prev_limit_up_pct": _safe_ratio(prev1["close"] - prev2["close"], prev2["close"]) * 100, "volume_ratio": _safe_ratio(today["volume"], prev1["volume"])}
+    elif strategy_name == "uptrend_limit_down":
+        df["ma20"] = df["close"].rolling(20).mean()
+        df["ma60"] = df["close"].rolling(60).mean()
+        df["vol_ma20"] = df["volume"].rolling(20).mean()
+        prev = df.iloc[-2]
+        today = df.iloc[-1]
+        matched = (
+            not pd.isna(prev["ma20"])
+            and not pd.isna(prev["ma60"])
+            and not pd.isna(today["vol_ma20"])
+            and prev["ma20"] > prev["ma60"]
+            and today["close"] <= prev["close"] * 0.905
+            and today["volume"] > today["vol_ma20"] * 2.0
+        )
+        score = 66 + _bounded_ratio(today["volume"], today["vol_ma20"] * 2.0, cap=16)
+        metrics = {"ma20": prev["ma20"], "ma60": prev["ma60"], "volume_ratio": _safe_ratio(today["volume"], today["vol_ma20"])}
+    else:
+        return None
+
+    if not matched:
+        return None
+    return _candidate_payload(symbol, strategy_name, df.iloc[-1], score, metrics)
+
+
+def _run_rps_breakout(bars: pd.DataFrame) -> List[Dict[str, Any]]:
+    period = 120
+    if bars.empty:
+        return []
+    df = bars[["symbol", "date", "close", "high"]].copy()
+    df["close_shift"] = df.groupby("symbol")["close"].shift(period)
+    df["pct_change"] = (df["close"] - df["close_shift"]) / df["close_shift"]
+    latest_date = df["date"].max()
+    latest_df = df[df["date"] == latest_date].dropna(subset=["pct_change"]).copy()
+    if latest_df.empty:
+        return []
+    latest_df["rps"] = latest_df["pct_change"].rank(pct=True) * 100
+
+    roll_high = (
+        df.groupby("symbol")["high"]
+        .rolling(window=period, min_periods=period // 2)
+        .max()
+        .reset_index(level=0, drop=True)
+    )
+    df["roll_high"] = roll_high
+    latest_roll_high = df[df["date"] == latest_date][["symbol", "roll_high"]]
+    latest_df = latest_df.merge(latest_roll_high, on="symbol")
+    selected = latest_df[(latest_df["rps"] >= 90) & (latest_df["close"] >= latest_df["roll_high"] * 0.90)]
+
+    candidates: List[Dict[str, Any]] = []
+    for _, row in selected.iterrows():
+        score = min(99.0, 76 + float(row["rps"] - 90) * 1.5)
+        metrics = {"rps": row["rps"], "pct_change_120": row["pct_change"] * 100, "roll_high_120": row["roll_high"]}
+        candidates.append(_candidate_payload(str(row["symbol"]), "rps_breakout", row, score, metrics))
+    return candidates
+
+
+def _candidate_payload(
+    symbol: str,
+    strategy_name: str,
+    last: Any,
+    score: float,
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    spec = STRATEGY_SPECS[strategy_name]
+    payload = {
+        "code": symbol,
+        "name": _display_stock_name(symbol),
+        "source": f"sequoia:{strategy_name}",
+        "matched_strategies": [strategy_name],
+        "strategy_tags": list(spec.tags),
+        "reason": spec.reason,
+        "signal_score": round(float(score), 2),
+        "latest_date": _format_date(last.get("date") if hasattr(last, "get") else None),
+        "metrics": _jsonable_metrics(metrics),
+    }
+    payload["reason_dimensions"] = _candidate_reason_dimensions(payload)
+    return payload
+
+
+def _display_stock_name(code: Any, current_name: Any = None) -> str:
+    code_text = str(code or "").strip()
+    current_text = str(current_name or "").strip()
+    if is_meaningful_stock_name(current_text, code_text):
+        return current_text
+    for name in (STOCK_NAME_MAP.get(code_text), get_index_stock_name(code_text)):
+        if is_meaningful_stock_name(name, code_text):
+            return str(name)
+    return code_text
+
+
+def _merge_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for item in candidates:
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        if code not in by_code:
+            by_code[code] = dict(item)
+            continue
+        current = by_code[code]
+        current["signal_score"] = round(max(float(current.get("signal_score") or 0), float(item.get("signal_score") or 0)) + 4, 2)
+        current["matched_strategies"] = _unique([*(current.get("matched_strategies") or []), *(item.get("matched_strategies") or [])])
+        current["strategy_tags"] = _unique([*(current.get("strategy_tags") or []), *(item.get("strategy_tags") or [])])
+        current["source"] = "sequoia:multi_strategy"
+        current["reason"] = f"多策略共振：{', '.join(current['matched_strategies'])}。"
+        metrics = dict(current.get("metrics") or {})
+        metrics[str(item.get("source") or "sequoia")] = item.get("metrics") or {}
+        current["metrics"] = metrics
+    merged = list(by_code.values())
+    for item in merged:
+        item["reason_dimensions"] = _candidate_reason_dimensions(item)
+    return merged
+
+
+def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
+    strategies = _display_strategy_names(item.get("matched_strategies") or [])
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    dimensions: List[Dict[str, str]] = []
+    if strategies:
+        dimensions.append({
+            "dimension": "strategy",
+            "label": "策略",
+            "detail": f"Sequoia 形态/动量策略入池：{'、'.join(strategies)}",
+        })
+    technical_bits = []
+    for key, label in (
+        ("high_20", "20 日高点"),
+        ("volume_ratio", "量比"),
+        ("rps", "RPS"),
+        ("pct_change_120", "120 日涨幅"),
+        ("momentum_40", "40 日动量"),
+        ("range_10", "10 日区间"),
+    ):
+        value = metrics.get(key)
+        if value is not None:
+            technical_bits.append(f"{label}={value}")
+    if technical_bits:
+        dimensions.append({"dimension": "technical", "label": "技术面", "detail": "；".join(technical_bits[:3])})
+    capital_bits = []
+    for key, label in (("turnover", "成交额"), ("volume_ratio", "量比")):
+        value = metrics.get(key)
+        if value is not None:
+            capital_bits.append(f"{label}={value}")
+    if capital_bits:
+        dimensions.append({"dimension": "capital", "label": "资金面", "detail": "流动性代理：" + "；".join(capital_bits[:3])})
+    return dimensions
+
+
+def _display_strategy_names(names: Iterable[Any]) -> List[str]:
+    mapping = {
+        "ma_volume": "均线放量突破",
+        "turtle_trade": "海龟突破",
+        "high_tight_flag": "高窄旗形",
+        "limit_up_shakeout": "涨停洗盘",
+        "uptrend_limit_down": "上升趋势跌停错杀",
+        "rps_breakout": "RPS 强势突破",
+        "breakout": "突破",
+        "rps": "RPS 强势",
+        "relative_strength": "相对强势",
+        "momentum": "动量",
+        "liquidity": "流动性",
+    }
+    result: List[str] = []
+    for name in names:
+        text = mapping.get(str(name), str(name))
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _safe_ratio(numerator: Any, denominator: Any) -> float:
+    try:
+        denominator_f = float(denominator)
+        if denominator_f == 0:
+            return 0.0
+        return float(numerator) / denominator_f
+    except Exception:
+        return 0.0
+
+
+def _bounded_ratio(numerator: Any, denominator: Any, *, cap: float) -> float:
+    return min(max((_safe_ratio(numerator, denominator) - 1.0) * 10.0, 0.0), cap)
+
+
+def _unique(items: Iterable[Any]) -> List[str]:
+    result: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _jsonable_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for key, value in metrics.items():
+        if isinstance(value, dict):
+            payload[str(key)] = _jsonable_metrics(value)
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+        if hasattr(value, "item"):
+            value = value.item()
+        if isinstance(value, float):
+            payload[str(key)] = round(value, 4)
+        else:
+            payload[str(key)] = value
+    return payload
+
+
+def _format_date(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:
+        return str(value)

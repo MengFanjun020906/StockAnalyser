@@ -16,12 +16,18 @@ same implementation.
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from src.agent.debate import DebateResult, format_debate_appendix, run_adversarial_debate, should_run_debate
 from src.agent.llm_adapter import LLMToolAdapter
+from src.agent.planner import build_planning_result
+from src.agent.planning_prompts import PromptBuildOptions, build_planning_system_prompt
 from src.agent.runner import run_agent_loop, parse_dashboard_json
+from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
 from src.agent.tools.registry import ToolRegistry
+from src.schemas.agent_context import AgentUserContext
 from src.report_language import normalize_report_language
 from src.market_context import get_market_role, get_market_guidelines
 
@@ -44,6 +50,8 @@ class AgentResult:
     provider: str = ""
     model: str = ""                            # comma-separated models used (supports fallback)
     error: Optional[str] = None
+    debate: Optional[Dict[str, Any]] = None
+    stock_selection: Optional[Dict[str, Any]] = None
 
 
 # ============================================================
@@ -443,6 +451,8 @@ class AgentExecutor:
         use_legacy_default_prompt: bool = False,
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
+        tool_call_timeout_seconds: Optional[float] = None,
+        orchestration_mode: str = "legacy",
     ):
         self.tool_registry = tool_registry
         self.llm_adapter = llm_adapter
@@ -451,6 +461,65 @@ class AgentExecutor:
         self.use_legacy_default_prompt = use_legacy_default_prompt
         self.max_steps = max_steps
         self.timeout_seconds = timeout_seconds
+        self.tool_call_timeout_seconds = tool_call_timeout_seconds
+        self.orchestration_mode = orchestration_mode
+
+    def _build_system_prompt(
+        self,
+        context: Optional[Dict[str, Any]],
+        *,
+        chat_mode: bool = False,
+    ) -> str:
+        """Build the correct system prompt for normal or planning execution."""
+        skills_section = ""
+        if self.skill_instructions:
+            skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
+        default_skill_policy_section = ""
+        if self.default_skill_policy:
+            default_skill_policy_section = f"\n{self.default_skill_policy}\n"
+        report_language = normalize_report_language((context or {}).get("report_language", "zh"))
+        stock_code = (context or {}).get("stock_code", "")
+        market_role = get_market_role(stock_code, report_language)
+        market_guidelines = get_market_guidelines(stock_code, report_language)
+        agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        planning_mode = _is_planning_execute_context(agent_user_context)
+
+        if planning_mode:
+            extra_sections = [
+                f"## 市场角色\n\n你当前以{market_role}身份分析本次请求。",
+                market_guidelines,
+                _build_language_section(report_language, chat_mode=chat_mode),
+            ]
+            if default_skill_policy_section:
+                extra_sections.append(default_skill_policy_section)
+            if skills_section:
+                extra_sections.append(skills_section)
+            return build_planning_system_prompt(
+                PromptBuildOptions(
+                    language="en" if report_language == "en" else "zh",
+                    extra_instructions="\n\n".join(section.strip() for section in extra_sections if section.strip()),
+                )
+            )
+
+        if chat_mode:
+            prompt_template = (
+                LEGACY_DEFAULT_CHAT_SYSTEM_PROMPT
+                if self.use_legacy_default_prompt
+                else CHAT_SYSTEM_PROMPT
+            )
+        else:
+            prompt_template = (
+                LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
+                if self.use_legacy_default_prompt
+                else AGENT_SYSTEM_PROMPT
+            )
+        return prompt_template.format(
+            market_role=market_role,
+            market_guidelines=market_guidelines,
+            default_skill_policy_section=default_skill_policy_section,
+            skills_section=skills_section,
+            language_section=_build_language_section(report_language, chat_mode=chat_mode),
+        )
 
     def run(self, task: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the agent loop for a given task.
@@ -462,29 +531,7 @@ class AgentExecutor:
         Returns:
             AgentResult with parsed dashboard or error.
         """
-        # Build system prompt with skills
-        skills_section = ""
-        if self.skill_instructions:
-            skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
-        default_skill_policy_section = ""
-        if self.default_skill_policy:
-            default_skill_policy_section = f"\n{self.default_skill_policy}\n"
-        report_language = normalize_report_language((context or {}).get("report_language", "zh"))
-        stock_code = (context or {}).get("stock_code", "")
-        market_role = get_market_role(stock_code, report_language)
-        market_guidelines = get_market_guidelines(stock_code, report_language)
-        prompt_template = (
-            LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
-            if self.use_legacy_default_prompt
-            else AGENT_SYSTEM_PROMPT
-        )
-        system_prompt = prompt_template.format(
-            market_role=market_role,
-            market_guidelines=market_guidelines,
-            default_skill_policy_section=default_skill_policy_section,
-            skills_section=skills_section,
-            language_section=_build_language_section(report_language),
-        )
+        system_prompt = self._build_system_prompt(context, chat_mode=False)
 
         # Build tool declarations in OpenAI format (litellm handles all providers)
         tool_decls = self.tool_registry.to_openai_tools()
@@ -495,7 +542,13 @@ class AgentExecutor:
             {"role": "user", "content": self._build_user_message(task, context)},
         ]
 
-        return self._run_loop(messages, tool_decls, parse_dashboard=True)
+        return self._run_loop(
+            messages,
+            tool_decls,
+            parse_dashboard=True,
+            original_task=task,
+            context=context,
+        )
 
     def chat(self, message: str, session_id: str, progress_callback: Optional[Callable] = None, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the agent loop for a free-form chat message.
@@ -511,29 +564,7 @@ class AgentExecutor:
         """
         from src.agent.conversation import conversation_manager
 
-        # Build system prompt with skills
-        skills_section = ""
-        if self.skill_instructions:
-            skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
-        default_skill_policy_section = ""
-        if self.default_skill_policy:
-            default_skill_policy_section = f"\n{self.default_skill_policy}\n"
-        report_language = normalize_report_language((context or {}).get("report_language", "zh"))
-        stock_code = (context or {}).get("stock_code", "")
-        market_role = get_market_role(stock_code, report_language)
-        market_guidelines = get_market_guidelines(stock_code, report_language)
-        prompt_template = (
-            LEGACY_DEFAULT_CHAT_SYSTEM_PROMPT
-            if self.use_legacy_default_prompt
-            else CHAT_SYSTEM_PROMPT
-        )
-        system_prompt = prompt_template.format(
-            market_role=market_role,
-            market_guidelines=market_guidelines,
-            default_skill_policy_section=default_skill_policy_section,
-            skills_section=skills_section,
-            language_section=_build_language_section(report_language, chat_mode=True),
-        )
+        system_prompt = self._build_system_prompt(context, chat_mode=True)
 
         # Build tool declarations in OpenAI format (litellm handles all providers)
         tool_decls = self.tool_registry.to_openai_tools()
@@ -572,12 +603,23 @@ class AgentExecutor:
                 messages.append({"role": "user", "content": context_msg})
                 messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
 
-        messages.append({"role": "user", "content": message})
+        agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        if _is_planning_execute_context(agent_user_context):
+            messages.append({"role": "user", "content": self._build_user_message(message, context)})
+        else:
+            messages.append({"role": "user", "content": message})
 
         # Persist the user turn immediately so the session appears in history during processing
         conversation_manager.add_message(session_id, "user", message)
 
-        result = self._run_loop(messages, tool_decls, parse_dashboard=False, progress_callback=progress_callback)
+        result = self._run_loop(
+            messages,
+            tool_decls,
+            parse_dashboard=False,
+            progress_callback=progress_callback,
+            original_task=message,
+            context=context,
+        )
 
         # Persist assistant reply (or error note) for context continuity
         if result.success:
@@ -588,13 +630,42 @@ class AgentExecutor:
 
         return result
 
-    def _run_loop(self, messages: List[Dict[str, Any]], tool_decls: List[Dict[str, Any]], parse_dashboard: bool, progress_callback: Optional[Callable] = None) -> AgentResult:
+    def _run_loop(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_decls: List[Dict[str, Any]],
+        parse_dashboard: bool,
+        progress_callback: Optional[Callable] = None,
+        *,
+        original_task: str = "",
+        context: Optional[Dict[str, Any]] = None,
+    ) -> AgentResult:
         """Delegate to the shared runner and adapt the result.
 
         This preserves the exact same observable behaviour as the original
         inline implementation while sharing the single authoritative loop
         in :mod:`src.agent.runner`.
         """
+        stock_selection = self._maybe_run_stock_selection(
+            context=context,
+            original_task=original_task,
+            progress_callback=progress_callback,
+        )
+        if stock_selection and (stock_selection.success or stock_selection.final_report_json):
+            return AgentResult(
+                success=True,
+                content=stock_selection.final_markdown,
+                dashboard=None,
+                tool_calls_log=stock_selection.tool_calls_log,
+                total_steps=len(stock_selection.tool_calls_log),
+                total_tokens=stock_selection.total_tokens,
+                provider="agent",
+                model=", ".join(stock_selection.models_used),
+                error=None,
+                debate=None,
+                stock_selection=stock_selection.to_dict(),
+            )
+
         loop_result = run_agent_loop(
             messages=messages,
             tool_registry=self.tool_registry,
@@ -602,15 +673,36 @@ class AgentExecutor:
             max_steps=self.max_steps,
             progress_callback=progress_callback,
             max_wall_clock_seconds=self.timeout_seconds,
+            tool_call_timeout_seconds=self.tool_call_timeout_seconds,
         )
 
         model_str = loop_result.model
 
+        debate = self._maybe_run_debate(
+            loop_content=loop_result.content,
+            loop_tool_calls=loop_result.tool_calls_log,
+            context=context,
+            original_task=original_task,
+            progress_callback=progress_callback,
+        )
+        final_content = loop_result.content
+        agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        if _is_planning_execute_context(agent_user_context):
+            final_content = _normalize_planning_execute_final_content(final_content)
+        if debate and debate.success:
+            final_content = f"{final_content.rstrip()}\n\n{format_debate_appendix(debate)}".rstrip()
+            debate.debug_outputs["final_report_with_debate"] = final_content
+            loop_result.total_tokens += debate.total_tokens
+            for model in debate.models_used:
+                if model and model not in loop_result.models_used:
+                    loop_result.models_used.append(model)
+        model_str = loop_result.model
+
         if parse_dashboard and loop_result.success:
-            dashboard = parse_dashboard_json(loop_result.content)
+            dashboard = parse_dashboard_json(final_content)
             return AgentResult(
                 success=dashboard is not None,
-                content=loop_result.content,
+                content=final_content,
                 dashboard=dashboard,
                 tool_calls_log=loop_result.tool_calls_log,
                 total_steps=loop_result.total_steps,
@@ -618,11 +710,13 @@ class AgentExecutor:
                 provider=loop_result.provider,
                 model=model_str,
                 error=None if dashboard else "Failed to parse dashboard JSON from agent response",
+                debate=debate.to_dict() if debate else None,
+                stock_selection=stock_selection.to_dict() if stock_selection else None,
             )
 
         return AgentResult(
             success=loop_result.success,
-            content=loop_result.content,
+            content=final_content,
             dashboard=None,
             tool_calls_log=loop_result.tool_calls_log,
             total_steps=loop_result.total_steps,
@@ -630,6 +724,59 @@ class AgentExecutor:
             provider=loop_result.provider,
             model=model_str,
             error=loop_result.error,
+            debate=debate.to_dict() if debate else None,
+            stock_selection=stock_selection.to_dict() if stock_selection else None,
+        )
+
+    def _maybe_run_stock_selection(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        original_task: str,
+        progress_callback: Optional[Callable],
+    ):
+        context = context or {}
+        agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+        if not should_run_stock_selection(agent_user_context):
+            return None
+        return run_stock_selection_pipeline(
+            task=original_task,
+            agent_user_context=agent_user_context,
+            tool_registry=self.tool_registry,
+            llm_adapter=self.llm_adapter,
+            timeout_seconds=self.timeout_seconds,
+            progress_callback=progress_callback,
+            run_id=context.get("session_id") or "selection-run",
+            orchestration_mode=self.orchestration_mode,
+        )
+
+    def _maybe_run_debate(
+        self,
+        *,
+        loop_content: str,
+        loop_tool_calls: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]],
+        original_task: str,
+        progress_callback: Optional[Callable],
+    ) -> Optional[DebateResult]:
+        if not loop_content or not loop_tool_calls:
+            return None
+        context = context or {}
+        agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+        if not should_run_debate(agent_user_context=agent_user_context, tool_calls=loop_tool_calls):
+            return None
+        planner = None
+        if agent_user_context is not None:
+            planner = build_planning_result(agent_user_context, tool_registry=self.tool_registry).to_dict()
+        return run_adversarial_debate(
+            task=original_task,
+            primary_report=loop_content,
+            agent_user_context=agent_user_context,
+            planner=planner,
+            tool_calls=loop_tool_calls,
+            llm_adapter=self.llm_adapter,
+            timeout_seconds=self.timeout_seconds,
+            progress_callback=progress_callback,
         )
 
     def _build_user_message(self, task: str, context: Optional[Dict[str, Any]] = None) -> str:
@@ -637,6 +784,18 @@ class AgentExecutor:
         parts = [task]
         if context:
             report_language = normalize_report_language(context.get("report_language", "zh"))
+            agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+            if agent_user_context is not None:
+                planning_result = build_planning_result(
+                    agent_user_context,
+                    tool_registry=self.tool_registry,
+                )
+                parts.append("\n[系统生成的 AgentUserContext]\n" + agent_user_context.model_dump_json(indent=2))
+                parts.append("\n[系统生成的 Planner 工具执行计划]\n" + json.dumps(planning_result.to_dict(), ensure_ascii=False, indent=2))
+                parts.append(
+                    "\n请先遵循 Planner 的 capability -> tools 计划调用必要工具；"
+                    "如某工具缺失或返回失败，记录原因并使用已有证据降级分析。"
+                )
             if context.get("stock_code"):
                 parts.append(f"\n股票代码: {context['stock_code']}")
             if context.get("report_type"):
@@ -656,3 +815,28 @@ class AgentExecutor:
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)
+
+
+def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
+    """Return an AgentUserContext from a model/dict payload, or None if absent."""
+    if value is None:
+        return None
+    if isinstance(value, AgentUserContext):
+        return value
+    if isinstance(value, dict):
+        return AgentUserContext(**value)
+    return None
+
+
+def _is_planning_execute_context(context: Optional[AgentUserContext]) -> bool:
+    return bool(context and context.report.analysis_mode == "planning_execute")
+
+
+_FINAL_OUTPUT_STEP_TITLE_RE = re.compile(r"(?m)^(第[一二三四五六七八九十]+(?:步|阶段))[:：][ \t]*")
+
+
+def _normalize_planning_execute_final_content(content: str) -> str:
+    """Remove execution-step labels from final markdown while keeping analysis text."""
+    if not content:
+        return content
+    return _FINAL_OUTPUT_STEP_TITLE_RE.sub("", content)

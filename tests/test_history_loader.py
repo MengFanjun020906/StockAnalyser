@@ -108,6 +108,27 @@ class HistoryLoaderTestCase(unittest.TestCase):
         finally:
             reset_frozen_target_date(token)
 
+    @patch("src.services.history_loader._get_fetcher_manager")
+    @patch("src.storage.get_db")
+    def test_weekend_accepts_latest_completed_trading_day_cache(self, mock_get_db, mock_get_fm):
+        from src.services.history_loader import load_history_df
+
+        latest_trade_date = date(2026, 5, 15)
+        fake_bar = MagicMock()
+        fake_bar.to_dict.return_value = {"date": latest_trade_date.isoformat(), "close": 10}
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = [fake_bar] * 40
+        mock_get_db.return_value = mock_db
+        mock_fm = MagicMock()
+        mock_get_fm.return_value = mock_fm
+
+        with patch("src.services.history_loader._effective_cache_end", return_value=latest_trade_date):
+            df, source = load_history_df("000300", days=260, target_date=date(2026, 5, 17))
+
+        self.assertIsNotNone(df)
+        self.assertEqual(source, "db_cache")
+        mock_fm.get_daily_data.assert_not_called()
+
     # ------------------------------------------------------------------
     # normalize_stock_code fallback for prefixed codes
     # ------------------------------------------------------------------

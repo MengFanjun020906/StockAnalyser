@@ -8,6 +8,7 @@ interface consumed by the AgentExecutor, via LiteLLM.
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
+_AUTHENTICATION_HINTS = ("authentication", "api key", "invalid", "unauthorized", "401")
+
 
 def _resolve_litellm_exception(name: str) -> type[BaseException]:
     """Return a catchable LiteLLM exception class even in stubbed test environments."""
@@ -40,6 +43,39 @@ def _resolve_litellm_exception(name: str) -> type[BaseException]:
 
     _FallbackLiteLLMError.__name__ = f"Fallback{name}"
     return _FallbackLiteLLMError
+
+
+def _looks_like_authentication_error(error: BaseException) -> bool:
+    """Best-effort auth error detection across LiteLLM/provider exception text."""
+    error_text = str(error).lower()
+    return any(hint in error_text for hint in _AUTHENTICATION_HINTS)
+
+
+def _mask_api_key_suffix(error: BaseException) -> str:
+    """Extract the masked API key suffix from provider errors when present."""
+    match = re.search(r"(?:api key|key):\s*\*+([A-Za-z0-9_-]{3,8})", str(error), re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _llm_error_hint(model: str, error: BaseException, config: Any) -> str:
+    """Return an actionable config hint for common LLM provider failures."""
+    provider = model.split("/", 1)[0] if "/" in model else "openai"
+    if provider != "deepseek" or not _looks_like_authentication_error(error):
+        return ""
+
+    source = getattr(config, "llm_models_source", "") or "legacy_env"
+    if source == "llm_channels":
+        key_name = "LLM_<DEEPSEEK_CHANNEL>_API_KEY or DEEPSEEK_API_KEY"
+    elif source == "litellm_config":
+        key_name = "the DeepSeek api_key in LITELLM_CONFIG, or DEEPSEEK_API_KEY for direct fallback models"
+    else:
+        key_name = "DEEPSEEK_API_KEY"
+    suffix = _mask_api_key_suffix(error)
+    suffix_note = f" Provider rejected the key ending with {suffix}." if suffix else ""
+    return (
+        " DeepSeek authentication failed."
+        f"{suffix_note} Update {key_name}; OPENAI_API_KEY is not used for deepseek/* models."
+    )
 
 
 # ============================================================
@@ -373,7 +409,8 @@ class LLMToolAdapter:
                 continue
 
         suffix = " (rate-limit encountered during fallback)" if hit_rate_limit else ""
-        error_msg = f"All LLM models failed{suffix}. Last error: {last_error}"
+        hint = _llm_error_hint(models_to_try[-1], last_error, config) if last_error else ""
+        error_msg = f"All LLM models failed{suffix}. Last error: {last_error}{hint}"
         logger.error(error_msg)
         return LLMResponse(content=error_msg, provider="error")
 

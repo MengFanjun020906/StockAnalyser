@@ -27,6 +27,9 @@ ensure_litellm_stub()
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+if "fake_useragent" not in sys.modules:
+    sys.modules["fake_useragent"] = MagicMock()
+
 
 def _builtin_strategy_names() -> set[str]:
     strategies_dir = Path(__file__).resolve().parent.parent / "strategies"
@@ -49,12 +52,18 @@ class TestAgentConfig(unittest.TestCase):
         config = Config._load_from_env()
         self.assertEqual(config.agent_litellm_model, "")
         self.assertFalse(config.agent_mode)
+        self.assertEqual(config.agent_analysis_mode, "normal")
+        self.assertEqual(config.agent_orchestration_mode, "legacy")
         self.assertEqual(config.agent_max_steps, AGENT_MAX_STEPS_DEFAULT)
         self.assertEqual(config.agent_skills, [])
+        self.assertEqual(config.agent_tool_call_timeout_seconds, 30.0)
 
     @patch.dict(os.environ, {
         'AGENT_MODE': 'true',
+        'AGENT_ANALYSIS_MODE': 'planning_execute',
+        'AGENT_ORCHESTRATION_MODE': 'expert_graph',
         'AGENT_MAX_STEPS': '15',
+        'AGENT_TOOL_CALL_TIMEOUT_SECONDS': '12.5',
         'AGENT_SKILLS': 'dragon_head,shrink_pullback,volume_breakout',
     }, clear=True)
     def test_agent_config_from_env(self):
@@ -63,7 +72,10 @@ class TestAgentConfig(unittest.TestCase):
         Config._instance = None
         config = Config._load_from_env()
         self.assertTrue(config.agent_mode)
+        self.assertEqual(config.agent_analysis_mode, "planning_execute")
+        self.assertEqual(config.agent_orchestration_mode, "expert_graph")
         self.assertEqual(config.agent_max_steps, 15)
+        self.assertEqual(config.agent_tool_call_timeout_seconds, 12.5)
         self.assertEqual(config.agent_skills, ['dragon_head', 'shrink_pullback', 'volume_breakout'])
 
     @patch.dict(os.environ, {'AGENT_MODE': 'false'}, clear=True)
@@ -193,6 +205,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -214,6 +227,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=["wave_theory"],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -235,6 +249,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -245,6 +260,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
 
         self.assertIn("严进策略", kwargs["default_skill_policy"])
         self.assertTrue(kwargs["use_legacy_default_prompt"])
+        self.assertEqual(kwargs["tool_call_timeout_seconds"], 30)
         skill_manager.activate.assert_called_once_with(["bull_trend"])
 
     def test_explicit_empty_request_falls_back_to_primary_default_skill(self):
@@ -253,6 +269,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -274,6 +291,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -295,6 +313,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=["missing_skill"],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -316,6 +335,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -337,6 +357,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             agent_skills=[],
             agent_max_steps=10,
             agent_orchestrator_timeout_s=600,
+            agent_tool_call_timeout_seconds=30,
         )
         kwargs, skill_manager = self._run_factory_case(
             config,
@@ -606,6 +627,33 @@ class TestAgentResultConversion(unittest.TestCase):
             agent_result, "600519", "贵州茅台", ReportType.SIMPLE, "q-valid"
         )
         self.assertEqual(result.name, "贵州茅台")
+
+    def test_convert_overwrites_mismatched_input_and_dashboard_name_by_code(self):
+        """Code/name identity is authoritative; 301028 must not be reported as 友升股份."""
+        pipeline = self._make_pipeline()
+
+        from src.agent.executor import AgentResult
+        from src.enums import ReportType
+
+        agent_result = AgentResult(
+            success=True,
+            content="{}",
+            dashboard={
+                "stock_name": "友升股份",
+                "sentiment_score": 70,
+                "trend_prediction": "震荡",
+                "operation_advice": "观望",
+                "decision_type": "hold",
+            },
+            provider="gemini",
+        )
+
+        result = pipeline._agent_result_to_analysis_result(
+            agent_result, "301028", "友升股份", ReportType.SIMPLE, "q-name-guard"
+        )
+
+        self.assertEqual(result.code, "301028")
+        self.assertEqual(result.name, "鼎熔岩")
 
 
 # ============================================================
@@ -1317,6 +1365,37 @@ class TestAgentConstructionChain(unittest.TestCase):
         self.assertIn("All LLM models failed (rate-limit encountered during fallback).", result.content)
         self.assertIn("window exceeded", result.content)
         mock_sleep.assert_not_called()
+
+    @patch("src.agent.llm_adapter.Router")
+    def test_llm_adapter_adds_deepseek_auth_configuration_hint(self, _mock_router):
+        """DeepSeek auth failures should point at the DeepSeek key, not generic fallback failure."""
+        mock_cfg = SimpleNamespace(
+            agent_litellm_model="",
+            litellm_model="deepseek/deepseek-chat",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+            llm_temperature=0.7,
+            llm_models_source="legacy_env",
+            gemini_api_keys=[],
+            anthropic_api_keys=[],
+            openai_api_keys=[],
+            deepseek_api_keys=["sk-test-value"],
+            openai_base_url=None,
+        )
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        adapter = LLMToolAdapter(config=mock_cfg)
+        adapter._call_litellm_model = MagicMock(
+            side_effect=RuntimeError("Authentication Fails, Your api key: ****g0ys is invalid")
+        )
+
+        result = adapter.call_completion(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        self.assertEqual(result.provider, "error")
+        self.assertIn("DeepSeek authentication failed.", result.content)
+        self.assertIn("DEEPSEEK_API_KEY", result.content)
+        self.assertIn("OPENAI_API_KEY is not used for deepseek/* models", result.content)
+        self.assertIn("ending with g0ys", result.content)
 
     @patch("src.agent.llm_adapter.Router")
     def test_llm_adapter_reports_missing_configuration_without_generic_none_error(self, _mock_router):

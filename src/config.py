@@ -179,6 +179,12 @@ def normalize_news_strategy_profile(value: Optional[str]) -> str:
     return candidate if candidate in NEWS_STRATEGY_WINDOWS else "short"
 
 
+def normalize_graphiti_group_strategy(value: Optional[str]) -> str:
+    """Normalize Graphiti group strategy to supported values."""
+    candidate = (value or "market").strip().lower()
+    return candidate if candidate in {"market", "user", "single"} else "market"
+
+
 def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Optional[str]) -> int:
     """Resolve effective news window days from profile and global max-age."""
     profile = normalize_news_strategy_profile(news_strategy_profile)
@@ -279,6 +285,24 @@ def normalize_llm_channel_model(model: str, protocol: Optional[str], base_url: O
     if not resolved_protocol:
         return normalized_model
     return f"{resolved_protocol}/{normalized_model}"
+
+
+def _env_list(name: str) -> List[str]:
+    """Read a comma-separated environment variable into non-empty values."""
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
+def _read_provider_api_keys(
+    *,
+    multi_key_env: str,
+    single_key_env: str,
+) -> List[str]:
+    """Read provider keys with *_API_KEYS taking precedence over *_API_KEY."""
+    api_keys = _env_list(multi_key_env)
+    if api_keys:
+        return api_keys
+    single_key = os.getenv(single_key_env, "").strip()
+    return [single_key] if single_key else []
 
 
 def get_configured_llm_models(model_list: List[Dict[str, Any]]) -> List[str]:
@@ -592,6 +616,8 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tushare_http_url: str = "http://api.tushare.pro"
+    stockapi_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
@@ -671,17 +697,44 @@ class Config:
     news_strategy_profile: str = "short"  # 新闻窗口策略档位：ultra_short/short/medium/long
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
+    # === Graphiti 知识图谱配置 ===
+    graphiti_enabled: bool = False
+    graphiti_neo4j_uri: str = "bolt://localhost:7687"
+    graphiti_neo4j_user: str = "neo4j"
+    graphiti_neo4j_password: Optional[str] = None
+    graphiti_llm_model: str = ""
+    graphiti_embedding_model: str = ""
+    graphiti_embedding_base_url: Optional[str] = None
+    graphiti_embedding_api_key: Optional[str] = None
+    graphiti_group_strategy: str = "market"
+
     # === Agent 模式配置 ===
     agent_litellm_model: str = ""  # Optional Agent-only primary model; empty inherits LITELLM_MODEL
     agent_mode: bool = False
     _agent_mode_explicit: bool = False  # True when AGENT_MODE was explicitly set in env
+    agent_analysis_mode: str = "normal"  # Agent analysis mode: normal | planning_execute
     agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT
     agent_skills: List[str] = field(default_factory=list)
     agent_skill_dir: Optional[str] = None
     agent_nl_routing: bool = False  # Enable natural language routing in bot dispatcher
     agent_arch: str = "single"     # Agent architecture: 'single' (legacy) or 'multi' (orchestrator)
+    agent_orchestration_mode: str = "legacy"  # Watchlist orchestration: legacy | expert_graph
     agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
+    agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
+    agent_candidate_expert_timeout_seconds: float = 20.0  # Max seconds for one L1 candidate expert discovery packet
+    agent_selection_deep_dive_limit: int = 6  # Max L1 candidates that enter stock-level deep-dive evidence collection
+    agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
+    agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
+    agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
+    agent_candidate_enforce_name_code_match: bool = True  # Exclude candidates whose provided name conflicts with stock master data
+    agent_candidate_pool_db_path: str = ""  # Optional SQLite path for persisted candidate-pool runs; empty reuses DATABASE_PATH
+    agent_fundamental_candidate_db_path: str = ""  # Optional SQLite path for precomputed fundamental candidate snapshots
+    agent_stock_info_boards_timeout_seconds: float = 1.0  # Max seconds for optional stock board membership enrichment
+    agent_chip_distribution_timeout_seconds: float = 3.0  # Max seconds for chip distribution data-source probing
+    agent_sector_rankings_timeout_seconds: float = 3.0  # Max seconds for sector ranking data-source probing
+    agent_regime_component_timeout_seconds: float = 8.0  # Max seconds for one market-regime auxiliary component
+    agent_tushare_tool_timeout_seconds: float = 5.0  # Max seconds for one Tushare Agent tool request
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
     agent_deep_research_budget: int = 30000  # Max token budget for deep research
     agent_deep_research_timeout: int = 180  # Max seconds for /research command before returning timeout
@@ -853,6 +906,8 @@ class Config:
     fundamental_stage_timeout_seconds: float = 1.5
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = 0.8
+    # Agent 显式资金流工具超时（秒）；资金流端点常慢于基本面聚合预算
+    agent_capital_flow_timeout_seconds: float = 3.0
     # 单能力失败重试次数（已包含首次）
     fundamental_retry_max: int = 1
     # 基本面上下文短 TTL（秒）
@@ -922,6 +977,8 @@ class Config:
 
     # --- Post-init validation ---------------------------------------------------
     _VALID_AGENT_ARCH = {"single", "multi"}
+    _VALID_AGENT_ANALYSIS_MODE = {"normal", "planning_execute"}
+    _VALID_AGENT_ORCHESTRATION_MODES = {"legacy", "expert_graph"}
     _VALID_ORCHESTRATOR_MODES = {"quick", "standard", "full", "specialist"}
     _VALID_SKILL_ROUTING = {"auto", "manual"}
     _WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS = frozenset(
@@ -944,6 +1001,18 @@ class Config:
                 self.agent_arch, self._VALID_AGENT_ARCH,
             )
             object.__setattr__(self, "agent_arch", "single")
+        if self.agent_analysis_mode not in self._VALID_AGENT_ANALYSIS_MODE:
+            _log.warning(
+                "Invalid AGENT_ANALYSIS_MODE=%r, falling back to 'normal'. Valid: %s",
+                self.agent_analysis_mode, self._VALID_AGENT_ANALYSIS_MODE,
+            )
+            object.__setattr__(self, "agent_analysis_mode", "normal")
+        if self.agent_orchestration_mode not in self._VALID_AGENT_ORCHESTRATION_MODES:
+            _log.warning(
+                "Invalid AGENT_ORCHESTRATION_MODE=%r, falling back to 'legacy'. Valid: %s",
+                self.agent_orchestration_mode, self._VALID_AGENT_ORCHESTRATION_MODES,
+            )
+            object.__setattr__(self, "agent_orchestration_mode", "legacy")
         if self.agent_orchestrator_mode in {"strategy", "skill"}:
             _log.info(
                 "AGENT_ORCHESTRATOR_MODE=%s is deprecated; normalizing to 'specialist'",
@@ -1056,18 +1125,16 @@ class Config:
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
-        _gemini_keys_raw = os.getenv('GEMINI_API_KEYS', '')
-        gemini_api_keys = [k.strip() for k in _gemini_keys_raw.split(',') if k.strip()]
-        _single_gemini = os.getenv('GEMINI_API_KEY', '').strip()
-        if not gemini_api_keys and _single_gemini:
-            gemini_api_keys = [_single_gemini]
+        gemini_api_keys = _read_provider_api_keys(
+            multi_key_env='GEMINI_API_KEYS',
+            single_key_env='GEMINI_API_KEY',
+        )
 
         # ANTHROPIC_API_KEYS > ANTHROPIC_API_KEY
-        _anthropic_keys_raw = os.getenv('ANTHROPIC_API_KEYS', '')
-        anthropic_api_keys = [k.strip() for k in _anthropic_keys_raw.split(',') if k.strip()]
-        _single_anthropic = os.getenv('ANTHROPIC_API_KEY', '').strip()
-        if not anthropic_api_keys and _single_anthropic:
-            anthropic_api_keys = [_single_anthropic]
+        anthropic_api_keys = _read_provider_api_keys(
+            multi_key_env='ANTHROPIC_API_KEYS',
+            single_key_env='ANTHROPIC_API_KEY',
+        )
 
         # OPENAI_API_KEYS > AIHUBMIX_KEY > OPENAI_API_KEY
         _openai_keys_raw = os.getenv('OPENAI_API_KEYS', '')
@@ -1080,12 +1147,10 @@ class Config:
                 openai_api_keys = [_fallback_key]
 
         # DEEPSEEK_API_KEYS > DEEPSEEK_API_KEY (independent from OpenAI-compatible layer)
-        _deepseek_keys_raw = os.getenv('DEEPSEEK_API_KEYS', '')
-        deepseek_api_keys = [k.strip() for k in _deepseek_keys_raw.split(',') if k.strip()]
-        if not deepseek_api_keys:
-            _single_deepseek = os.getenv('DEEPSEEK_API_KEY', '').strip()
-            if _single_deepseek:
-                deepseek_api_keys = [_single_deepseek]
+        deepseek_api_keys = _read_provider_api_keys(
+            multi_key_env='DEEPSEEK_API_KEYS',
+            single_key_env='DEEPSEEK_API_KEY',
+        )
 
         # LITELLM_MODEL: explicit config takes precedence; else infer from available keys
         litellm_model = os.getenv('LITELLM_MODEL', '').strip()
@@ -1279,6 +1344,8 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_http_url=(os.getenv('TUSHARE_HTTP_URL') or "http://api.tushare.pro").strip(),
+            stockapi_token=os.getenv('STOCKAPI_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
@@ -1340,9 +1407,19 @@ class Config:
                 os.getenv('NEWS_STRATEGY_PROFILE', 'short')
             ),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
+            graphiti_enabled=os.getenv('GRAPHITI_ENABLED', 'false').lower() == 'true',
+            graphiti_neo4j_uri=os.getenv('NEO4J_URI', 'bolt://localhost:7687'),
+            graphiti_neo4j_user=os.getenv('NEO4J_USER', 'neo4j'),
+            graphiti_neo4j_password=os.getenv('NEO4J_PASSWORD') or None,
+            graphiti_llm_model=os.getenv('GRAPHITI_LLM_MODEL', '').strip(),
+            graphiti_embedding_model=os.getenv('GRAPHITI_EMBEDDING_MODEL', '').strip(),
+            graphiti_embedding_base_url=os.getenv('GRAPHITI_EMBEDDING_BASE_URL') or None,
+            graphiti_embedding_api_key=os.getenv('GRAPHITI_EMBEDDING_API_KEY') or None,
+            graphiti_group_strategy=normalize_graphiti_group_strategy(os.getenv('GRAPHITI_GROUP_STRATEGY', 'market')),
             agent_litellm_model=agent_litellm_model,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
+            agent_analysis_mode=os.getenv('AGENT_ANALYSIS_MODE', 'normal').strip().lower(),
             agent_max_steps=parse_env_int(
                 os.getenv('AGENT_MAX_STEPS'),
                 AGENT_MAX_STEPS_DEFAULT,
@@ -1353,12 +1430,83 @@ class Config:
             agent_skill_dir=os.getenv('AGENT_SKILL_DIR') or os.getenv('AGENT_STRATEGY_DIR'),
             agent_nl_routing=os.getenv('AGENT_NL_ROUTING', 'false').lower() == 'true',
             agent_arch=os.getenv('AGENT_ARCH', 'single').lower(),
+            agent_orchestration_mode=os.getenv('AGENT_ORCHESTRATION_MODE', 'legacy').strip().lower(),
             agent_orchestrator_mode=os.getenv('AGENT_ORCHESTRATOR_MODE', 'standard').lower(),
             agent_orchestrator_timeout_s=parse_env_int(
                 os.getenv('AGENT_ORCHESTRATOR_TIMEOUT_S'),
                 600,
                 field_name='AGENT_ORCHESTRATOR_TIMEOUT_S',
                 minimum=0,
+            ),
+            agent_tool_call_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_TOOL_CALL_TIMEOUT_SECONDS'),
+                30.0,
+                field_name='AGENT_TOOL_CALL_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            agent_candidate_expert_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS'),
+                20.0,
+                field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            agent_selection_deep_dive_limit=parse_env_int(
+                os.getenv('AGENT_SELECTION_DEEP_DIVE_LIMIT'),
+                6,
+                field_name='AGENT_SELECTION_DEEP_DIVE_LIMIT',
+                minimum=1,
+                maximum=20,
+            ),
+            agent_candidate_blacklist_codes=[
+                code.strip() for code in os.getenv('AGENT_CANDIDATE_BLACKLIST_CODES', '').split(',') if code.strip()
+            ],
+            agent_candidate_min_avg_amount=parse_env_float(
+                os.getenv('AGENT_CANDIDATE_MIN_AVG_AMOUNT'),
+                0.0,
+                field_name='AGENT_CANDIDATE_MIN_AVG_AMOUNT',
+                minimum=0.0,
+            ),
+            agent_candidate_min_listing_days=parse_env_int(
+                os.getenv('AGENT_CANDIDATE_MIN_LISTING_DAYS'),
+                0,
+                field_name='AGENT_CANDIDATE_MIN_LISTING_DAYS',
+                minimum=0,
+            ),
+            agent_candidate_enforce_name_code_match=parse_env_bool(
+                os.getenv('AGENT_CANDIDATE_ENFORCE_NAME_CODE_MATCH'),
+                True,
+            ),
+            agent_candidate_pool_db_path=os.getenv('AGENT_CANDIDATE_POOL_DB_PATH', '').strip(),
+            agent_fundamental_candidate_db_path=os.getenv('AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH', '').strip(),
+            agent_stock_info_boards_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS'),
+                1.0,
+                field_name='AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_chip_distribution_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_sector_rankings_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_regime_component_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS'),
+                8.0,
+                field_name='AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            agent_tushare_tool_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS'),
+                5.0,
+                field_name='AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS',
+                minimum=1.0,
             ),
             agent_risk_override=os.getenv('AGENT_RISK_OVERRIDE', 'true').lower() == 'true',
             agent_deep_research_budget=parse_env_int(
@@ -1557,6 +1705,12 @@ class Config:
                 field_name='FUNDAMENTAL_FETCH_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
+            agent_capital_flow_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS'),
+                3.0,
+                field_name='AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
             fundamental_retry_max=parse_env_int(os.getenv('FUNDAMENTAL_RETRY_MAX'), 1, field_name='FUNDAMENTAL_RETRY_MAX', minimum=0),
             fundamental_cache_ttl_seconds=parse_env_int(
                 os.getenv('FUNDAMENTAL_CACHE_TTL_SECONDS'),
@@ -1688,6 +1842,12 @@ class Config:
             raw_models = [m.strip() for m in models_raw.split(',') if m.strip()]
             protocol = resolve_llm_channel_protocol(protocol_raw, base_url=base_url, models=raw_models, channel_name=ch_name)
             models = [normalize_llm_channel_model(m, protocol, base_url) for m in raw_models]
+
+            if not api_keys and protocol == "deepseek":
+                api_keys = _read_provider_api_keys(
+                    multi_key_env='DEEPSEEK_API_KEYS',
+                    single_key_env='DEEPSEEK_API_KEY',
+                )
 
             # Extra headers (JSON string, optional)
             extra_headers_raw = os.getenv(f'LLM_{ch_upper}_EXTRA_HEADERS', '').strip()
@@ -2161,6 +2321,32 @@ class Config:
             primary environment variable / field name it relates to.
         """
         issues: List[ConfigIssue] = []
+
+        if self.graphiti_enabled:
+            if not self.graphiti_neo4j_uri.strip():
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message="GRAPHITI_ENABLED=true 时必须配置 NEO4J_URI",
+                    field="NEO4J_URI",
+                ))
+            if not self.graphiti_neo4j_user.strip():
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message="GRAPHITI_ENABLED=true 时必须配置 NEO4J_USER",
+                    field="NEO4J_USER",
+                ))
+            if not (self.graphiti_neo4j_password or "").strip():
+                issues.append(ConfigIssue(
+                    severity="warning",
+                    message="GRAPHITI_ENABLED=true 但未配置 NEO4J_PASSWORD，Neo4j 可能无法连接",
+                    field="NEO4J_PASSWORD",
+                ))
+            if self.graphiti_embedding_model and "/" not in self.graphiti_embedding_model:
+                issues.append(ConfigIssue(
+                    severity="warning",
+                    message="GRAPHITI_EMBEDDING_MODEL 建议使用 provider/model 格式，例如 openai/text-embedding-3-small",
+                    field="GRAPHITI_EMBEDDING_MODEL",
+                ))
 
         # --- Stock list ---
         if not self.stock_list:

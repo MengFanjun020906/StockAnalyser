@@ -28,7 +28,8 @@ from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import GeminiAnalyzer, AnalysisResult, fill_chip_structure_if_needed, fill_price_position_if_needed
-from src.data.stock_mapping import STOCK_NAME_MAP
+from src.data.stock_index_loader import get_index_stock_name
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.notification import NotificationService, NotificationChannel
 from src.report_language import (
     get_unknown_text,
@@ -513,6 +514,17 @@ class StockAnalysisPipeline:
                     )
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) 保存分析历史失败: {e}")
+                try:
+                    self._ingest_analysis_to_graphiti(
+                        code=code,
+                        stock_name=stock_name,
+                        report_type=report_type,
+                        result=result,
+                        context=enhanced_context,
+                        news_context=news_context,
+                    )
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) Graphiti 入图失败: {e}")
 
             return result
 
@@ -687,6 +699,38 @@ class StockAnalysisPipeline:
 
         return enhanced
 
+    def _ingest_analysis_to_graphiti(
+        self,
+        *,
+        code: str,
+        stock_name: str,
+        report_type: ReportType,
+        result: AnalysisResult,
+        context: Dict[str, Any],
+        news_context: Optional[str],
+    ) -> None:
+        """Best-effort write of analysis results to Graphiti."""
+        if not getattr(self.config, "graphiti_enabled", False):
+            return
+
+        try:
+            from src.services.graphiti import get_graphiti_service
+
+            market = get_market_for_stock(normalize_stock_code(code)) or "cn"
+            service = get_graphiti_service()
+            service.ingest_analysis_sync(
+                code=code,
+                stock_name=stock_name,
+                report_type=report_type.value,
+                result=result,
+                context=context,
+                news_context=news_context,
+                market=market,
+                user_id=getattr(self.source_message, "sender_id", None),
+            )
+        except Exception as exc:
+            logger.warning("%s(%s) Graphiti 入图调用失败: %s", stock_name, code, exc, exc_info=True)
+
     def _attach_belong_boards_to_fundamental_context(
         self,
         code: str,
@@ -775,6 +819,7 @@ class StockAnalysisPipeline:
         try:
             from src.agent.factory import build_agent_executor
             report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
+            analysis_mode = getattr(self.config, "agent_analysis_mode", "normal")
 
             # Build executor from shared factory (ToolRegistry and SkillManager prototype are cached)
             executor = build_agent_executor(self.config, getattr(self.config, 'agent_skills', None) or None)
@@ -794,6 +839,31 @@ class StockAnalysisPipeline:
                 initial_context["chip_distribution"] = self._safe_to_dict(chip_data)
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
+
+            if analysis_mode == "planning_execute":
+                try:
+                    from src.agent.context_builder import build_agent_user_context_from_portfolio_service
+                    from src.services.portfolio_service import PortfolioService
+
+                    prompt_for_context = (
+                        f"Analyze stock {code} ({stock_name})."
+                        if report_language == "en"
+                        else f"分析股票 {code} ({stock_name})"
+                    )
+                    initial_context["agent_user_context"] = build_agent_user_context_from_portfolio_service(
+                        PortfolioService(),
+                        symbol=code,
+                        cost_method="fifo",
+                        user_prompt=prompt_for_context,
+                        analysis_mode="planning_execute",
+                        report_language=report_language,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Agent planning_execute context injection failed; fallback to no-account context: %s",
+                        code,
+                        exc,
+                    )
 
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
@@ -890,6 +960,17 @@ class StockAnalysisPipeline:
                     )
                 except Exception as e:
                     logger.warning(f"[{code}] 保存 Agent 分析历史失败: {e}")
+                try:
+                    self._ingest_analysis_to_graphiti(
+                        code=code,
+                        stock_name=resolved_stock_name,
+                        report_type=report_type,
+                        result=result,
+                        context=initial_context,
+                        news_context=None,
+                    )
+                except Exception as e:
+                    logger.warning(f"[{code}] Agent Graphiti 入图失败: {e}")
 
             return result
 
@@ -928,8 +1009,7 @@ class StockAnalysisPipeline:
         if agent_result.success and agent_result.dashboard:
             dash = agent_result.dashboard
             ai_stock_name = str(dash.get("stock_name", "")).strip()
-            if ai_stock_name and self._is_placeholder_stock_name(stock_name, code):
-                result.name = ai_stock_name
+            result.name = self._resolve_consistent_stock_name(code, stock_name, ai_stock_name)
             result.sentiment_score = self._safe_int(dash.get("sentiment_score"), 50)
             result.trend_prediction = dash.get("trend_prediction", "Unknown" if report_language == "en" else "未知")
             raw_advice = dash.get("operation_advice", "Watch" if report_language == "en" else "观望")
@@ -970,6 +1050,22 @@ class StockAnalysisPipeline:
                 result.error_message = "Agent failed to generate a valid decision dashboard" if report_language == "en" else "Agent 未能生成有效的决策仪表盘"
 
         return result
+
+    @staticmethod
+    def _resolve_consistent_stock_name(code: str, input_name: str, ai_stock_name: str = "") -> str:
+        """Resolve display name by code first; never trust a mismatched AI/input name."""
+        normalized_code = normalize_stock_code(code)
+        for name in (STOCK_NAME_MAP.get(normalized_code), get_index_stock_name(normalized_code)):
+            if is_meaningful_stock_name(name, normalized_code):
+                return str(name).strip()
+        if StockAnalysisPipeline._is_placeholder_stock_name(input_name, normalized_code):
+            if is_meaningful_stock_name(ai_stock_name, normalized_code):
+                return str(ai_stock_name).strip()
+        if is_meaningful_stock_name(input_name, normalized_code):
+            return str(input_name).strip()
+        if is_meaningful_stock_name(ai_stock_name, normalized_code):
+            return str(ai_stock_name).strip()
+        return input_name or normalized_code
 
     @staticmethod
     def _apply_trend_fallback(

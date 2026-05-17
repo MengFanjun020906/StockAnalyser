@@ -5,6 +5,7 @@ Contract tests for get_stock_info tool output semantics.
 
 import os
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -64,6 +65,15 @@ class _DummyManager:
         return "贵州茅台"
 
 
+class _SlowBoardsManager(_DummyManager):
+    def _run_with_timeout(self, task, timeout_seconds, task_name):
+        return None, f"{task_name} timeout", int(float(timeout_seconds) * 1000)
+
+    def get_belong_boards(self, _stock_code: str):
+        time.sleep(10)
+        return [{"name": "不应该等待"}]
+
+
 class TestGetStockInfoContract(unittest.TestCase):
     def test_get_stock_info_preserves_board_semantics(self) -> None:
         manager = _DummyManager()
@@ -85,6 +95,16 @@ class TestGetStockInfoContract(unittest.TestCase):
             result["fundamental_context"]["boards"]["data"],
             result["sector_rankings"],
         )
+
+    def test_get_stock_info_bounds_optional_belong_boards(self) -> None:
+        manager = _SlowBoardsManager()
+        with patch("src.agent.tools.data_tools._get_fetcher_manager", return_value=manager):
+            result = _handle_get_stock_info("600519")
+
+        self.assertEqual(result["name"], "贵州茅台")
+        self.assertEqual(result["belong_boards"], [])
+        self.assertIn("belong_boards timeout", result["belong_boards_errors"])
+        self.assertEqual(result["belong_boards_source_chain"][0]["result"], "timeout")
 
 
 if __name__ == "__main__":

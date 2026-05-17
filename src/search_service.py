@@ -2717,7 +2717,8 @@ class SearchService:
         stock_code: str,
         stock_name: str,
         max_results: int = 5,
-        focus_keywords: Optional[List[str]] = None
+        focus_keywords: Optional[List[str]] = None,
+        max_provider_attempts: Optional[int] = None,
     ) -> SearchResponse:
         """
         搜索股票相关新闻
@@ -2727,6 +2728,7 @@ class SearchService:
             stock_name: 股票名称
             max_results: 最大返回结果数
             focus_keywords: 重点关注的关键词列表
+            max_provider_attempts: 最多尝试多少个可用 provider；默认不限制
             
         Returns:
             SearchResponse 对象
@@ -2797,9 +2799,19 @@ class SearchService:
             fallback_response: Optional[SearchResponse] = None
             best_preferred_response: Optional[SearchResponse] = None
             best_preferred_count = 0
+            provider_attempts = 0
             for provider in self._providers:
                 if not provider.is_available:
                     continue
+                if max_provider_attempts is not None and provider_attempts >= max(1, int(max_provider_attempts)):
+                    logger.info(
+                        "股票新闻搜索已达到 provider 尝试上限: %s(%s), attempts=%s",
+                        stock_name,
+                        stock_code,
+                        provider_attempts,
+                    )
+                    break
+                provider_attempts += 1
 
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
@@ -2899,6 +2911,74 @@ class SearchService:
                 provider="None",
                 success=False,
                 error_message="所有搜索引擎都不可用或搜索失败"
+            )
+        finally:
+            if cache_owner and cache_event is not None:
+                self._release_cache_fill(cache_key, cache_event)
+
+    def search_general_news(self, query: str, max_results: int = 5, days: Optional[int] = None) -> SearchResponse:
+        """Search topical news without anchoring the query to any stock code.
+
+        This is intended for top-down discovery flows such as:
+        market/business/technology hot news -> mentioned listed companies ->
+        candidate stocks. It deliberately does not accept a stock symbol so the
+        caller cannot accidentally turn the flow into stock-first validation.
+        """
+        search_days = max(1, int(days or self._effective_news_window_days()))
+        provider_max_results = self._provider_request_size(max_results)
+        cache_key = self._cache_key(f"general_news|{query}", max_results, search_days)
+        cached, cache_owner, cache_event = self._get_cached_or_reserve(cache_key)
+        if cached is not None:
+            return cached
+
+        if not cache_owner and cache_event is not None:
+            cached = self._wait_for_cached(cache_key, cache_event)
+            if cached is not None:
+                return cached
+            cached, cache_owner, cache_event = self._get_cached_or_reserve(cache_key)
+            if cached is not None:
+                return cached
+
+        try:
+            had_provider_success = False
+            for provider in self._providers:
+                if not provider.is_available:
+                    continue
+
+                search_kwargs: Dict[str, Any] = {}
+                if isinstance(provider, TavilySearchProvider):
+                    search_kwargs["topic"] = "news"
+
+                response = provider.search(
+                    query,
+                    provider_max_results,
+                    days=search_days,
+                    **search_kwargs,
+                )
+                had_provider_success = had_provider_success or bool(response.success)
+                filtered_response = self._filter_news_response(
+                    response,
+                    search_days=search_days,
+                    max_results=provider_max_results,
+                    log_scope=f"general_news:{provider.name}",
+                )
+                if filtered_response.success and filtered_response.results:
+                    limited_response = self._limit_search_response(
+                        filtered_response,
+                        max_results=max_results,
+                    )
+                    self._put_cache(cache_key, limited_response)
+                    return limited_response
+
+            if had_provider_success:
+                return SearchResponse(query=query, results=[], provider="Filtered", success=True)
+
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider="None",
+                success=False,
+                error_message="所有搜索引擎都不可用或搜索失败",
             )
         finally:
             if cache_owner and cache_event is not None:
