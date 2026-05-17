@@ -219,6 +219,9 @@ def build_deep_dive_prompt(payload: Dict[str, Any]) -> str:
 6. 必须给出价格、量能、公告、业绩或板块环境失效条件。
 7. 如果无法给止损位，不得建议 open。
 8. 6 个核心维度中有 2 个以上为 missing / tool_failed / unknown 时，action_bias 不得为 open。
+9. `summary.main_supporting_evidence`、`summary.main_risks`、`full.key_evidence`、`full.risk_flags`、`full.failure_conditions` 不能空泛；只要输入里有工具数据，就必须提炼成可读证据。
+10. `full.dimension_summary.*.summary` 必须写成具体中文结论，例如“MA5/MA20 多头但 RSI 超买”或“资金流工具失败，不能确认主力同步”，不得只写“有利/不利/无数据”。
+11. 如果某项工具失败，要把失败写入对应维度和 `missing_evidence/tool_failures`，但不要因此抹掉其他维度已有的有效证据。
 
 {JSON_RULES}
 {COMMON_ENUMS}
@@ -287,6 +290,10 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 8. 账户摘要为空或可用现金缺失时，portfolio_action 不得为 open。
 9. 如果 market_regime 为 risk_off / panic，portfolio_action 必须为 wait 或 reject；如果 volatility_bucket 为 extreme，不得主动开新仓。
 10. 如果 market_regime 为 high_volatility 或 volatility_bucket 为 high_vol / extreme，任何 open 计划首仓必须显著降档，并写入 auto_downgrade_rules。
+11. candidate_discovery 里的 signal_score/final_score 只是“入池召回分”，不得当成买入推荐分，也不得据此决定首选排序。
+12. positions_plan 的 rank 必须按“可执行性”排序：open 且证据完整优先；wait 只有在动作强度至少 medium、具备明确入场条件和止损条件、且没有强反向证据时才可排在前列；reject/monitor/watch 不得包装成首选。
+13. 如果所有深度分析标的都是 wait/reject，或 wait 标的 action_strength 为 weak/none，summary.core_reason 必须明确写“本轮没有可直接入手标的”，recommended_position_count 必须为 0。
+14. 未进入 single_stock_deep_dive 的候选只能作为观察池，不得写入可执行开仓计划。
 
 {JSON_RULES}
 {COMMON_ENUMS}
@@ -378,7 +385,9 @@ def build_judge_decision_prompt(payload: Dict[str, Any]) -> str:
 2. 如果主方案中任一股票价格高于 no_chase_line 且没有回踩确认条件，该股票必须降级为 wait。
 3. 如果账户约束缺失，最终动作不得为 open。
 4. 如果候选池不足或候选发现阶段为 insufficient_candidates，最终动作必须为 monitor 或 reject。
-5. 如果裁决为 reject，必须说明终止本轮还是回到候选发现阶段。
+5. 如果候选池已经形成，但证据质量不足、资金/基本面/消息缺口较多或市场状态 unknown，最终动作优先用 wait 或 monitor；不要把“不能立即建仓”写成 reject。
+6. 只有出现硬排除、候选池为空、明确重大风险或全部候选均不适合继续观察时，才能裁决 reject。
+7. 如果裁决为 reject，必须说明终止本轮还是回到候选发现阶段。
 
 {JSON_RULES}
 {COMMON_ENUMS}

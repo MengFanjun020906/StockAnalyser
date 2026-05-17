@@ -5,7 +5,16 @@ import pandas as pd
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 from src.agent.tools import market_tools
-from src.agent.tools.market_tools import _handle_discover_watchlist_candidates
+from src.agent.tools.market_tools import _candidate_discovery_response, _handle_discover_watchlist_candidates
+
+
+def _isolated_candidate_env(tmp_path, **overrides):
+    env = {
+        "DATABASE_PATH": str(tmp_path / "isolated-stock-analysis.db"),
+        "AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH": str(tmp_path / "missing-fundamental.db"),
+    }
+    env.update({key: str(value) for key, value in overrides.items()})
+    return env
 
 
 def _write_daily_db(path, rows):
@@ -116,8 +125,8 @@ def test_discover_watchlist_candidates_uses_seed_symbols_directly():
     assert "get_realtime_quote" in result["next_required_tools"]
 
 
-def test_discover_watchlist_candidates_falls_back_when_sector_lookup_empty():
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": "/tmp/not-exists-sequoia.db", "ALPHASIFT_CANDIDATE_DB_PATH": "/tmp/not-exists-alphasift.db"}), patch(
+def test_discover_watchlist_candidates_falls_back_when_sector_lookup_empty(tmp_path):
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH="/tmp/not-exists-sequoia.db", ALPHASIFT_CANDIDATE_DB_PATH="/tmp/not-exists-alphasift.db")), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=[],
     ):
@@ -389,7 +398,7 @@ def test_discover_watchlist_candidates_alphasift_source(tmp_path):
     _write_daily_db(db_path, _bars_for_alphasift_breakout("600003"))
     _write_alphasift_strategy_dir(strategy_dir)
 
-    with patch.dict("os.environ", {"ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}):
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, ALPHASIFT_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_STRATEGY_DIR=str(strategy_dir))):
         result = _handle_discover_watchlist_candidates(
             candidate_source="alphasift",
             strategy_names=["unit_breakout"],
@@ -408,7 +417,7 @@ def test_auto_alphasift_falls_back_to_yaml_strategies_when_requested_names_are_s
     _write_daily_db(db_path, _bars_for_alphasift_breakout("600003"))
     _write_alphasift_strategy_dir(strategy_dir)
 
-    with patch.dict("os.environ", {"ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}), patch(
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, ALPHASIFT_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_STRATEGY_DIR=str(strategy_dir))), patch(
         "src.agent.tools.market_tools.SequoiaCandidateProvider.discover",
         return_value={"status": "empty", "candidate_count": 0, "candidates": [], "diagnostics": []},
     ), patch(
@@ -437,11 +446,31 @@ def test_auto_alphasift_falls_back_to_yaml_strategies_when_requested_names_are_s
 
 def test_discover_watchlist_candidates_auto_uses_candidate_experts(tmp_path):
     db_path = tmp_path / "sequoia.db"
+    fundamental_db_path = tmp_path / "fundamental.db"
     strategy_dir = tmp_path / "strategies"
     _write_daily_db(db_path, _bars_for_turtle("600001") + _bars_for_alphasift_breakout("600003"))
     _write_alphasift_strategy_dir(strategy_dir)
+    from src.agent.candidate_providers.fundamental_provider import ensure_fundamental_candidate_schema, upsert_fundamental_snapshots
+    ensure_fundamental_candidate_schema(str(fundamental_db_path))
+    upsert_fundamental_snapshots(
+        [{
+            "code": "600005",
+            "name": "基本面候选",
+            "report_period": "20251231",
+            "roe": 19,
+            "gross_margin": 45,
+            "net_margin": 17,
+            "revenue_growth": 24,
+            "profit_growth": 38,
+            "operating_cashflow_ratio": 95,
+            "debt_ratio": 36,
+            "pe_ttm": 24,
+            "pb": 2.8,
+        }],
+        str(fundamental_db_path),
+    )
 
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}), patch(
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_STRATEGY_DIR=str(strategy_dir), AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH=str(fundamental_db_path))), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=["半导体"],
     ), patch(
@@ -497,7 +526,13 @@ def test_discover_watchlist_candidates_auto_uses_candidate_experts(tmp_path):
     }
     assert result["themes"][0]["theme"] == "人工智能"
     assert result["capacity"]["max_candidates_to_deep_dive"] == 5
-    assert {item["code"] for item in result["candidates"]} == {"600001", "600002", "600003"}
+    assert {item["code"] for item in result["candidates"]} == {"600001", "600002", "600003", "600005"}
+    scores = [float(item.get("signal_score") or 0) for item in result["candidates"]]
+    assert scores == sorted(scores, reverse=True)
+    assert any(item.get("candidate_dimensions") == ["fundamental"] for item in result["candidates"])
+    fundamental_packet = next(packet for packet in result["expert_packets"] if packet["expert"] == "fundamental_expert")
+    assert fundamental_packet["status"] == "ok"
+    assert fundamental_packet["candidates"][0]["code"] == "600005"
     assert any(item.get("candidate_experts") for item in result["candidates"])
     assert any(step["source"] == "candidate_expert:sector_theme_expert" for step in result["discovery_steps"])
 
@@ -508,7 +543,7 @@ def test_discover_watchlist_candidates_auto_merges_sequoia_and_sector(tmp_path):
     _write_daily_db(db_path, _bars_for_turtle("600001") + _bars_for_alphasift_breakout("600003"))
     _write_alphasift_strategy_dir(strategy_dir)
 
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}), patch(
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_STRATEGY_DIR=str(strategy_dir))), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=["半导体"],
     ), patch(
@@ -553,7 +588,7 @@ def test_discover_watchlist_candidates_sector_uses_local_strategy_fallback_when_
     _write_daily_db(db_path, _bars_for_turtle("600001") + _bars_for_alphasift_breakout("600003"))
     _write_alphasift_strategy_dir(strategy_dir)
 
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_CANDIDATE_DB_PATH": str(db_path), "ALPHASIFT_STRATEGY_DIR": str(strategy_dir)}), patch(
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_CANDIDATE_DB_PATH=str(db_path), ALPHASIFT_STRATEGY_DIR=str(strategy_dir))), patch(
         "src.agent.tools.market_tools._fetch_sector_constituents",
         return_value=(
             [],
@@ -586,8 +621,8 @@ def test_discover_watchlist_candidates_sector_uses_local_strategy_fallback_when_
     assert all(item["source"] != "fallback_seed_pool" for item in result["candidates"])
 
 
-def test_discover_watchlist_candidates_sector_fallback_seed_only_after_local_sources_unavailable():
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": "/tmp/not-exists-sequoia.db", "ALPHASIFT_CANDIDATE_DB_PATH": "/tmp/not-exists-alphasift.db"}), patch(
+def test_discover_watchlist_candidates_sector_fallback_seed_only_after_local_sources_unavailable(tmp_path):
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH="/tmp/not-exists-sequoia.db", ALPHASIFT_CANDIDATE_DB_PATH="/tmp/not-exists-alphasift.db")), patch(
         "src.agent.tools.market_tools._fetch_sector_constituents",
         return_value=([], [{"source": "akshare:industry", "status": "empty", "sector": "半导体"}]),
     ):
@@ -666,8 +701,8 @@ def test_discover_watchlist_candidates_resolves_display_names_from_stock_index()
     assert result["candidates"][0]["name"] == "东田微"
 
 
-def test_discover_watchlist_candidates_falls_back_when_candidate_expert_sources_missing():
-    with patch.dict("os.environ", {"SEQUOIA_CANDIDATE_DB_PATH": "/tmp/not-exists-sequoia.db", "ALPHASIFT_CANDIDATE_DB_PATH": "/tmp/not-exists-alphasift.db"}), patch(
+def test_discover_watchlist_candidates_falls_back_when_candidate_expert_sources_missing(tmp_path):
+    with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH="/tmp/not-exists-sequoia.db", ALPHASIFT_CANDIDATE_DB_PATH="/tmp/not-exists-alphasift.db")), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=[],
     ), patch(
@@ -687,3 +722,86 @@ def test_discover_watchlist_candidates_falls_back_when_candidate_expert_sources_
     assert strategy_step["status"] == "unavailable"
     assert technical_step["status"] == "unavailable"
     assert result["candidates"][0]["source"] == "fallback_seed_pool"
+
+
+def test_discover_watchlist_candidates_excludes_hard_risk_candidates(tmp_path):
+    db_path = tmp_path / "sequoia.db"
+    strategy_dir = tmp_path / "strategies"
+    _write_daily_db(db_path, _bars_for_turtle("600001") + _bars_for_alphasift_breakout("600003"))
+    _write_alphasift_strategy_dir(strategy_dir)
+
+    with patch.dict("os.environ", _isolated_candidate_env(
+        tmp_path,
+        SEQUOIA_CANDIDATE_DB_PATH=str(db_path),
+        ALPHASIFT_CANDIDATE_DB_PATH=str(db_path),
+        ALPHASIFT_STRATEGY_DIR=str(strategy_dir),
+        AGENT_CANDIDATE_BLACKLIST_CODES="600002",
+    )), patch(
+        "src.agent.tools.market_tools._top_sector_names",
+        return_value=["半导体"],
+    ), patch(
+        "src.agent.tools.market_tools._fetch_sector_constituents",
+        return_value=(
+            [
+                {
+                    "code": "600002",
+                    "name": "板块黑名单",
+                    "source": "akshare:industry:半导体",
+                    "reason": "来自强势板块。",
+                    "change_pct": 5.0,
+                },
+                {
+                    "code": "600004",
+                    "name": "ST测试",
+                    "source": "akshare:industry:半导体",
+                    "reason": "来自强势板块。",
+                    "change_pct": 4.0,
+                },
+            ],
+            [{"source": "akshare:industry", "status": "ok", "sector": "半导体"}],
+        ),
+    ), patch(
+        "src.agent.tools.market_tools._discover_event_impact_candidates",
+        return_value={"status": "empty", "candidates": [], "events": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._discover_news_momentum_candidates",
+        return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ):
+        result = _handle_discover_watchlist_candidates(
+            candidate_source="auto",
+            strategy_names=["turtle_trade", "unit_breakout"],
+            limit=5,
+        )
+
+    assert {item["code"] for item in result["candidates"]} == {"600001", "600003"}
+    assert result["hard_exclusion"]["excluded_count"] == 2
+    assert result["hard_exclusion"]["reason_counts"]["blacklisted"] == 1
+    assert result["hard_exclusion"]["reason_counts"]["st_or_special_treatment"] == 1
+    assert result["quality"]["hard_exclusion_count"] == 2
+    assert result["quality"]["hard_strategy_trunk_missing"] is False
+    hard_step = next(step for step in result["discovery_steps"] if step["source"] == "candidate_hard_exclusion")
+    assert hard_step["count"] == 2
+
+
+def test_discover_watchlist_candidates_reports_hard_strategy_trunk_missing_without_fallback():
+    result = _candidate_discovery_response(
+        status="ok",
+        market="cn",
+        candidates=[
+            {
+                "code": "600001",
+                "name": "板块候选",
+                "source": "akshare:industry:半导体",
+                "reason": "强势板块成分股。",
+                "reason_dimensions": [{"dimension": "sentiment", "label": "情绪/热点", "detail": "来自强势板块"}],
+            }
+        ],
+        discovery_steps=[],
+        fallback_used=False,
+        candidate_source="sector",
+        note="unit",
+    )
+
+    assert result["quality"]["hard_strategy_trunk_missing"] is True
+    assert result["quality"]["source_counts"]["sector"] == 1
+    assert result["hard_exclusion"]["excluded_count"] == 0

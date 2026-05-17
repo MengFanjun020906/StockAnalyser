@@ -165,6 +165,34 @@ def test_detect_market_regime_tool_uses_persisted_state_and_context():
     assert fake_db.saved is not None
 
 
+def test_market_history_prefers_tushare_index_daily_fast_path():
+    rows = [
+        {
+            "ts_code": "000300.SH",
+            "trade_date": "20260515",
+            "open": 100,
+            "high": 102,
+            "low": 99,
+            "close": 101,
+            "vol": 1000,
+            "amount": 10000,
+        }
+    ]
+
+    import pandas as pd
+    from src.agent.tools import market_tools
+
+    with patch("data_provider.tushare_client.get_tushare_token", return_value="token"), \
+         patch("data_provider.tushare_client.query_tushare_api", return_value=pd.DataFrame(rows)), \
+         patch("src.services.history_loader.load_history_df") as fallback_loader:
+        history, source = market_tools._load_market_history("000300", 260)
+
+    assert source == "tushare:index_daily"
+    assert history[0]["date"] == "2026-05-15"
+    assert history[0]["close"] == 101
+    fallback_loader.assert_not_called()
+
+
 def test_detect_market_regime_tool_returns_structured_timeout_diagnostics():
     with patch("src.agent.tools.market_tools._run_with_timeout", return_value=(None, "market_history timeout", 10)), \
          patch("src.storage.get_db", side_effect=RuntimeError("db unavailable")):

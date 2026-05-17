@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from threading import Thread
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from src.agent.candidate_experts import CandidateExpertOrchestrator
+from src.agent.candidate_experts import CandidateExpertOrchestrator, apply_hard_exclusion
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 from src.agent.regime import SentimentComponents, coerce_bars, detect_market_regime
@@ -597,6 +597,53 @@ def _merge_and_score_candidates(candidates: Iterable[Dict[str, Any]], limit: int
         append(item)
 
     return selected
+
+
+def _apply_candidate_hard_exclusion_for_response(candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Apply hard-exclusion rules for non expert-graph discovery modes."""
+    filtered, diagnostics = apply_hard_exclusion(candidates)
+    for item in filtered:
+        item.setdefault("lifecycle_status", "new")
+    return filtered, diagnostics
+
+
+def _build_candidate_quality_summary(candidates: List[Dict[str, Any]], hard_exclusion: Dict[str, Any]) -> Dict[str, Any]:
+    dimension_counts: Dict[str, int] = {}
+    source_counts: Dict[str, int] = {}
+    lifecycle_counts: Dict[str, int] = {}
+    multi_source_count = 0
+    fallback_count = 0
+    for item in candidates:
+        sources = [str(src) for src in item.get("recall_sources") or [] if str(src)]
+        if not sources and item.get("source"):
+            sources = [str(item.get("source"))]
+        if len(sources) > 1:
+            multi_source_count += 1
+        family = _candidate_source_family(item)
+        source_counts[family] = source_counts.get(family, 0) + 1
+        if family == "fallback":
+            fallback_count += 1
+        lifecycle_status = str(item.get("lifecycle_status") or "new")
+        lifecycle_counts[lifecycle_status] = lifecycle_counts.get(lifecycle_status, 0) + 1
+        dimensions = item.get("candidate_dimensions") or [
+            entry.get("dimension")
+            for entry in item.get("reason_dimensions") or []
+            if isinstance(entry, dict)
+        ]
+        for dimension in dimensions or ["unknown"]:
+            key = str(dimension or "unknown")
+            dimension_counts[key] = dimension_counts.get(key, 0) + 1
+    hard_strategy_count = source_counts.get("alphasift", 0) + source_counts.get("sequoia", 0)
+    return {
+        "candidate_count": len(candidates),
+        "source_counts": source_counts,
+        "dimension_counts": dimension_counts,
+        "lifecycle_counts": lifecycle_counts,
+        "multi_source_count": multi_source_count,
+        "fallback_count": fallback_count,
+        "hard_strategy_trunk_missing": hard_strategy_count == 0,
+        "hard_exclusion_count": int(hard_exclusion.get("excluded_count") or 0),
+    }
 
 
 def _normalize_stock_candidate(row: Dict[str, Any], *, source: str, reason: str) -> Optional[Dict[str, Any]]:
@@ -1700,6 +1747,10 @@ def _derive_market_flow_component(flow: Dict[str, Any]) -> Optional[float]:
 
 
 def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    fast_rows, fast_source = _load_index_history_from_tushare(index_code, lookback_days)
+    if fast_rows:
+        return fast_rows, fast_source
+
     from src.services.history_loader import load_history_df
 
     df, source = load_history_df(index_code, days=lookback_days)
@@ -1710,6 +1761,67 @@ def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict
         if "date" in row:
             row["date"] = str(row["date"])
     return rows, source
+
+
+def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    try:
+        from data_provider.tushare_client import get_tushare_token, query_tushare_api
+    except Exception:
+        return [], ""
+    if not get_tushare_token():
+        return [], ""
+
+    ts_code = _normalize_index_ts_code(index_code)
+    end_day = datetime.now().date()
+    start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
+    try:
+        df = query_tushare_api(
+            "index_daily",
+            params={
+                "ts_code": ts_code,
+                "start_date": start_day.strftime("%Y%m%d"),
+                "end_date": end_day.strftime("%Y%m%d"),
+            },
+            fields="ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
+            timeout=5,
+        )
+    except Exception as exc:
+        logger.debug("Tushare index_daily failed for %s: %s", ts_code, exc)
+        return [], "tushare:index_daily_failed"
+    if df is None or df.empty:
+        return [], "tushare:index_daily_empty"
+
+    rows: List[Dict[str, Any]] = []
+    for row in df.to_dict(orient="records"):
+        trade_date = str(row.get("trade_date") or "")
+        if len(trade_date) == 8 and trade_date.isdigit():
+            trade_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
+        rows.append({
+            "date": trade_date,
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("vol"),
+            "amount": row.get("amount"),
+            "pct_chg": row.get("pct_chg"),
+        })
+    rows = sorted(rows, key=lambda item: str(item.get("date") or ""))
+    return rows[-lookback_days:], "tushare:index_daily"
+
+
+def _normalize_index_ts_code(index_code: str) -> str:
+    raw = str(index_code or "000300").strip().upper()
+    if raw.endswith((".SH", ".SZ")):
+        return raw
+    if raw.startswith("SH"):
+        return f"{raw[2:]}.SH"
+    if raw.startswith("SZ"):
+        return f"{raw[2:]}.SZ"
+    code = re.sub(r"\D", "", raw) or "000300"
+    if code in {"000001", "000016", "000300", "000688"}:
+        return f"{code}.SH"
+    return f"{code}.SZ"
 
 
 def _handle_detect_market_regime(
@@ -1729,7 +1841,8 @@ def _handle_detect_market_regime(
         }
 
     lookback = max(120, min(int(lookback_days or 260), 520))
-    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 2.0)
+    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 8.0)
+    auxiliary_timeout = max(1.0, min(3.0, component_timeout))
     history_result, history_err, history_ms = _run_with_timeout(
         lambda: _load_market_history(index_code or "000300", lookback),
         component_timeout,
@@ -1759,9 +1872,9 @@ def _handle_detect_market_regime(
     margin: Dict[str, Any] = {}
     market_flow: Dict[str, Any] = {}
 
-    component_tasks = {
-        "market_indices": lambda: _handle_get_market_indices(region="cn"),
-        "sector_rankings": lambda: _handle_get_sector_rankings(top_n=10),
+    component_tasks: Dict[str, Tuple[Callable[[], Any], float]] = {
+        "market_indices": (lambda: _handle_get_market_indices(region="cn"), auxiliary_timeout),
+        "sector_rankings": (lambda: _handle_get_sector_rankings(top_n=10), auxiliary_timeout),
     }
     try:
         from src.agent.tools.data_tools import (
@@ -1770,10 +1883,11 @@ def _handle_detect_market_regime(
             _handle_get_northbound_capital_flow,
         )
 
+        short_optional_timeout = max(1.0, min(1.5, auxiliary_timeout))
         component_tasks.update({
-            "market_flow": lambda: _handle_get_market_capital_flow(top_n=5),
-            "northbound": lambda: _handle_get_northbound_capital_flow(limit=10),
-            "margin": lambda: _handle_get_margin_trading_summary(limit=10),
+            "market_flow": (lambda: _handle_get_market_capital_flow(top_n=5), short_optional_timeout),
+            "northbound": (lambda: _handle_get_northbound_capital_flow(limit=10), auxiliary_timeout),
+            "margin": (lambda: _handle_get_margin_trading_summary(limit=10), auxiliary_timeout),
         })
     except Exception as exc:
         data_errors.append(f"capital_flow_components_import: {exc}")
@@ -1788,20 +1902,21 @@ def _handle_detect_market_regime(
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(component_tasks)))
     try:
         futures = {
-            pool.submit(_run_with_timeout, task, component_timeout, name): name
-            for name, task in component_tasks.items()
+            pool.submit(_run_with_timeout, task, timeout_s, name): name
+            for name, (task, timeout_s) in component_tasks.items()
         }
         done, pending = concurrent.futures.wait(
             futures,
-            timeout=component_timeout + 0.5,
+            timeout=max(timeout_s for _task, timeout_s in component_tasks.values()) + 0.5,
             return_when=concurrent.futures.ALL_COMPLETED,
         )
         for future in pending:
             name = futures[future]
+            timeout_s = component_tasks[name][1]
             future.cancel()
             component_diagnostics[name] = {
                 "status": "timeout",
-                "duration_ms": int(component_timeout * 1000),
+                "duration_ms": int(timeout_s * 1000),
                 "error": f"{name} timeout",
             }
             data_errors.append(f"{name}: {name} timeout")
@@ -1973,24 +2088,15 @@ def _handle_discover_watchlist_candidates(
                 "reason": "用户或上下文提供的候选标的。",
             })
     if candidates:
-        return {
-            "status": "ok",
-            "market": market,
-            "candidate_count": len(_dedupe_candidates(candidates, effective_limit)),
-            "candidates": _dedupe_candidates(candidates, effective_limit),
-            "discovery_steps": [{"source": "user_seed", "status": "ok"}],
-            "next_required_tools": [
-                "get_realtime_quote",
-                "analyze_trend",
-                "calculate_ma",
-                "get_volume_analysis",
-                "analyze_pattern",
-                "search_stock_news",
-                "score_stock_news_sentiment",
-                "get_capital_flow",
-            ],
-            "note": "后续必须对候选标的逐只调用行情、技术、消息和资金工具后才能排序。",
-        }
+        return _candidate_discovery_response(
+            status="ok",
+            market=market,
+            candidates=_dedupe_candidates(candidates, effective_limit),
+            discovery_steps=[{"source": "user_seed", "status": "ok", "count": len(candidates)}],
+            fallback_used=False,
+            candidate_source="user_seed",
+            note="后续必须对候选标的逐只调用行情、技术、消息和资金工具后才能排序。",
+        )
 
     if market != "cn":
         return {
@@ -2039,6 +2145,8 @@ def _handle_discover_watchlist_candidates(
             expert_packets=expert_result.get("expert_packets") or [],
             themes=expert_result.get("themes") or [],
             capacity=expert_result.get("capacity") or {},
+            quality=expert_result.get("quality") or {},
+            hard_exclusion=expert_result.get("hard_exclusion") or {},
         )
 
     alphasift_result: Dict[str, Any] = {}
@@ -2265,7 +2373,22 @@ def _candidate_discovery_response(
     expert_packets: Optional[List[Dict[str, Any]]] = None,
     themes: Optional[List[Dict[str, Any]]] = None,
     capacity: Optional[Dict[str, Any]] = None,
+    quality: Optional[Dict[str, Any]] = None,
+    hard_exclusion: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    if hard_exclusion is None:
+        candidates, hard_exclusion = _apply_candidate_hard_exclusion_for_response(candidates)
+        discovery_steps = [
+            *discovery_steps,
+            {
+                "source": "candidate_hard_exclusion",
+                "status": "ok",
+                "count": hard_exclusion.get("excluded_count", 0),
+                "diagnostics": hard_exclusion,
+            },
+        ]
+    if quality is None:
+        quality = _build_candidate_quality_summary(candidates, hard_exclusion)
     payload = {
         "status": status,
         "market": market,
@@ -2285,6 +2408,8 @@ def _candidate_discovery_response(
             "get_capital_flow",
         ],
         "note": note,
+        "quality": quality,
+        "hard_exclusion": hard_exclusion,
     }
     if expert_packets is not None:
         payload["expert_packets"] = expert_packets
@@ -2292,6 +2417,16 @@ def _candidate_discovery_response(
         payload["themes"] = themes
     if capacity is not None:
         payload["capacity"] = capacity
+    try:
+        from src.agent.candidate_pool_store import CandidatePoolStore
+
+        saved = CandidatePoolStore().save_run(payload)
+        payload["candidate_pool_run_id"] = saved.get("run_id")
+        payload["candidate_pool_persisted"] = True
+    except Exception as exc:
+        logger.warning("Candidate pool persistence skipped: %s", exc)
+        payload["candidate_pool_persisted"] = False
+        payload["candidate_pool_persist_error"] = str(exc)
     return payload
 
 

@@ -306,6 +306,13 @@ daily_stock_analysis/
 | `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 StockAPI `codeFlow` 个股历史资金流 | `3.0` | 可选 |
 | `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 默认调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
 | `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace | `30.0` | 可选 |
+| `AGENT_SELECTION_DEEP_DIVE_LIMIT` | `watchlist_scan` 最多对多少只 L1 候选做逐股深度分析；调大可减少“候选观察”，但会增加工具调用和耗时 | `6` | 可选 |
+| `AGENT_CANDIDATE_BLACKLIST_CODES` | L1 候选池硬排除黑名单，逗号分隔；命中后不会进入候选池 | - | 可选 |
+| `AGENT_CANDIDATE_MIN_AVG_AMOUNT` | 候选源提供均成交额/成交额字段时的最低流动性阈值；`0` 表示不启用 | `0` | 可选 |
+| `AGENT_CANDIDATE_MIN_LISTING_DAYS` | 候选源提供上市天数字段时的最低上市天数；`0` 表示不启用 | `0` | 可选 |
+| `AGENT_CANDIDATE_ENFORCE_NAME_CODE_MATCH` | 候选源名称与本地主数据代码名称冲突时排除，避免报告名称/代码错配 | `true` | 可选 |
+| `AGENT_CANDIDATE_POOL_DB_PATH` | L1 候选池运行记录 SQLite 路径；为空时复用 `DATABASE_PATH`，供 `/candidate-pool` 页面展示历史批次、来源分布和生命周期 | - | 可选 |
+| `AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH` | 基本面候选预计算 SQLite 路径；为空时复用 `DATABASE_PATH`，表由 `scripts/update_fundamental_candidates.py` 创建和刷新 | - | 可选 |
 | `FUNDAMENTAL_RETRY_MAX` | 基本面能力重试次数（含首次） | `1` | 可选 |
 | `FUNDAMENTAL_CACHE_TTL_SECONDS` | 基本面聚合缓存 TTL（秒），短缓存减轻重复拉取 | `120` | 可选 |
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（TTL 内按时间淘汰） | `256` | 可选 |
@@ -313,6 +320,7 @@ daily_stock_analysis/
 > 行为说明：
 > - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
 > - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并裁剪旧数据。
+> - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
 > - `get_capital_flow` 默认优先使用 StockAPI 历史资金流 `codeFlow`，用最近可用交易日 `mainAmount` 生成 `main_net_inflow`、近 5 日和近 10 日累计主力净流入；当前不再默认调用东方财富个股资金流端点。未配置 `STOCKAPI_TOKEN` 时会按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；
 > - ETF：返回可得项，缺失能力标记为 `not_supported`，整体不影响原流程；

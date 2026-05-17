@@ -25,6 +25,7 @@ export interface ChatResponse {
 
 export interface AgentTraceRunRequest {
   message: string;
+  session_id?: string;
   account_id?: number;
   stock_code?: string;
   stock_name?: string;
@@ -89,6 +90,16 @@ export interface AgentTraceRunResponse {
   runtime_config?: Record<string, unknown> | null;
 }
 
+export interface AgentTraceHistoryItemResponse {
+  id: string;
+  createdAt: string;
+  message: string;
+  stockCode: string;
+  accountId?: number | null;
+  status: 'success' | 'error';
+  result: AgentTraceRunResponse;
+}
+
 export interface AgentRuntimeConfigResponse {
   runtime_config: Record<string, unknown>;
 }
@@ -134,6 +145,10 @@ export const agentApi = {
   },
   async getRuntimeConfig(): Promise<AgentRuntimeConfigResponse> {
     const response = await apiClient.get<AgentRuntimeConfigResponse>('/api/v1/agent/runtime-config');
+    return response.data;
+  },
+  async getTraceSession(sessionId: string): Promise<AgentTraceHistoryItemResponse> {
+    const response = await apiClient.get<AgentTraceHistoryItemResponse>(`/api/v1/agent/trace/sessions/${encodeURIComponent(sessionId)}`);
     return response.data;
   },
   async traceStream(

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,6 +28,7 @@ from src.agent.stock_selection_prompts import (
     build_portfolio_allocation_prompt,
 )
 from src.agent.tools.registry import ToolRegistry
+from src.config import Config
 from src.schemas.agent_context import AgentUserContext
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 SELECTION_INTENT = "watchlist_scan"
 DEFAULT_CANDIDATE_LIMIT = 8
-DEFAULT_DEEP_DIVE_LIMIT = 4
+DEFAULT_DEEP_DIVE_LIMIT = 6
+MIN_RICH_REPORT_DEEP_DIVE_TARGETS = 3
 FAILED_TOOL_STATUSES = {"failed", "error", "tool_failed", "timeout"}
 
 
@@ -72,6 +75,7 @@ class SelectionRunContext:
     stages: Dict[str, SelectionStage] = field(default_factory=dict)
     evidence_ledger: Dict[str, Any] = field(default_factory=lambda: {"summary": {}, "full_ref": "selection_evidence_ledger.json"})
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
     market_regime: Dict[str, Any] = field(default_factory=dict)
     orchestration_mode: str = "legacy"
     expert_state: Optional[AgentState] = None
@@ -111,6 +115,7 @@ class SelectionRunContext:
                 for name, stage in self.stages.items()
             },
             "evidence_ledger": self.evidence_ledger,
+            "tool_call_count": len(self.tool_calls),
             "market_regime": self.market_regime,
             "orchestration_mode": self.orchestration_mode,
             "expert_state": self.expert_state.to_trace_dict() if self.expert_state else None,
@@ -188,6 +193,7 @@ def run_stock_selection_pipeline(
         investor_profile=_investor_profile(agent_user_context),
         candidate_strategy="hot_sector",
         orchestration_mode=_resolve_orchestration_mode(orchestration_mode),
+        progress_callback=progress_callback,
     )
     result = StockSelectionResult(enabled=True, context=ctx)
     base_evidence: Dict[str, Any] = {}
@@ -211,7 +217,7 @@ def run_stock_selection_pipeline(
                 "target_symbols": list(agent_user_context.report.target_symbols or []),
                 "candidate_strategy": ctx.candidate_strategy,
                 "strategy_thresholds": ctx.strategy_thresholds,
-                "tool_seed_result": _summarize_payload(discovery_seed),
+                "tool_seed_result": _compact_candidate_seed(discovery_seed),
                 "available_tools": tool_registry.list_names(),
             }),
             fallback=_fallback_candidate_discovery(ctx, discovery_seed),
@@ -253,8 +259,8 @@ def run_stock_selection_pipeline(
                 "candidate_pool_summary": ctx.stage_summary("candidate_discovery"),
                 "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
                 "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
-                "base_evidence": _summarize_payload(base_evidence),
+                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                "base_evidence": _compact_base_evidence(base_evidence),
             }),
             fallback=_fallback_candidate_screening(ctx, base_evidence),
             timeout_seconds=timeout_seconds,
@@ -266,7 +272,13 @@ def run_stock_selection_pipeline(
         deep_targets = _deep_dive_targets(ctx.stage_summary("candidate_screening"), ctx.stage_full("candidate_screening"))
         if not deep_targets:
             deep_targets = candidates[: min(2, len(candidates))]
-        deep_targets = deep_targets[:DEFAULT_DEEP_DIVE_LIMIT]
+        deep_dive_limit = _selection_deep_dive_limit()
+        deep_targets = _expand_deep_dive_targets_for_rich_report(
+            deep_targets=deep_targets,
+            candidates=candidates,
+            screening_full=ctx.stage_full("candidate_screening"),
+        )
+        deep_targets = deep_targets[:deep_dive_limit]
         deep_dive_outputs: List[Dict[str, Any]] = []
         for code in deep_targets:
             detailed_evidence = _collect_deep_dive_evidence(ctx, tool_registry, code)
@@ -277,6 +289,13 @@ def run_stock_selection_pipeline(
                 stock_name=stock_name,
                 market=ctx.market,
                 evidence=detailed_evidence,
+            )
+            prompt_evidence = _deep_dive_prompt_evidence(
+                ctx=ctx,
+                code=code,
+                stock_name=stock_name,
+                detailed_evidence=detailed_evidence,
+                evidence_cards=evidence_cards,
             )
             deep_payload = _call_stage_json(
                 ctx=ctx,
@@ -290,8 +309,8 @@ def run_stock_selection_pipeline(
                     "investor_profile": ctx.investor_profile,
                     "screening_summary": ctx.stage_summary("candidate_screening"),
                     "market_regime": _summarize_market_regime(ctx.market_regime),
-                    "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
-                    "stock_evidence": _summarize_payload(detailed_evidence, max_chars=5000),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                    "stock_evidence": prompt_evidence,
                 }),
                 fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
                 timeout_seconds=timeout_seconds,
@@ -339,7 +358,7 @@ def run_stock_selection_pipeline(
                 "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
                 "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
                 "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
+                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
             }),
             fallback=_fallback_adversarial_review(ctx),
             timeout_seconds=timeout_seconds,
@@ -359,11 +378,13 @@ def run_stock_selection_pipeline(
                 "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
                 "opposing_review_summary": ctx.stage_summary("adversarial_review"),
                 "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": ctx.evidence_ledger.get("summary"),
+                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
             }),
             fallback=_fallback_judge_decision(ctx),
             timeout_seconds=timeout_seconds,
         )
+        _stabilize_judge_decision(ctx, judge_payload)
+        _apply_judge_position_overrides(ctx, judge_payload)
         _enforce_stage_stock_identity(ctx, judge_payload, "judge_decision")
         ctx.set_stage("judge_decision", judge_payload)
         ctx.next_step = (judge_payload.get("summary") or {}).get("next_step") or "render_final_report"
@@ -398,29 +419,128 @@ def run_stock_selection_pipeline(
 
 
 def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
-    """Render final stock-selection JSON into a compact Markdown report."""
+    """Render final stock-selection JSON into a user-readable report."""
     judge = report.get("judge_decision", {}).get("summary", {})
     allocation = report.get("portfolio_allocation", {}).get("summary", {})
     positions = report.get("portfolio_allocation", {}).get("full", {}).get("positions_plan", [])
     adversarial = report.get("adversarial_review", {}).get("summary", {})
+    discovery = report.get("candidate_discovery", {})
+    discovery_summary = discovery.get("summary") if isinstance(discovery.get("summary"), dict) else {}
+    discovery_full = discovery.get("full") if isinstance(discovery.get("full"), dict) else {}
+    candidates = discovery_full.get("candidates") if isinstance(discovery_full.get("candidates"), list) else []
+    llm_candidate_summary = (
+        discovery_full.get("llm_candidate_summary")
+        if isinstance(discovery_full.get("llm_candidate_summary"), list)
+        else []
+    )
+    llm_candidate_by_code = {
+        str(item.get("code") or item.get("stock_code")): item
+        for item in llm_candidate_summary
+        if isinstance(item, dict) and (item.get("code") or item.get("stock_code"))
+    }
+    candidate_quality = discovery_full.get("quality") if isinstance(discovery_full.get("quality"), dict) else {}
+    screening_summary = report.get("candidate_screening", {}).get("summary", {})
+    deep_dive_full = report.get("single_stock_deep_dive", {}).get("full", {})
+    deep_results = deep_dive_full.get("results") if isinstance(deep_dive_full, dict) and isinstance(deep_dive_full.get("results"), list) else []
+    all_missing = _report_missing_evidence(report)
+    core_reason = _primary_report_core_reason(
+        allocation=allocation,
+        deep_results=deep_results,
+        judge=judge,
+    )
+    review_note = _auxiliary_review_note(judge)
+    recommendations = _recommendation_items(
+        positions=positions,
+        deep_results=deep_results,
+        candidates=candidates,
+        llm_candidate_by_code=llm_candidate_by_code,
+    )
+    actionable_recommendations = [item for item in recommendations if _is_actionable_recommendation(item)]
+    observation_items = [item for item in recommendations if not _is_actionable_recommendation(item) and _is_observable_item(item)]
 
     lines = [
-        "# 选股与持仓配置报告",
+        "# 选股分析报告：下周可关注候选",
         "",
-        "## 一、最终结论",
+        "## 一、核心推荐结论",
         "",
         "| 项目 | 结论 |",
         "| --- | --- |",
         f"| 最终动作 | {judge.get('final_action') or allocation.get('portfolio_action') or '-'} |",
         f"| 裁决 | {judge.get('primary_plan_verdict') or '-'} |",
-        f"| 核心原因 | {_markdown_cell(judge.get('decision_summary') or allocation.get('core_reason') or '-')} |",
+        f"| 首选标的 | {_markdown_cell(_preferred_candidate_label(actionable_recommendations))} |",
+        f"| 可观察标的 | {_markdown_cell(_watch_candidate_labels(observation_items))} |",
+        f"| 核心原因 | {_markdown_cell(core_reason)} |",
         f"| 最大约束 | {_markdown_cell(allocation.get('main_constraint') or '-')} |",
+        f"| 候选池规模 | {_markdown_cell(discovery_summary.get('source_count') or discovery.get('candidate_count') or candidate_quality.get('candidate_count') or len(candidates))} 只 |",
         "",
-        "## 二、组合配置表",
+        "## 二、推荐排序与入场决策",
+        "",
+    ]
+
+    if actionable_recommendations:
+        for idx, item in enumerate(actionable_recommendations[:4], start=1):
+            lines.extend(_render_recommendation_block(idx, item))
+    else:
+        lines.extend([
+            "本轮没有形成可直接入手的股票。原因是组合配置和 Judge 均指向等待，且深度分析标的缺少明确入场价、止损线或存在反向证据。",
+            "",
+        ])
+
+    if observation_items:
+        lines.extend([
+            "### 观察池",
+            "",
+            "以下股票只代表后续跟踪对象，不代表可以买入；入池分只衡量召回强度，不等于推荐分。",
+            "",
+            "| 股票 | 当前状态 | 观察原因 | 主要风险/缺口 |",
+            "| --- | --- | --- | --- |",
+        ])
+        for item in observation_items[:6]:
+            lines.append(
+                "| {stock} | {status} | {reason} | {risk} |".format(
+                    stock=_markdown_cell(_stock_label(item)),
+                    status=_markdown_cell(_observation_status(item)),
+                    reason=_markdown_cell(_observation_reason(item)),
+                    risk=_markdown_cell(_observation_risk(item)),
+                )
+            )
+        lines.append("")
+
+    lines.extend([
+        "",
+        "## 三、Execute 证据摘要",
+        "",
+        "| 证据项 | 状态 | 关键结果 | 对选股结论的影响 |",
+        "| --- | --- | --- | --- |",
+    ])
+    for row in _evidence_summary_rows(report, candidates, deep_results):
+        lines.append(
+            "| {name} | {status} | {result} | {impact} |".format(
+                name=_markdown_cell(row.get("name") or "-"),
+                status=_markdown_cell(row.get("status") or "-"),
+                result=_markdown_cell(row.get("result") or "-"),
+                impact=_markdown_cell(row.get("impact") or "-"),
+            )
+        )
+
+    lines.extend([
+        "",
+        "## 四、关键风险与等待确认",
+        "",
+    ])
+    risk_lines = _final_risk_lines(recommendations, adversarial, all_missing)
+    if risk_lines:
+        lines.extend([f"- {_markdown_cell(item)}" for item in risk_lines])
+    else:
+        lines.append("- 当前没有结构化风险条目，但仍需按价格、仓位和数据时效执行风控。")
+
+    lines.extend([
+        "",
+        "## 五、组合配置表",
         "",
         "| 排名 | 股票 | 动作 | 首仓比例 | 入场条件 | 止损条件 | 复查触发 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
+    ])
     if positions:
         for item in positions:
             lines.append(
@@ -439,15 +559,116 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 三、反方审查与 Judge 裁决",
+        "## 六、辅助审查摘要",
         "",
-        f"- 反方观点：{adversarial.get('opposing_summary') or '-'}",
-        f"- Judge 结论：{judge.get('decision_summary') or '-'}",
+        "反方审查和 Judge 裁决只作为主方案的校验层，完整原始输出保留在 Trace artifact 中。",
+        "",
+        "| 审查项 | 摘要 |",
+        "| --- | --- |",
+        f"| 辅助审查 | {_markdown_cell(review_note)} |",
+        f"| 反方提醒 | {_markdown_cell(_brief_markdown_text(adversarial.get('opposing_summary') or '-', 180))} |",
+        f"| Judge 调整 | {_markdown_cell(_brief_markdown_text(judge.get('decision_summary') or '-', 180))} |",
     ])
+    top_risks = adversarial.get("top_risk_points") if isinstance(adversarial.get("top_risk_points"), list) else []
+    if top_risks:
+        lines.extend(["", "审查关注风险："])
+        lines.extend([f"- {_markdown_cell(_brief_markdown_text(item, 160))}" for item in top_risks[:3]])
+    if all_missing:
+        lines.extend(["", "待补关键证据："])
+        lines.extend([f"- {_markdown_cell(_brief_markdown_text(item, 160))}" for item in all_missing[:2]])
+
+    lines.extend([
+        "",
+        "## 附录一、候选池来源与入池理由",
+        "",
+        "这部分用于追溯候选为什么进池，不代表买入结论。",
+        "",
+        "按入池分降序展示；入池分只衡量 L1 召回强度，不代表推荐买入。",
+        "",
+        "| 排名 | 股票 | 入池通道 | 入池分 | 深度分析 | 入池理由 | 关注点 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ])
+    if candidates:
+        deep_analyzed_codes = _deep_dive_code_set(deep_results)
+        for idx, display_item in enumerate(_candidate_appendix_items(candidates, llm_candidate_by_code)[:12], start=1):
+            labels = _candidate_labels(display_item)
+            lines.append(
+                "| {rank} | {stock} | {source} | {score} | {deep_status} | {reason} | {labels} |".format(
+                    rank=idx,
+                    stock=_markdown_cell(_stock_label(display_item)),
+                    source=_markdown_cell(_candidate_source_label(display_item)),
+                    score=_markdown_cell(_format_score(_candidate_display_score(display_item))),
+                    deep_status=_markdown_cell(_candidate_deep_dive_status(display_item, deep_analyzed_codes)),
+                    reason=_markdown_cell(_candidate_reason(display_item)),
+                    labels=_markdown_cell("、".join(labels[:6]) if labels else "-"),
+                )
+            )
+    else:
+        lines.append("| - | - | - | - | - | 本轮没有形成可用候选池。 | - |")
+
+    if candidate_quality:
+        lines.extend([
+            "",
+            "候选池质量摘要："
+            f"候选 {candidate_quality.get('candidate_count', len(candidates))} 只；"
+            f"多源共振 {candidate_quality.get('multi_source_count', 0)} 只；"
+            f"兜底观察 {candidate_quality.get('fallback_count', 0)} 只；"
+            f"硬排除 {candidate_quality.get('hard_exclusion_count', 0)} 只。",
+        ])
+
+    if deep_results:
+        lines.extend([
+            "",
+            "## 附录二、逐股维度证据展开",
+        ])
+        for result in deep_results:
+            if not isinstance(result, dict):
+                continue
+            summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+            full = result.get("full") if isinstance(result.get("full"), dict) else {}
+            stock = full.get("stock") if isinstance(full.get("stock"), dict) else {}
+            lines.extend([
+                "",
+                f"### {_markdown_cell(_stock_label({**stock, **summary}))}",
+                "",
+                "| 维度 | 结论 | 证据摘要 |",
+                "| --- | --- | --- |",
+            ])
+            dimension_summary = full.get("dimension_summary") if isinstance(full.get("dimension_summary"), dict) else {}
+            if dimension_summary:
+                for key, item in dimension_summary.items():
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(
+                        "| {dimension} | {verdict} | {summary} |".format(
+                            dimension=_markdown_cell(_dimension_label(key)),
+                            verdict=_markdown_cell(_verdict_label(item.get("verdict"))),
+                            summary=_markdown_cell(_truncate(str(item.get("summary") or "-"), 240)),
+                        )
+                    )
+            else:
+                lines.append("| - | - | 本轮没有返回维度证据摘要。 |")
+
+            evidence_items = _as_text_list(full.get("key_evidence") or summary.get("main_supporting_evidence"))
+            risk_items = _as_text_list(full.get("risk_flags") or summary.get("main_risks"))
+            failure_items = _as_text_list(full.get("failure_conditions"))
+            missing_items = _as_text_list(full.get("missing_evidence") or summary.get("main_missing_evidence"))
+            if evidence_items:
+                lines.extend(["", "关键支持证据："])
+                lines.extend([f"- {_markdown_cell(item)}" for item in evidence_items[:5]])
+            if risk_items:
+                lines.extend(["", "主要反证/风险："])
+                lines.extend([f"- {_markdown_cell(item)}" for item in risk_items[:5]])
+            if failure_items:
+                lines.extend(["", "失效条件："])
+                lines.extend([f"- {_markdown_cell(item)}" for item in failure_items[:5]])
+            if missing_items:
+                lines.extend(["", "仍缺证据："])
+                lines.extend([f"- {_markdown_cell(item)}" for item in missing_items[:5]])
 
     risk_controls = report.get("judge_decision", {}).get("full", {}).get("risk_controls", [])
     if risk_controls:
-        lines.extend(["", "## 四、风控条件"])
+        lines.extend(["", "## 附录三、风控条件"])
         lines.extend([f"- {item}" for item in risk_controls])
     return "\n".join(lines).strip()
 
@@ -799,28 +1020,61 @@ def _execute_tool(
     tool_name: str,
     arguments: Dict[str, Any],
 ) -> Any:
+    step = len(ctx.tool_calls) + 1
     call: Dict[str, Any] = {
+        "step": step,
         "tool": tool_name,
         "arguments": arguments,
         "success": False,
         "result_preview": "",
         "selection_stage": True,
     }
+    started_at = _monotonic_time()
+    _emit(
+        ctx.progress_callback,
+        "tool_start",
+        step=step,
+        tool=tool_name,
+        arguments=arguments,
+        selection_stage=True,
+    )
     try:
         if tool_registry.get(tool_name) is None:
             raise KeyError(f"Tool '{tool_name}' not registered")
         result = tool_registry.execute(tool_name, **arguments)
         call["success"] = not _is_failed_tool_result(result)
+        call["result_json"] = _compact_tool_result_for_trace(result)
         call["result_preview"] = _truncate(json.dumps(result, ensure_ascii=False, default=str), 1200)
+        call["result_length"] = len(json.dumps(result, ensure_ascii=False, default=str))
         return result
     except Exception as exc:
         error_payload = {"status": "tool_failed", "tool": tool_name, "error": str(exc)}
         call["success"] = False
+        call["result_json"] = error_payload
         call["result_preview"] = json.dumps(error_payload, ensure_ascii=False)
+        call["result_length"] = len(call["result_preview"])
         return error_payload
     finally:
+        call["duration"] = round(_monotonic_time() - started_at, 3)
         ctx.tool_calls.append(call)
         _refresh_evidence_summary(ctx)
+        _emit(ctx.progress_callback, "tool_done", **call)
+
+
+def _monotonic_time() -> float:
+    return time.monotonic()
+
+
+def _compact_tool_result_for_trace(result: Any) -> Any:
+    """Keep structured trace payloads useful without duplicating large raw blobs."""
+    if not isinstance(result, dict):
+        return result
+    candidates = result.get("candidates")
+    if isinstance(candidates, list) and result.get("status") is not None:
+        return _compact_candidate_seed(result, limit=DEFAULT_CANDIDATE_LIMIT)
+    if result.get("expert_packets") or result.get("discovery_steps") or result.get("quality"):
+        return _compact_candidate_seed(result, limit=DEFAULT_CANDIDATE_LIMIT)
+    return result
 
 
 def _is_failed_tool_result(result: Any) -> bool:
@@ -889,6 +1143,319 @@ def _refresh_evidence_summary(ctx: SelectionRunContext) -> None:
     }
 
 
+def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT_CANDIDATE_LIMIT) -> Dict[str, Any]:
+    if not isinstance(seed_result, dict):
+        return {"status": "invalid", "candidate_count": 0, "candidates": []}
+    candidates = seed_result.get("candidates") if isinstance(seed_result.get("candidates"), list) else []
+    compact_candidates: List[Dict[str, Any]] = []
+    for item in candidates[:limit]:
+        if not isinstance(item, dict):
+            continue
+        compact_candidates.append({
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "market": item.get("market"),
+            "source": item.get("source"),
+            "signal_score": item.get("signal_score"),
+            "final_score": item.get("final_score"),
+            "score": item.get("score"),
+            "reason": _truncate(str(item.get("reason") or ""), 360),
+            "reason_dimensions": _compact_reason_dimensions(item.get("reason_dimensions")),
+            "recall_sources": _as_text_list(item.get("recall_sources"))[:6],
+            "matched_strategies": _as_text_list(item.get("matched_strategies"))[:6],
+            "strategy_tags": _as_text_list(item.get("strategy_tags"))[:8],
+        })
+    return {
+        "status": seed_result.get("status"),
+        "market": seed_result.get("market"),
+        "candidate_source": seed_result.get("candidate_source"),
+        "candidate_count": seed_result.get("candidate_count") or len(candidates),
+        "candidates": compact_candidates,
+        "quality_summary": seed_result.get("quality_summary"),
+        "lifecycle_summary": seed_result.get("lifecycle_summary"),
+        "source_summary": _compact_source_summary(seed_result.get("source_summary")),
+        "discovery_steps": _compact_discovery_steps(seed_result.get("discovery_steps")),
+        "theme_observations": _compact_theme_observations(seed_result),
+        "errors": _as_text_list(seed_result.get("errors"))[:6],
+    }
+
+
+def _compact_reason_dimensions(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for item in value[:6]:
+        if not isinstance(item, dict):
+            continue
+        result.append({
+            "dimension": item.get("dimension"),
+            "label": item.get("label"),
+            "detail": _truncate(str(item.get("detail") or ""), 240),
+        })
+    return result
+
+
+def _compact_source_summary(value: Any) -> Any:
+    if isinstance(value, list):
+        return value[:10]
+    if isinstance(value, dict):
+        return {
+            key: value.get(key)
+            for key in ("strategy", "technical", "capital", "fundamental", "sector", "news", "sentiment")
+            if key in value
+        }
+    return value
+
+
+def _compact_discovery_steps(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    steps: List[Dict[str, Any]] = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        steps.append({
+            "source": item.get("source") or item.get("expert") or item.get("candidate_source"),
+            "status": item.get("status"),
+            "count": item.get("count") or item.get("candidate_count"),
+            "errors": _as_text_list(item.get("errors"))[:3],
+            "message": _truncate(str(item.get("message") or item.get("summary") or ""), 240),
+        })
+    return steps
+
+
+def _compact_theme_observations(seed_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    observations: List[Dict[str, Any]] = []
+    for key in ("theme_observations", "themes", "watch_only_events"):
+        value = seed_result.get(key)
+        if isinstance(value, list):
+            for item in value[:6]:
+                if isinstance(item, dict):
+                    observations.append({
+                        "theme": item.get("theme") or item.get("title") or item.get("name"),
+                        "summary": _truncate(str(item.get("summary") or item.get("reason") or ""), 260),
+                        "status": item.get("status"),
+                    })
+                elif item:
+                    observations.append({"theme": str(item), "summary": ""})
+    return observations[:6]
+
+
+def _compact_evidence_ledger_for_prompt(ctx: SelectionRunContext) -> Dict[str, Any]:
+    summary = ctx.evidence_ledger.get("summary") if isinstance(ctx.evidence_ledger, dict) else {}
+    entries = summary.get("entries") if isinstance(summary, dict) and isinstance(summary.get("entries"), list) else []
+    recent: List[Dict[str, Any]] = []
+    for entry in entries[-12:]:
+        if not isinstance(entry, dict):
+            continue
+        recent.append({
+            "tool": entry.get("tool"),
+            "arguments": entry.get("arguments"),
+            "status": entry.get("status"),
+        })
+    return {
+        "entry_count": summary.get("entry_count") if isinstance(summary, dict) else len(ctx.tool_calls),
+        "success_count": summary.get("success_count") if isinstance(summary, dict) else None,
+        "failed_tools": list(dict.fromkeys(summary.get("failed_tools") or []))[:12] if isinstance(summary, dict) else [],
+        "recent_tools": recent,
+        "full_ref": ctx.evidence_ledger.get("full_ref") if isinstance(ctx.evidence_ledger, dict) else "selection_evidence_ledger.json",
+    }
+
+
+def _compact_base_evidence(base_evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(base_evidence, dict):
+        return {}
+    quotes = base_evidence.get("quotes") if isinstance(base_evidence.get("quotes"), dict) else {}
+    compact_quotes: Dict[str, Any] = {}
+    for code, quote in list(quotes.items())[:DEFAULT_CANDIDATE_LIMIT]:
+        compact_quotes[str(code)] = _compact_quote(quote)
+    return {
+        "detect_market_regime": _summarize_market_regime(base_evidence.get("detect_market_regime") or {}),
+        "market_indices": _compact_market_indices(base_evidence.get("get_market_indices")),
+        "sector_rankings": _compact_sector_rankings(base_evidence.get("get_sector_rankings")),
+        "quotes": compact_quotes,
+    }
+
+
+def _compact_quote(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "invalid"}
+    return {
+        "status": value.get("status", "ok"),
+        "code": value.get("code") or value.get("stock_code"),
+        "name": value.get("name"),
+        "price": value.get("price") or value.get("current_price"),
+        "change_pct": value.get("change_pct") or value.get("pct_chg"),
+        "turnover_rate": value.get("turnover_rate"),
+        "volume_ratio": value.get("volume_ratio"),
+        "quote_trade_date": value.get("quote_trade_date") or value.get("latest_date") or value.get("date"),
+        "market_session": value.get("market_session"),
+        "errors": _as_text_list(value.get("errors"))[:3],
+    }
+
+
+def _compact_market_indices(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "missing", "indices": []}
+    indices = value.get("indices") if isinstance(value.get("indices"), list) else []
+    return {
+        "status": value.get("status", "ok"),
+        "indices": [
+            {
+                "name": item.get("name"),
+                "code": item.get("code"),
+                "price": item.get("price") or item.get("close"),
+                "change_pct": item.get("change_pct") or item.get("pct_chg"),
+            }
+            for item in indices[:8]
+            if isinstance(item, dict)
+        ],
+        "errors": _as_text_list(value.get("errors"))[:3],
+    }
+
+
+def _compact_sector_rankings(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"status": "missing", "top": [], "bottom": []}
+    top = value.get("top_sectors") or value.get("sectors") or []
+    bottom = value.get("bottom_sectors") or []
+    return {
+        "status": value.get("status", "ok"),
+        "top": _compact_sector_items(top),
+        "bottom": _compact_sector_items(bottom),
+        "errors": _as_text_list(value.get("errors"))[:3],
+    }
+
+
+def _compact_sector_items(items: Any) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    result: List[Dict[str, Any]] = []
+    for item in items[:6]:
+        if not isinstance(item, dict):
+            continue
+        result.append({
+            "name": item.get("name") or item.get("sector_name"),
+            "change_pct": item.get("change_pct") or item.get("涨跌幅"),
+            "main_net_inflow": item.get("main_net_inflow") or item.get("main_amount"),
+            "rank": item.get("rank"),
+        })
+    return result
+
+
+def _deep_dive_prompt_evidence(
+    *,
+    ctx: SelectionRunContext,
+    code: str,
+    stock_name: str,
+    detailed_evidence: Dict[str, Any],
+    evidence_cards: List[Any],
+) -> Dict[str, Any]:
+    card_view = _evidence_cards_prompt_view(evidence_cards)
+    return {
+        "stock": {"code": code, "name": stock_name, "market": ctx.market},
+        "evidence_cards": card_view,
+        "dimension_summary": _dimension_summary_from_cards(card_view),
+        "tool_failures": _tool_failures_from_evidence(detailed_evidence),
+        "raw_refs": [card.get("raw_ref") for card in card_view if card.get("raw_ref")],
+        "protocol": {
+            "name": "EvidenceCard",
+            "version": "v1",
+            "raw_policy": "raw tool JSON is retained only by raw_ref/full artifacts; prompts receive compact cards.",
+        },
+    }
+
+
+def _evidence_cards_prompt_view(cards: List[Any]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for card in cards:
+        if hasattr(card, "model_dump"):
+            item = card.model_dump(mode="json")
+        elif isinstance(card, dict):
+            item = card
+        else:
+            continue
+        data_quality = item.get("data_quality") if isinstance(item.get("data_quality"), dict) else {}
+        impact = item.get("impact") if isinstance(item.get("impact"), dict) else {}
+        result.append({
+            "card_id": item.get("card_id"),
+            "dimension": item.get("dimension"),
+            "data_quality": {
+                "status": data_quality.get("status"),
+                "as_of": data_quality.get("as_of"),
+                "freshness": data_quality.get("freshness"),
+                "source": data_quality.get("source"),
+                "warnings": _as_text_list(data_quality.get("warnings"))[:4],
+                "missing_fields": _as_text_list(data_quality.get("missing_fields"))[:6],
+            },
+            "impact": {
+                "stance": impact.get("stance"),
+                "action_bias": impact.get("action_bias"),
+                "confidence": impact.get("confidence"),
+                "score_delta": impact.get("score_delta"),
+                "reason": _truncate(str(impact.get("reason") or ""), 320),
+            },
+            "signals": [
+                {
+                    "name": signal.get("name"),
+                    "value": signal.get("value"),
+                    "unit": signal.get("unit"),
+                    "direction": signal.get("direction"),
+                    "strength": signal.get("strength"),
+                    "score_delta": signal.get("score_delta"),
+                    "interpretation": _truncate(str(signal.get("interpretation") or ""), 260),
+                }
+                for signal in (item.get("signals") or [])[:4]
+                if isinstance(signal, dict)
+            ],
+            "counter_evidence": [
+                {
+                    "refuted_claim": counter.get("refuted_claim"),
+                    "refutation": _truncate(str(counter.get("refutation") or ""), 260),
+                    "severity": counter.get("severity"),
+                }
+                for counter in (item.get("counter_evidence") or [])[:3]
+                if isinstance(counter, dict)
+            ],
+            "expiry": item.get("expiry"),
+            "raw_ref": item.get("raw_ref"),
+        })
+    return result
+
+
+def _dimension_summary_from_cards(cards: List[Dict[str, Any]]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    for card in cards:
+        dimension = str(card.get("dimension") or "unknown")
+        impact = card.get("impact") if isinstance(card.get("impact"), dict) else {}
+        quality = card.get("data_quality") if isinstance(card.get("data_quality"), dict) else {}
+        summary[dimension] = {
+            "stance": impact.get("stance"),
+            "action_bias": impact.get("action_bias"),
+            "confidence": impact.get("confidence"),
+            "score_delta": impact.get("score_delta"),
+            "data_status": quality.get("status"),
+            "freshness": quality.get("freshness"),
+            "missing_fields": quality.get("missing_fields") or [],
+        }
+    return summary
+
+
+def _tool_failures_from_evidence(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+    failures: List[Dict[str, Any]] = []
+    if not isinstance(evidence, dict):
+        return failures
+    for tool_name, raw in evidence.items():
+        if not isinstance(raw, dict) or not _is_failed_tool_result(raw):
+            continue
+        failures.append({
+            "tool": tool_name,
+            "status": raw.get("status") or ("timeout" if raw.get("timeout") else "failed"),
+            "errors": _as_text_list(raw.get("errors") or raw.get("error") or raw.get("error_summary"))[:4],
+        })
+    return failures
+
+
 def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[str, Any]) -> Dict[str, Any]:
     candidates = seed_result.get("candidates") if isinstance(seed_result, dict) else []
     candidates = candidates if isinstance(candidates, list) else []
@@ -923,16 +1490,22 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
 
 def _merge_discovery_candidates(payload: Dict[str, Any], seed_result: Dict[str, Any]) -> None:
     full = payload.setdefault("full", {})
-    candidates = full.get("candidates")
-    if candidates:
-        return
     seed_candidates = seed_result.get("candidates") if isinstance(seed_result, dict) else []
     if isinstance(seed_candidates, list):
+        llm_candidates = full.get("candidates")
+        if isinstance(llm_candidates, list) and llm_candidates:
+            full["llm_candidate_summary"] = llm_candidates
         full["candidates"] = seed_candidates
         payload["candidate_count"] = len(seed_candidates)
-        payload.setdefault("summary", {})["candidate_codes"] = [
+        summary = payload.setdefault("summary", {})
+        summary["candidate_codes"] = [
             str(item.get("code")) for item in seed_candidates if isinstance(item, dict) and item.get("code")
         ]
+        summary["candidate_source"] = seed_result.get("candidate_source") or summary.get("candidate_source")
+        summary["source_count"] = len(seed_candidates)
+        for key in ("expert_packets", "quality", "hard_exclusion", "capacity", "themes", "discovery_steps", "candidate_pool_run_id"):
+            if key in seed_result and key not in full:
+                full[key] = seed_result.get(key)
 
 
 def _fallback_candidate_screening(ctx: SelectionRunContext, base_evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -1265,6 +1838,168 @@ def _fallback_judge_decision(ctx: SelectionRunContext) -> Dict[str, Any]:
     }
 
 
+def _stabilize_judge_decision(ctx: SelectionRunContext, payload: Dict[str, Any]) -> None:
+    """Normalize over-aggressive judge outputs for non-empty candidate pools."""
+    if not isinstance(payload, dict):
+        return
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        payload["summary"] = summary
+    full = payload.get("full")
+    if not isinstance(full, dict):
+        full = {}
+        payload["full"] = full
+
+    candidates = ctx.stage_full("candidate_discovery").get("candidates") or []
+    candidate_count = len(candidates) if isinstance(candidates, list) else 0
+    discovery_status = str(ctx.stages.get("candidate_discovery", SelectionStage()).status or "")
+    action = str(summary.get("final_action") or "").strip().lower()
+    next_step = str(summary.get("next_step") or "").strip()
+    fallback_path = full.get("fallback_path") if isinstance(full.get("fallback_path"), dict) else {}
+
+    if action != "reject" or candidate_count <= 0 or discovery_status == "insufficient_candidates":
+        return
+
+    # A non-empty candidate pool with weak evidence should remain an actionable
+    # watchlist, not be rendered as a failed stock-picking run.
+    summary["final_action"] = "wait"
+    if summary.get("primary_plan_verdict") == "reject":
+        summary["primary_plan_verdict"] = "wait_for_more_data"
+    original_reason = str(summary.get("decision_summary") or "").strip()
+    guard_note = "候选池已形成但证据质量不足，系统将“拒绝建仓”降级为“等待确认”，保留候选观察和后续复查条件。"
+    summary["decision_summary"] = f"{original_reason}；{guard_note}" if original_reason else guard_note
+    summary["next_step"] = next_step if next_step and next_step != "stop_no_trade" else "render_final_report"
+    required_changes = full.get("required_plan_changes")
+    if not isinstance(required_changes, list):
+        required_changes = []
+    if guard_note not in required_changes:
+        required_changes.append(guard_note)
+    full["required_plan_changes"] = required_changes
+    if not isinstance(fallback_path, dict):
+        fallback_path = {}
+    fallback_path.update({
+        "when": "wait_for_more_data",
+        "next_step": "render_final_report",
+        "reason": "保留候选池，等待技术回踩、资金流和基本面/消息证据补齐后复查。",
+    })
+    full["fallback_path"] = fallback_path
+
+
+def _apply_judge_position_overrides(ctx: SelectionRunContext, payload: Dict[str, Any]) -> None:
+    """Apply explicit Judge action changes back to the portfolio table."""
+    if not isinstance(payload, dict):
+        return
+    allocation_stage = ctx.stages.get("portfolio_allocation")
+    if allocation_stage is None or not isinstance(allocation_stage.full, dict):
+        return
+
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    full = payload.get("full") if isinstance(payload.get("full"), dict) else {}
+    positions = allocation_stage.full.get("positions_plan")
+    if not isinstance(positions, list) or not positions:
+        return
+
+    override_text = _judge_override_text(summary, full)
+    monitor_codes = _monitor_override_codes(override_text)
+    final_action = str(summary.get("final_action") or "").strip().lower()
+    apply_all = final_action == "monitor" and not monitor_codes
+    if not monitor_codes and not apply_all:
+        return
+
+    changed = False
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+        if apply_all or code in monitor_codes:
+            _downgrade_position_to_monitor(item, reason="Judge 裁决要求降为仅监控，不保留具体买入触发。")
+            changed = True
+
+    if not changed:
+        return
+
+    allocation_stage.summary["portfolio_action"] = "monitor"
+    allocation_stage.summary["recommended_position_count"] = 0
+    allocation_stage.summary["initial_total_position_pct"] = 0
+    allocation_stage.summary["reserved_cash_pct"] = 100
+    core_reason = str(allocation_stage.summary.get("core_reason") or "").strip()
+    override_reason = "Judge 已把部分或全部候选降为仅监控，组合层取消开仓计划。"
+    allocation_stage.summary["core_reason"] = f"{core_reason}；{override_reason}" if core_reason else override_reason
+
+    brief = allocation_stage.summary.get("positions_plan_brief")
+    if isinstance(brief, list):
+        for item in brief:
+            if isinstance(item, dict):
+                code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+                if apply_all or code in monitor_codes:
+                    item["action"] = "monitor"
+                    item["initial_position_pct"] = 0
+
+    risk_controls = allocation_stage.full.get("risk_controls")
+    if not isinstance(risk_controls, list):
+        risk_controls = []
+    if override_reason not in risk_controls:
+        risk_controls.append(override_reason)
+    allocation_stage.full["risk_controls"] = risk_controls
+
+
+def _judge_override_text(summary: Dict[str, Any], full: Dict[str, Any]) -> str:
+    values: List[str] = []
+    for key in ("decision_summary", "final_action", "primary_plan_verdict"):
+        if summary.get(key):
+            values.append(str(summary[key]))
+    for key in (
+        "required_plan_changes",
+        "accepted_arguments",
+        "rejected_arguments",
+        "risk_controls",
+        "fallback_path",
+    ):
+        value = full.get(key)
+        if isinstance(value, list):
+            values.extend(str(item) for item in value if item)
+        elif isinstance(value, dict):
+            values.extend(str(item) for item in value.values() if item)
+        elif value:
+            values.append(str(value))
+    return "\n".join(values)
+
+
+def _monitor_override_codes(text: str) -> List[str]:
+    codes: List[str] = []
+    patterns = (
+        r"将\s*(\d{6})[^。；;\n]*?(?:降为|降级为|改为|调整为)[^。；;\n]*?(?:仅监控|monitor)",
+        r"(\d{6})[^。；;\n]*?(?:降为|降级为|改为|调整为)[^。；;\n]*?(?:仅监控|monitor)",
+        r"(\d{6})[^。；;\n]*?(?:仅监控|monitor)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            code = _normalize_stock_identity_code(match.group(1))
+            if code and code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _downgrade_position_to_monitor(item: Dict[str, Any], *, reason: str) -> None:
+    item["action"] = "monitor"
+    item["action_strength"] = "none"
+    item["initial_position_pct"] = 0
+    item["initial_amount"] = 0
+    item["entry_condition"] = "仅监控，不设置买入触发；等待基本面、资金或消息证据补齐后重新评估。"
+    item["add_condition"] = "-"
+    item["stop_loss_condition"] = "未建仓，不设置交易止损；若继续走弱则移出观察。"
+    item["review_trigger"] = item.get("review_trigger") or "下一轮候选池刷新或关键公告/资金变化后复查"
+    original_reason = str(item.get("reason") or "").strip()
+    item["reason"] = f"{original_reason}；{reason}" if original_reason else reason
+    risk_flags = item.get("risk_flags")
+    if not isinstance(risk_flags, list):
+        risk_flags = []
+    if reason not in risk_flags:
+        risk_flags.append(reason)
+    item["risk_flags"] = risk_flags
+
+
 def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
     return {
         "selection_context": ctx.to_dict(include_full=False),
@@ -1334,6 +2069,58 @@ def _deep_dive_targets(summary: Dict[str, Any], full: Dict[str, Any]) -> List[st
         if isinstance(item, dict) and item.get("screening_result") == "deep_dive" and item.get("code"):
             codes.append(str(item["code"]))
     return codes
+
+
+def _selection_deep_dive_limit() -> int:
+    try:
+        config = Config.get_instance()
+        raw = getattr(config, "agent_selection_deep_dive_limit", DEFAULT_DEEP_DIVE_LIMIT)
+    except Exception:
+        raw = os.getenv("AGENT_SELECTION_DEEP_DIVE_LIMIT", str(DEFAULT_DEEP_DIVE_LIMIT))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_DEEP_DIVE_LIMIT
+    return max(1, min(20, value))
+
+
+def _expand_deep_dive_targets_for_rich_report(
+    *,
+    deep_targets: List[str],
+    candidates: List[str],
+    screening_full: Dict[str, Any],
+) -> List[str]:
+    """Keep reports useful by deep-diving enough non-rejected candidates."""
+    targets = [_normalize_stock_identity_code(item) for item in deep_targets if item]
+    targets = [item for item in targets if item]
+    if len(candidates) < MIN_RICH_REPORT_DEEP_DIVE_TARGETS or len(targets) >= MIN_RICH_REPORT_DEEP_DIVE_TARGETS:
+        return list(dict.fromkeys(targets))
+
+    rejected_codes = _screening_rejected_codes(screening_full)
+    for code in candidates:
+        normalized = _normalize_stock_identity_code(code)
+        if not normalized or normalized in rejected_codes or normalized in targets:
+            continue
+        targets.append(normalized)
+        if len(targets) >= MIN_RICH_REPORT_DEEP_DIVE_TARGETS:
+            break
+    return list(dict.fromkeys(targets))
+
+
+def _screening_rejected_codes(screening_full: Dict[str, Any]) -> set[str]:
+    rejected: set[str] = set()
+    shortlist = screening_full.get("shortlist") if isinstance(screening_full, dict) else []
+    if not isinstance(shortlist, list):
+        return rejected
+    for item in shortlist:
+        if not isinstance(item, dict):
+            continue
+        result = str(item.get("screening_result") or "").strip().lower()
+        if result == "reject":
+            code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+            if code:
+                rejected.add(code)
+    return rejected
 
 
 def _stock_name_from_evidence(code: str, evidence: Dict[str, Any]) -> str:
@@ -1468,6 +2255,727 @@ def _all_missing_evidence(ctx: SelectionRunContext) -> List[str]:
     return list(dict.fromkeys(missing))
 
 
+def _report_missing_evidence(report: Dict[str, Any]) -> List[str]:
+    missing: List[str] = []
+    for stage_name in ("candidate_discovery", "candidate_screening", "single_stock_deep_dive", "portfolio_allocation", "adversarial_review"):
+        stage = report.get(stage_name)
+        full = stage.get("full") if isinstance(stage, dict) and isinstance(stage.get("full"), dict) else {}
+        stage_missing = full.get("missing_evidence")
+        if isinstance(stage_missing, list):
+            missing.extend(str(item) for item in stage_missing if item)
+        results = full.get("results")
+        if isinstance(results, list):
+            for item in results:
+                item_full = item.get("full") if isinstance(item, dict) and isinstance(item.get("full"), dict) else {}
+                item_missing = item_full.get("missing_evidence")
+                if isinstance(item_missing, list):
+                    missing.extend(str(value) for value in item_missing if value)
+        summary = stage.get("summary") if isinstance(stage, dict) and isinstance(stage.get("summary"), dict) else {}
+        summary_missing = summary.get("top_evidence_gaps")
+        if isinstance(summary_missing, list):
+            missing.extend(str(item) for item in summary_missing if item)
+    return list(dict.fromkeys(missing))
+
+
+def _primary_report_core_reason(
+    *,
+    allocation: Dict[str, Any],
+    deep_results: List[Any],
+    judge: Dict[str, Any],
+) -> str:
+    """Keep the final report centered on evidence and allocation, not debate prose."""
+    allocation_reason = str(allocation.get("core_reason") or "").strip()
+    if allocation_reason:
+        return _brief_markdown_text(allocation_reason, 260)
+
+    stock_reasons: List[str] = []
+    for result in deep_results[:3]:
+        if not isinstance(result, dict):
+            continue
+        summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+        full = result.get("full") if isinstance(result.get("full"), dict) else {}
+        stock = full.get("stock") if isinstance(full.get("stock"), dict) else {}
+        label = _stock_label({**stock, **summary})
+        reason = (
+            summary.get("key_reason")
+            or summary.get("reason")
+            or full.get("reason")
+            or _first_text(summary.get("main_supporting_evidence"))
+            or _first_text(full.get("key_evidence"))
+            or _dimension_reason(full.get("dimension_summary"))
+        )
+        if reason:
+            stock_reasons.append(f"{label}: {reason}")
+    if stock_reasons:
+        return _brief_markdown_text("；".join(stock_reasons), 260)
+
+    judge_summary = str(judge.get("decision_summary") or "").strip()
+    if judge_summary:
+        return _brief_markdown_text(judge_summary, 180)
+    return "-"
+
+
+def _auxiliary_review_note(judge: Dict[str, Any]) -> str:
+    verdict = str(judge.get("primary_plan_verdict") or "").strip()
+    action = str(judge.get("final_action") or "").strip()
+    if verdict and action:
+        return f"{verdict}，最终动作 {action}；详见第六节辅助审查摘要。"
+    if verdict:
+        return f"{verdict}；详见第六节辅助审查摘要。"
+    if action:
+        return f"最终动作 {action}；详见第六节辅助审查摘要。"
+    return "-"
+
+
+def _recommendation_items(
+    *,
+    positions: List[Any],
+    deep_results: List[Any],
+    candidates: List[Any],
+    llm_candidate_by_code: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for result in deep_results:
+        if not isinstance(result, dict):
+            continue
+        summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+        full = result.get("full") if isinstance(result.get("full"), dict) else {}
+        stock = full.get("stock") if isinstance(full.get("stock"), dict) else {}
+        entry_quality = full.get("entry_quality") if isinstance(full.get("entry_quality"), dict) else {}
+        code = _normalize_stock_identity_code(summary.get("code") or stock.get("code"))
+        if not code:
+            continue
+        by_code[code] = {
+            "code": code,
+            "name": summary.get("name") or stock.get("name"),
+            "action": summary.get("action_bias") or full.get("action_bias") or "wait",
+            "action_strength": summary.get("action_strength") or full.get("action_strength") or "weak",
+            "has_deep_dive": True,
+            "quote_basis": summary.get("quote_basis") or full.get("quote_basis"),
+            "ideal_entry_zone": summary.get("ideal_entry_zone") or entry_quality.get("ideal_entry_zone"),
+            "secondary_entry_zone": summary.get("secondary_entry_zone") or entry_quality.get("secondary_entry_zone"),
+            "no_chase_line": summary.get("no_chase_line") or entry_quality.get("no_chase_line"),
+            "stop_loss": summary.get("stop_loss") or entry_quality.get("stop_loss"),
+            "target_1": summary.get("target_1") or entry_quality.get("target_1"),
+            "target_2": summary.get("target_2") or entry_quality.get("target_2"),
+            "supporting_evidence": _as_text_list(full.get("key_evidence") or summary.get("main_supporting_evidence")),
+            "risk_flags": _as_text_list(full.get("risk_flags") or summary.get("main_risks")),
+            "failure_conditions": _as_text_list(full.get("failure_conditions")),
+            "missing_evidence": _as_text_list(full.get("missing_evidence") or summary.get("main_missing_evidence")),
+            "reason": (
+                summary.get("key_reason")
+                or summary.get("reason")
+                or full.get("reason")
+                or _first_text(summary.get("main_supporting_evidence"))
+                or _dimension_reason(full.get("dimension_summary"))
+            ),
+        }
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+        if not code:
+            continue
+        display_item = dict(llm_candidate_by_code.get(code) or {})
+        display_item.update(item)
+        target = by_code.setdefault(code, {"code": code, "name": display_item.get("name"), "action": "watch", "action_strength": "weak"})
+        target.setdefault("name", display_item.get("name"))
+        target["has_candidate"] = True
+        target["candidate_score"] = display_item.get("final_score") or display_item.get("signal_score") or display_item.get("score")
+        target["candidate_reason"] = _candidate_reason(display_item)
+        target["candidate_source"] = _candidate_source_label(display_item)
+        target["candidate_labels"] = _candidate_labels(display_item)
+
+    for idx, plan in enumerate(positions):
+        if not isinstance(plan, dict):
+            continue
+        code = _normalize_stock_identity_code(plan.get("code") or plan.get("stock_code"))
+        if not code:
+            continue
+        target = by_code.setdefault(code, {"code": code, "name": plan.get("name")})
+        target.update({
+            "rank": plan.get("rank") or idx + 1,
+            "name": plan.get("name") or target.get("name"),
+            "has_plan": True,
+            "action": plan.get("action") or target.get("action") or "wait",
+            "action_strength": plan.get("action_strength") or target.get("action_strength") or "weak",
+            "initial_position_pct": plan.get("initial_position_pct"),
+            "initial_amount": plan.get("initial_amount"),
+            "entry_condition": plan.get("entry_condition"),
+            "add_condition": plan.get("add_condition"),
+            "stop_loss_condition": plan.get("stop_loss_condition"),
+            "take_profit_condition": plan.get("take_profit_condition"),
+            "review_trigger": plan.get("review_trigger"),
+            "plan_reason": plan.get("reason"),
+        })
+
+    items = list(by_code.values())
+    items.sort(key=lambda item: (
+        _recommendation_sort_rank(item),
+        int(item.get("rank") or 999),
+        -_safe_float(item.get("candidate_score")),
+        str(item.get("code") or ""),
+    ))
+    return items
+
+
+def _action_rank(value: Any) -> int:
+    action = str(value or "").strip().lower()
+    if action in {"open", "buy"}:
+        return 0
+    if action in {"wait", "monitor", "watch"}:
+        return 1
+    if action == "hold":
+        return 2
+    if action in {"reject", "avoid"}:
+        return 3
+    return 4
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _recommendation_sort_rank(item: Dict[str, Any]) -> int:
+    if _is_actionable_recommendation(item):
+        return _action_rank(item.get("action"))
+    if _is_observable_item(item):
+        return 10 + _action_rank(item.get("action"))
+    return 99
+
+
+def _is_actionable_recommendation(item: Dict[str, Any]) -> bool:
+    action = str(item.get("action") or "").strip().lower()
+    if action in {"reject", "avoid", "monitor", "watch"}:
+        return False
+    if action in {"open", "buy"}:
+        return bool(item.get("has_plan") or item.get("has_deep_dive"))
+    if action != "wait":
+        return False
+    if not (item.get("has_plan") and item.get("has_deep_dive")):
+        return False
+    if str(item.get("action_strength") or "").strip().lower() in {"", "none", "weak"}:
+        return False
+    if not (item.get("ideal_entry_zone") or item.get("entry_condition")):
+        return False
+    if not (item.get("stop_loss") or item.get("stop_loss_condition")):
+        return False
+    risks = " ".join(_as_text_list(item.get("risk_flags"))[:4])
+    if any(marker in risks for marker in ("强势空头", "资金流出", "净流出", "数据过期", "严重过期", "基本面缺失")):
+        return False
+    return True
+
+
+def _is_observable_item(item: Dict[str, Any]) -> bool:
+    action = str(item.get("action") or "").strip().lower()
+    if action in {"reject", "avoid"}:
+        return False
+    return bool(item.get("has_candidate") or item.get("has_deep_dive") or item.get("has_plan"))
+
+
+def _preferred_candidate_label(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "暂无可入手标的"
+    return _stock_label(items[0])
+
+
+def _watch_candidate_labels(items: List[Dict[str, Any]]) -> str:
+    labels = [_stock_label(item) for item in items[:4]]
+    return "、".join(labels) if labels else "-"
+
+
+def _observation_status(item: Dict[str, Any]) -> str:
+    action = str(item.get("action") or "watch").strip().lower()
+    strength = str(item.get("action_strength") or "").strip().lower()
+    if item.get("has_plan") or item.get("has_deep_dive"):
+        if action == "wait":
+            return f"等待确认{f' / {strength}' if strength else ''}"
+        if action in {"monitor", "watch"}:
+            return "仅跟踪"
+    return "候选观察"
+
+
+def _observation_reason(item: Dict[str, Any]) -> str:
+    for key in ("plan_reason", "reason", "candidate_reason"):
+        value = item.get(key)
+        if value:
+            return _brief_markdown_text(_translate_report_text(value), 120)
+    labels = _as_text_list(item.get("candidate_labels"))
+    if labels:
+        return f"入池关注点：{'、'.join(labels[:4])}"
+    return "候选池召回，等待深度证据验证。"
+
+
+def _observation_risk(item: Dict[str, Any]) -> str:
+    risks = _as_text_list(item.get("risk_flags")) or _as_text_list(item.get("missing_evidence")) or _as_text_list(item.get("failure_conditions"))
+    if risks:
+        return _brief_markdown_text("；".join(risks[:2]), 140)
+    if not item.get("has_deep_dive"):
+        return f"未进入本轮逐股深度分析；当前深挖上限为 {_selection_deep_dive_limit()} 只，仍需补技术、资金、消息和基本面证据。"
+    return "等待价格、资金或消息进一步确认。"
+
+
+def _render_recommendation_block(rank: int, item: Dict[str, Any]) -> List[str]:
+    medal = {1: "🥇 首选", 2: "🥈 次选", 3: "🥉 观察"}.get(rank, f"第 {rank} 顺位")
+    score = item.get("candidate_score")
+    title_suffix = f"（{_format_score(score)}分）" if score is not None else ""
+    lines = [
+        f"### {medal}：{_markdown_cell(_stock_label(item))}{title_suffix}",
+        "",
+        "| 项目 | 决策 |",
+        "| --- | --- |",
+        f"| 入场结论 | {_markdown_cell(item.get('action') or 'wait')} |",
+        f"| 动作强度 | {_markdown_cell(item.get('action_strength') or '-')} |",
+        f"| 行情口径 | {_markdown_cell(_quote_basis_label(item.get('quote_basis')))} |",
+        f"| 理想入场区间 | {_markdown_cell(item.get('ideal_entry_zone') or item.get('entry_condition') or '等待回踩或突破确认')} |",
+        f"| 次优入场区间 | {_markdown_cell(item.get('secondary_entry_zone') or '-')} |",
+        f"| 禁止追高线 | {_markdown_cell(item.get('no_chase_line') or '-')} |",
+        f"| 首仓比例 | {_markdown_cell(_format_pct(item.get('initial_position_pct')))} |",
+        f"| 加仓条件 | {_markdown_cell(item.get('add_condition') or '-')} |",
+        f"| 止损位 | {_markdown_cell(item.get('stop_loss') or item.get('stop_loss_condition') or '-')} |",
+        f"| 第一目标位 | {_markdown_cell(item.get('target_1') or item.get('take_profit_condition') or '-')} |",
+        f"| 第二目标位 | {_markdown_cell(item.get('target_2') or '-')} |",
+        f"| 复查触发 | {_markdown_cell(item.get('review_trigger') or '-')} |",
+        "",
+    ]
+    reasons = _recommendation_reasons(item)
+    if reasons:
+        lines.append("入选理由：")
+        lines.extend([f"- {_markdown_cell(reason)}" for reason in reasons[:5]])
+        lines.append("")
+    risks = _as_text_list(item.get("risk_flags")) or _as_text_list(item.get("failure_conditions")) or _as_text_list(item.get("missing_evidence"))
+    if risks:
+        lines.append(f"风险：{_markdown_cell('；'.join(risks[:3]))}")
+        lines.append("")
+    return lines
+
+
+def _recommendation_reasons(item: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    for value in _as_text_list(item.get("supporting_evidence")):
+        reasons.append(_translate_report_text(value))
+    for key in ("reason", "candidate_reason", "plan_reason"):
+        value = item.get(key)
+        if value:
+            reasons.append(_translate_report_text(value))
+    labels = _as_text_list(item.get("candidate_labels"))
+    if labels:
+        reasons.append(f"入池关注点：{'、'.join(labels[:5])}")
+    return list(dict.fromkeys(reason for reason in reasons if reason))[:6]
+
+
+def _format_score(value: Any) -> str:
+    try:
+        return f"{float(value):.1f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _quote_basis_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    labels = {
+        "intraday": "盘中实时数据",
+        "latest_trading_day": "最近有效交易日",
+        "eod": "收盘后数据",
+    }
+    return labels.get(raw, raw or "-")
+
+
+def _evidence_summary_rows(
+    report: Dict[str, Any],
+    candidates: List[Any],
+    deep_results: List[Any],
+) -> List[Dict[str, str]]:
+    regime = report.get("market_regime") if isinstance(report.get("market_regime"), dict) else {}
+    discovery = report.get("candidate_discovery", {})
+    rows = [
+        {
+            "name": "市场状态",
+            "status": str(regime.get("status") or ("partial" if regime else "missing")),
+            "result": _market_regime_summary_text(regime),
+            "impact": "决定是否降低开仓和追高权重",
+        },
+        {
+            "name": "候选发现",
+            "status": str(discovery.get("status") or "partial"),
+            "result": f"形成 {len(candidates)} 只候选，主要来源：{_candidate_source_mix(candidates)}",
+            "impact": "提供可筛选对象，不等于买入结论",
+        },
+    ]
+    dimension_hits = _summarize_deep_dimensions(deep_results)
+    for name, key, impact in (
+        ("技术面", "technical", "决定是否具备趋势和入场时机"),
+        ("资金筹码", "capital_flow", "验证资金是否同步"),
+        ("消息事件", "news_event", "验证是否有真实催化或利空"),
+        ("基本面", "fundamental", "约束长期持有质量和估值风险"),
+    ):
+        item = dimension_hits.get(key) or {}
+        rows.append({
+            "name": name,
+            "status": item.get("status") or "partial",
+            "result": item.get("summary") or "本轮证据不足或未形成明确方向",
+            "impact": impact,
+        })
+    return rows
+
+
+def _market_regime_summary_text(regime: Dict[str, Any]) -> str:
+    if not regime:
+        return "市场状态未知"
+    bits = [
+        f"regime={regime.get('regime')}" if regime.get("regime") else "",
+        f"风险={regime.get('risk_level')}" if regime.get("risk_level") else "",
+        f"波动={regime.get('volatility_bucket')}" if regime.get("volatility_bucket") else "",
+    ]
+    hints = _as_text_list(regime.get("strategy_hints"))
+    return "，".join(bit for bit in bits if bit) or (hints[0] if hints else "市场状态已识别")
+
+
+def _candidate_source_mix(candidates: List[Any]) -> str:
+    labels: List[str] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            labels.append(_candidate_source_label(item))
+    labels = [label for label in labels if label and label != "-"]
+    return "、".join(list(dict.fromkeys(labels))[:4]) if labels else "-"
+
+
+def _candidate_appendix_items(
+    candidates: List[Any],
+    llm_candidate_by_code: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    display_items: List[Dict[str, Any]] = []
+    for idx, item in enumerate(candidates):
+        if not isinstance(item, dict):
+            continue
+        code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+        if not code:
+            continue
+        display_item = dict(llm_candidate_by_code.get(code) or {})
+        display_item.update(item)
+        display_item["_candidate_original_index"] = idx
+        display_items.append(display_item)
+    display_items.sort(
+        key=lambda item: (
+            -_candidate_display_score(item),
+            int(item.get("_candidate_original_index") or 0),
+            str(item.get("code") or item.get("stock_code") or ""),
+        )
+    )
+    return display_items
+
+
+def _candidate_display_score(item: Dict[str, Any]) -> float:
+    return _safe_float(item.get("final_score") or item.get("signal_score") or item.get("score"))
+
+
+def _deep_dive_code_set(deep_results: List[Any]) -> set[str]:
+    codes: set[str] = set()
+    for result in deep_results:
+        if not isinstance(result, dict):
+            continue
+        summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+        full = result.get("full") if isinstance(result.get("full"), dict) else {}
+        stock = full.get("stock") if isinstance(full.get("stock"), dict) else {}
+        code = _normalize_stock_identity_code(summary.get("code") or stock.get("code"))
+        if code:
+            codes.add(code)
+    return codes
+
+
+def _candidate_deep_dive_status(item: Dict[str, Any], deep_analyzed_codes: set[str]) -> str:
+    code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+    if code and code in deep_analyzed_codes:
+        return "已完成"
+    return f"未覆盖（深挖上限 {_selection_deep_dive_limit()} 只）"
+
+
+def _summarize_deep_dimensions(deep_results: List[Any]) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    for item in deep_results:
+        if not isinstance(item, dict):
+            continue
+        full = item.get("full") if isinstance(item.get("full"), dict) else {}
+        dimension_summary = full.get("dimension_summary") if isinstance(full.get("dimension_summary"), dict) else {}
+        for key, value in dimension_summary.items():
+            if not isinstance(value, dict) or key in result:
+                continue
+            result[str(key)] = {
+                "status": _verdict_label(value.get("verdict")),
+                "summary": _brief_markdown_text(value.get("summary") or "-", 180),
+            }
+    return result
+
+
+def _final_risk_lines(recommendations: List[Dict[str, Any]], adversarial: Dict[str, Any], all_missing: List[str]) -> List[str]:
+    risks: List[str] = []
+    for item in recommendations[:3]:
+        stock = _stock_label(item)
+        for risk in _as_text_list(item.get("risk_flags"))[:2]:
+            risks.append(f"{stock}：{risk}")
+        for failure in _as_text_list(item.get("failure_conditions"))[:1]:
+            risks.append(f"{stock} 淘汰条件：{failure}")
+    risks.extend(_as_text_list(adversarial.get("top_risk_points"))[:3])
+    if all_missing:
+        risks.append(f"待补关键证据：{'、'.join(all_missing[:2])}")
+    return list(dict.fromkeys(_translate_report_text(item) for item in risks if item))[:8]
+
+
+def _stock_label(item: Dict[str, Any]) -> str:
+    code = str(item.get("code") or item.get("stock_code") or "-")
+    name = str(item.get("name") or item.get("stock_name") or "").strip()
+    return f"{code} {name}".strip()
+
+
+def _first_text(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            if item:
+                return str(item)
+        return ""
+    return str(value or "")
+
+
+REPORT_STRATEGY_LABELS = {
+    "ma_volume": "均线放量突破",
+    "turtle_trade": "海龟突破",
+    "high_tight_flag": "高窄旗形",
+    "limit_up_shakeout": "涨停洗盘",
+    "uptrend_limit_down": "上升趋势跌停错杀",
+    "rps_breakout": "RPS 强势突破",
+    "volume_breakout": "放量突破",
+    "capital_heat": "资金热度",
+    "quality_value": "质量价值",
+    "shrink_pullback": "缩量回踩",
+    "balanced_alpha": "均衡 Alpha",
+    "dual_low": "双低价值",
+    "momentum_quality": "动量质量",
+    "oversold_reversal": "超跌反转",
+    "fundamental_quality": "基本面质量",
+    "hot_sector": "强势板块",
+    "breakout": "突破",
+    "rps": "RPS 强势",
+    "momentum": "动量",
+    "relative_strength": "相对强势",
+    "liquidity": "流动性",
+    "ma_cross": "均线信号",
+    "multi_factor": "多因子",
+    "balanced": "均衡",
+    "quality": "质量",
+    "growth": "成长",
+    "value": "估值",
+    "news_momentum": "消息动量",
+}
+
+REPORT_DIMENSION_LABELS = {
+    "strategy": "策略",
+    "technical": "技术面",
+    "capital": "资金面",
+    "fundamental": "基本面",
+    "message": "消息面",
+    "sentiment": "情绪/热点",
+    "sector": "板块主题",
+    "fallback": "兜底观察",
+}
+
+REPORT_SOURCE_PREFIX_LABELS = (
+    ("alphasift:", "AlphaSift 多因子"),
+    ("sequoia:", "Sequoia 技术形态"),
+    ("fundamental:", "基本面质量筛选"),
+    ("news_momentum:", "公司消息/公告"),
+    ("news_sentiment:", "新闻情绪"),
+    ("event_impact:", "事件影响链"),
+    ("akshare:industry:", "强势行业板块"),
+    ("akshare:concept:", "强势概念板块"),
+    ("fallback_seed_pool", "固定兜底观察池"),
+    ("user_seed", "用户输入"),
+)
+
+
+def _candidate_source_label(item: Dict[str, Any]) -> str:
+    sources = _candidate_source_values(item)
+    labels = [_source_token_label(source) for source in sources]
+    labels = [label for label in labels if label and label != "-"]
+    return "、".join(list(dict.fromkeys(labels))[:3]) if labels else "-"
+
+
+def _candidate_source_values(item: Dict[str, Any]) -> List[str]:
+    values: List[str] = []
+    for value in [item.get("source"), item.get("candidate_source")]:
+        if value:
+            values.append(str(value))
+    for key in ("recall_sources", "evidence_refs"):
+        raw = item.get(key)
+        if isinstance(raw, list):
+            values.extend(str(entry) for entry in raw if entry)
+    return list(dict.fromkeys(values))
+
+
+def _source_token_label(source: str) -> str:
+    text = str(source or "").strip()
+    if not text:
+        return "-"
+    if text == "alphasift:multi_strategy":
+        return "AlphaSift 多策略共振"
+    if text == "sequoia:multi_strategy":
+        return "Sequoia 多策略共振"
+    if text == "fundamental:quality_snapshot":
+        return "基本面质量筛选"
+    if text == "news_momentum:company_event":
+        return "公司消息/公告"
+    for prefix, label in REPORT_SOURCE_PREFIX_LABELS:
+        if text == prefix or text.startswith(prefix):
+            suffix = text[len(prefix):]
+            if suffix == "multi_strategy":
+                return f"{label}多策略共振"
+            suffix_label = REPORT_STRATEGY_LABELS.get(suffix, suffix)
+            return f"{label}：{suffix_label}" if suffix_label else label
+    return REPORT_STRATEGY_LABELS.get(text, _humanize_token(text))
+
+
+def _strategy_token_label(token: str) -> str:
+    text = str(token or "").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        return _source_token_label(text)
+    return REPORT_STRATEGY_LABELS.get(text, _humanize_token(text))
+
+
+def _humanize_token(token: str) -> str:
+    text = str(token or "").strip()
+    if not text:
+        return ""
+    if re.search(r"[A-Za-z_]", text):
+        return text.replace("_", " ")
+    return text
+
+
+def _translate_report_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    replacements = {
+        "AlphaSift YAML 多因子策略入池": "AlphaSift 多因子策略入池",
+        "alphasift:multi_strategy": "AlphaSift 多策略共振",
+        "sequoia:multi_strategy": "Sequoia 多策略共振",
+        "news_momentum:company_event": "公司消息/公告",
+        "fundamental:quality_snapshot": "基本面质量筛选",
+        "fundamental_quality": "基本面质量",
+        "llm_friendly": "",
+    }
+    for raw, label in {**REPORT_STRATEGY_LABELS, **replacements}.items():
+        if label:
+            text = text.replace(raw, label)
+        else:
+            text = text.replace(raw, "")
+    text = re.sub(r"[、,，；;]\s*[、,，；;]+", "；", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip(" ；;、,，")
+
+
+def _candidate_labels(item: Dict[str, Any]) -> List[str]:
+    labels: List[str] = []
+    for key in ("matched_strategies", "strategy_tags"):
+        value = item.get(key)
+        if isinstance(value, list):
+            labels.extend(_strategy_token_label(str(entry)) for entry in value if entry)
+    for source in _candidate_source_values(item):
+        labels.append(_source_token_label(source))
+    reason_dimensions = item.get("reason_dimensions")
+    if isinstance(reason_dimensions, list):
+        for entry in reason_dimensions:
+            if isinstance(entry, dict):
+                dimension = str(entry.get("dimension") or "")
+                labels.append(str(entry.get("label") or REPORT_DIMENSION_LABELS.get(dimension) or dimension or ""))
+    blocked = {"llm friendly"}
+    return list(dict.fromkeys(label for label in labels if label and label not in blocked))
+
+
+def _candidate_reason(item: Dict[str, Any]) -> str:
+    reasons = []
+    for key in ("reason", "entry_reason"):
+        if item.get(key):
+            reasons.append(str(item[key]))
+    entry_reasons = item.get("entry_reasons")
+    if isinstance(entry_reasons, list):
+        reasons.extend(str(reason) for reason in entry_reasons if reason)
+    reason_dimensions = item.get("reason_dimensions")
+    if isinstance(reason_dimensions, list):
+        for entry in reason_dimensions:
+            if isinstance(entry, dict) and entry.get("detail"):
+                reasons.append(str(entry["detail"]))
+    unique = list(dict.fromkeys(_translate_report_text(reason).strip() for reason in reasons if reason and str(reason).strip()))
+    concise: List[str] = []
+    for reason in unique:
+        if not reason:
+            continue
+        if reason in concise:
+            continue
+        if any(reason != existing and reason in existing for existing in concise):
+            continue
+        concise.append(reason)
+    return "；".join(concise[:3]) if concise else "-"
+
+
+def _dimension_reason(dimension_summary: Any) -> str:
+    if not isinstance(dimension_summary, dict):
+        return ""
+    reasons: List[str] = []
+    for key, item in dimension_summary.items():
+        if not isinstance(item, dict):
+            continue
+        verdict = str(item.get("verdict") or "").strip().lower()
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        if verdict in {"support", "weaken", "tool_failed", "missing"}:
+            reasons.append(f"{_dimension_label(key)}：{summary}")
+    if not reasons:
+        for key, item in dimension_summary.items():
+            if isinstance(item, dict) and item.get("summary"):
+                reasons.append(f"{_dimension_label(key)}：{item['summary']}")
+                break
+    return "；".join(reasons[:2])
+
+
+def _dimension_label(key: Any) -> str:
+    labels = {
+        "technical": "技术面",
+        "price_structure": "价格结构",
+        "fundamental": "基本面",
+        "news_event": "消息面",
+        "capital_flow": "资金面",
+        "market_sector": "板块/市场",
+        "account_fit": "账户适配",
+    }
+    return labels.get(str(key), str(key))
+
+
+def _verdict_label(value: Any) -> str:
+    labels = {
+        "support": "支持",
+        "weaken": "削弱",
+        "neutral": "中性",
+        "missing": "缺失",
+        "tool_failed": "工具失败",
+        "unknown": "未知",
+    }
+    return labels.get(str(value or ""), str(value or "-"))
+
+
+def _as_text_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if value:
+        return [str(value)]
+    return []
+
+
 def _summarize_payload(payload: Any, *, max_chars: int = 3000) -> Any:
     text = json.dumps(payload, ensure_ascii=False, default=str)
     if len(text) <= max_chars:
@@ -1524,6 +3032,13 @@ def _format_pct(value: Any) -> str:
 def _markdown_cell(value: Any) -> str:
     text = str(value if value is not None else "-")
     return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _brief_markdown_text(value: Any, max_chars: int) -> str:
+    text = " ".join(str(value if value is not None else "-").split())
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
 
 
 def _truncate(value: str, max_chars: int) -> str:

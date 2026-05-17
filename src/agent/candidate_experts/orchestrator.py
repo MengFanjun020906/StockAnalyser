@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+from src.agent.candidate_experts.filters import apply_hard_exclusion
 from src.agent.candidate_experts.schemas import (
     CandidateDataQuality,
     ExpertCandidate,
@@ -16,6 +17,7 @@ from src.agent.candidate_experts.schemas import (
     ThemeWatchItem,
 )
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
+from src.agent.candidate_providers.fundamental_provider import FundamentalCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 
 
@@ -72,18 +74,21 @@ def _candidate_from_raw(
 
 def _raw_from_candidate(candidate: ExpertCandidate) -> Dict[str, Any]:
     payload = dict(candidate.raw or {})
+    evidence_refs = [ref for ref in candidate.evidence_refs if ref]
     payload.update({
         "code": candidate.code,
         "name": candidate.name,
         "market": candidate.market,
-        "source": payload.get("source") or (candidate.evidence_refs[0] if candidate.evidence_refs else candidate.dimension),
+        "source": payload.get("source") or (evidence_refs[0] if evidence_refs else candidate.dimension),
         "reason": candidate.reason,
         "signal_score": candidate.score,
         "candidate_expert": payload.get("candidate_expert"),
         "candidate_dimension": payload.get("candidate_dimension"),
         "candidate_confidence": candidate.confidence,
         "candidate_stance": candidate.stance,
-        "evidence_refs": candidate.evidence_refs,
+        "evidence_refs": evidence_refs,
+        "recall_sources": payload.get("recall_sources") or evidence_refs,
+        "entry_reasons": payload.get("entry_reasons") or [candidate.reason],
     })
     if candidate.reason_dimensions:
         payload["reason_dimensions"] = candidate.reason_dimensions
@@ -150,10 +155,9 @@ class CandidateExpertOrchestrator:
                 limit=min(20, provider_limit),
                 tools=tools,
             ),
-            "fundamental_expert": lambda: self._empty_packet(
-                expert="fundamental_expert",
-                dimension="fundamental",
-                reason="Fundamental discovery provider is not wired yet; evaluate phase can still use Tushare fundamentals.",
+            "fundamental_expert": lambda: self._fundamental_packet(
+                limit=provider_limit,
+                strategy_names=strategy_names,
             ),
             "capital_flow_expert": lambda: self._empty_packet(
                 expert="capital_flow_expert",
@@ -170,8 +174,15 @@ class CandidateExpertOrchestrator:
             ),
         ]
         merged = self._merge_packets(packets, effective_limit)
+        hard_exclusion = merged["hard_exclusion"]
         fallback_used = False
         discovery_steps = [packet.to_discovery_step() for packet in packets]
+        discovery_steps.append({
+            "source": "candidate_hard_exclusion",
+            "status": "ok",
+            "count": hard_exclusion.get("excluded_count", 0),
+            "diagnostics": hard_exclusion,
+        })
         candidates = merged["candidates"]
         if not candidates:
             fallback_fn = tools.get("fallback")
@@ -187,12 +198,15 @@ class CandidateExpertOrchestrator:
             "fallback_used": fallback_used,
             "expert_packets": [packet.model_dump(mode="json") for packet in packets],
             "themes": merged["themes"],
+            "quality": merged["quality"],
+            "hard_exclusion": hard_exclusion,
             "discovery_steps": discovery_steps,
             "capacity": {
                 "max_candidates_to_deep_dive": effective_limit,
                 "min_per_expert": self.min_per_expert,
                 "max_per_expert": self.max_per_expert,
                 "max_theme_watch_items": self.max_theme_watch_items,
+                "soft_quotas": _default_soft_quotas(),
             },
         }
 
@@ -356,6 +370,35 @@ class CandidateExpertOrchestrator:
                 as_of=result.get("latest_date"),
                 source_chain=[{"provider": "sequoia", "db_path": result.get("db_path")}],
                 warnings=[] if candidates else [str(result.get("error") or "Sequoia produced no candidates")],
+            ),
+            candidates=candidates,
+            diagnostics=result.get("diagnostics") or [],
+            errors=[str(result.get("error"))] if result.get("error") else [],
+        )
+
+    def _fundamental_packet(self, *, limit: int, strategy_names: Optional[Sequence[str]]) -> ExpertCandidatePacket:
+        result = FundamentalCandidateProvider().discover(limit=limit, strategy_names=strategy_names)
+        candidates = [
+            _candidate_from_raw(
+                item,
+                expert="fundamental_expert",
+                dimension="fundamental",
+                default_reason="基本面质量/成长/估值预计算候选。",
+                evidence_prefix="fundamental",
+                default_confidence=0.58,
+            )
+            for item in result.get("candidates") or []
+            if item.get("code")
+        ]
+        return ExpertCandidatePacket(
+            expert="fundamental_expert",
+            dimension="fundamental",
+            status=_status_from_provider(result),
+            data_quality=CandidateDataQuality(
+                freshness="filing_or_weekly",
+                as_of=result.get("latest_period") or result.get("updated_at"),
+                source_chain=[{"provider": "fundamental_candidate_snapshot", "db_path": result.get("db_path"), "table": result.get("table")}],
+                warnings=[] if candidates else [str(result.get("error") or "Fundamental candidate snapshot produced no candidates")],
             ),
             candidates=candidates,
             diagnostics=result.get("diagnostics") or [],
@@ -528,14 +571,28 @@ class CandidateExpertOrchestrator:
                     if ref and ref not in sources:
                         sources.append(ref)
                 current["recall_sources"] = sources
+                entry_reasons = list(current.get("entry_reasons") or [])
+                if candidate.reason and candidate.reason not in entry_reasons:
+                    entry_reasons.append(candidate.reason)
+                current["entry_reasons"] = entry_reasons
+                counter_evidence = list(current.get("counter_evidence") or [])
+                for evidence in candidate.counter_evidence:
+                    if evidence not in counter_evidence:
+                        counter_evidence.append(evidence)
+                if counter_evidence:
+                    current["counter_evidence"] = counter_evidence
                 if len(current["candidate_experts"]) > 1:
                     current["source"] = "multi_expert_recall"
                     current["reason"] = f"多专家候选共振：{'、'.join(current['candidate_dimensions'])}。"
         ranked = list(by_code.values())
+        ranked, hard_exclusion = apply_hard_exclusion(ranked)
         for item in ranked:
             supporting_confidences = [float(value) for value in (item.get("expert_confidences") or {}).values()]
             consensus_bonus = min(15.0, sum(value * 5.0 for value in supporting_confidences))
             item["signal_score"] = round(max(0.0, min(100.0, float(item.get("signal_score") or 0) + consensus_bonus)), 2)
+            item["consensus_bonus"] = round(consensus_bonus, 2)
+            item["lifecycle_status"] = "new"
+            item["mixed_evidence"] = bool(item.get("counter_evidence"))
         ranked.sort(
             key=lambda item: (
                 float(item.get("signal_score") or 0),
@@ -549,7 +606,12 @@ class CandidateExpertOrchestrator:
         themes = []
         for packet in packets:
             themes.extend([theme.model_dump(mode="json") for theme in packet.themes])
-        return {"candidates": selected, "themes": themes[: self.max_theme_watch_items]}
+        return {
+            "candidates": selected,
+            "themes": themes[: self.max_theme_watch_items],
+            "quality": _candidate_quality_summary(selected, packets, hard_exclusion),
+            "hard_exclusion": hard_exclusion,
+        }
 
     def _select_with_capacity(self, ranked: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
         selected: List[Dict[str, Any]] = []
@@ -597,6 +659,7 @@ class CandidateExpertOrchestrator:
                 per_expert_count[str(owner)] = per_expert_count.get(str(owner), 0) + 1
             if len(selected) >= limit:
                 break
+        selected.sort(key=lambda item: -float(item.get("signal_score") or 0))
         return selected
 
 
@@ -636,3 +699,51 @@ def _resolve_timeout(value: Optional[float]) -> float:
 
 def _as_dict_list(value: Any) -> List[Dict[str, Any]]:
     return [item for item in (value or []) if isinstance(item, dict)]
+
+
+def _default_soft_quotas() -> Dict[str, Dict[str, int]]:
+    return {
+        "strategy_factor_expert": {"min": 2, "max": 4},
+        "technical_candidate_expert": {"min": 2, "max": 4},
+        "capital_flow_expert": {"min": 1, "max": 3},
+        "fundamental_expert": {"min": 1, "max": 3},
+        "sector_theme_expert": {"min": 0, "max": 2},
+        "news_event_expert": {"min": 0, "max": 2},
+        "sentiment_theme_expert": {"min": 0, "max": 1},
+        "fallback_seed_pool": {"min": 0, "max": 0},
+    }
+
+
+def _candidate_quality_summary(
+    candidates: List[Dict[str, Any]],
+    packets: List[ExpertCandidatePacket],
+    hard_exclusion: Dict[str, Any],
+) -> Dict[str, Any]:
+    dimensions: Dict[str, int] = {}
+    experts: Dict[str, int] = {}
+    lifecycle: Dict[str, int] = {}
+    fallback_count = 0
+    for item in candidates:
+        if item.get("source") == "fallback_seed_pool" or "fallback_seed_pool" in (item.get("recall_sources") or []):
+            fallback_count += 1
+        lifecycle_status = str(item.get("lifecycle_status") or "new")
+        lifecycle[lifecycle_status] = lifecycle.get(lifecycle_status, 0) + 1
+        for dimension in item.get("candidate_dimensions") or []:
+            key = str(dimension or "unknown")
+            dimensions[key] = dimensions.get(key, 0) + 1
+        for expert in item.get("candidate_experts") or []:
+            key = str(expert or "unknown")
+            experts[key] = experts.get(key, 0) + 1
+    packet_status = {packet.expert: packet.status for packet in packets}
+    strategy_count = experts.get("strategy_factor_expert", 0)
+    technical_count = experts.get("technical_candidate_expert", 0)
+    return {
+        "candidate_count": len(candidates),
+        "dimension_counts": dimensions,
+        "expert_counts": experts,
+        "lifecycle_counts": lifecycle,
+        "fallback_count": fallback_count,
+        "hard_strategy_trunk_missing": strategy_count == 0 and technical_count == 0,
+        "hard_exclusion_count": int(hard_exclusion.get("excluded_count") or 0),
+        "packet_status": packet_status,
+    }

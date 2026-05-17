@@ -11,6 +11,11 @@ model_list:
       api_base: os.environ/XIAOMI_MIMO_URL
       api_key: os.environ/XIAOMI_MIMO_API_KEY
 
+  - model_name: deepseek/deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
 router_settings:
   routing_strategy: simple-shuffle
   num_retries: 2

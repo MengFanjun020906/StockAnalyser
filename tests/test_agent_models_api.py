@@ -891,6 +891,44 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
         self.assertTrue(context["agent_user_context"].report.include_watchlist_ranking)
 
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": ""}, clear=False)
+    def test_trace_context_does_not_default_to_watchlist_without_explicit_selection_request(self) -> None:
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="解释一下什么是均线多头排列",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "qa")
+        self.assertFalse(context["agent_user_context"].report.include_watchlist_ranking)
+        self.assertEqual(context["_trace_intent_resolution"]["source"], "default")
+        self.assertFalse(context["_trace_intent_resolution"]["explicit_watchlist_request"])
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_trace_context_guards_mimo_watchlist_when_user_did_not_ask_for_selection(self, mock_completion) -> None:
+        mock_completion.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"intent":"watchlist_scan"}'))]
+        )
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="解释一下什么是均线多头排列",
+                inject_portfolio_context=False,
+                report_intent=None,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "qa")
+        self.assertFalse(context["agent_user_context"].report.include_watchlist_ranking)
+        self.assertEqual(context["_trace_intent_resolution"]["source"], "mimo_guard")
+        self.assertEqual(context["_trace_intent_resolution"]["classifier_intent"], "watchlist_scan")
+        self.assertFalse(context["_trace_intent_resolution"]["explicit_watchlist_request"])
+
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
     @patch("litellm.completion")
     def test_trace_context_uses_mimo_intent_classifier_for_natural_stock_selection_request(self, mock_completion) -> None:
@@ -967,6 +1005,57 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(summary["intent_resolution"]["intent"], "watchlist_scan")
         self.assertFalse(summary["intent_resolution"]["classifier_success"])
         self.assertIn("Not supported model", summary["intent_resolution"]["classifier_error"])
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
+    @patch("litellm.completion")
+    def test_trace_context_does_not_override_position_review_on_classifier_failure(self, mock_completion) -> None:
+        mock_completion.side_effect = RuntimeError("classifier down")
+        mock_portfolio_service = MagicMock()
+        mock_portfolio_service.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-05-15",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 7,
+                    "account_name": "A股主账户",
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 20000,
+                    "total_market_value": 30000,
+                    "total_equity": 50000,
+                    "positions": [
+                        {
+                            "symbol": "301028",
+                            "name": "鼎熔岩",
+                            "quantity": 1000,
+                            "avg_cost": 16.8,
+                            "market_value": 30000,
+                            "position_pct": 60,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch("src.services.portfolio_service.PortfolioService", return_value=mock_portfolio_service):
+            context = agent._build_trace_context(
+                request=agent.AgentTraceRunRequest(
+                    message="我持有的301028要不要继续拿",
+                    account_id=7,
+                    inject_portfolio_context=True,
+                    report_intent=None,
+                ),
+                config=SimpleNamespace(report_language="zh"),
+            )
+
+        self.assertEqual(context["agent_user_context"].report.intent, "position_review")
+        self.assertFalse(context["agent_user_context"].report.include_watchlist_ranking)
+        summary = agent._build_trace_context_summary(context)
+        self.assertEqual(summary["intent_resolution"]["source"], "default")
+        planner = agent._build_planner_trace(context)
+        self.assertIsNotNone(planner)
+        self.assertEqual(planner["intent"], "position_review")
 
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": "sk-api-key"}, clear=False)
     @patch("litellm.completion")

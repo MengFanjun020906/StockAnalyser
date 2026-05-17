@@ -723,10 +723,17 @@ class Config:
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
     agent_candidate_expert_timeout_seconds: float = 20.0  # Max seconds for one L1 candidate expert discovery packet
+    agent_selection_deep_dive_limit: int = 6  # Max L1 candidates that enter stock-level deep-dive evidence collection
+    agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
+    agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
+    agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
+    agent_candidate_enforce_name_code_match: bool = True  # Exclude candidates whose provided name conflicts with stock master data
+    agent_candidate_pool_db_path: str = ""  # Optional SQLite path for persisted candidate-pool runs; empty reuses DATABASE_PATH
+    agent_fundamental_candidate_db_path: str = ""  # Optional SQLite path for precomputed fundamental candidate snapshots
     agent_stock_info_boards_timeout_seconds: float = 1.0  # Max seconds for optional stock board membership enrichment
     agent_chip_distribution_timeout_seconds: float = 3.0  # Max seconds for chip distribution data-source probing
     agent_sector_rankings_timeout_seconds: float = 3.0  # Max seconds for sector ranking data-source probing
-    agent_regime_component_timeout_seconds: float = 2.0  # Max seconds for one market-regime auxiliary component
+    agent_regime_component_timeout_seconds: float = 8.0  # Max seconds for one market-regime auxiliary component
     agent_tushare_tool_timeout_seconds: float = 5.0  # Max seconds for one Tushare Agent tool request
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
     agent_deep_research_budget: int = 30000  # Max token budget for deep research
@@ -1443,6 +1450,34 @@ class Config:
                 field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
+            agent_selection_deep_dive_limit=parse_env_int(
+                os.getenv('AGENT_SELECTION_DEEP_DIVE_LIMIT'),
+                6,
+                field_name='AGENT_SELECTION_DEEP_DIVE_LIMIT',
+                minimum=1,
+                maximum=20,
+            ),
+            agent_candidate_blacklist_codes=[
+                code.strip() for code in os.getenv('AGENT_CANDIDATE_BLACKLIST_CODES', '').split(',') if code.strip()
+            ],
+            agent_candidate_min_avg_amount=parse_env_float(
+                os.getenv('AGENT_CANDIDATE_MIN_AVG_AMOUNT'),
+                0.0,
+                field_name='AGENT_CANDIDATE_MIN_AVG_AMOUNT',
+                minimum=0.0,
+            ),
+            agent_candidate_min_listing_days=parse_env_int(
+                os.getenv('AGENT_CANDIDATE_MIN_LISTING_DAYS'),
+                0,
+                field_name='AGENT_CANDIDATE_MIN_LISTING_DAYS',
+                minimum=0,
+            ),
+            agent_candidate_enforce_name_code_match=parse_env_bool(
+                os.getenv('AGENT_CANDIDATE_ENFORCE_NAME_CODE_MATCH'),
+                True,
+            ),
+            agent_candidate_pool_db_path=os.getenv('AGENT_CANDIDATE_POOL_DB_PATH', '').strip(),
+            agent_fundamental_candidate_db_path=os.getenv('AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH', '').strip(),
             agent_stock_info_boards_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS'),
                 1.0,
@@ -1463,7 +1498,7 @@ class Config:
             ),
             agent_regime_component_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS'),
-                2.0,
+                8.0,
                 field_name='AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),

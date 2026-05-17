@@ -344,12 +344,20 @@ P1 建议先采用 `C + B`：
 
 | 表 | 关键字段 | 更新频率 |
 | --- | --- | --- |
-| `fundamental_snapshot` | `code`、`report_period`、`roe`、`gross_margin`、`net_margin`、`revenue_growth`、`profit_growth`、`operating_cashflow_ratio`、`debt_ratio`、`pe_ttm`、`pb` | 季报后更新，周级补齐估值 |
-| `fundamental_events` | `code`、`event_type`、`event_date`、`direction`、`amount`、`summary`、`source` | 每日 |
+| `fundamental_candidate_snapshot` | `code`、`report_period`、`roe`、`gross_margin`、`net_margin`、`revenue_growth`、`profit_growth`、`operating_cashflow_ratio`、`debt_ratio`、`pe_ttm`、`pb`、`market_cap`、`dividend_yield` | 季报后更新，周级补齐估值 |
+| `fundamental_candidate_events` | `code`、`event_type`、`event_date`、`direction`、`amount`、`summary`、`source` | 每日 |
 | `shareholder_events` | 回购、增持、减持、解禁、质押、股东变化 | 每日 |
 | `institution_snapshot` | 机构持仓、评级、盈利预测变化、覆盖家数 | 周级或月级 |
 
 P2 的核心不是“实时查到所有财务字段”，而是让候选理由能写出具体指标，并让缺失数据明确降权。
+
+当前落地状态：
+
+- 已实现 `FundamentalCandidateProvider`，Trace 运行时只读取本地 `fundamental_candidate_snapshot` / `fundamental_candidate_events`，不实时全市场拉财报。
+- 已接入 `fundamental_expert` 到 L1 候选发现编排，候选会带 `candidate_dimension=fundamental`、`candidate_expert=fundamental_expert`、具体指标和报告期。
+- 已提供 Tushare 刷新脚本 `scripts/update_fundamental_candidates.py`，用于把基础财务快照写入本地 SQLite。
+- Trace 页和独立候选池页已展示 P2 基本面状态：专家状态、候选数、快照行数、报告期、DB/table、错误/告警和候选指标。
+- 尚未完成 `shareholder_events` / `institution_snapshot` 的独立预计算表，也未把回购、增减持、机构评级等事件作为基本面发现的强信号。
 
 验收：
 
@@ -379,7 +387,7 @@ P2 的核心不是“实时查到所有财务字段”，而是让候选理由�
 
 验收：
 
-- 每日候选池落库。
+- 每日候选池落库。当前第一步已落地 `agent_candidate_pool_runs` / `agent_candidate_pool_items`，`discover_watchlist_candidates` 返回后 best-effort 写入，前端 `/candidate-pool` 可查看最新/历史候选池、来源分布、生命周期和硬排除摘要。
 - 可按策略查看历史表现。
 - 最近表现差的策略自动降权。
 
@@ -472,21 +480,23 @@ Regime 来源：
 
 ### P2：基本面发现专家
 
-- [ ] 实现 `FundamentalCandidateProvider`，基于成长、质量、估值、现金流、回购增持、业绩预告生成候选。
-- [ ] 建立 `fundamental_snapshot` 预计算表，覆盖 ROE、毛利率、净利率、营收增长、利润增长、现金流、负债率、PE/PB。
-- [ ] 建立 `fundamental_events`、`shareholder_events`、`institution_snapshot` 表，覆盖业绩事件、回购增减持、解禁质押、机构变化。
-- [ ] 明确财务指标更新策略：季报后全量刷新，交易日增量补充参考事件和估值。
-- [ ] 基本面候选理由必须包含具体指标和报告期，不能只写“估值低”“基本面好”。
+- [x] 实现 `FundamentalCandidateProvider`，基于成长、质量、估值、现金流生成候选；回购增持、业绩预告先通过事件表预留。
+- [x] 建立 `fundamental_candidate_snapshot` 预计算表，覆盖 ROE、毛利率、净利率、营收增长、利润增长、现金流、负债率、PE/PB、分红率。
+- [x] 建立 `fundamental_candidate_events` 表，支持正/负向基本面事件对候选得分加减分。
+- [x] 明确财务指标更新策略：Trace 只读预计算表，刷新由 `scripts/update_fundamental_candidates.py` 或后续调度任务完成。
+- [x] 基本面候选理由包含具体指标和报告期，前端展示 ROE、营收/利润增速、现金流、PE/PB。
+- [ ] 建立 `shareholder_events`、`institution_snapshot` 表，覆盖回购增减持、解禁质押、机构变化。
+- [ ] 将业绩预告、回购、增持、减持、机构评级变化作为基本面发现的强事件信号。
 
 ### P3：生命周期、质量评估和回评闭环
 
-- [ ] 新增候选池落库表，记录每日候选、来源、分数、证据、有效期、生命周期状态和最终 Judge 结果。
-- [ ] 实现候选生命周期状态：`new`、`active`、`watching`、`decayed`、`removed`。
+- [x] 新增候选池落库表，记录每日候选、来源、分数、证据、有效期和生命周期状态；最终 Judge 结果待深度分析链路回写。
+- [x] 实现候选生命周期第一版状态：首次出现为 `new`，历史重复出现自动标记为 `active`；`watching`、`decayed`、`removed` 待有效期和回评任务接入。
 - [ ] 实现 T+1/T+3/T+5/T+10 候选回评任务。
 - [ ] 增加候选池质量指标：覆盖率、精准率、多样性、时效性、负面命中率、有效转化率。
 - [ ] 为 AlphaSift / Sequoia / 资金 / 基本面 / 消息候选分别统计胜率、平均收益、回撤和超额收益。
 - [ ] 将回评结果接入候选合并权重，近期表现差的策略自动降权。
-- [ ] 增加候选池质量面板：显示硬策略、资金、基本面、消息、板块占比，以及新进入/持续观察/降权移出变化。
+- [x] 增加候选池质量面板：独立 Web 页面显示硬策略、资金、基本面、消息、板块占比，以及新进入/持续观察变化。
 
 ### P4：Regime 和策略权重
 

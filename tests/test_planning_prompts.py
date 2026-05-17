@@ -1,11 +1,14 @@
 from src.agent.planning_prompts import (
+    CANDIDATE_POOL_PROTOCOL,
     CONSTRAINTS,
     DEBATE_PROTOCOL,
     ENTRY_ANALYSIS_OUTPUT_FORMAT,
     EVENT_TRIGGER_POLICY,
     EXECUTE_PROTOCOL,
+    EN_SYSTEM_PROMPT,
     POSITION_REVIEW_OUTPUT_FORMAT,
     TOOL_USE_POLICY,
+    WATCHLIST_SCAN_OUTPUT_FORMAT,
     ZH_SYSTEM_PROMPT,
     PromptBuildOptions,
     build_planning_system_prompt,
@@ -19,7 +22,7 @@ def test_default_zh_prompt_uses_single_section_source():
 
     assert ZH_SYSTEM_PROMPT == prompt
     assert build_zh_planning_system_prompt() == prompt
-    assert len(get_default_prompt_sections()) == 15
+    assert len(get_default_prompt_sections()) == 17
 
 
 def test_default_zh_prompt_contains_phase_one_contract_sections():
@@ -29,6 +32,7 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "你是 StockAnalyser Agent",
         "## 分析维度与能力域",
         "## Planning -> Execute 协议",
+        "## Watchlist Candidate Pool Protocol",
         "## Execute Protocol",
         "## Debate Protocol",
         "### Planner 角色边界",
@@ -40,6 +44,7 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "## 重大事件触发规则",
         "## 持仓报告输出规范（position_review）",
         "## 入场报告输出规范（entry_analysis）",
+        "## 选股报告输出规范（watchlist_scan）",
         "持仓动作表格",
         "执行动作矩阵",
         "入场决策表格",
@@ -57,6 +62,7 @@ def test_prompt_options_can_remove_optional_policy_sections():
     assert TOOL_USE_POLICY not in prompt
     assert EVENT_TRIGGER_POLICY not in prompt
     assert EXECUTE_PROTOCOL in prompt
+    assert CANDIDATE_POOL_PROTOCOL in prompt
     assert DEBATE_PROTOCOL in prompt
     assert CONSTRAINTS in prompt
     assert POSITION_REVIEW_OUTPUT_FORMAT in prompt
@@ -134,6 +140,125 @@ def test_entry_analysis_requires_actionable_entry_plan():
     for snippet in required_snippets:
         assert snippet in ENTRY_ANALYSIS_OUTPUT_FORMAT
         assert snippet in build_planning_system_prompt()
+
+
+def test_watchlist_candidate_pool_protocol_defines_l1_boundaries_and_schema():
+    prompt = build_planning_system_prompt()
+    required_snippets = [
+        "候选池只存在于 `watchlist_scan`",
+        "`position_review`：禁止启动全市场候选池",
+        "`entry_analysis`：如果用户已给出明确标的，只分析该标的",
+        "\"expert_packets\"",
+        "\"themes\"",
+        "\"quality\"",
+        "\"hard_exclusion\"",
+        "\"capacity\"",
+        "signal_score/final_score/score",
+        "只表示 L1 入池召回强度",
+        "不得当成买入推荐分",
+        "`themes` 是主题/事件观察，不是股票候选",
+        "`fallback_seed_pool`",
+        "只能作为兜底观察池",
+        "没有完成逐股深度分析的股票，只能显示为“观察池”",
+        "系统注入给二阶段的候选池应使用以下压缩模板",
+        "## 候选池（来自一阶段多专家发现）",
+        "完整数据：candidate_discovery.json / candidate_pool_run_id",
+        "一阶段只增删和合并候选池成员；二阶段不修改候选池成员",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in CANDIDATE_POOL_PROTOCOL
+        assert snippet in prompt
+
+
+def test_watchlist_prompt_rules_keep_candidate_score_out_of_recommendation_score():
+    prompt = build_planning_system_prompt()
+    required_snippets = [
+        "候选池分数必须命名为“入池分/召回分”",
+        "不得写成“推荐分/买入分”",
+        "不得把 L1 入池分、策略命中或主题观察当成买入依据",
+        "未深度分析候选被包装为推荐",
+        "候选池入池分只叫“入池分/召回分”",
+        "表头必须叫“入池分”，禁止写“推荐分”",
+        "未完成逐股深度分析的股票不得进入首选/次选/可买入区域",
+        "如果全部候选都是 wait/monitor/reject",
+        "暂无可入手标的",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in prompt
+
+
+def test_watchlist_scan_output_format_is_first_class_contract():
+    prompt = build_planning_system_prompt()
+    required_snippets = [
+        "## 选股报告输出规范（watchlist_scan）",
+        "严格按以下顺序输出",
+        "1. 核心推荐结论",
+        "2. 最终推荐表格",
+        "3. 候选池概览",
+        "4. 逐股深度摘要",
+        "5. 组合配置与执行条件",
+        "6. 反方审查摘要与 Judge 裁决",
+        "| 最终动作 | OPEN_PARTIAL/WAIT_FOR_MORE_DATA/REJECT_ALL/MONITOR |",
+        "| 股票 | 入池来源 | 入池分 | 是否深度分析 | 入池理由 | 观察状态 |",
+        "| 股票 | 结论 | 入场条件 | 止损/淘汰 | 关键支持 | 主要反证/缺口 |",
+        "| 股票 | 动作 | 首仓金额/比例 | 加仓条件 | 降级条件 | 复查时间 |",
+        "如果全部候选都是 wait/monitor/reject",
+        "首选标的` 必须写“暂无可入手标的”",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in WATCHLIST_SCAN_OUTPUT_FORMAT
+        assert snippet in prompt
+
+
+def test_watchlist_debate_protocol_requires_structured_judge_fields():
+    prompt = build_planning_system_prompt()
+    required_snippets = [
+        '"final_action": "open_partial | wait_for_more_data | reject_all | monitor"',
+        '"accepted_candidates"',
+        '"rejected_candidates"',
+        '"wait_candidates"',
+        '"portfolio_allocation_accepted"',
+        '"allocation_adjustments"',
+        '"risk_controls"',
+        '"unresolved_conflicts"',
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in DEBATE_PROTOCOL
+        assert snippet in prompt
+
+
+def test_tool_budget_and_tool_policy_are_not_duplicate_watchlist_rules():
+    prompt = build_planning_system_prompt()
+
+    assert "预算值由 runner 根据 `AGENT_MAX_STEPS`" in EXECUTE_PROTOCOL
+    assert "超过 12 次进入“工具节约阶段”" in EXECUTE_PROTOCOL
+    assert "超过 16 次进入“关键预算阶段”" in EXECUTE_PROTOCOL
+    assert "watchlist_scan 的候选池规则、触发边界、压缩注入格式和逐股取证要求见 `Watchlist Candidate Pool Protocol`" in TOOL_USE_POLICY
+    assert "discover_watchlist_candidates` 只产生候选" not in TOOL_USE_POLICY
+    assert "预算值由 runner 根据 `AGENT_MAX_STEPS`" in prompt
+
+
+def test_english_prompt_is_marked_placeholder():
+    assert "lightweight placeholder" in EN_SYSTEM_PROMPT
+    assert "not the production" in EN_SYSTEM_PROMPT
+    assert "Chinese prompt sections" in EN_SYSTEM_PROMPT
+
+
+def test_global_output_and_scheduled_trigger_constraints_are_present():
+    prompt = build_planning_system_prompt()
+    required_snippets = [
+        "系统调度任务触发",
+        "不要在没有触发源时生成泛化日报",
+        "最终用户可见报告默认不超过 3000 个中文字符",
+        "工具未返回时不得凭术语补写",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in prompt
 
 
 def test_prompt_requires_realtime_quote_session_wording():

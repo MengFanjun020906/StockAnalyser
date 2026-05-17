@@ -1,10 +1,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import AgentTracePage from '../AgentTracePage';
 
 const mocks = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getRuntimeConfig: vi.fn(),
+  getTraceSession: vi.fn(),
   runTrace: vi.fn(),
   traceStream: vi.fn(),
 }));
@@ -12,6 +14,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../api/agent', () => ({
   agentApi: {
     getRuntimeConfig: mocks.getRuntimeConfig,
+    getTraceSession: mocks.getTraceSession,
     runTrace: mocks.runTrace,
     traceStream: mocks.traceStream,
   },
@@ -24,23 +27,35 @@ vi.mock('../../api/portfolio', () => ({
 }));
 
 describe('AgentTracePage', () => {
+  const renderPage = (initialEntry = '/agent-trace') => render(
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <Routes>
+        <Route path="/agent-trace" element={<AgentTracePage />} />
+        <Route path="/agent-trace/:sessionId" element={<AgentTracePage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
   beforeEach(() => {
     window.localStorage.clear();
     mocks.getAccounts.mockReset();
     mocks.getRuntimeConfig.mockReset();
+    mocks.getTraceSession.mockReset();
     mocks.runTrace.mockReset();
     mocks.traceStream.mockReset();
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
+    mocks.getTraceSession.mockRejectedValue(new Error('not found'));
   });
 
   it('runs a trace and renders planner, events, tools, and final output', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('12345678-1234-1234-1234-123456789abc');
     mocks.getAccounts.mockResolvedValue({
       accounts: [{ id: 7, name: 'A股主账户', market: 'cn', baseCurrency: 'CNY', isActive: true }],
     });
     mocks.traceStream.mockResolvedValue(makeStreamResponse([
       {
         type: 'context_ready',
-        session_id: 'trace-1',
+        session_id: 'trace-12345678123412341234123456789abc',
         agent_user_context: { report: { analysis_mode: 'planning_execute' } },
         context_summary: {
           account_count: 1,
@@ -75,7 +90,7 @@ describe('AgentTracePage', () => {
           },
         },
       },
-      { type: 'planner_ready', session_id: 'trace-1', planner: { intent: 'position_review', required_tools: ['get_realtime_quote'] } },
+      { type: 'planner_ready', session_id: 'trace-12345678123412341234123456789abc', planner: { intent: 'position_review', required_tools: ['get_realtime_quote'] } },
       { type: 'tool_start', step: 1, tool: 'get_realtime_quote', display_name: '获取实时行情', arguments: { stock_code: '600519' } },
       {
         type: 'tool_done',
@@ -91,7 +106,7 @@ describe('AgentTracePage', () => {
       {
         type: 'done',
         success: true,
-        session_id: 'trace-1',
+        session_id: 'trace-12345678123412341234123456789abc',
         content: '## 最终结论\n\n持仓策略：**持有，但不急着加仓**',
         error: null,
         total_steps: 2,
@@ -216,7 +231,7 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
     fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
     await waitFor(() => {
@@ -226,9 +241,10 @@ describe('AgentTracePage', () => {
 
     await waitFor(() => {
       expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        session_id: 'trace-12345678123412341234123456789abc',
         account_id: 7,
         analysis_mode: 'planning_execute',
-        stock_code: '600519',
+        stock_code: undefined,
         report_intent: undefined,
         risk_preference: 'balanced',
         trading_horizon: 'long_term',
@@ -238,6 +254,8 @@ describe('AgentTracePage', () => {
         default_stop_loss_pct: 8,
       }));
     });
+    expect(screen.getByText('trace-12345678123412341234123456789abc')).toBeInTheDocument();
+    vi.spyOn(crypto, 'randomUUID').mockRestore();
 
     expect(screen.getByText('A股主账户')).toBeInTheDocument();
     await waitFor(() => {
@@ -246,6 +264,18 @@ describe('AgentTracePage', () => {
     expect(screen.getByRole('heading', { name: '最终结论' })).toBeInTheDocument();
     expect(screen.getByText('持有，但不急着加仓')).toBeInTheDocument();
     expect(screen.getByText('分析完成')).toBeInTheDocument();
+    const createObjectURL = vi.fn((_object: Blob | MediaSource) => 'blob:agent-report');
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(window.URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+    Object.defineProperty(window.URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    fireEvent.click(screen.getByRole('button', { name: '导出 MD' }));
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    const exportedBlob = createObjectURL.mock.calls[0]?.[0];
+    expect(exportedBlob).toBeInstanceOf(Blob);
+    await expect((exportedBlob as Blob).text()).resolves.toContain('## 最终结论');
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:agent-report');
     expect(screen.getAllByText('风控闸门').length).toBeGreaterThan(0);
     expect(screen.getAllByText('风控通过，允许执行「hold」。').length).toBeGreaterThan(0);
     expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
@@ -294,7 +324,7 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
     expect(await screen.findByText('历史')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /601399/ }));
@@ -304,6 +334,49 @@ describe('AgentTracePage', () => {
     expect(await screen.findByText('expert_graph')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
+  });
+
+  it('loads a completed trace from backend artifact when URL session is not in local history', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-remote',
+      createdAt: '2026-05-17T12:57:45',
+      message: '帮我选一下下周可以入手的股票',
+      stockCode: '',
+      accountId: 3,
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-remote',
+        content: '远端落盘结论',
+        error: null,
+        total_steps: 33,
+        total_tokens: 53301,
+        provider: 'agent',
+        model: 'xiaomi-mimo',
+        mode: 'planning_execute',
+        events: [],
+        tool_calls: [],
+        planner: { intent: 'watchlist_scan' },
+        context_summary: {
+          account_count: 1,
+          position_count: 1,
+          investor: { risk_preference: 'balanced', trading_horizon: 'long_term' },
+        },
+        stock_selection: { enabled: true, success: true, final_report_json: { orchestration_mode: 'expert_graph' } },
+        risk_gate: null,
+        artifact_dir: '/tmp/trace-remote',
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    });
+
+    renderPage('/agent-trace/trace-remote');
+
+    expect(await screen.findByText('远端落盘结论')).toBeInTheDocument();
+    expect(screen.getByText('已从后端加载 Trace')).toBeInTheDocument();
+    expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-remote');
+    expect(JSON.parse(window.localStorage.getItem('dsa.agentTrace.history.v1') || '[]')[0].id).toBe('trace-remote');
   });
 
   it('does not show OK for get_capital_flow events without explicit success', async () => {
@@ -337,7 +410,7 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
 
@@ -402,7 +475,7 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
 
@@ -410,7 +483,7 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('风控阻断：原动作「sell」被改为「manual_review」。').length).toBeGreaterThan(0);
   });
 
-  it('does not send the default stock code for stock-selection prompts', async () => {
+  it('does not send any stock code from the default stock-selection prompt', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
     mocks.traceStream.mockResolvedValue(makeStreamResponse([
@@ -452,6 +525,9 @@ describe('AgentTracePage', () => {
                   strategy_tags: ['breakout', 'rps'],
                   reason: '多专家候选共振：technical、sentiment。',
                   signal_score: 92.5,
+                  consensus_bonus: 7.05,
+                  lifecycle_status: 'new',
+                  mixed_evidence: true,
                   latest_date: '2026-05-08',
                   metrics: { turnover: 150000000, rps: 94.2 },
                   reason_dimensions: [
@@ -579,6 +655,22 @@ describe('AgentTracePage', () => {
                 min_per_expert: 1,
                 max_per_expert: 4,
                 max_theme_watch_items: 8,
+              },
+              quality: {
+                candidate_count: 3,
+                hard_strategy_trunk_missing: false,
+                hard_exclusion_count: 1,
+                fallback_count: 0,
+                multi_source_count: 1,
+                dimension_counts: { strategy: 1, technical: 1, sentiment: 2 },
+                source_counts: { strategy_factor_expert: 1, technical_candidate_expert: 1, sector_theme_expert: 2 },
+                lifecycle_counts: { new: 3 },
+              },
+              hard_exclusion: {
+                excluded_count: 1,
+                reason_counts: { st_or_special_treatment: 1 },
+                examples: [{ code: '600999', name: 'ST测试', reason: 'st_or_special_treatment', source: 'sequoia:turtle_trade' }],
+                policy: { min_avg_amount: 0, min_listing_days: 0, blacklist_count: 0, enforce_name_code_match: true },
               },
               discovery_steps: [
                 { source: 'candidate_expert:strategy_factor_expert', status: 'ok', count: 1, theme_count: 0 },
@@ -841,11 +933,10 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
-    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
-    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
-    expect(screen.getByText('默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。')).toBeInTheDocument();
+    expect(await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/)).toBeInTheDocument();
+    expect(screen.queryByText('默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     await waitFor(() => {
@@ -865,31 +956,35 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('观察中，未形成个股候选').length).toBeGreaterThan(0);
     expect(screen.getByText('多专家选股状态')).toBeInTheDocument();
     expect(screen.getByText('expert_graph')).toBeInTheDocument();
-    expect(screen.getByText('1. 候选来源')).toBeInTheDocument();
-    expect(screen.getByText(/解释股票为什么进入候选池/)).toBeInTheDocument();
-    expect(screen.getByText('2. 维度验证')).toBeInTheDocument();
-    expect(screen.getByText(/技术、资金、市场、消息和基本面分别提供支持/)).toBeInTheDocument();
-    expect(screen.getAllByText('支持依据').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('数据缺口').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('反证/风险').length).toBeGreaterThan(0);
-    expect(screen.getByText('资金流工具')).toBeInTheDocument();
-    expect(screen.getByText('资金流失败时不追高')).toBeInTheDocument();
-    expect(screen.getByText('市场环境专家')).toBeInTheDocument();
-    expect(screen.getByText('候选发现专家')).toBeInTheDocument();
-    expect(screen.getByText('技术结构专家')).toBeInTheDocument();
-    expect(screen.getByText('资金筹码专家')).toBeInTheDocument();
-    expect(screen.getByText('消息情绪专家')).toBeInTheDocument();
-    expect(screen.getByText('候选池多专家发现')).toBeInTheDocument();
-    expect(screen.getAllByText('策略多因子专家').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('技术形态专家').length).toBeGreaterThan(0);
+    expect(screen.getByText('1. L1 候选发现专家')).toBeInTheDocument();
+    expect(screen.getByText(/这些专家只负责 discover 候选池/)).toBeInTheDocument();
+    expect(screen.queryByText('2. 维度验证')).not.toBeInTheDocument();
+    expect(screen.queryByText('市场环境专家')).not.toBeInTheDocument();
+    expect(screen.queryByText('候选发现专家')).not.toBeInTheDocument();
+    expect(screen.queryByText('技术结构专家')).not.toBeInTheDocument();
+    expect(screen.queryByText('资金筹码专家')).not.toBeInTheDocument();
+    expect(screen.queryByText('消息情绪专家')).not.toBeInTheDocument();
+    expect(screen.getByText('2. 合并后的候选池')).toBeInTheDocument();
+    expect(screen.getAllByText('AlphaSift 策略多因子专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Sequoia 技术形态专家').length).toBeGreaterThan(0);
     expect(screen.getAllByText('板块主题专家').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('资金面专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('资金发现专家').length).toBeGreaterThan(0);
     expect(screen.getAllByText('消息事件专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('必须出候选').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('默认只观察主题').length).toBeGreaterThan(0);
     expect(screen.getAllByText('情绪/宏观专家').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('基本面专家').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('基本面发现专家').length).toBeGreaterThan(0);
     expect(screen.getByText('深挖上限 8')).toBeInTheDocument();
     expect(screen.getByText('专家保底 1')).toBeInTheDocument();
     expect(screen.getByText('单专家最多 4')).toBeInTheDocument();
+    expect(screen.getByText('候选池质量与门禁')).toBeInTheDocument();
+    expect(screen.getByText('硬策略主干可用')).toBeInTheDocument();
+    expect(screen.getByText('硬排除 1')).toBeInTheDocument();
+    expect(screen.getByText('硬排除明细')).toBeInTheDocument();
+    expect(screen.getAllByText(/ST\/特殊处理 1/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/600999 ST测试 · ST\/特殊处理/)).toBeInTheDocument();
+    expect(screen.getByText('多源共振')).toBeInTheDocument();
+    expect(screen.getByText('新进入 3')).toBeInTheDocument();
     expect(screen.getByText('主题观察 (1)')).toBeInTheDocument();
     expect(screen.getByText('人工智能')).toBeInTheDocument();
     expect(screen.getByText('AI 应用订单与算力投入持续升温')).toBeInTheDocument();
@@ -908,6 +1003,9 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('301183').length).toBeGreaterThan(0);
     expect(screen.getAllByText('东田微').length).toBeGreaterThan(0);
     expect(screen.getAllByText('评分 92.5').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('共振 +7.05').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('新进入').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('存在反证').length).toBeGreaterThan(0);
     expect(screen.getAllByText('多专家候选共振').length).toBeGreaterThan(0);
     expect(screen.getAllByText('AlphaSift 多因子：volume_breakout').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/AlphaSift YAML 多因子策略入池/).length).toBeGreaterThan(0);
@@ -927,7 +1025,7 @@ describe('AgentTracePage', () => {
     expect(screen.queryByText('rps_breakout')).not.toBeInTheDocument();
   });
 
-  it('keeps expert_graph status when expert graph event arrives before incomplete final payload', async () => {
+  it('keeps expert_graph status without treating validation expert_state as L1 discovery', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
     mocks.traceStream.mockResolvedValue(makeStreamResponse([
@@ -971,21 +1069,23 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
-    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
     fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     expect(await screen.findByText('选股结论')).toBeInTheDocument();
     expect(await screen.findByText('expert_graph')).toBeInTheDocument();
-    expect(await screen.findByText('市场环境专家')).toBeInTheDocument();
+    expect(await screen.findByText(/本轮没有返回 L1 候选发现专家包/)).toBeInTheDocument();
+    expect(screen.queryByText('1. L1 候选发现专家')).not.toBeInTheDocument();
+    expect(screen.queryByText('市场环境专家')).not.toBeInTheDocument();
     await waitFor(() => {
       expect(screen.queryByText(/本次选股结果仍为 legacy/)).not.toBeInTheDocument();
     });
   });
 
-  it('keeps expert graph evidence when final payload is stale legacy', async () => {
+  it('keeps expert_graph status when final payload is stale legacy but hides validation experts from L1', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
     mocks.traceStream.mockResolvedValue(makeStreamResponse([
@@ -1034,15 +1134,16 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
-    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
     fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     expect(await screen.findByText('选股结论')).toBeInTheDocument();
     expect(await screen.findByText('expert_graph')).toBeInTheDocument();
-    expect(await screen.findByText('消息情绪专家')).toBeInTheDocument();
+    expect(await screen.findByText(/本轮没有返回 L1 候选发现专家包/)).toBeInTheDocument();
+    expect(screen.queryByText('消息情绪专家')).not.toBeInTheDocument();
     await waitFor(() => {
       expect(screen.queryByText(/本次选股结果仍为 legacy/)).not.toBeInTheDocument();
     });
@@ -1103,13 +1204,13 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
-    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
     fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
-    expect(await screen.findByText(/本轮选股结束时没有返回 expert_state/)).toBeInTheDocument();
+    expect(await screen.findByText(/本轮没有返回 L1 候选发现专家包/)).toBeInTheDocument();
     expect(screen.queryByText(/本次选股结果仍为 legacy/)).not.toBeInTheDocument();
     expect(screen.queryByText(/本次请求未进入选股链路/)).not.toBeInTheDocument();
   });
@@ -1154,16 +1255,16 @@ describe('AgentTracePage', () => {
       120,
     ));
 
-    render(<AgentTracePage />);
+    renderPage();
 
-    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
     fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
-    expect(await screen.findByText(/选股链路正在运行/)).toBeInTheDocument();
+    expect(await screen.findByText(/多专家候选发现正在运行/)).toBeInTheDocument();
     expect(screen.getByText(/最新阶段：候选发现完成/)).toBeInTheDocument();
     expect(screen.queryByText(/请重新运行选股链路/)).not.toBeInTheDocument();
-    expect(await screen.findByText(/本轮选股结束时没有返回 expert_state/)).toBeInTheDocument();
+    expect(await screen.findByText(/本轮没有返回 L1 候选发现专家包/)).toBeInTheDocument();
   });
 
   it('renders fallback seed candidates as observation pool instead of strategy candidates', async () => {
@@ -1215,9 +1316,9 @@ describe('AgentTracePage', () => {
       },
     ]));
 
-    render(<AgentTracePage />);
+    renderPage();
 
-    const promptInput = await screen.findByDisplayValue(/我持有 600519/);
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
     fireEvent.change(promptInput, { target: { value: '我现在有5w，我希望你帮我选股' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 

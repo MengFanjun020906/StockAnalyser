@@ -113,6 +113,58 @@ Graphiti/Neo4j 可选集成已经接入最小链路。系统可以把每次 agen
 
 不开 Graphiti 时，主分析链路仍可运行。
 
+## 当前系统框架
+
+你现在看到的系统可以理解为两层协作框架：
+
+- 第一层是 **L1 多专家选股候选池**：只负责发现“哪些股票值得进入候选池”，不做买入结论。
+- 第二层是 **planning_execute 分析与报告链路**：理解用户问题、注入账户约束、对候选或单股逐步取证，最后输出报告和交易计划。
+
+```mermaid
+flowchart TD
+    U[用户问题<br/>选股 / 持仓诊断 / 入场分析] --> I[意图识别与上下文构建<br/>MiMo/LLM 分类 + 账户/持仓/风险偏好]
+
+    I --> Q{是否是选股扫描<br/>watchlist_scan?}
+
+    Q -- 是 --> L1[L1 多专家候选池<br/>discover only]
+    Q -- 否，用户给了股票/持仓 --> P[planning_execute<br/>计划与取证]
+
+    subgraph A["第一层：多专家选股候选池"]
+      L1 --> AS[AlphaSift 策略多因子专家<br/>YAML 多策略硬筛]
+      L1 --> SQ[Sequoia 技术形态专家<br/>突破 / RPS / 形态]
+      L1 --> CF[资金发现专家<br/>主力 / 龙虎榜 / 两融 / 板块资金]
+      L1 --> FD[基本面发现专家<br/>成长 / 质量 / 估值 / 安全边际]
+      L1 --> ST[板块主题专家<br/>强势板块扩散到个股]
+      L1 --> NE[消息事件专家<br/>公司级硬事件]
+      L1 --> SM[情绪/宏观专家<br/>主题观察与验证线索]
+      AS --> CP[合并候选池<br/>去重 / 评分 / 硬排除 / 生命周期]
+      SQ --> CP
+      CF --> CP
+      FD --> CP
+      ST --> CP
+      NE --> CP
+      SM --> CP
+    end
+
+    CP --> P
+
+    subgraph B["第二层：planning_execute 分析与报告链路"]
+      P --> PLAN[Planner<br/>生成工具计划]
+      PLAN --> EV[工具取证<br/>行情 / 技术结构 / 资金 / 消息 / 基本面 / Regime]
+      EV --> LEDGER[Evidence Ledger<br/>结构化证据与工具失败诊断]
+      LEDGER --> DD[候选初筛与单股深挖<br/>只分析候选池或用户指定股票]
+      DD --> ALLOC[组合配置<br/>账户现金 / 仓位 / 风险偏好]
+      ALLOC --> ADV[反方审查<br/>强制挑战主方案]
+      ADV --> JUDGE[Judge 裁决<br/>open / wait / monitor / reject]
+      JUDGE --> RISK[Risk Gate<br/>T+1 / 涨跌停 / ST / 止损 / 仓位]
+      RISK --> REPORT[最终报告 + TradePlan<br/>候选理由 / 证据缺口 / 风控条件]
+    end
+
+    REPORT --> TRACE[Agent Trace 落盘<br/>可复盘、可回看、可进入记忆/回测]
+```
+
+第一层和第二层的边界很重要：候选池专家只回答“为什么这只股票进入候选”，不能回答“现在能不能买”；是否可以买、怎么买、仓位多少、什么条件下放弃，必须进入第二层的取证、反方审查、Judge 和 Risk Gate。
+
 ## 一次完整分析会发生什么
 
 ```text

@@ -420,9 +420,18 @@ def _build_trace_context(
                 default_stop_loss_pct=request.default_stop_loss_pct,
                 notes=request.investor_notes,
             )
+            _normalize_injected_report_intent(
+                context["agent_user_context"],
+                stock_code=stock_code,
+                user_message=request.message,
+            )
             _apply_trace_report_overrides(
                 context["agent_user_context"],
-                report_intent=intent_resolution["intent"],
+                report_intent=(
+                    intent_resolution["intent"]
+                    if _should_override_injected_report_intent(intent_resolution)
+                    else None
+                ),
             )
         except Exception as exc:
             logger.warning("Agent trace portfolio context injection failed: %s", exc)
@@ -437,6 +446,52 @@ def _build_trace_context(
         )
 
     return context
+
+
+def _normalize_injected_report_intent(agent_user_context: Any, *, stock_code: str, user_message: str = "") -> None:
+    report = getattr(agent_user_context, "report", None)
+    if report is None:
+        return
+    current_intent = getattr(report, "intent", None)
+    if isinstance(report, dict):
+        current_intent = report.get("intent")
+    if current_intent not in {None, "", "auto"}:
+        return
+    target_symbols = list(getattr(report, "target_symbols", []) or [])
+    if isinstance(report, dict):
+        target_symbols = list(report.get("target_symbols") or [])
+    primary_symbol = getattr(report, "primary_symbol", None)
+    if isinstance(report, dict):
+        primary_symbol = report.get("primary_symbol")
+    target = str(stock_code or primary_symbol or (target_symbols[0] if target_symbols else "") or "").strip()
+    positions = getattr(agent_user_context, "positions", []) or []
+    has_position = bool(target and hasattr(agent_user_context, "has_position_for") and agent_user_context.has_position_for(target))
+    has_any_position = any(getattr(position, "quantity", 0) for position in positions)
+    intent = "position_review" if (has_position or (has_any_position and not target)) else (
+        "entry_analysis" if target else ("watchlist_scan" if _message_explicitly_requests_watchlist_scan(user_message) else "qa")
+    )
+    if isinstance(report, dict):
+        report["intent"] = intent
+        report["include_watchlist_ranking"] = intent == "watchlist_scan"
+        return
+    try:
+        setattr(report, "intent", intent)
+        setattr(report, "include_watchlist_ranking", intent == "watchlist_scan")
+    except Exception:
+        logger.debug("Agent trace injected report intent normalization skipped")
+
+
+def _should_override_injected_report_intent(intent_resolution: TraceIntentResolution) -> bool:
+    """Only override portfolio-derived intent when the user or classifier said so.
+
+    Portfolio context can already resolve a holding review from real positions.
+    A classifier failure falls back to a generic default; that default must not
+    overwrite an injected ``position_review`` context.
+    """
+    return bool(
+        intent_resolution.get("requested_intent")
+        or (intent_resolution.get("source") == "mimo" and intent_resolution.get("classifier_success"))
+    )
 
 
 def _build_minimal_trace_agent_user_context(
@@ -478,19 +533,55 @@ def _build_minimal_trace_agent_user_context(
 def _resolve_trace_report_intent(*, request: AgentTraceRunRequest, stock_code: str) -> TraceIntentResolution:
     llm_intent, classifier_meta = _classify_trace_report_intent_with_mimo(request.message)
     requested_intent = request.report_intent if request.report_intent != "auto" else None
+    explicit_watchlist_request = _message_explicitly_requests_watchlist_scan(request.message)
     base: TraceIntentResolution = {
         "requested_intent": requested_intent,
         "stock_code_present": bool(stock_code),
+        "explicit_watchlist_request": explicit_watchlist_request,
         **classifier_meta,
     }
     if llm_intent:
         if llm_intent == "watchlist_scan":
-            return {**base, "source": "mimo", "intent": "watchlist_scan"}
+            if explicit_watchlist_request or requested_intent == "watchlist_scan":
+                return {**base, "source": "mimo", "intent": "watchlist_scan"}
+            return {**base, "source": "mimo_guard", "intent": "qa"}
         if not requested_intent:
             return {**base, "source": "mimo", "intent": llm_intent}
     if requested_intent:
         return {**base, "source": "explicit", "intent": requested_intent}
-    return {**base, "source": "default", "intent": "entry_analysis" if stock_code else "watchlist_scan"}
+    if stock_code:
+        return {**base, "source": "default", "intent": "entry_analysis"}
+    return {**base, "source": "default", "intent": "watchlist_scan" if explicit_watchlist_request else "qa"}
+
+
+def _message_explicitly_requests_watchlist_scan(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    positive_patterns = (
+        "选股",
+        "筛股",
+        "候选股",
+        "候选池",
+        "推荐股票",
+        "推荐几只",
+        "推荐标的",
+        "入手的股票",
+        "可以买的股票",
+        "可关注候选",
+        "下周可以入手",
+        "下周可入手",
+        "下周买什么",
+        "买什么股票",
+        "配置股票",
+        "股票池",
+        "watchlist",
+        "stock pick",
+        "stock picks",
+        "screen stocks",
+        "pick stocks",
+    )
+    return any(pattern in text for pattern in positive_patterns)
 
 
 def _classify_trace_report_intent_with_mimo(message: str) -> tuple[Optional[ReportIntent], Dict[str, Any]]:
@@ -522,8 +613,10 @@ def _classify_trace_report_intent_with_mimo(message: str) -> tuple[Optional[Repo
                         "你是股票分析系统的意图分类器。只输出 JSON。"
                         "intent 必须是 watchlist_scan、entry_analysis、position_review、"
                         "event_impact、risk_review、qa 之一。"
-                        "当用户要求从市场中挑选/筛选/推荐/配置可以买入或下周可入手的股票时，"
-                        "即使没有出现“选股”二字，也必须输出 watchlist_scan。"
+                        "只有用户明确要求从市场中挑选/筛选/推荐/配置股票、构建候选池、"
+                        "或询问下周/近期可以买什么股票时，才输出 watchlist_scan。"
+                        "普通解释、复盘、账户风险、持仓诊断、单票分析、工具排障、文档和实现问题，"
+                        "都不要输出 watchlist_scan，也不要触发候选池。"
                     ),
                 },
                 {
@@ -705,6 +798,10 @@ def _build_agent_runtime_config(config: Any) -> Dict[str, Any]:
         "agent_orchestrator_timeout_s": getattr(config, "agent_orchestrator_timeout_s", None),
         "agent_tool_call_timeout_seconds": getattr(config, "agent_tool_call_timeout_seconds", None),
         "agent_candidate_expert_timeout_seconds": getattr(config, "agent_candidate_expert_timeout_seconds", None),
+        "agent_candidate_min_avg_amount": getattr(config, "agent_candidate_min_avg_amount", None),
+        "agent_candidate_min_listing_days": getattr(config, "agent_candidate_min_listing_days", None),
+        "agent_candidate_blacklist_count": len(getattr(config, "agent_candidate_blacklist_codes", []) or []),
+        "agent_candidate_enforce_name_code_match": getattr(config, "agent_candidate_enforce_name_code_match", None),
         "mimo_intent_classifier_configured": bool(
             (os.getenv("XIAOMI_MIMO_URL") or "").strip()
             and (os.getenv("XIAOMI_MIMO_KEY") or os.getenv("XIAOMI_MIMO_API_KEY") or "").strip()
@@ -739,6 +836,123 @@ def _safe_trace_session_dir_name(session_id: str) -> str:
     safe_session = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in session_id).strip("-")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}-{safe_session or uuid.uuid4().hex}"
+
+
+def _safe_trace_session_suffix(session_id: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in session_id).strip("-")
+
+
+def _read_trace_json_file(path: Path, default: Any = None) -> Any:
+    try:
+        if not path.exists():
+            return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("Trace artifact JSON read failed for %s: %s", path, exc)
+        return default
+
+
+def _read_trace_events(path: Path, *, limit: int = 500) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    events: List[Dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                events.append(item)
+    except Exception as exc:
+        logger.debug("Trace artifact event read failed for %s: %s", path, exc)
+    return events[-limit:]
+
+
+def _find_trace_artifact_dir(session_id: str) -> Optional[Path]:
+    safe_session = _safe_trace_session_suffix(session_id)
+    if not safe_session:
+        return None
+    root = _trace_artifact_root()
+    if not root.exists():
+        return None
+    matches = [path for path in root.glob(f"*-{safe_session}") if path.is_dir()]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, Any]:
+    summary = _read_trace_json_file(path / "summary.json", {}) or {}
+    request_payload = _read_trace_json_file(path / "request.json", {}) or {}
+    context_payload = _read_trace_json_file(path / "context.json", {}) or {}
+    planner = _read_trace_json_file(path / "planner.json", None)
+    tool_calls = _normalize_tool_calls_status(_read_trace_json_file(path / "tool_calls.json", []) or [])
+    final_content = ""
+    try:
+        final_content = (path / "final.md").read_text(encoding="utf-8")
+    except Exception:
+        final_content = ""
+    stock_selection = _read_trace_json_file(path / "stock_selection.json", None)
+    risk_gate = _read_trace_json_file(path / "risk_gate.json", summary.get("risk_gate"))
+    debate = _read_trace_json_file(path / "debate.json", None)
+    events = _read_trace_events(path / "events.ndjson")
+    agent_user_context = context_payload.get("agent_user_context") if isinstance(context_payload, dict) else None
+    context_summary = (
+        summary.get("context_summary")
+        or (context_payload.get("context_summary") if isinstance(context_payload, dict) else None)
+    )
+    result = {
+        "success": bool(summary.get("success")),
+        "session_id": session_id,
+        "content": final_content,
+        "error": summary.get("error"),
+        "total_steps": int(summary.get("total_steps") or len(tool_calls)),
+        "total_tokens": int(summary.get("total_tokens") or 0),
+        "provider": str(summary.get("provider") or ""),
+        "model": str(summary.get("model") or ""),
+        "mode": str(request_payload.get("analysis_mode") or "planning_execute"),
+        "events": events,
+        "tool_calls": tool_calls,
+        "planner": planner,
+        "agent_user_context": agent_user_context,
+        "context_summary": context_summary,
+        "debate": debate,
+        "stock_selection": stock_selection,
+        "risk_gate": risk_gate,
+        "artifact_dir": str(path),
+        "runtime_config": None,
+    }
+    message = str(request_payload.get("message") or "")
+    stock_code = str(request_payload.get("stock_code") or "")
+    return {
+        "id": session_id,
+        "createdAt": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+        "message": message,
+        "stockCode": stock_code,
+        "accountId": request_payload.get("account_id"),
+        "status": "success" if result["success"] else "error",
+        "result": result,
+    }
+
+
+@router.get("/trace/sessions/{session_id}")
+async def get_agent_trace_session(session_id: str):
+    """Load a completed Agent Trace from local artifacts by session id."""
+    normalized = session_id.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail={"error": "invalid_session_id"})
+    if not normalized.startswith("trace-"):
+        normalized = f"trace-{normalized}"
+    artifact_dir = _find_trace_artifact_dir(normalized)
+    if artifact_dir is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"未找到 Trace session {normalized} 的落盘记录"},
+        )
+    return _trace_history_item_from_artifact(normalized, artifact_dir)
 
 
 def _write_trace_json(path: Path, payload: Any) -> None:
@@ -1664,6 +1878,12 @@ async def run_agent_trace(request: AgentTraceRunRequest):
 
     requested_session_id = (request.session_id or uuid.uuid4().hex).strip()
     session_id = requested_session_id if requested_session_id.startswith("trace-") else f"trace-{requested_session_id}"
+    logger.info(
+        "Agent trace run requested: session_id=%s mode=%s message_preview=%s",
+        session_id,
+        request.analysis_mode,
+        request.message[:120],
+    )
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
     if skills is not None:
@@ -1747,6 +1967,12 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
 
     requested_session_id = (request.session_id or uuid.uuid4().hex).strip()
     session_id = requested_session_id if requested_session_id.startswith("trace-") else f"trace-{requested_session_id}"
+    logger.info(
+        "Agent trace stream requested: session_id=%s mode=%s message_preview=%s",
+        session_id,
+        request.analysis_mode,
+        request.message[:120],
+    )
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     skills = request.effective_skills

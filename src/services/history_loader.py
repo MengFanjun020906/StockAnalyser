@@ -18,6 +18,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 _CACHE_MIN_RECORDS = 30
+_CACHE_STALE_GRACE_DAYS = 4
 
 # ---------------------------------------------------------------------------
 # Frozen target date (ContextVar) – set once per stock in pipeline, read by
@@ -123,6 +124,36 @@ def _select_best_bars(db, stock_code: str, start: date, end: date) -> Tuple[Opti
     return best_code, best_bars
 
 
+def _effective_cache_end(stock_code: str, end: date) -> date:
+    """Return the latest daily-bar date that is acceptable for cache hits."""
+    try:
+        from src.core.trading_calendar import get_effective_trading_date, get_market_for_stock
+
+        market = get_market_for_stock(str(stock_code or "")) or "cn"
+        effective = get_effective_trading_date(
+            market,
+            current_time=datetime(end.year, end.month, end.day, 23, 59, 59),
+        )
+        return effective if isinstance(effective, date) else end
+    except Exception as exc:
+        logger.debug("load_history_df(%s): effective trading date fallback: %s", stock_code, exc)
+        if end.weekday() == 5:
+            return end - timedelta(days=1)
+        if end.weekday() == 6:
+            return end - timedelta(days=2)
+        return end
+
+
+def _cache_latest_is_fresh(latest_date: date, effective_end: date, natural_end: date) -> bool:
+    """Accept latest completed trading data, with a small holiday fail-open grace."""
+    if latest_date == date.min:
+        return False
+    if latest_date >= effective_end:
+        return True
+    stale_days = (natural_end - latest_date).days
+    return 0 <= stale_days <= _CACHE_STALE_GRACE_DAYS and latest_date.weekday() < 5
+
+
 def load_history_df(
     stock_code: str,
     days: int = 60,
@@ -152,11 +183,12 @@ def load_history_df(
         _code, bars = _select_best_bars(db, stock_code, start, end)
         required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
         latest_date = max((_bar_date(bar) for bar in bars), default=date.min)
-        if bars and latest_date >= end and len(bars) >= required_records:
+        effective_end = _effective_cache_end(stock_code, end)
+        if bars and _cache_latest_is_fresh(latest_date, effective_end, end) and len(bars) >= required_records:
             df = pd.DataFrame([b.to_dict() for b in bars])
             logger.debug(
-                "load_history_df(%s): %d bars from DB (requested %d)",
-                stock_code, len(df), days,
+                "load_history_df(%s): %d bars from DB (requested %d, latest=%s, effective_end=%s)",
+                stock_code, len(df), days, latest_date, effective_end,
             )
             return df, "db_cache"
     except Exception as e:

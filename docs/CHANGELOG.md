@@ -10,10 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
 
+- [改进] Agent Trace 最终报告新增 Markdown 导出按钮，便于保存和复盘本轮分析结果。
 - [文档] 新增 Agent 候选池多专家架构方案，明确当前串行候选召回与真正多专家候选生成的区别，并规划 AlphaSift、Sequoia、sector、消息和资金工具的复用路径。
 - [文档] 新增 Agent 候选池策略缺口与建设路线，梳理 AlphaSift、Sequoia、资金、基本面、消息和回评闭环的待办事项。
+- [文档] 新增消息事件 Graphiti 知识图谱方案，规划新闻入库、事件归一、成熟度追踪、验证事实、图谱候选生成和前端事件链路展示。
+- [新功能] Agent L1 候选池新增硬排除层、候选质量摘要和生命周期诊断，前端同步展示硬策略主干、共振、兜底和排除原因。
+- [新功能] Agent L1 候选池新增基本面发现专家，基于本地预计算 `fundamental_candidate_snapshot` 表输出质量、成长、估值和现金流候选，并提供 Tushare 刷新脚本。
+- [新功能] Agent L1 候选池新增 SQLite 运行记录、查询 API 和独立 Web 页面，支持查看最新/历史候选、来源维度、生命周期、兜底和硬排除摘要。
+- [改进] P2 基本面候选闭环补齐前端可见性，候选池 API、Trace 和独立候选池页展示基本面专家状态、快照行数、报告期、DB/table 诊断和候选财务指标。
+- [修复] `scripts/update_fundamental_candidates.py` 启动时加载项目 `.env`，避免 `TUSHARE_TOKEN` 已配置但脚本进程读不到导致 `fundamental_candidate_snapshot` 为空。
+- [改进] `scripts/update_fundamental_candidates.py` 新增断点续跑和分批落库，支持 `--resume` 跳过已写入股票、`--force` 强制重刷、`--flush-every` 控制批量写入，降低长任务中断损耗。
+- [修复] `detect_market_regime` 的历史 K 线缓存按最近有效交易日判断新鲜度，并将组件默认预算调至 8 秒，避免周末或盘前误判缓存失效后被 2 秒预算提前截断。
+- [改进] 选股流水线传给 LLM 的候选发现、初筛和单股深挖上下文改用 EvidenceCard 压缩视图，保留 raw_ref 供 Trace 展开，避免大段原始工具 JSON 稀释模型注意力。
+- [改进] 选股最终报告将反方审查和 Judge 裁决收敛为辅助摘要，结论区优先展示组合配置与逐股证据，避免辩论内容喧宾夺主。
+- [改进] Agent Trace 前端运行时将 `session_id` 写入 `/agent-trace/<session_id>` URL，并让后端日志显式记录 Trace session，便于按页面地址定位日志和 artifact。
+- [修复] Agent Trace 打开 `/agent-trace/<session_id>` 时若浏览器本地历史为空，会从后端已落盘 artifact 恢复结果，避免已有 trace URL 页面为空。
+- [修复] Agent Trace 历史记录改为只在浏览器本地保存轻量 session 索引，完整结果从后端 artifact 恢复，避免大型选股 Trace 完成后因 `localStorage` 超配额导致页面黑屏。
 - [新功能] `discover_watchlist_candidates(auto)` 接入候选池多专家发现层，策略、技术、板块、消息、情绪等专家独立输出 `ExpertCandidatePacket` 后统一合并，并保留主题观察、容量控制和专家诊断。
 - [改进] Agent Trace 前端展示候选池多专家发现结果，包含各发现专家状态、候选数、主题观察、容量控制和候选来源专家标签。
+- [修复] Agent Trace 将“多专家选股”限定为 L1 候选发现专家，不再把市场环境、维度验证或组合风控专家展示为选股专家，并以 `discover_watchlist_candidates` 的候选池作为 L1 权威来源。
+- [修复] 选股最终报告补充候选池来源、入池理由、逐股深度分析和证据缺口，并将“有候选但证据不足”的 Judge 结果从 `reject` 稳定降级为 `wait`，避免最终报告只剩拒绝结论。
+- [改进] 选股最终报告新增运行链路说明、逐股维度证据展开和 Judge monitor 覆盖同步，并扩大多候选场景下的深度分析覆盖面，避免报告只显示浅摘要。
+- [改进] 选股最终报告改为结果优先结构，先展示推荐排序、入场区间、仓位、止损和证据摘要，将候选池来源与逐股调试证据降级为附录。
+- [修复] 选股最终报告区分“入池召回分”和“可执行推荐”，弱等待、反向证据或仅候选池命中的股票不再被包装为首选/次选。
+- [修复] Agent Trace 注入真实持仓上下文时，若 MiMo 意图分类失败，不再用默认 `watchlist_scan` 覆盖 `position_review`，避免持仓问答误进入候选池选股链路。
+- [改进] planning_execute 系统 Prompt 新增候选池边界协议和 watchlist_scan 独立输出格式，明确 L1 候选池 schema、二阶段注入模板、入池分语义、Judge 裁决字段和 watchlist/持仓/单票入场触发边界。
+- [改进] 选股报告候选池附录按“入池分”降序展示，并标注每只候选是否进入逐股深度分析；新增 `AGENT_SELECTION_DEEP_DIVE_LIMIT` 控制深挖覆盖数量。
+- [修复] Agent Trace 无明确选股意图时不再默认进入 `watchlist_scan`，即使 MiMo 误判为选股也会被显式选股意图护栏降级为 `qa`，避免无关问题构建候选池。
+- [文档] README 新增两层系统框架图，明确 L1 多专家候选池与 `planning_execute` 分析报告链路的边界和数据流。
 - [文档] 新增 Agent Evidence Card 协议文档，定义多专家链路中工具 raw、EvidenceCard、ExpertEvidencePacket 和 JudgeInputPacket 的压缩传递契约。
 - [新功能] 多专家选股链路新增 EvidenceCard 中间层，工具 raw 结果通过 evidence_adapter 压缩为专家证据包和 Judge 输入包，并保留 raw/full_ref 供 Trace 展开。
 - [改进] Agent Trace 选股 artifact 新增 `evidence_cards.json`、`expert_packets.json` 和 `judge_input_packet.json`，便于前端与排障工具直接读取压缩证据层。

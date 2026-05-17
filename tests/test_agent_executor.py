@@ -1212,7 +1212,7 @@ class TestBuildUserMessage(unittest.TestCase):
         )
 
         self.assertTrue(result.success)
-        self.assertIn("选股与持仓配置报告", result.content)
+        self.assertIn("选股分析报告：下周可关注候选", result.content)
         self.assertIsNotNone(result.stock_selection)
         self.assertEqual(result.stock_selection["final_report_json"]["orchestration_mode"], "expert_graph")
         self.assertIsNotNone(result.stock_selection["final_report_json"]["expert_state"])
@@ -1254,7 +1254,7 @@ class TestBuildUserMessage(unittest.TestCase):
         )
 
         self.assertTrue(result.success)
-        self.assertIn("选股与持仓配置报告", result.content)
+        self.assertIn("选股分析报告：下周可关注候选", result.content)
         self.assertIsNotNone(result.stock_selection)
         self.assertFalse(adapter.call_with_tools.called)
 

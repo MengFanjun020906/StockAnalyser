@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BrainCircuit,
   Check,
   ChevronDown,
   Circle,
+  Download,
   History,
   Loader2,
   Play,
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useNavigate, useParams } from 'react-router-dom';
 import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
 import { portfolioApi } from '../api/portfolio';
 import { ApiErrorAlert, Button, JsonViewer } from '../components/common';
@@ -24,8 +26,10 @@ import { cn } from '../utils/cn';
    Constants & Types
    ═══════════════════════════════════════════════ */
 
-const DEFAULT_PROMPT = '我持有 600519，帮我分析未来走势，适合继续拿长线吗？如果要加仓或减仓，关键观察点是什么？';
-const DEFAULT_STOCK_CODE = '600519';
+const DEFAULT_PROMPT = '帮我选一下下周可以入手的股票，并说明候选池来源、入池理由、主要风险和等待确认条件。';
+const DEFAULT_STOCK_CODE = '';
+const HISTORY_CONTENT_PREVIEW_CHARS = 4000;
+const TOOL_PREVIEW_RENDER_CHARS = 6000;
 const RISK_OPTIONS = [
   { value: 'conservative', label: '保守' },
   { value: 'balanced', label: '均衡' },
@@ -47,6 +51,7 @@ const REPORT_INTENT_OPTIONS = [
 ];
 const TRACE_HISTORY_KEY = 'dsa.agentTrace.history.v1';
 const TRACE_HISTORY_LIMIT = 10;
+const TRACE_SESSION_PREFIX = 'trace-';
 
 type TraceStatus = 'idle' | 'running' | 'done' | 'error';
 type TraceStreamEvent = Record<string, unknown> & {
@@ -69,6 +74,7 @@ type TraceHistoryItem = {
   accountId?: number;
   status: 'success' | 'error';
   result: AgentTraceRunResponse;
+  isCompact?: boolean;
 };
 
 /* ═══════════════════════════════════════════════
@@ -76,7 +82,7 @@ type TraceHistoryItem = {
    ═══════════════════════════════════════════════ */
 
 const formatDuration = (duration?: number): string => {
-  if (duration == null) return '-';
+  if (typeof duration !== 'number' || !Number.isFinite(duration)) return '-';
   return `${duration.toFixed(2)}s`;
 };
 
@@ -111,6 +117,34 @@ const toStringList = (value: unknown): string[] => {
   if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
   if (typeof value === 'string') return value ? [value] : [];
   return [String(value)];
+};
+
+const sanitizeMarkdownFileNamePart = (value: string): string => value
+  .trim()
+  .replace(/\s+/g, '-')
+  .replace(/[^a-zA-Z0-9._-]+/g, '-')
+  .replace(/-+/g, '-')
+  .replace(/^-+|-+$/g, '');
+
+const buildTraceMarkdownFileName = (result: AgentTraceRunResponse): string => {
+  const sessionPart = sanitizeMarkdownFileNamePart(result.session_id || 'trace');
+  const datePart = new Date().toISOString().slice(0, 10);
+  return `agent-trace-${sessionPart}-${datePart}.md`;
+};
+
+const downloadMarkdownReport = (result: AgentTraceRunResponse): void => {
+  if (!result.content) return;
+  const blob = new Blob([result.content], { type: 'text/markdown;charset=utf-8' });
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = buildTraceMarkdownFileName(result);
+  anchor.rel = 'noopener noreferrer';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  window.URL.revokeObjectURL(url);
 };
 
 const toRecordList = (value: unknown): Record<string, unknown>[] => {
@@ -257,18 +291,103 @@ const loadTraceHistory = (): TraceHistoryItem[] => {
     const raw = window.localStorage.getItem(TRACE_HISTORY_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.slice(0, TRACE_HISTORY_LIMIT) as TraceHistoryItem[] : [];
+    return Array.isArray(parsed)
+      ? parsed.slice(0, TRACE_HISTORY_LIMIT).map(compactTraceHistoryItem) as TraceHistoryItem[]
+      : [];
   } catch { return []; }
 };
 
 const saveTraceHistory = (items: TraceHistoryItem[]) => {
-  window.localStorage.setItem(TRACE_HISTORY_KEY, JSON.stringify(items.slice(0, TRACE_HISTORY_LIMIT)));
+  const compactItems = items.slice(0, TRACE_HISTORY_LIMIT).map(compactTraceHistoryItem);
+  try {
+    window.localStorage.setItem(TRACE_HISTORY_KEY, JSON.stringify(compactItems));
+  } catch (error) {
+    try {
+      window.localStorage.setItem(TRACE_HISTORY_KEY, JSON.stringify(compactItems.slice(0, 1)));
+    } catch {
+      // History is only a convenience index. Ignore quota/security errors so the trace page keeps rendering.
+    }
+    if (import.meta.env.DEV) {
+      console.warn('Agent Trace history save skipped:', error);
+    }
+  }
 };
 
 const persistTraceHistory = (items: TraceHistoryItem[], next: TraceHistoryItem): TraceHistoryItem[] => {
-  const merged = [next, ...items.filter((item) => item.id !== next.id)].slice(0, TRACE_HISTORY_LIMIT);
+  const compactNext = compactTraceHistoryItem(next);
+  const merged = [compactNext, ...items.map(compactTraceHistoryItem).filter((item) => item.id !== compactNext.id)].slice(0, TRACE_HISTORY_LIMIT);
   saveTraceHistory(merged);
   return merged;
+};
+
+const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
+  const result = item.result || createEmptyTraceResult();
+  const finalReport = asRecord(result.stock_selection?.final_report_json) || {};
+  const selectionContext = asRecord(result.stock_selection?.selection_context) || {};
+  const compactStockSelection = result.stock_selection ? {
+    enabled: result.stock_selection.enabled ?? true,
+    success: result.stock_selection.success ?? result.success,
+    final_report_json: {
+      orchestration_mode: finalReport.orchestration_mode,
+    },
+    selection_context: {
+      orchestration_mode: selectionContext.orchestration_mode,
+    },
+  } : null;
+
+  return {
+    ...item,
+    isCompact: true,
+    result: {
+      ...createEmptyTraceResult(),
+      success: result.success,
+      session_id: result.session_id || item.id,
+      content: truncateText(result.content || '', HISTORY_CONTENT_PREVIEW_CHARS),
+      error: result.error ?? null,
+      total_steps: result.total_steps || 0,
+      total_tokens: result.total_tokens || 0,
+      provider: result.provider || '',
+      model: result.model || '',
+      mode: result.mode || 'planning_execute',
+      events: [],
+      tool_calls: [],
+      planner: result.planner ? { intent: result.planner.intent, primary_symbol: result.planner.primary_symbol } : null,
+      agent_user_context: null,
+      context_summary: result.context_summary ? {
+        account_count: result.context_summary.account_count,
+        position_count: result.context_summary.position_count,
+        investor: asRecord(result.context_summary.investor),
+      } : null,
+      debate: null,
+      stock_selection: compactStockSelection,
+      risk_gate: null,
+      artifact_dir: result.artifact_dir || null,
+      runtime_config: result.runtime_config || null,
+    },
+  };
+};
+
+const shouldLoadFullTraceFromBackend = (item: TraceHistoryItem | undefined): boolean => (
+  Boolean(item?.isCompact && item.result?.artifact_dir && item.result?.session_id)
+);
+
+const truncateText = (value: string, maxChars: number): string => {
+  if (!value || value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n\n...[已截断 ${value.length - maxChars} 字，完整内容请从后端 Trace artifact 读取]`;
+};
+
+const normalizeTraceSessionId = (value: string | undefined | null): string => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.startsWith(TRACE_SESSION_PREFIX) ? raw : `${TRACE_SESSION_PREFIX}${raw}`;
+};
+
+const createTraceSessionId = (): string => {
+  const random =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().replace(/-/g, '')
+      : `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  return `${TRACE_SESSION_PREFIX}${random}`;
 };
 
 const DIMENSION_LABELS: Record<string, string> = {
@@ -297,20 +416,9 @@ type DisplayCandidate = {
   latestDate: string;
   metrics: Record<string, unknown>;
   reasonDimensions: CandidateReasonDimension[];
-};
-
-type ExpertOpinionDisplay = {
-  expertName: string;
-  dimension: string;
-  label: string;
-  role: '候选来源' | '验证专家' | '组合裁决';
-  roleDescription: string;
-  verdict: string;
-  confidence?: number;
-  summary: string;
-  supportingEvidence: string[];
-  missingEvidence: string[];
-  riskFlags: string[];
+  lifecycleStatus: string;
+  consensusBonus?: number;
+  mixedEvidence: boolean;
 };
 
 type CandidateDimensionGroup = {
@@ -331,8 +439,14 @@ type CandidateExpertPacketDisplay = {
   count: number;
   themeCount: number;
   freshness: string;
+  asOf: string;
+  sourceChain: Record<string, unknown>[];
+  diagnostics: Record<string, unknown>[];
   warnings: string[];
   errors: string[];
+  required: boolean;
+  directStockCandidate: boolean;
+  goal: string;
 };
 
 type CandidateThemeDisplay = {
@@ -348,6 +462,25 @@ type CandidateCapacityDisplay = {
   minPerExpert?: number;
   maxPerExpert?: number;
   maxThemeWatchItems?: number;
+  softQuotas?: Record<string, { min?: number; max?: number }>;
+};
+
+type CandidateQualityDisplay = {
+  candidateCount: number;
+  hardStrategyTrunkMissing: boolean;
+  hardExclusionCount: number;
+  fallbackCount: number;
+  multiSourceCount: number;
+  dimensionCounts: Record<string, number>;
+  sourceCounts: Record<string, number>;
+  lifecycleCounts: Record<string, number>;
+};
+
+type CandidateHardExclusionDisplay = {
+  excludedCount: number;
+  reasonCounts: Record<string, number>;
+  examples: Array<{ code: string; name: string; reason: string; source?: string }>;
+  policy: Record<string, unknown>;
 };
 
 type EventImpactWatch = {
@@ -408,23 +541,23 @@ const SOURCE_LABEL_PREFIXES: Array<[string, string]> = [
 ];
 
 const CANDIDATE_EXPERT_LABELS: Record<string, string> = {
-  strategy_factor_expert: '策略多因子专家',
-  technical_candidate_expert: '技术形态专家',
+  strategy_factor_expert: 'AlphaSift 策略多因子专家',
+  technical_candidate_expert: 'Sequoia 技术形态专家',
   sector_theme_expert: '板块主题专家',
-  capital_flow_expert: '资金面专家',
+  capital_flow_expert: '资金发现专家',
   news_event_expert: '消息事件专家',
   sentiment_theme_expert: '情绪/宏观专家',
-  fundamental_expert: '基本面专家',
+  fundamental_expert: '基本面发现专家',
 };
 
-const EXPERT_LABELS: Record<string, string> = {
-  market_regime_expert: '市场环境专家',
-  candidate_discovery_expert: '候选发现专家',
-  technical_expert: '技术结构专家',
-  capital_chip_expert: '资金筹码专家',
-  news_sentiment_expert: '消息情绪专家',
-  fundamental_expert: '基本面专家',
-  portfolio_risk_expert: '组合风控专家',
+const CANDIDATE_EXPERT_META: Record<string, { goal: string; required: boolean; directStockCandidate: boolean }> = {
+  strategy_factor_expert: { goal: 'YAML 多策略硬筛', required: true, directStockCandidate: true },
+  technical_candidate_expert: { goal: '技术形态/突破/RPS', required: true, directStockCandidate: true },
+  capital_flow_expert: { goal: '主力、龙虎榜、两融、板块资金', required: true, directStockCandidate: true },
+  fundamental_expert: { goal: '成长、质量、估值、安全边际', required: true, directStockCandidate: true },
+  sector_theme_expert: { goal: '强势板块扩散到个股', required: false, directStockCandidate: true },
+  news_event_expert: { goal: '公司级硬事件', required: false, directStockCandidate: true },
+  sentiment_theme_expert: { goal: '主题观察和验证线索', required: false, directStockCandidate: false },
 };
 
 const DIMENSION_GROUP_LABELS: Record<string, string> = {
@@ -484,15 +617,6 @@ const displayReasonText = (reason: string): string => {
   return text;
 };
 
-const compactEvidenceText = (text: string, maxLength = 120): string => {
-  const normalized = displayReasonText(text)
-    .replace(/\s+/g, ' ')
-    .replace(/[✅⚠️]/g, '')
-    .trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength)}...`;
-};
-
 const STRATEGY_ONLY_TAGS = new Set(['breakout', 'rps', 'momentum', 'relative_strength', 'liquidity', 'ma_cross']);
 
 const isStrategySummaryReason = (reason: string): boolean => {
@@ -514,6 +638,30 @@ const formatMetricValue = (value: unknown): string => {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 };
 
+const formatMetricWithSuffix = (value: unknown, suffix = ''): string => {
+  if (value == null || value === '') return '';
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  return `${num.toLocaleString(undefined, { maximumFractionDigits: 2 })}${suffix}`;
+};
+
+const fundamentalMetricBadges = (candidate: DisplayCandidate): string[] => {
+  const metrics = candidate.metrics || {};
+  return [
+    ['ROE', metrics.roe, '%'],
+    ['营收增速', metrics.revenue_growth ?? metrics.revenueGrowth, '%'],
+    ['利润增速', metrics.profit_growth ?? metrics.profitGrowth, '%'],
+    ['现金流/利润', metrics.operating_cashflow_ratio ?? metrics.operatingCashflowRatio, '%'],
+    ['PE', metrics.pe_ttm ?? metrics.peTtm, ''],
+    ['PB', metrics.pb, ''],
+  ]
+    .map(([label, value, suffix]) => {
+      const formatted = formatMetricWithSuffix(value, String(suffix));
+      return formatted ? `${label} ${formatted}` : '';
+    })
+    .filter(Boolean);
+};
+
 const dimensionTone = (dimension: string): string => {
   if (dimension === 'strategy') return 'border-blue-100 bg-blue-50 text-blue-700';
   if (dimension === 'technical') return 'border-emerald-100 bg-emerald-50 text-emerald-700';
@@ -526,47 +674,6 @@ const dimensionTone = (dimension: string): string => {
   return 'border-[#e8e8e3] bg-[#f5f5f0] text-[#666]';
 };
 
-const verdictTone = (verdict: string): string => {
-  if (['support', 'supports_primary', 'open'].includes(verdict)) return 'bg-emerald-50 text-emerald-700';
-  if (['caution', 'mixed', 'wait', 'monitor'].includes(verdict)) return 'bg-amber-50 text-amber-700';
-  if (['oppose', 'supports_opposing', 'reject'].includes(verdict)) return 'bg-red-50 text-red-700';
-  return 'bg-[#f0f0ec] text-[#777]';
-};
-
-const displayVerdict = (verdict: string): string => {
-  const mapping: Record<string, string> = {
-    support: '支持',
-    neutral: '中性',
-    caution: '谨慎',
-    oppose: '反对',
-    insufficient_data: '证据不足',
-    open: '可开仓',
-    wait: '等待',
-    monitor: '监控',
-    reject: '否决',
-  };
-  return mapping[verdict] || verdict.replace(/_/g, ' ');
-};
-
-const getExpertRole = (expertName: string): ExpertOpinionDisplay['role'] => {
-  if (expertName === 'candidate_discovery_expert') return '候选来源';
-  if (expertName === 'portfolio_risk_expert') return '组合裁决';
-  return '验证专家';
-};
-
-const getExpertRoleDescription = (expertName: string): string => {
-  const mapping: Record<string, string> = {
-    candidate_discovery_expert: '说明这只股票为什么进入候选池，不等于推荐买入。',
-    market_regime_expert: '判断大盘环境和风险乘数，用来约束是否适合开仓。',
-    technical_expert: '验证趋势、均线、结构和价格行为是否支持候选。',
-    capital_chip_expert: '验证主力资金、筹码分布和资金一致性。',
-    news_sentiment_expert: '验证新闻、公告和事件是否构成真实催化。',
-    fundamental_expert: '验证估值、成长、财务和机构数据是否支撑。',
-    portfolio_risk_expert: '结合账户仓位、现金和风控规则给出动作约束。',
-  };
-  return mapping[expertName] || '提供该维度的支持、反证和数据缺口。';
-};
-
 const displayEventMaturity = (maturity: string): string => {
   const mapping: Record<string, string> = {
     breaking: '突发观察',
@@ -575,6 +682,39 @@ const displayEventMaturity = (maturity: string): string => {
   };
   return mapping[maturity] || maturity || '未知';
 };
+
+const displayLifecycleStatus = (status: string): string => {
+  const mapping: Record<string, string> = {
+    new: '新进入',
+    active: '持续有效',
+    watching: '观察中',
+    decayed: '已降权',
+    removed: '已移出',
+  };
+  return mapping[status] || status || '未知';
+};
+
+const displayExclusionReason = (reason: string): string => {
+  const mapping: Record<string, string> = {
+    missing_code: '缺少代码',
+    blacklisted: '黑名单',
+    st_or_special_treatment: 'ST/特殊处理',
+    suspended: '停牌',
+    delist_risk: '退市风险',
+    untradable_limit_locked: '极端不可成交',
+    new_listing_risk: '上市时间过短',
+    insufficient_liquidity: '流动性不足',
+    name_code_mismatch: '名称代码不一致',
+  };
+  return mapping[reason] || reason;
+};
+
+const displayQualityKey = (key: string): string => (
+  DIMENSION_GROUP_LABELS[key]
+  || CANDIDATE_EXPERT_LABELS[key]
+  || displaySourceName(key)
+  || key
+);
 
 const formatConfidence = (value: unknown): string => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
@@ -721,6 +861,9 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
     latestDate: String(item.latest_date || item.date || ''),
     metrics,
     reasonDimensions: isFallbackSeed ? fallbackReasonDimensions : normalizeReasonDimensions(item),
+    lifecycleStatus: String(item.lifecycle_status || 'new'),
+    consensusBonus: typeof item.consensus_bonus === 'number' ? item.consensus_bonus : undefined,
+    mixedEvidence: Boolean(item.mixed_evidence),
   };
 };
 
@@ -743,6 +886,9 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     current.score = Math.max(current.score ?? 0, candidate.score ?? 0) || current.score || candidate.score;
     current.latestDate = current.latestDate || candidate.latestDate;
     current.metrics = { ...candidate.metrics, ...current.metrics };
+    current.lifecycleStatus = current.lifecycleStatus || candidate.lifecycleStatus;
+    current.consensusBonus = Math.max(current.consensusBonus ?? 0, candidate.consensusBonus ?? 0) || current.consensusBonus || candidate.consensusBonus;
+    current.mixedEvidence = current.mixedEvidence || candidate.mixedEvidence;
     current.reasonDimensions = [...current.reasonDimensions];
     candidate.reasonDimensions.forEach((entry) => {
       if (!current.reasonDimensions.some((item) => item.dimension === entry.dimension && item.detail === entry.detail)) {
@@ -785,6 +931,7 @@ const extractCandidateExpertPackets = (result: AgentTraceRunResponse): Candidate
       const expert = String(packet.expert || '');
       const dimension = String(packet.dimension || '');
       const dataQuality = asRecord(packet.data_quality) || {};
+      const meta = CANDIDATE_EXPERT_META[expert] || { goal: '', required: false, directStockCandidate: true };
       return {
         expert,
         dimension,
@@ -794,8 +941,14 @@ const extractCandidateExpertPackets = (result: AgentTraceRunResponse): Candidate
         count: toRecordList(packet.candidates).length,
         themeCount: toRecordList(packet.themes).length,
         freshness: String(dataQuality.freshness || 'unknown'),
+        asOf: String(dataQuality.as_of || ''),
+        sourceChain: toRecordList(dataQuality.source_chain),
+        diagnostics: toRecordList(packet.diagnostics),
         warnings: [...toStringList(dataQuality.warnings), ...toStringList(packet.warnings)],
         errors: toStringList(packet.errors),
+        required: meta.required,
+        directStockCandidate: meta.directStockCandidate,
+        goal: meta.goal,
       };
     })
     .filter((packet) => {
@@ -837,6 +990,46 @@ const extractCandidateCapacity = (result: AgentTraceRunResponse): CandidateCapac
     minPerExpert: typeof capacity.min_per_expert === 'number' ? capacity.min_per_expert : undefined,
     maxPerExpert: typeof capacity.max_per_expert === 'number' ? capacity.max_per_expert : undefined,
     maxThemeWatchItems: typeof capacity.max_theme_watch_items === 'number' ? capacity.max_theme_watch_items : undefined,
+    softQuotas: asRecord(capacity.soft_quotas) as CandidateCapacityDisplay['softQuotas'],
+  };
+};
+
+const extractCandidateQuality = (result: AgentTraceRunResponse): CandidateQualityDisplay | null => {
+  const quality = result.tool_calls
+    .filter((call) => call.tool === 'discover_watchlist_candidates')
+    .map((call) => asRecord(call.result_json)?.quality)
+    .map(asRecord)
+    .find(Boolean);
+  if (!quality) return null;
+  return {
+    candidateCount: Number(quality.candidate_count || 0),
+    hardStrategyTrunkMissing: Boolean(quality.hard_strategy_trunk_missing),
+    hardExclusionCount: Number(quality.hard_exclusion_count || 0),
+    fallbackCount: Number(quality.fallback_count || 0),
+    multiSourceCount: Number(quality.multi_source_count || 0),
+    dimensionCounts: Object.fromEntries(Object.entries(asRecord(quality.dimension_counts) || {}).map(([key, value]) => [key, Number(value || 0)])),
+    sourceCounts: Object.fromEntries(Object.entries(asRecord(quality.source_counts) || asRecord(quality.expert_counts) || {}).map(([key, value]) => [key, Number(value || 0)])),
+    lifecycleCounts: Object.fromEntries(Object.entries(asRecord(quality.lifecycle_counts) || {}).map(([key, value]) => [key, Number(value || 0)])),
+  };
+};
+
+const extractCandidateHardExclusion = (result: AgentTraceRunResponse): CandidateHardExclusionDisplay | null => {
+  const hardExclusion = result.tool_calls
+    .filter((call) => call.tool === 'discover_watchlist_candidates')
+    .map((call) => asRecord(call.result_json)?.hard_exclusion)
+    .map(asRecord)
+    .find(Boolean);
+  if (!hardExclusion) return null;
+  return {
+    excludedCount: Number(hardExclusion.excluded_count || 0),
+    reasonCounts: Object.fromEntries(Object.entries(asRecord(hardExclusion.reason_counts) || {}).map(([key, value]) => [key, Number(value || 0)])),
+    examples: toRecordList(hardExclusion.examples).map((item) => ({
+      code: String(item.code || ''),
+      name: String(item.name || ''),
+      reason: String(item.reason || ''),
+      source: item.source ? String(item.source) : undefined,
+    })),
+    policy: asRecord(hardExclusion.policy) || {},
   };
 };
 
@@ -880,29 +1073,6 @@ const extractExpertState = (stockSelection: Record<string, unknown> | null): Rec
   const finalReport = asRecord(normalized?.final_report_json) || {};
   const selCtx = asRecord(normalized?.selection_context) || {};
   return asRecord(finalReport.expert_state) || asRecord(selCtx.expert_state);
-};
-
-const extractExpertOpinions = (stockSelection: Record<string, unknown> | null): ExpertOpinionDisplay[] => {
-  const expertState = extractExpertState(stockSelection);
-  const opinions = asRecord(expertState?.expert_opinions);
-  if (!opinions) return [];
-  return Object.entries(opinions).map(([expertName, raw]) => {
-    const item = asRecord(raw) || {};
-    const dimension = String(item.dimension || expertName);
-    return {
-      expertName,
-      dimension,
-      label: EXPERT_LABELS[expertName] || String(item.expert_name || expertName).replace(/_/g, ' '),
-      role: getExpertRole(expertName),
-      roleDescription: getExpertRoleDescription(expertName),
-      verdict: String(item.verdict || 'insufficient_data'),
-      confidence: typeof item.confidence === 'number' ? item.confidence : undefined,
-      summary: compactEvidenceText(String(item.summary || ''), 180),
-      supportingEvidence: toStringList(item.supporting_evidence).map((entry) => compactEvidenceText(entry, 140)),
-      missingEvidence: toStringList(item.missing_evidence).map((entry) => compactEvidenceText(entry, 140)),
-      riskFlags: toStringList(item.risk_flags).map((entry) => compactEvidenceText(entry, 140)),
-    };
-  });
 };
 
 const SELECTION_STAGE_LABELS: Record<string, string> = {
@@ -956,44 +1126,6 @@ const getTraceReportIntent = (result: AgentTraceRunResponse): string => {
 const getIntentResolution = (result: AgentTraceRunResponse): Record<string, unknown> | null => (
   asRecord(asRecord(result.context_summary)?.intent_resolution)
 );
-
-const groupExpertOpinions = (opinions: ExpertOpinionDisplay[]): Array<{
-  role: ExpertOpinionDisplay['role'];
-  title: string;
-  description: string;
-  opinions: ExpertOpinionDisplay[];
-}> => {
-  const sections: Array<{
-    role: ExpertOpinionDisplay['role'];
-    title: string;
-    description: string;
-    opinions: ExpertOpinionDisplay[];
-  }> = [
-    {
-      role: '候选来源',
-      title: '1. 候选来源',
-      description: '解释股票为什么进入候选池。这里是召回，不是买入结论。',
-      opinions: [],
-    },
-    {
-      role: '验证专家',
-      title: '2. 维度验证',
-      description: '技术、资金、市场、消息和基本面分别提供支持、反证和缺口。',
-      opinions: [],
-    },
-    {
-      role: '组合裁决',
-      title: '3. 组合与风控',
-      description: '把候选信号放到账户仓位和风控约束里，决定能不能动手。',
-      opinions: [],
-    },
-  ];
-  const byRole = new Map(sections.map((section) => [section.role, section]));
-  opinions.forEach((opinion) => {
-    byRole.get(opinion.role)?.opinions.push(opinion);
-  });
-  return sections.filter((section) => section.opinions.length > 0);
-};
 
 const buildCandidateDimensionGroups = (candidates: DisplayCandidate[]): CandidateDimensionGroup[] => {
   const byDimension = new Map<string, CandidateDimensionGroup>();
@@ -1125,6 +1257,8 @@ const textareaClass = 'min-h-20 w-full resize-y rounded-xl border border-[#e8e8e
    ═══════════════════════════════════════════════ */
 
 const AgentTracePage: React.FC = () => {
+  const navigate = useNavigate();
+  const { sessionId: routeSessionId } = useParams<{ sessionId?: string }>();
   const [message, setMessage] = useState(DEFAULT_PROMPT);
   const [stockCode, setStockCode] = useState(DEFAULT_STOCK_CODE);
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
@@ -1147,11 +1281,74 @@ const AgentTracePage: React.FC = () => {
   const [historyItems, setHistoryItems] = useState<TraceHistoryItem[]>([]);
   const [showConfig, setShowConfig] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<Record<string, unknown> | null>(null);
+  const activeRunSessionIdRef = useRef<string | null>(null);
+  const runtimeConfigRef = useRef<Record<string, unknown> | null>(null);
+
+  const hydrateTraceSessionFromBackend = (sessionId: string, fallback?: TraceHistoryItem) => {
+    const placeholder = fallback?.result || createEmptyTraceResult();
+    setResult({
+      ...placeholder,
+      session_id: sessionId,
+      runtime_config: runtimeConfigRef.current || placeholder.runtime_config || runtimeConfig,
+    });
+    setTraceStatus('running');
+    setStatusMessage(fallback ? '正在从后端加载完整 Trace 记录...' : '正在从后端加载 Trace 记录...');
+    agentApi.getTraceSession(sessionId)
+      .then((item) => {
+        const next: TraceHistoryItem = {
+          ...item,
+          accountId: item.accountId ?? undefined,
+          result: { ...item.result, runtime_config: runtimeConfigRef.current || item.result.runtime_config },
+        };
+        setResult(next.result);
+        setSelectedToolIndex(0);
+        setError(null);
+        setTraceStatus(next.status === 'success' ? 'done' : 'error');
+        setStatusMessage(next.status === 'success' ? '已从后端加载 Trace' : '已从后端加载失败记录');
+        setMessage(next.message);
+        setStockCode(next.stockCode);
+        setSelectedAccountId(next.accountId ? String(next.accountId) : '');
+        setHistoryItems((items) => persistTraceHistory(items, next));
+      })
+      .catch((err) => {
+        if (fallback) {
+          setResult({ ...fallback.result, runtime_config: runtimeConfigRef.current || fallback.result.runtime_config });
+          setTraceStatus(fallback.status === 'success' ? 'done' : 'error');
+          setStatusMessage('后端完整 Trace 加载失败，当前显示本地轻量历史摘要');
+          setMessage(fallback.message);
+          setStockCode(fallback.stockCode);
+          setSelectedAccountId(fallback.accountId ? String(fallback.accountId) : '');
+        } else {
+          setError(getParsedApiError(err));
+          setTraceStatus('error');
+          setStatusMessage('未找到该 Trace 记录');
+        }
+      });
+  };
 
   useEffect(() => {
     document.title = 'Agent Trace';
     setHistoryItems(loadTraceHistory());
   }, []);
+
+  useEffect(() => {
+    const sessionId = normalizeTraceSessionId(routeSessionId);
+    if (!sessionId) return;
+    if (activeRunSessionIdRef.current === sessionId) return;
+    const historyItem = loadTraceHistory().find((item) => item.id === sessionId || item.result.session_id === sessionId);
+    if (!historyItem || shouldLoadFullTraceFromBackend(historyItem)) {
+      hydrateTraceSessionFromBackend(sessionId, historyItem);
+      return;
+    }
+    setResult({ ...historyItem.result, runtime_config: runtimeConfigRef.current || historyItem.result.runtime_config });
+    setSelectedToolIndex(0);
+    setError(null);
+    setTraceStatus(historyItem.status === 'success' ? 'done' : 'error');
+    setStatusMessage(historyItem.status === 'success' ? '已加载历史' : '已加载失败记录');
+    setMessage(historyItem.message);
+    setStockCode(historyItem.stockCode);
+    setSelectedAccountId(historyItem.accountId ? String(historyItem.accountId) : '');
+  }, [routeSessionId]);
 
   useEffect(() => {
     let alive = true;
@@ -1165,10 +1362,17 @@ const AgentTracePage: React.FC = () => {
     let alive = true;
     agentApi.getRuntimeConfig()
       .then((response) => {
-        if (alive) setRuntimeConfig(asRecord(response.runtime_config));
+        if (alive) {
+          const next = asRecord(response.runtime_config);
+          runtimeConfigRef.current = next;
+          setRuntimeConfig(next);
+        }
       })
       .catch(() => {
-        if (alive) setRuntimeConfig(null);
+        if (alive) {
+          runtimeConfigRef.current = null;
+          setRuntimeConfig(null);
+        }
       });
     return () => { alive = false; };
   }, []);
@@ -1176,20 +1380,24 @@ const AgentTracePage: React.FC = () => {
   useEffect(() => {
     if (!runtimeConfig) return;
     setResult((prev) => (prev ? { ...prev, runtime_config: runtimeConfig } : prev));
-  }, [runtimeConfig]);
+  }, [runtimeConfig, result?.session_id]);
 
   const selectedTool = result?.tool_calls[selectedToolIndex] ?? null;
 
   const handleRun = async () => {
+    const sessionId = createTraceSessionId();
+    activeRunSessionIdRef.current = sessionId;
     const stockCodeToSend = shouldSendStockCode(message, stockCode) ? stockCode.trim() : undefined;
+    navigate(`/agent-trace/${encodeURIComponent(sessionId)}`, { replace: false });
     setRunning(true);
     setTraceStatus('running');
     setStatusMessage('正在准备上下文...');
     setError(null);
     setSelectedToolIndex(0);
-    setResult({ ...createEmptyTraceResult(), runtime_config: runtimeConfig });
+    setResult({ ...createEmptyTraceResult(), session_id: sessionId, runtime_config: runtimeConfig });
     try {
       const response = await agentApi.traceStream({
+        session_id: sessionId,
         message,
         account_id: selectedAccountId ? Number(selectedAccountId) : undefined,
         stock_code: stockCodeToSend,
@@ -1210,12 +1418,21 @@ const AgentTracePage: React.FC = () => {
       setTraceStatus('error');
       setStatusMessage(err instanceof Error ? err.message : 'Trace 运行失败');
     } finally {
+      activeRunSessionIdRef.current = null;
       setRunning(false);
     }
   };
 
   const handleSelectHistory = (item: TraceHistoryItem) => {
-    setResult({ ...item.result, runtime_config: runtimeConfig || item.result.runtime_config });
+    const sessionId = item.result.session_id || item.id;
+    if (sessionId) {
+      navigate(`/agent-trace/${encodeURIComponent(sessionId)}`, { replace: false });
+    }
+    if (shouldLoadFullTraceFromBackend(item) && sessionId) {
+      hydrateTraceSessionFromBackend(sessionId, item);
+      return;
+    }
+    setResult({ ...item.result, runtime_config: runtimeConfigRef.current || runtimeConfig || item.result.runtime_config });
     setSelectedToolIndex(0);
     setError(null);
     setTraceStatus(item.status === 'success' ? 'done' : 'error');
@@ -1322,6 +1539,7 @@ const AgentTracePage: React.FC = () => {
     if (type === 'done') {
       setTraceStatus(event.success ? 'done' : 'error');
       setStatusMessage(event.success ? '分析完成' : String(event.error || '失败'));
+      setError(event.success ? null : getParsedApiError(String(event.error || '失败')));
       setResult((prev) => {
         const cur = prev || createEmptyTraceResult();
         const next = {
@@ -1425,7 +1643,7 @@ const AgentTracePage: React.FC = () => {
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <label className="block">
                   <span className="mb-1 block text-[11px] text-[#999]">股票代码</span>
-                  <input value={stockCode} onChange={(e) => setStockCode(e.target.value)} className={inputClass} placeholder="600519" />
+                  <input value={stockCode} onChange={(e) => setStockCode(e.target.value)} className={inputClass} placeholder="可选，输入后才会随请求发送" />
                 </label>
                 <label className="block">
                   <span className="mb-1 block text-[11px] text-[#999]">账户</span>
@@ -1602,7 +1820,21 @@ const AgentTracePage: React.FC = () => {
             {/* Final Output */}
             {result.content ? (
               <div className="mt-8 border-t border-[#eeeee9] pt-6">
-                <h3 className="mb-3 text-sm font-medium text-[#1a1a1a]">最终报告</h3>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                  <h3 className="text-sm font-medium text-[#1a1a1a]">最终报告</h3>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="border-[#e8e8e3] bg-white text-[#333] hover:bg-[#f5f5f0]"
+                    onClick={() => downloadMarkdownReport(result)}
+                    title="导出 Markdown 文件"
+                    aria-label="导出 MD"
+                  >
+                    <Download className="h-4 w-4" aria-hidden="true" />
+                    导出 MD
+                  </Button>
+                </div>
                 {result.error ? (
                   <div className="mb-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">{result.error}</div>
                 ) : null}
@@ -1642,8 +1874,6 @@ const L1Detail: React.FC<{
   const screeningSummary = asRecord(asRecord(finalReport.candidate_screening)?.summary) || asRecord(asRecord(stages.candidate_screening)?.summary) || {};
   const deepTargets = toStringList(screeningSummary.deep_dive_targets);
   const candidates = extractDiscoveryCandidates(result, stockSelection);
-  const expertState = extractExpertState(stockSelection);
-  const expertOpinions = extractExpertOpinions(stockSelection);
   const orchestrationMode = getSelectionOrchestrationMode(stockSelection);
   const runtimeOrchestrationMode = getRuntimeOrchestrationMode(result);
   const reportIntent = getTraceReportIntent(result);
@@ -1655,22 +1885,31 @@ const L1Detail: React.FC<{
   const classifierModel = typeof intentResolution?.classifier_model === 'string' ? intentResolution.classifier_model : '';
   const displayOrchestrationMode = runtimeOrchestrationMode || orchestrationMode;
   const latestSelectionStage = getLatestSelectionStage(result);
-  const isWaitingForExpertState = (
-    isWatchlistScan
-    && displayOrchestrationMode === 'expert_graph'
-    && !expertOpinions.length
-    && traceStatus === 'running'
-  );
   const dimensionGroups = buildCandidateDimensionGroups(candidates);
-  const expertSections = groupExpertOpinions(expertOpinions);
   const hasSentimentCandidates = hasCandidateDimension(dimensionGroups, ['sentiment', 'message']);
   const fallbackCandidates = candidates.filter((candidate) => (
     candidate.source === 'fallback_seed_pool' || candidate.recallSources.includes('fallback_seed_pool')
   ));
   const discoverySteps = extractDiscoverySteps(result);
   const candidateExpertPackets = extractCandidateExpertPackets(result);
+  const isWaitingForCandidateExperts = (
+    isWatchlistScan
+    && displayOrchestrationMode === 'expert_graph'
+    && !candidateExpertPackets.length
+    && traceStatus === 'running'
+  );
   const candidateThemes = extractCandidateExpertThemes(result);
   const candidateCapacity = extractCandidateCapacity(result);
+  const candidateQuality = extractCandidateQuality(result);
+  const candidateHardExclusion = extractCandidateHardExclusion(result);
+  const fundamentalPacket = candidateExpertPackets.find((packet) => packet.expert === 'fundamental_expert');
+  const fundamentalCandidates = candidates.filter((candidate) => (
+    candidate.candidateExperts.includes('fundamental_expert')
+    || candidate.candidateDimensions.includes('fundamental')
+    || candidate.source.startsWith('fundamental:')
+  ));
+  const fundamentalSource = fundamentalPacket?.sourceChain.find(Boolean) || {};
+  const fundamentalSnapshotDiag = (fundamentalPacket?.diagnostics || []).find((item) => String(item.source || '').startsWith('fundamental_candidate')) || {};
   const eventWatches = extractEventImpactWatches(result);
 
   return (
@@ -1688,54 +1927,100 @@ const L1Detail: React.FC<{
           {stockSelection && runtimeOrchestrationMode && runtimeOrchestrationMode !== orchestrationMode ? (
             <span className="text-[11px] text-amber-700">本次选股结果仍为 {orchestrationMode}，后端配置为 {runtimeOrchestrationMode}</span>
           ) : null}
-          {expertState?.status ? <span className="text-[11px] text-[#999]">status: {String(expertState.status)}</span> : null}
         </div>
-        {expertSections.length ? (
+        {candidateExpertPackets.length ? (
           <div className="mt-3 space-y-3">
-            {expertSections.map((section) => (
-              <div key={section.role} className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
+            <div className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
+              <div className="mb-3 flex flex-wrap items-baseline gap-2">
+                <span className="text-xs font-semibold text-[#1a1a1a]">1. L1 候选发现专家</span>
+                <span className="text-[11px] text-[#777]">这些专家只负责 discover 候选池，不负责后续验证、买入裁决或组合风控。</span>
+                {candidateCapacity ? (
+                  <div className="ml-auto flex flex-wrap gap-1.5 text-[10px] text-[#777]">
+                    {candidateCapacity.maxCandidatesToDeepDive != null ? (
+                      <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">深挖上限 {candidateCapacity.maxCandidatesToDeepDive}</span>
+                    ) : null}
+                    {candidateCapacity.minPerExpert != null ? (
+                      <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">专家保底 {candidateCapacity.minPerExpert}</span>
+                    ) : null}
+                    {candidateCapacity.maxPerExpert != null ? (
+                      <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">单专家最多 {candidateCapacity.maxPerExpert}</span>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+              <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                {candidateExpertPackets.map((packet) => (
+                  <div key={packet.expert} className={cn('rounded-lg border p-3', dimensionTone(packet.dimension))}>
+                    <div className="mb-2 flex items-center gap-2">
+                      <span className="text-xs font-semibold">{packet.label}</span>
+                      <span className="ml-auto rounded-full bg-white/75 px-2 py-0.5 text-[10px] font-medium">{packet.status}</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed opacity-85">{packet.goal || '候选发现'}</p>
+                    <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
+                      <span className="rounded-md bg-white/75 px-2 py-0.5">候选 {packet.count}</span>
+                      {packet.themeCount ? <span className="rounded-md bg-white/75 px-2 py-0.5">主题 {packet.themeCount}</span> : null}
+                      <span className="rounded-md bg-white/75 px-2 py-0.5">{packet.required ? '必须出候选' : '可选'}</span>
+                      <span className="rounded-md bg-white/75 px-2 py-0.5">{packet.directStockCandidate ? '可直接推个股' : '默认只观察主题'}</span>
+                    </div>
+                    {packet.warnings.length || packet.errors.length ? (
+                      <p className="mt-2 line-clamp-2 text-[10px] leading-relaxed opacity-80">
+                        {[...packet.errors, ...packet.warnings].slice(0, 2).join('；')}
+                      </p>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+            {candidates.length ? (
+              <div className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
                 <div className="mb-3 flex flex-wrap items-baseline gap-2">
-                  <span className="text-xs font-semibold text-[#1a1a1a]">{section.title}</span>
-                  <span className="text-[11px] text-[#777]">{section.description}</span>
+                  <span className="text-xs font-semibold text-[#1a1a1a]">2. 合并后的候选池</span>
+                  <span className="text-[11px] text-[#777]">{candidates.length} 只；候选进入后续阶段才会做技术/资金/消息/基本面验证和 Judge 裁决。</span>
                 </div>
-                <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                  {section.opinions.map((opinion) => (
-                    <details key={opinion.expertName} className="group rounded-lg border border-[#eeeee9] bg-[#fbfbf8] p-3">
-                      <summary className="cursor-pointer list-none">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-semibold text-[#333]">{opinion.label}</span>
-                          <span className={cn('ml-auto rounded-full px-2 py-0.5 text-[10px] font-medium', verdictTone(opinion.verdict))}>
-                            {displayVerdict(opinion.verdict)}
-                          </span>
-                        </div>
-                        <p className="mt-2 text-[12px] leading-relaxed text-[#555]">{opinion.summary || opinion.roleDescription}</p>
-                        <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
-                          <span className="rounded-md bg-[#f0f0ec] px-2 py-0.5 text-[#777]">置信 {formatConfidence(opinion.confidence)}</span>
-                          {opinion.supportingEvidence.length ? <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-emerald-700">支持依据 {opinion.supportingEvidence.length}</span> : null}
-                          {opinion.missingEvidence.length ? <span className="rounded-md bg-amber-50 px-2 py-0.5 text-amber-700">数据缺口 {opinion.missingEvidence.length}</span> : null}
-                          {opinion.riskFlags.length ? <span className="rounded-md bg-red-50 px-2 py-0.5 text-red-700">反证/风险 {opinion.riskFlags.length}</span> : null}
-                        </div>
-                        <p className="mt-2 text-[10px] text-[#999] group-open:hidden">展开查看依据、缺口和风险明细</p>
-                      </summary>
-                      <div className="mt-3 border-t border-[#eeeee9] pt-3 text-[11px] leading-relaxed">
-                        <p className="mb-2 text-[#777]">{opinion.roleDescription}</p>
-                        <EvidenceList title="支持依据" tone="support" items={opinion.supportingEvidence} emptyText="本专家没有给出明确支持依据。" />
-                        <EvidenceList title="数据缺口" tone="missing" items={opinion.missingEvidence} emptyText="本专家没有标记关键数据缺口。" />
-                        <EvidenceList title="反证/风险" tone="risk" items={opinion.riskFlags} emptyText="本专家没有标记明确反证或风险。" />
-                      </div>
-                    </details>
+                <div className="flex flex-wrap gap-1.5">
+                  {candidates.slice(0, 12).map((candidate) => (
+                    <span key={`expert-summary-candidate-${candidate.code}`} className="rounded-full border border-[#e8e8e3] bg-[#fbfbf8] px-2.5 py-1 text-[11px] text-[#555]">
+                      <span className="font-mono font-semibold text-[#1a1a1a]">{candidate.code}</span>
+                      {candidate.name ? ` ${candidate.name}` : ''}
+                    </span>
                   ))}
                 </div>
               </div>
-            ))}
+            ) : null}
+            {fundamentalPacket ? (
+              <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-stone-800">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-semibold">P2 基本面发现闭环</span>
+                  <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-medium">{fundamentalPacket.status}</span>
+                  <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px]">候选 {fundamentalCandidates.length}</span>
+                  {fundamentalPacket.asOf ? <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px]">报告期 {fundamentalPacket.asOf}</span> : null}
+                  {fundamentalSnapshotDiag.row_count != null ? (
+                    <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px]">快照 {String(fundamentalSnapshotDiag.row_count)} 行</span>
+                  ) : null}
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  基本面专家读取本地预计算表，不在本轮 Trace 里实时全市场拉财报；如果这里为 0 只，优先检查快照表是否为空或筛选阈值是否未命中。
+                </p>
+                <div className="mt-2 grid gap-2 text-[10px] md:grid-cols-2">
+                  <div className="rounded-md bg-white/70 px-2 py-1.5">
+                    <span className="text-stone-500">数据源：</span>
+                    <span className="break-all">{[fundamentalSource.table, fundamentalSource.db_path].filter(Boolean).join(' · ') || '-'}</span>
+                  </div>
+                  <div className="rounded-md bg-white/70 px-2 py-1.5">
+                    <span className="text-stone-500">诊断：</span>
+                    <span>{[...fundamentalPacket.errors, ...fundamentalPacket.warnings].slice(0, 2).join('；') || '基本面专家已参与本轮候选发现。'}</span>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
         ) : isWatchlistScan ? (
           <p className="mt-2 text-xs text-[#777]">
-            {displayOrchestrationMode === 'expert_graph' && isWaitingForExpertState
-              ? `多专家模式已开启，选股链路正在运行，当前尚未生成 expert_state。${latestSelectionStage ? `最新阶段：${latestSelectionStage.label}；` : ''}等后端发出 selection_expert_graph_done 后会显示专家意见。`
+            {displayOrchestrationMode === 'expert_graph' && isWaitingForCandidateExperts
+              ? `多专家候选发现正在运行，当前尚未返回 discover 专家包。${latestSelectionStage ? `最新阶段：${latestSelectionStage.label}；` : ''}`
               : displayOrchestrationMode === 'expert_graph'
-                ? `本轮选股结束时没有返回 expert_state。${latestSelectionStage ? `最后阶段：${latestSelectionStage.label}；` : ''}请检查后端是否生成 selection_expert_graph_done 事件或是否在该阶段前超时。`
-                : '当前为 legacy 选股链路，尚未输出专家图谱。设置 AGENT_ORCHESTRATION_MODE=expert_graph 并重启后端后会显示专家意见。'}
+                ? `本轮没有返回 L1 候选发现专家包。${latestSelectionStage ? `最后阶段：${latestSelectionStage.label}；` : ''}请检查 discover_watchlist_candidates 是否完成。`
+                : '当前为 legacy 选股链路，尚未输出 L1 候选发现专家包。设置 AGENT_ORCHESTRATION_MODE=expert_graph 并重启后端后会显示。'}
           </p>
         ) : (
           <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">
@@ -1753,63 +2038,93 @@ const L1Detail: React.FC<{
         )}
       </div>
 
-      {candidateExpertPackets.length ? (
+      {candidateQuality ? (
         <div className="rounded-lg border border-[#eeeee9] bg-white p-4">
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <p className="text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池多专家发现</p>
-            {candidateCapacity ? (
-              <div className="ml-auto flex flex-wrap gap-1.5 text-[10px] text-[#777]">
-                {candidateCapacity.maxCandidatesToDeepDive != null ? (
-                  <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">深挖上限 {candidateCapacity.maxCandidatesToDeepDive}</span>
-                ) : null}
-                {candidateCapacity.minPerExpert != null ? (
-                  <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">专家保底 {candidateCapacity.minPerExpert}</span>
-                ) : null}
-                {candidateCapacity.maxPerExpert != null ? (
-                  <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">单专家最多 {candidateCapacity.maxPerExpert}</span>
-                ) : null}
-              </div>
+            <p className="text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池质量与门禁</p>
+            {candidateQuality.hardStrategyTrunkMissing ? (
+              <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700">硬策略主干缺失</span>
+            ) : (
+              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">硬策略主干可用</span>
+            )}
+            {candidateQuality.hardExclusionCount ? (
+              <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">硬排除 {candidateQuality.hardExclusionCount}</span>
             ) : null}
           </div>
-          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-            {candidateExpertPackets.map((packet) => (
-              <div key={packet.expert} className={cn('rounded-lg border p-3', dimensionTone(packet.dimension))}>
-                <div className="mb-2 flex items-center gap-2">
-                  <span className="text-xs font-semibold">{packet.label}</span>
-                  <span className="ml-auto rounded-full bg-white/75 px-2 py-0.5 text-[10px] font-medium">{packet.status}</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5 text-[10px]">
-                  <span className="rounded-md bg-white/75 px-2 py-0.5">候选 {packet.count}</span>
-                  {packet.themeCount ? <span className="rounded-md bg-white/75 px-2 py-0.5">主题 {packet.themeCount}</span> : null}
-                  <span className="rounded-md bg-white/75 px-2 py-0.5">{packet.dimensionLabel}</span>
-                  {packet.freshness !== 'unknown' ? <span className="rounded-md bg-white/75 px-2 py-0.5">新鲜度 {packet.freshness}</span> : null}
-                </div>
-                {packet.warnings.length || packet.errors.length ? (
-                  <p className="mt-2 line-clamp-2 text-[10px] leading-relaxed opacity-80">
-                    {[...packet.errors, ...packet.warnings].slice(0, 2).join('；')}
-                  </p>
-                ) : null}
-              </div>
-            ))}
+          <div className="grid gap-2 md:grid-cols-4">
+            <div className="rounded-lg bg-[#f8f8f3] p-3">
+              <p className="text-[10px] uppercase tracking-wider text-[#999]">候选数量</p>
+              <p className="mt-1 text-lg font-semibold text-[#1a1a1a]">{candidateQuality.candidateCount}</p>
+            </div>
+            <div className="rounded-lg bg-[#f8f8f3] p-3">
+              <p className="text-[10px] uppercase tracking-wider text-[#999]">多源共振</p>
+              <p className="mt-1 text-lg font-semibold text-[#1a1a1a]">{candidateQuality.multiSourceCount}</p>
+            </div>
+            <div className="rounded-lg bg-[#f8f8f3] p-3">
+              <p className="text-[10px] uppercase tracking-wider text-[#999]">兜底观察</p>
+              <p className="mt-1 text-lg font-semibold text-[#1a1a1a]">{candidateQuality.fallbackCount}</p>
+            </div>
+            <div className="rounded-lg bg-[#f8f8f3] p-3">
+              <p className="text-[10px] uppercase tracking-wider text-[#999]">生命周期</p>
+              <p className="mt-1 text-xs leading-relaxed text-[#555]">
+                {Object.entries(candidateQuality.lifecycleCounts).map(([key, count]) => `${displayLifecycleStatus(key)} ${count}`).join('；') || '-'}
+              </p>
+            </div>
           </div>
-          {candidateThemes.length ? (
-            <div className="mt-4">
-              <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-[#999]">主题观察 ({candidateThemes.length})</p>
-              <div className="grid gap-2 md:grid-cols-2">
-                {candidateThemes.slice(0, 6).map((theme) => (
-                  <div key={`${theme.theme}-${theme.eventTitle}`} className="rounded-lg border border-purple-100 bg-purple-50 px-3 py-2 text-purple-700">
-                    <div className="mb-1 flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-semibold">{theme.theme}</span>
-                      <span className="rounded-full bg-white/75 px-2 py-0.5 text-[10px]">{displayEventMaturity(theme.status)}</span>
-                      {theme.confidence != null ? <span className="text-[10px] opacity-80">置信 {formatConfidence(theme.confidence)}</span> : null}
-                    </div>
-                    {theme.eventTitle ? <p className="text-[11px] leading-relaxed">{theme.eventTitle}</p> : null}
-                    {theme.reason ? <p className="mt-1 line-clamp-2 text-[10px] leading-relaxed opacity-80">{theme.reason}</p> : null}
-                  </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <div>
+              <p className="mb-1.5 text-[10px] uppercase tracking-wider text-[#999]">维度分布</p>
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(candidateQuality.dimensionCounts).map(([key, count]) => (
+                  <span key={key} className="rounded-full bg-[#f0f0ec] px-2 py-0.5 text-[10px] text-[#666]">{displayQualityKey(key)} {count}</span>
                 ))}
               </div>
             </div>
+            <div>
+              <p className="mb-1.5 text-[10px] uppercase tracking-wider text-[#999]">来源分布</p>
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(candidateQuality.sourceCounts).map(([key, count]) => (
+                  <span key={key} className="rounded-full bg-[#f0f0ec] px-2 py-0.5 text-[10px] text-[#666]">{displayQualityKey(key)} {count}</span>
+                ))}
+              </div>
+            </div>
+          </div>
+          {candidateHardExclusion?.excludedCount ? (
+            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
+              <p className="text-[11px] font-semibold">硬排除明细</p>
+              <p className="mt-1 text-[10px] leading-relaxed">
+                {Object.entries(candidateHardExclusion.reasonCounts).map(([key, count]) => `${displayExclusionReason(key)} ${count}`).join('；')}
+              </p>
+              {candidateHardExclusion.examples.length ? (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {candidateHardExclusion.examples.slice(0, 6).map((item) => (
+                    <span key={`${item.code}-${item.reason}`} className="rounded-md bg-white/80 px-2 py-0.5 text-[10px]">
+                      {item.code}{item.name ? ` ${item.name}` : ''} · {displayExclusionReason(item.reason)}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           ) : null}
+        </div>
+      ) : null}
+
+      {candidateThemes.length ? (
+        <div className="rounded-lg border border-[#eeeee9] bg-white p-4">
+          <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-[#999]">主题观察 ({candidateThemes.length})</p>
+          <div className="grid gap-2 md:grid-cols-2">
+            {candidateThemes.slice(0, 6).map((theme) => (
+              <div key={`${theme.theme}-${theme.eventTitle}`} className="rounded-lg border border-purple-100 bg-purple-50 px-3 py-2 text-purple-700">
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-semibold">{theme.theme}</span>
+                  <span className="rounded-full bg-white/75 px-2 py-0.5 text-[10px]">{displayEventMaturity(theme.status)}</span>
+                  {theme.confidence != null ? <span className="text-[10px] opacity-80">置信 {formatConfidence(theme.confidence)}</span> : null}
+                </div>
+                {theme.eventTitle ? <p className="text-[11px] leading-relaxed">{theme.eventTitle}</p> : null}
+                {theme.reason ? <p className="mt-1 line-clamp-2 text-[10px] leading-relaxed opacity-80">{theme.reason}</p> : null}
+              </div>
+            ))}
+          </div>
         </div>
       ) : null}
 
@@ -1902,6 +2217,13 @@ const L1Detail: React.FC<{
                       {details.length ? (
                         <p className="mt-1 text-[11px] leading-relaxed text-[#555]">{details.slice(0, 2).join('；')}</p>
                       ) : null}
+                      {group.dimension === 'fundamental' && fundamentalMetricBadges(candidate).length ? (
+                        <div className="mt-1.5 flex flex-wrap gap-1">
+                          {fundamentalMetricBadges(candidate).slice(0, 6).map((badge) => (
+                            <span key={badge} className="rounded-md bg-white px-1.5 py-0.5 text-[10px] text-stone-700">{badge}</span>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -1960,6 +2282,15 @@ const L1Detail: React.FC<{
                     <span className="font-mono text-sm font-semibold text-[#1a1a1a]">{c.code}</span>
                     {c.name ? <span className="text-sm font-medium text-[#333]">{c.name}</span> : null}
                     {c.score != null ? <span className="rounded-full bg-[#1a1a1a] px-2 py-0.5 text-[10px] font-medium text-white">评分 {formatMetricValue(c.score)}</span> : null}
+                    {c.consensusBonus != null && c.consensusBonus > 0 ? (
+                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">共振 +{formatMetricValue(c.consensusBonus)}</span>
+                    ) : null}
+                    {c.lifecycleStatus ? (
+                      <span className="rounded-full bg-[#f0f0ec] px-2 py-0.5 text-[10px] text-[#666]">{displayLifecycleStatus(c.lifecycleStatus)}</span>
+                    ) : null}
+                    {c.mixedEvidence ? (
+                      <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">存在反证</span>
+                    ) : null}
                     {c.latestDate ? <span className="text-[11px] text-[#999]">{c.latestDate}</span> : null}
                   </div>
 
@@ -2060,85 +2391,57 @@ const L1Detail: React.FC<{
   );
 };
 
-const EvidenceList: React.FC<{
-  title: string;
-  tone: 'support' | 'missing' | 'risk';
-  items: string[];
-  emptyText: string;
-}> = ({ title, tone, items, emptyText }) => {
-  const titleClass = tone === 'support'
-    ? 'text-emerald-700'
-    : tone === 'missing'
-      ? 'text-amber-700'
-      : 'text-red-700';
-  if (!items.length) {
-    return (
-      <div className="mt-2">
-        <div className={cn('text-[10px] font-semibold', titleClass)}>{title}</div>
-        <p className="mt-1 text-[#999]">{emptyText}</p>
-      </div>
-    );
-  }
-  return (
-    <div className="mt-2">
-      <div className={cn('text-[10px] font-semibold', titleClass)}>{title}</div>
-      <ul className="mt-1 space-y-1">
-        {items.slice(0, 4).map((item, index) => (
-          <li key={`${title}-${index}`} className="rounded-md bg-white px-2 py-1 text-[#555]">{item}</li>
-        ))}
-      </ul>
-    </div>
-  );
-};
-
 const L2Detail: React.FC<{
   toolCalls: AgentTraceToolCall[];
   selectedIndex: number;
   onSelect: (i: number) => void;
   selectedTool: AgentTraceToolCall | null;
-}> = ({ toolCalls, selectedIndex, onSelect, selectedTool }) => (
-  <div className="space-y-3">
-    {/* Tool list */}
-    <div className="max-h-[300px] overflow-y-auto rounded-lg border border-[#eeeee9]">
-      {toolCalls.length ? toolCalls.map((call, i) => (
-        <button
-          key={`${call.step}-${call.tool}-${i}`}
-          type="button"
-          onClick={() => onSelect(i)}
-          className={cn(
-            'flex w-full items-center gap-3 border-b border-[#f2f2ed] px-3 py-2 text-left text-xs transition-colors last:border-0 hover:bg-[#f5f5f0]',
-            selectedIndex === i && 'bg-[#f5f5f0]',
-          )}
-        >
-          <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', call.success ? 'bg-emerald-500' : 'bg-red-500')} />
-          <span className="min-w-0 flex-1 truncate font-medium text-[#333]">{call.tool}</span>
-          <span className="shrink-0 font-mono text-[#999]">{formatDuration(call.duration)}</span>
-        </button>
-      )) : (
-        <p className="p-3 text-xs text-[#999]">暂无工具调用</p>
-      )}
-    </div>
-    {/* Selected tool detail */}
-    {selectedTool ? (
-      <div className="rounded-lg border border-[#eeeee9] p-4">
-        <div className="mb-3 flex items-center gap-3 text-xs">
-          <Wrench className="h-3.5 w-3.5 text-[#999]" />
-          <span className="font-medium text-[#333]">{selectedTool.tool}</span>
-          <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', selectedTool.success ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700')}>
-            {selectedTool.success ? 'OK' : 'FAIL'}
-          </span>
-          <span className="ml-auto font-mono text-[#999]">step {selectedTool.step} · {formatDuration(selectedTool.duration)}</span>
-        </div>
-        <JsonViewer data={(selectedTool.arguments || {}) as Record<string, unknown>} maxHeight="160px" />
-        {selectedTool.result_preview ? (
-          <pre className="mt-3 max-h-[180px] overflow-auto rounded-lg bg-[#f5f5f0] p-3 font-mono text-[11px] leading-5 text-[#555] whitespace-pre-wrap">
-            {selectedTool.result_preview}
-          </pre>
-        ) : null}
+}> = ({ toolCalls, selectedIndex, onSelect, selectedTool }) => {
+  const preview = selectedTool?.result_preview ? truncateText(String(selectedTool.result_preview), TOOL_PREVIEW_RENDER_CHARS) : '';
+  return (
+    <div className="space-y-3">
+      {/* Tool list */}
+      <div className="max-h-[300px] overflow-y-auto rounded-lg border border-[#eeeee9]">
+        {toolCalls.length ? toolCalls.map((call, i) => (
+          <button
+            key={`${call.step}-${call.tool}-${i}`}
+            type="button"
+            onClick={() => onSelect(i)}
+            className={cn(
+              'flex w-full items-center gap-3 border-b border-[#f2f2ed] px-3 py-2 text-left text-xs transition-colors last:border-0 hover:bg-[#f5f5f0]',
+              selectedIndex === i && 'bg-[#f5f5f0]',
+            )}
+          >
+            <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', call.success ? 'bg-emerald-500' : 'bg-red-500')} />
+            <span className="min-w-0 flex-1 truncate font-medium text-[#333]">{String(call.tool || '-')}</span>
+            <span className="shrink-0 font-mono text-[#999]">{formatDuration(call.duration)}</span>
+          </button>
+        )) : (
+          <p className="p-3 text-xs text-[#999]">暂无工具调用</p>
+        )}
       </div>
-    ) : null}
-  </div>
-);
+      {/* Selected tool detail */}
+      {selectedTool ? (
+        <div className="rounded-lg border border-[#eeeee9] p-4">
+          <div className="mb-3 flex items-center gap-3 text-xs">
+            <Wrench className="h-3.5 w-3.5 text-[#999]" />
+            <span className="font-medium text-[#333]">{String(selectedTool.tool || '-')}</span>
+            <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', selectedTool.success ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700')}>
+              {selectedTool.success ? 'OK' : 'FAIL'}
+            </span>
+            <span className="ml-auto font-mono text-[#999]">step {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
+          </div>
+          <JsonViewer data={(selectedTool.arguments || {}) as Record<string, unknown>} maxHeight="160px" />
+          {preview ? (
+            <pre className="mt-3 max-h-[180px] overflow-auto rounded-lg bg-[#f5f5f0] p-3 font-mono text-[11px] leading-5 text-[#555] whitespace-pre-wrap">
+              {preview}
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+};
 
 const L3Detail: React.FC<{ result: AgentTraceRunResponse; debate: Record<string, unknown> | null }> = ({ result, debate }) => {
   const judge = asRecord(debate?.judge_decision);
@@ -2290,7 +2593,7 @@ const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ r
 function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<string, unknown> | null): string {
   const candidates = extractDiscoveryCandidates(result, stockSelection);
   const dataTools = result.tool_calls.filter((t) => t.tool.startsWith('get_') || t.tool.includes('quote'));
-  const expertOpinions = extractExpertOpinions(stockSelection);
+  const candidateExpertPackets = extractCandidateExpertPackets(result);
   const orchestrationMode = getRuntimeOrchestrationMode(result) || getSelectionOrchestrationMode(stockSelection);
   const reportIntent = getTraceReportIntent(result);
 
@@ -2298,10 +2601,10 @@ function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<
     const sourceLabels = Array.from(new Set(candidates.flatMap((item) => (
       item.recallSources.length ? item.recallSources : item.source ? [item.source] : []
     )).map(displaySourceName))).slice(0, 3);
-    const expertText = expertOpinions.length
-      ? `多专家模式已输出 ${expertOpinions.length} 个专家意见；`
+    const expertText = candidateExpertPackets.length
+      ? `L1 已输出 ${candidateExpertPackets.length} 个候选发现专家包；`
       : orchestrationMode === 'expert_graph'
-        ? '多专家模式已开启；'
+        ? 'L1 多专家候选发现已开启；'
         : '';
     return `${expertText}第一阶段已生成 ${candidates.length} 只候选股票，来源包括${sourceLabels.length ? sourceLabels.join('、') : '多路召回'}；候选会按策略、技术、资金、消息/情绪等维度分组展示。`;
   }
