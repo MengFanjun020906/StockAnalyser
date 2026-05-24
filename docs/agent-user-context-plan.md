@@ -120,7 +120,7 @@ A 股硬约束必须作为确定性规则，不交给 LLM 自由判断：
 - `src/schemas/agent_signal.py` 定义 `l1_signal`、`l2_summary`、`l3_decision`、`risk_gate`、`trade_plan` 和 `reasoning_trace` 的 Pydantic 协议。
 - `src/agent/risk_gate.py` 提供独立 `RiskGateEvaluator`，先覆盖 T+1、涨停禁追、跌停不可假定立即卖出、ST/退市/上市特殊期人工确认、止损/失效条件、关键数据质量、置信门槛、单股/总仓位和现金约束。
 - 协议层允许承载不完整或错误方案，风控层负责阻断、降级或转人工确认，保证后续 Trace、模拟盘和回测都能看到可审计原因。
-- `agent-trace` 已接入最小风控闭环：运行结束后会从 Debate Judge 或选股裁决生成 `TradePlan`，执行 `risk_gate`，并落盘 `risk_gate.json`；`/trace/run` 与 `/trace/stream` 的完成载荷会返回同一份风控结果。
+- `agent-trace` 已接入最小风控闭环：运行结束后会从 Debate Judge 或选股裁决生成 `TradePlan`，执行 `risk_gate`，并落盘 `risk_gate.json`；`/trace/run` 与 `/trace/stream` 的完成载荷会返回同一份风控结果。`watchlist_scan` 只有在存在唯一交易标的时才会生成单股票 `TradePlan/risk_gate`；多候选观察场景不再把持仓股或最后一条行情误当成目标标的。
 - Agent Trace 前端已新增 `Risk Gate` 面板，展示风控状态、允许动作、TradePlan、行情状态、规则检查、阻断原因和警告。
 - 这一阶段仍不接真实/模拟下单路径，也不让 LLM 覆盖风控结论；下一步再把方案保存和模拟盘托管接到该结果。
 
@@ -969,7 +969,7 @@ AgentUserContext
 - `src/agent/tools/market_tools.py` 提供 `discover_watchlist_candidates`，用于 watchlist_scan 在无用户候选股票代码时先生成候选池；`src/agent/stock_selection.py` 在 planning_execute 的 watchlist_scan 下优先执行阶段化选股流水线，并通过 `SelectionRunContext` 管理候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决；`src/agent/runner.py` 仍保留审计兜底，阻止空候选 watchlist_scan 直接输出最终选股结论。
 - Debate 三方共用同一份 `Shared Evidence Bundle`，包含用户问题、主报告、`AgentUserContext`、Planner 和工具 Evidence Ledger。
 - `api/v1/endpoints/agent.py` 的 Trace 响应和 SSE `done` 事件会返回 `debate` 字段，并在调试目录写入 `debate.json`。
-- Trace 结束时会构造 `TradePlan` 并调用 `RiskGateEvaluator`，将结果写入 `risk_gate.json`，同时在 `/trace/run` 响应和 `/trace/stream` 完成事件中返回。
+- Trace 结束时会在存在明确交易标的时构造 `TradePlan` 并调用 `RiskGateEvaluator`，将结果写入 `risk_gate.json`，同时在 `/trace/run` 响应和 `/trace/stream` 完成事件中返回；多候选 `watchlist_scan` 观察场景允许 `risk_gate=null`。
 - `apps/dsa-web/src/pages/AgentTracePage.tsx` 新增 `Debate Judge` 模块，展示主观点、反方观点、Judge 裁决、分维度证据、采纳/驳回论点和风控条件；Judge 输出会显式区分账户风险、技术面、资金面、消息面、基本面和数据质量。
 - Agent Trace 页面新增 `Risk Gate` 面板和分层 Trace 视图，可查看候选池来源、工具证据、辩论裁决、风控规则检查和复盘入口。
 - 开发调试模式下，`debate.debug_outputs` 会保留同一 session 内的原始主报告输出、Primary Thesis 原始输出、Opposing Thesis 原始输出、Judge 原始输出和最终合并输出；这些是模型可见输出和结构化 JSON，不包含隐藏思维链。

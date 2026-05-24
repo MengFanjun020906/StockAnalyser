@@ -805,3 +805,48 @@ def test_discover_watchlist_candidates_reports_hard_strategy_trunk_missing_witho
     assert result["quality"]["hard_strategy_trunk_missing"] is True
     assert result["quality"]["source_counts"]["sector"] == 1
     assert result["hard_exclusion"]["excluded_count"] == 0
+
+
+def test_discover_watchlist_candidates_auto_sanitizes_nan_metrics():
+    with patch(
+        "src.agent.tools.market_tools.CandidateExpertOrchestrator.discover",
+        return_value={
+            "status": "ok",
+            "candidate_source": "expert_graph_discovery",
+            "candidate_count": 1,
+            "candidates": [
+                {
+                    "code": "688707",
+                    "name": "振华新材",
+                    "source": "fundamental:tushare_daily_basic",
+                    "reason": "TuShare 日度估值/换手指标靠前，适合做基本面候选快照。",
+                    "signal_score": 100,
+                    "strategy_tags": ["fundamental", "daily_basic", "valuation"],
+                    "metrics": {
+                        "source_name": "tushare_daily_basic",
+                        "trade_date": "20260522",
+                        "pe_ttm": float("nan"),
+                        "pb": 2.1529,
+                    },
+                    "raw_source_item": {
+                        "ts_code": "688707.SH",
+                        "trade_date": "20260522",
+                        "pe": float("nan"),
+                        "pe_ttm": float("nan"),
+                        "pb": 2.1529,
+                        "dv_ratio": float("nan"),
+                    },
+                }
+            ],
+            "expert_packets": [],
+            "discovery_steps": [],
+            "errors": [],
+        },
+    ):
+        result = _handle_discover_watchlist_candidates(candidate_source="auto", limit=3)
+
+    candidate = result["candidates"][0]
+    assert candidate["metrics"]["pe_ttm"] is None
+    assert candidate["raw_source_item"]["pe"] is None
+    assert candidate["raw_source_item"]["pe_ttm"] is None
+    assert candidate["raw_source_item"]["dv_ratio"] is None

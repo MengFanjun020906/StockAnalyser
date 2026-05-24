@@ -494,6 +494,27 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(ledger["entries"][0]["status"], "failed")
         self.assertFalse(event["success"])
 
+    def test_sanitize_json_payload_coerces_non_finite_numbers(self) -> None:
+        payload = {
+            "ok": 1.23,
+            "nan": float("nan"),
+            "nested": {
+                "pos_inf": float("inf"),
+                "neg_inf": float("-inf"),
+                "items": [1, float("nan"), {"value": float("inf")}],
+            },
+        }
+
+        sanitized = agent._sanitize_json_payload(payload)
+
+        self.assertEqual(sanitized["ok"], 1.23)
+        self.assertIsNone(sanitized["nan"])
+        self.assertIsNone(sanitized["nested"]["pos_inf"])
+        self.assertIsNone(sanitized["nested"]["neg_inf"])
+        self.assertEqual(sanitized["nested"]["items"][0], 1)
+        self.assertIsNone(sanitized["nested"]["items"][1])
+        self.assertIsNone(sanitized["nested"]["items"][2]["value"])
+
     def test_trace_stream_emits_context_planner_tool_and_done_events(self) -> None:
         config = SimpleNamespace(
             is_agent_available=lambda: True,
@@ -680,6 +701,119 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                 risk_gate = json.load(fh)
             self.assertEqual(risk_gate["risk_gate"]["status"], "blocked")
 
+    def test_trace_watchlist_scan_without_single_symbol_skips_single_stock_risk_gate(self) -> None:
+        config = SimpleNamespace(is_agent_available=lambda: True, report_language="zh")
+        executor = MagicMock()
+        executor.chat.return_value = SimpleNamespace(
+            success=True,
+            content="trace ok",
+            error=None,
+            total_steps=2,
+            total_tokens=88,
+            provider="deepseek",
+            model="deepseek/deepseek-v4-pro",
+            debate=None,
+            stock_selection={
+                "success": True,
+                "selection_context": {
+                    "orchestration_mode": "expert_graph",
+                    "stages": {},
+                },
+                "final_report_json": {
+                    "portfolio_allocation": {
+                        "summary": {"portfolio_action": "wait"},
+                        "full": {
+                            "positions_plan": [
+                                {"code": "688707", "name": "振华新材", "action": "wait"},
+                                {"code": "688266", "name": "泽璟制药-U", "action": "monitor"},
+                            ],
+                        },
+                    },
+                    "judge_decision": {
+                        "summary": {
+                            "primary_plan_verdict": "wait_for_more_data",
+                            "final_action": "wait",
+                        }
+                    },
+                },
+            },
+            tool_calls_log=[
+                {
+                    "step": 1,
+                    "tool": "get_realtime_quote",
+                    "arguments": {"stock_code": "688707"},
+                    "success": True,
+                    "duration": 0.1,
+                    "result_length": 32,
+                    "result_preview": '{"code":"688707","price":16.47}',
+                    "result_json": {"code": "688707", "price": 16.47},
+                },
+                {
+                    "step": 2,
+                    "tool": "get_realtime_quote",
+                    "arguments": {"stock_code": "688266"},
+                    "success": True,
+                    "duration": 0.1,
+                    "result_length": 33,
+                    "result_preview": '{"code":"688266","price":102.07}',
+                    "result_json": {"code": "688266", "price": 102.07},
+                },
+            ],
+        )
+        request = agent.AgentTraceRunRequest(
+            message="帮我选下周可关注股票",
+            inject_portfolio_context=False,
+            context={
+                "agent_user_context": {
+                    "positions": [
+                        {
+                            "symbol": "300476",
+                            "quantity": 100,
+                            "avg_cost": 333.4998,
+                            "last_price": 375.5,
+                            "position_pct": 64.464051,
+                        }
+                    ],
+                    "report": {
+                        "analysis_mode": "planning_execute",
+                        "intent": "watchlist_scan",
+                        "primary_symbol": None,
+                        "target_symbols": [],
+                    },
+                }
+            },
+        )
+        real_get_running_loop = asyncio.get_running_loop
+
+        class _ImmediateLoop:
+            def __init__(self, loop):
+                self._loop = loop
+
+            def run_in_executor(self, _executor, func):
+                future = self._loop.create_future()
+                future.set_result(func())
+                return future
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config.database_path = os.path.join(tmpdir, "stock_analysis.db")
+            with patch("api.v1.endpoints.agent.get_config", return_value=config), patch(
+                "api.v1.endpoints.agent._build_executor",
+                return_value=executor,
+            ), patch(
+                "src.agent.conversation.conversation_manager.clear",
+            ), patch(
+                "src.storage.get_db",
+                return_value=MagicMock(),
+            ), patch(
+                "api.v1.endpoints.agent.asyncio.get_running_loop",
+                side_effect=lambda: _ImmediateLoop(real_get_running_loop()),
+            ):
+                payload = asyncio.run(agent.run_agent_trace(request)).model_dump()
+
+            self.assertIsNone(payload["risk_gate"])
+            with open(os.path.join(payload["artifact_dir"], "risk_gate.json"), encoding="utf-8") as fh:
+                self.assertIsNone(json.load(fh))
+
     def test_trace_finalize_ingests_graphiti_episode(self) -> None:
         config = SimpleNamespace(
             is_agent_available=lambda: True,
@@ -832,6 +966,57 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertIsNotNone(planner)
         self.assertEqual(planner["intent"], "watchlist_scan")
         self.assertIsNone(planner["primary_symbol"])
+
+    @patch("src.services.portfolio_service.PortfolioService")
+    def test_trace_context_injects_selected_account_even_when_checkbox_payload_is_false(self, mock_service_cls) -> None:
+        mock_portfolio_service = MagicMock()
+        mock_portfolio_service.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-05-15",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 3,
+                    "account_name": "5w账户",
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 34354.9,
+                    "total_market_value": 17600,
+                    "total_equity": 51954.9,
+                    "positions": [
+                        {
+                            "symbol": "301028",
+                            "quantity": 1000,
+                            "avg_cost": 16.87,
+                            "last_price": 17.6,
+                            "market_value_base": 17600,
+                            "unrealized_pnl_base": 730,
+                            "unrealized_pnl_pct": 4.33,
+                        }
+                    ],
+                }
+            ],
+        }
+        mock_service_cls.return_value = mock_portfolio_service
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="根据我目前的持仓，给我下周一的操作建议",
+                account_id=3,
+                inject_portfolio_context=False,
+                risk_preference="balanced",
+                trading_horizon="long_term",
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        mock_portfolio_service.get_portfolio_snapshot.assert_called_once()
+        self.assertEqual(mock_portfolio_service.get_portfolio_snapshot.call_args.kwargs["account_id"], 3)
+        summary = agent._build_trace_context_summary(context)
+        self.assertEqual(summary["account_count"], 1)
+        self.assertEqual(summary["accounts"][0]["account_id"], 3)
+        self.assertEqual(summary["position_count"], 1)
+        self.assertEqual(context["agent_user_context"].report.intent, "position_review")
 
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
     @patch("litellm.completion")
@@ -1125,6 +1310,35 @@ class AgentModelsSourceDetectionTestCase(unittest.TestCase):
         self.assertEqual(config.llm_models_source, "legacy_env")
         self.assertTrue(config.llm_model_list)
         self.assertEqual(config.llm_model_list[0]["model_name"], "__legacy_openai__")
+
+
+class AgentTraceRunRequestCandidateDiscoveryModeTestCase(unittest.TestCase):
+    def test_default_candidate_discovery_mode_is_none(self) -> None:
+        request = agent.AgentTraceRunRequest(message="hi")
+        self.assertIsNone(request.candidate_discovery_mode)
+
+    def test_accepts_deterministic_value(self) -> None:
+        request = agent.AgentTraceRunRequest(
+            message="hi",
+            candidate_discovery_mode="deterministic",
+        )
+        self.assertEqual(request.candidate_discovery_mode, "deterministic")
+
+    def test_accepts_llm_expert_committee_value(self) -> None:
+        request = agent.AgentTraceRunRequest(
+            message="hi",
+            candidate_discovery_mode="llm_expert_committee",
+        )
+        self.assertEqual(request.candidate_discovery_mode, "llm_expert_committee")
+
+    def test_rejects_invalid_candidate_discovery_mode(self) -> None:
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            agent.AgentTraceRunRequest(
+                message="hi",
+                candidate_discovery_mode="nonsense_value",
+            )
 
 
 if __name__ == "__main__":

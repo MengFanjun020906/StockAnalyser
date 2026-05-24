@@ -9,6 +9,7 @@ Tools:
 """
 
 import logging
+import math
 import re
 import concurrent.futures
 import time
@@ -303,6 +304,8 @@ def _candidate_source_family(item: Dict[str, Any]) -> str:
         ("alphasift:", "alphasift"),
         ("sequoia:", "sequoia"),
         ("akshare:", "sector"),
+        ("sector_theme:", "sector"),
+        ("capital_flow:", "capital"),
         ("event_impact:", "event_impact"),
         ("news_momentum:", "news_momentum"),
         ("news_sentiment:", "news_sentiment"),
@@ -311,6 +314,8 @@ def _candidate_source_family(item: Dict[str, Any]) -> str:
     ):
         if any(src == prefix or src.startswith(prefix) for src in sources):
             return family
+    if source.startswith("tushare:") or source.startswith("capital_flow:tushare_"):
+        return "capital"
     return source or "unknown"
 
 
@@ -337,7 +342,7 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
     strategy_labels = _display_strategy_names(strategies)
     alphasift_sources = [src for src in sources if src.startswith("alphasift:")]
     sequoia_sources = [src for src in sources if src.startswith("sequoia:")]
-    sector_sources = [src for src in sources if src.startswith("akshare:")]
+    sector_sources = [src for src in sources if src.startswith(("akshare:", "sector_theme:"))]
 
     if alphasift_sources:
         detail = "AlphaSift YAML 多因子策略入池"
@@ -353,8 +358,26 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
         add("strategy", "策略", f"命中策略：{'、'.join(strategy_labels)}")
 
     for src in sector_sources:
-        sector = src.split(":")[-1] if ":" in src else ""
-        add("sentiment", "情绪/热点", f"来自强势板块「{sector}」成分股" if sector else "来自强势板块成分股")
+        if src.startswith("sector_theme:"):
+            label = {
+                "sector_theme:tushare_moneyflow_ind_ths": "TuShare THS行业资金流",
+                "sector_theme:tushare_moneyflow_cnt_ths": "TuShare THS概念资金流",
+                "sector_theme:tushare_moneyflow_ind_dc": "TuShare 东财板块资金流",
+            }.get(src, src.replace("sector_theme:", ""))
+            board_name = str(metrics.get("board_name") or "").strip()
+            board_flow = metrics.get("board_net_inflow")
+            board_change = metrics.get("board_change_ratio")
+            detail_parts = [f"来源：{label}"]
+            if board_name:
+                detail_parts.append(f"主题：{board_name}")
+            if board_flow is not None:
+                detail_parts.append(f"板块净流入={_short_metric(board_flow)}")
+            if board_change is not None:
+                detail_parts.append(f"板块涨跌幅={_short_metric(board_change)}")
+            add("sentiment", "板块主题", "；".join(detail_parts))
+        else:
+            sector = src.split(":")[-1] if ":" in src else ""
+            add("sentiment", "情绪/热点", f"来自强势板块「{sector}」成分股" if sector else "来自强势板块成分股")
 
     news_sources = [src for src in sources if src.startswith(("news_sentiment:", "news_momentum:"))]
     if news_sources:
@@ -394,6 +417,38 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
         if validation_title:
             detail_parts.append(f"后续事实：{validation_title}")
         add("sentiment", "情绪/事件", "；".join(detail_parts) or "事件传导验证后的主题成分候选")
+
+    capital_sources = [src for src in sources if src.startswith("capital_flow:")]
+    if capital_sources:
+        detail_parts = []
+        source_labels = {
+            "capital_flow:tushare_moneyflow_ths": "THS资金流",
+            "capital_flow:tushare_moneyflow_dc": "东财资金流",
+            "capital_flow:tushare_dragon_tiger_list": "龙虎榜",
+            "capital_flow:tushare_dragon_tiger_inst": "龙虎榜席位",
+            "capital_flow:tushare_limit_list_ths": "THS涨停榜",
+            "capital_flow:tushare_limit_list_d": "涨停榜",
+            "capital_flow:tushare_limit_step": "连板天梯",
+            "capital_flow:tushare_hot_rank": "热榜",
+            "capital_flow:limit_up_pool": "涨停池",
+            "capital_flow:popularity_rank": "人气榜",
+            "capital_flow:hot_money_activity": "游资/龙虎榜",
+            "capital_flow:multi_source": "多资金来源",
+        }
+        labels = [source_labels.get(src, src.replace("capital_flow:", "")) for src in capital_sources]
+        if labels:
+            detail_parts.append("来源：" + "、".join(list(dict.fromkeys(labels))[:3]))
+        for key, label in (
+            ("limit_up_streak", "连板数"),
+            ("ceiling_amount", "封单额"),
+            ("turnover_ratio", "换手率"),
+            ("popularity", "人气值"),
+            ("net_inflow", "净买入"),
+        ):
+            value = item.get(key, metrics.get(key))
+            if value is not None:
+                detail_parts.append(f"{label}={_short_metric(value)}")
+        add("capital", "资金面", "；".join(detail_parts) or "资金活跃度候选")
 
     reason = str(item.get("reason") or "").strip()
     if reason and not dimensions:
@@ -814,6 +869,78 @@ def _fetch_sector_constituents(
         if candidates:
             break
     return (candidates, diagnostics) if include_diagnostics else candidates
+
+
+def _data_tool_result(tool_name: str, *, limit: int, **kwargs: Any) -> Dict[str, Any]:
+    handler_name = f"_handle_{tool_name}"
+    if tool_name in {
+        "get_tushare_moneyflow_ind_ths",
+        "get_tushare_moneyflow_ind_dc",
+        "get_tushare_moneyflow_cnt_ths",
+        "get_tushare_ths_member",
+        "get_tushare_announcements",
+        "get_tushare_stock_alerts",
+        "get_tushare_stock_shock",
+        "get_tushare_pledge_stat",
+        "get_tushare_pledge_detail",
+        "get_tushare_share_float",
+        "get_tushare_holder_trade",
+        "get_tushare_repurchase",
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_forecast",
+        "get_tushare_express",
+        "get_tushare_dividend",
+        "get_tushare_adj_factor",
+        "get_tushare_index_daily",
+        "get_tushare_trade_calendar",
+        "get_tushare_moneyflow_ths",
+        "get_tushare_moneyflow_dc",
+        "get_tushare_dragon_tiger_list",
+        "get_tushare_dragon_tiger_inst",
+        "get_tushare_limit_list_ths",
+        "get_tushare_limit_list_d",
+        "get_tushare_limit_step",
+        "get_tushare_hot_rank",
+    }:
+        timeout = _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)
+    else:
+        timeout = 2.5 if tool_name != "get_stockapi_hot_money_activity" else 2.0
+    try:
+        from src.agent.tools import data_tools
+
+        handler = getattr(data_tools, handler_name)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "items": [],
+            "errors": [f"{handler_name} unavailable: {exc}"],
+            "source_chain": [],
+        }
+    call_kwargs = dict(kwargs)
+    if "limit" not in call_kwargs:
+        call_kwargs["limit"] = max(1, min(int(limit or 10), 30))
+    result, err, duration_ms = _run_with_timeout(
+        lambda: handler(**call_kwargs),
+        timeout,
+        handler_name,
+    )
+    if err:
+        return {
+            "status": "timeout" if "timeout" in str(err).lower() else "failed",
+            "items": [],
+            "errors": [str(err)],
+            "source_chain": [{
+                "provider": handler_name,
+                "result": "timeout" if "timeout" in str(err).lower() else "failed",
+                "duration_ms": duration_ms,
+            }],
+        }
+    return result if isinstance(result, dict) else {"status": "failed", "items": [], "errors": [f"{handler_name} returned non-dict"]}
+
+
+def _stockapi_tool_result(tool_name: str, *, limit: int) -> Dict[str, Any]:
+    return _data_tool_result(tool_name, limit=limit)
 
 
 _NEWS_SENTIMENT_TOPICS = (
@@ -2128,6 +2255,28 @@ def _handle_discover_watchlist_candidates(
                     market=market,
                     limit=limit,
                 ),
+                "tushare_moneyflow_ind_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_ind_ths", limit=limit),
+                "tushare_moneyflow_ind_dc": lambda limit: _data_tool_result("get_tushare_moneyflow_ind_dc", limit=limit),
+                "tushare_moneyflow_cnt_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_cnt_ths", limit=limit),
+                "tushare_ths_member": lambda ts_code, limit: _data_tool_result("get_tushare_ths_member", ts_code=ts_code, limit=limit),
+                "tushare_moneyflow_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_ths", limit=limit),
+                "tushare_moneyflow_dc": lambda limit: _data_tool_result("get_tushare_moneyflow_dc", limit=limit),
+                "tushare_dragon_tiger_list": lambda limit: _data_tool_result("get_tushare_dragon_tiger_list", limit=limit),
+                "tushare_dragon_tiger_inst": lambda limit: _data_tool_result("get_tushare_dragon_tiger_inst", limit=limit),
+                "tushare_limit_list_ths": lambda limit: _data_tool_result("get_tushare_limit_list_ths", limit=limit),
+                "tushare_limit_list_d": lambda limit: _data_tool_result("get_tushare_limit_list_d", limit=limit),
+                "tushare_limit_step": lambda limit: _data_tool_result("get_tushare_limit_step", limit=limit),
+                "tushare_hot_rank": lambda limit: _data_tool_result("get_tushare_hot_rank", limit=limit),
+                "tushare_announcements": lambda limit: _data_tool_result("get_tushare_announcements", limit=limit),
+                "tushare_stock_alerts": lambda limit: _data_tool_result("get_tushare_stock_alerts", limit=limit),
+                "tushare_stock_shock": lambda limit: _data_tool_result("get_tushare_stock_shock", limit=limit),
+                "tushare_share_float": lambda limit: _data_tool_result("get_tushare_share_float", limit=limit),
+                "tushare_holder_trade": lambda limit: _data_tool_result("get_tushare_holder_trade", limit=limit),
+                "tushare_repurchase": lambda limit: _data_tool_result("get_tushare_repurchase", limit=limit),
+                "tushare_daily_basic": lambda limit: _data_tool_result("get_tushare_daily_basic", limit=limit),
+                "stockapi_limit_up_pool": lambda limit: _stockapi_tool_result("get_stockapi_limit_up_pool", limit=limit),
+                "stockapi_popularity_rank": lambda limit: _stockapi_tool_result("get_stockapi_popularity_rank", limit=limit),
+                "stockapi_hot_money_activity": lambda limit: _stockapi_tool_result("get_stockapi_hot_money_activity", limit=limit),
                 "fallback": lambda limit: _dedupe_candidates(
                     [{**item, "source": "fallback_seed_pool"} for item in DEFAULT_WATCHLIST_SEEDS],
                     limit,
@@ -2427,7 +2576,19 @@ def _candidate_discovery_response(
         logger.warning("Candidate pool persistence skipped: %s", exc)
         payload["candidate_pool_persisted"] = False
         payload["candidate_pool_persist_error"] = str(exc)
-    return payload
+    return _sanitize_non_finite_numbers(payload)
+
+
+def _sanitize_non_finite_numbers(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _sanitize_non_finite_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_non_finite_numbers(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_non_finite_numbers(item) for item in value]
+    return value
 
 
 discover_watchlist_candidates_tool = ToolDefinition(

@@ -6,6 +6,7 @@ Agent API endpoints.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -105,6 +106,7 @@ class AgentTraceRunRequest(BaseModel):
     max_acceptable_drawdown_pct: Optional[float] = Field(default=None, ge=0, le=100)
     default_stop_loss_pct: Optional[float] = Field(default=None, ge=0, le=100)
     investor_notes: Optional[str] = None
+    candidate_discovery_mode: Optional[Literal["deterministic", "llm_expert_committee"]] = None
 
     @property
     def effective_skills(self) -> Optional[List[str]]:
@@ -395,7 +397,10 @@ def _build_trace_context(
     intent_resolution = _resolve_trace_report_intent(request=request, stock_code=stock_code)
     context["_trace_intent_resolution"] = intent_resolution
 
-    should_inject = request.inject_portfolio_context and request.analysis_mode == "planning_execute"
+    should_inject = (
+        (request.inject_portfolio_context or request.account_id is not None)
+        and request.analysis_mode == "planning_execute"
+    )
     if should_inject and "agent_user_context" not in context:
         try:
             from src.agent.context_builder import build_agent_user_context_from_portfolio_service
@@ -444,6 +449,9 @@ def _build_trace_context(
             language=context.get("report_language", "zh"),
             intent_resolution=intent_resolution,
         )
+
+    if request.candidate_discovery_mode is not None:
+        context["candidate_discovery_mode"] = request.candidate_discovery_mode
 
     return context
 
@@ -721,6 +729,7 @@ def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
         "context_error": context.get("_trace_context_error"),
         "intent_resolution": context.get("_trace_intent_resolution"),
         "stock_code": context.get("stock_code"),
+        "candidate_discovery_mode": context.get("candidate_discovery_mode"),
         "account_count": 0,
         "position_count": 0,
         "target_position": None,
@@ -793,6 +802,7 @@ def _build_agent_runtime_config(config: Any) -> Dict[str, Any]:
         "agent_mode": bool(getattr(config, "agent_mode", False)),
         "agent_analysis_mode": getattr(config, "agent_analysis_mode", None),
         "agent_orchestration_mode": getattr(config, "agent_orchestration_mode", None),
+        "agent_candidate_discovery_mode": getattr(config, "agent_candidate_discovery_mode", None),
         "agent_arch": getattr(config, "agent_arch", None),
         "agent_max_steps": getattr(config, "agent_max_steps", None),
         "agent_orchestrator_timeout_s": getattr(config, "agent_orchestrator_timeout_s", None),
@@ -956,16 +966,30 @@ async def get_agent_trace_session(session_id: str):
 
 
 def _write_trace_json(path: Path, payload: Any) -> None:
+    sanitized = _sanitize_json_payload(payload)
     path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        json.dumps(sanitized, ensure_ascii=False, indent=2, default=str, allow_nan=False),
         encoding="utf-8",
     )
 
 
 def _append_trace_event(path: Path, event: Dict[str, Any]) -> None:
+    sanitized = _sanitize_json_payload(event)
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(event, ensure_ascii=False, default=str))
+        fh.write(json.dumps(sanitized, ensure_ascii=False, default=str, allow_nan=False))
         fh.write("\n")
+
+
+def _sanitize_json_payload(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _sanitize_json_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_json_payload(item) for item in value]
+    return value
 
 
 def _planner_to_todo_md(
@@ -1252,7 +1276,7 @@ def _build_trace_risk_gate_payload(
     if agent_user_context is None:
         return None
 
-    primary_symbol = _resolve_trace_primary_symbol(context, agent_user_context)
+    primary_symbol = _resolve_trace_primary_symbol(context, agent_user_context, result=result)
     if not primary_symbol:
         return None
 
@@ -1309,19 +1333,81 @@ def _coerce_trace_agent_user_context(context: Dict[str, Any]) -> Optional[AgentU
         return None
 
 
-def _resolve_trace_primary_symbol(context: Dict[str, Any], agent_user_context: AgentUserContext) -> Optional[str]:
+def _resolve_trace_primary_symbol(
+    context: Dict[str, Any],
+    agent_user_context: AgentUserContext,
+    *,
+    result: Any = None,
+) -> Optional[str]:
     report = agent_user_context.report
-    candidates = [
+    explicit_candidates = [
         context.get("stock_code"),
         report.primary_symbol,
         *(report.target_symbols or []),
+    ]
+    explicit_symbols = _trace_unique_symbols(explicit_candidates)
+    if report.intent == "watchlist_scan" or isinstance(getattr(result, "stock_selection", None), dict):
+        if len(explicit_symbols) == 1:
+            return explicit_symbols[0]
+        return _extract_trace_stock_selection_symbol(result)
+
+    fallback_candidates = [
+        *explicit_candidates,
         *((position.symbol for position in agent_user_context.positions if position.quantity > 0)),
     ]
-    for symbol in candidates:
+    for symbol in fallback_candidates:
         normalized = str(symbol or "").strip()
         if normalized:
             return normalized
     return None
+
+
+def _extract_trace_stock_selection_symbol(result: Any) -> Optional[str]:
+    stock_selection = getattr(result, "stock_selection", None) if result is not None else None
+    if not isinstance(stock_selection, dict):
+        return None
+    final_report = stock_selection.get("final_report_json") or {}
+    if not isinstance(final_report, dict):
+        return None
+    allocation = final_report.get("portfolio_allocation") or {}
+    if not isinstance(allocation, dict):
+        return None
+    full = allocation.get("full") or {}
+    if not isinstance(full, dict):
+        return None
+    positions = full.get("positions_plan") or []
+    if not isinstance(positions, list):
+        return None
+    symbols = _trace_unique_symbols(
+        item.get("code") or item.get("stock_code")
+        for item in positions
+        if isinstance(item, dict)
+    )
+    return symbols[0] if len(symbols) == 1 else None
+
+
+def _trace_unique_symbols(values: Any) -> List[str]:
+    symbols: List[str] = []
+    for value in values or []:
+        normalized = _normalize_trace_symbol(value)
+        if normalized and normalized not in symbols:
+            symbols.append(normalized)
+    return symbols
+
+
+def _normalize_trace_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    if "." in text:
+        prefix, suffix = text.split(".", 1)
+        if prefix.isdigit():
+            text = prefix
+        elif suffix.isdigit():
+            text = suffix
+    if len(text) > 2 and text[:2] in {"SH", "SZ", "BJ"} and text[2:].isdigit():
+        text = text[2:]
+    return text
 
 
 def _build_trace_trade_plan(
@@ -1513,7 +1599,7 @@ def _build_trace_quote_state(primary_symbol: str, tool_calls: List[Dict[str, Any
     try:
         from src.agent.risk_gate import QuoteState
 
-        quote_payload = _latest_tool_payload(tool_calls, "get_realtime_quote") or {}
+        quote_payload = _latest_tool_payload(tool_calls, "get_realtime_quote", stock_code=primary_symbol) or {}
         last_price = _to_float(
             quote_payload.get("price")
             or quote_payload.get("last_price")
@@ -1542,11 +1628,31 @@ def _build_trace_quote_state(primary_symbol: str, tool_calls: List[Dict[str, Any
         return None
 
 
-def _latest_tool_payload(tool_calls: List[Dict[str, Any]], tool_name: str) -> Optional[Dict[str, Any]]:
+def _latest_tool_payload(
+    tool_calls: List[Dict[str, Any]],
+    tool_name: str,
+    *,
+    stock_code: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    normalized_target = _normalize_trace_symbol(stock_code)
     for call in reversed(tool_calls or []):
         if not isinstance(call, dict) or call.get("tool") != tool_name:
             continue
-        payload = _parse_result_preview(call.get("result_preview"))
+        payload = call.get("result_json")
+        if not isinstance(payload, dict):
+            payload = _parse_result_preview(call.get("result_preview"))
+        if not isinstance(payload, dict):
+            continue
+        if normalized_target:
+            candidate_symbols = _trace_unique_symbols([
+                call.get("arguments", {}).get("stock_code") if isinstance(call.get("arguments"), dict) else None,
+                call.get("arguments", {}).get("symbol") if isinstance(call.get("arguments"), dict) else None,
+                payload.get("code"),
+                payload.get("stock_code"),
+                payload.get("symbol"),
+            ])
+            if normalized_target not in candidate_symbols:
+                continue
         if isinstance(payload, dict):
             return payload
     return None
@@ -1693,7 +1799,12 @@ class TraceArtifactWriter:
             final_report_json = stock_selection.get("final_report_json") or {}
             _write_trace_json(self.path / "final_report.json", final_report_json)
             for artifact_name, artifact_payload in _extract_evidence_artifacts(final_report_json).items():
-                _write_trace_json(self.path / f"{artifact_name}.json", artifact_payload)
+                if isinstance(artifact_payload, str):
+                    suffix = Path(artifact_name).suffix
+                    file_name = artifact_name if suffix else f"{artifact_name}.md"
+                    (self.path / file_name).write_text(artifact_payload, encoding="utf-8")
+                else:
+                    _write_trace_json(self.path / f"{artifact_name}.json", artifact_payload)
             stages = (selection_context.get("stages") or {}) if isinstance(selection_context, dict) else {}
             for stage_name, stage_payload in stages.items():
                 if not isinstance(stage_payload, dict):
@@ -1730,6 +1841,15 @@ def _extract_evidence_artifacts(final_report_json: Dict[str, Any]) -> Dict[str, 
         value = bundle.get(key)
         if value not in (None, [], {}):
             artifacts[key] = value
+    balanced_stage = final_report_json.get("balanced_candidate_evidence")
+    if isinstance(balanced_stage, dict):
+        full = balanced_stage.get("full") if isinstance(balanced_stage.get("full"), dict) else {}
+        evidence_json = full.get("candidate_evidence_json")
+        if evidence_json not in (None, [], {}):
+            artifacts["candidate_evidence"] = evidence_json
+        evidence_md = full.get("candidate_evidence_md")
+        if isinstance(evidence_md, str) and evidence_md.strip():
+            artifacts["candidate_evidence.md"] = evidence_md
     return artifacts
 
 
@@ -2071,7 +2191,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                     event = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     event = {"type": "heartbeat", "session_id": session_id, "message": "Trace still running"}
-                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                yield "data: " + json.dumps(_sanitize_json_payload(event), ensure_ascii=False, allow_nan=False) + "\n\n"
                 if event.get("type") in ("done", "error"):
                     break
         finally:
@@ -2263,9 +2383,9 @@ async def agent_chat_stream(request: ChatRequest):
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=300.0)
                 except asyncio.TimeoutError:
-                    yield "data: " + json.dumps({"type": "error", "message": "分析超时"}, ensure_ascii=False) + "\n\n"
+                    yield "data: " + json.dumps({"type": "error", "message": "分析超时"}, ensure_ascii=False, allow_nan=False) + "\n\n"
                     break
-                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                yield "data: " + json.dumps(_sanitize_json_payload(event), ensure_ascii=False, allow_nan=False) + "\n\n"
                 if event.get("type") in ("done", "error"):
                     break
         finally:

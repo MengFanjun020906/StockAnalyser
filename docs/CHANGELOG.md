@@ -10,7 +10,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
 
+- [新功能] `llm_expert_committee` 新增低位启动专家 `early_turn_expert`，接入 `get_realtime_quote`、`analyze_trend`、`calculate_ma`、`get_volume_analysis`、`analyze_price_structure`、`get_capital_flow`、`get_stock_info` 白名单；committee 共享种子池同步补充 `fundamental_snapshot` 与 `low_base_structure` 低位来源，避免低位专家成为仅在强势样本上运行的空壳接入。
+- [修复] Agent Trace 在 `watchlist_scan` 无唯一目标股票时不再错误复用持仓股和最后一条实时行情生成单股票 `risk_gate`；同时按股票代码精确匹配 `get_realtime_quote` 结果，并让单股深挖用真实 `quote_trade_date/price_label/freshness_note` 覆盖 LLM 错误行情口径，避免 Trace 报告出现串票或把休市行情写成盘中数据。
+- [新功能] 候选发现支持 LLM 专家委员会模式：新增 `src/agent/candidate_experts_v2/committee.py` facade（`run_committee_discovery`），`AgentTraceRunRequest.candidate_discovery_mode` 单次请求级生效，request 优先级 > `.env` `AGENT_CANDIDATE_DISCOVERY_MODE` > 默认 `deterministic`；committee 失败自动回退 deterministic 并 emit `selection_candidate_discovery_mode` 事件携带 `fallback=True`，避免 LLM 异常拖垮选股流水线。
+- [新功能] 前端 `AgentTracePage` 在配置面板新增"候选发现模式"下拉，选项 `deterministic`（默认）/`llm_expert_committee`（实验），选择会持久化到 `localStorage.dsa.candidateDiscoveryMode` 并按当次随 `traceStream` payload 提交。
+- [测试] 新增 `tests/test_candidate_committee.py`，覆盖 committee facade 的 schema 兼容、资金面证据 attach 与 deterministic 异常 coerce 路径；`tests/test_agent_stock_selection.py` 补充 `SelectionRunContext.candidate_discovery_mode` 默认值、`_resolve_candidate_discovery_mode` fallback 与 `_run_candidate_discovery_tool` LLM 分流/降级用例；`tests/test_agent_models_api.py` 补充 `AgentTraceRunRequest.candidate_discovery_mode` 合法/非法/默认值 Pydantic 校验。
+- [新功能] 新增 macOS 一键部署：`scripts/install-mac.sh`（自动检测 Intel / Apple Silicon，装 Xcode CLT + Homebrew + `python@3.11` + `node@22` + `uv` + 项目依赖，剔除 graphiti / neo4j 并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB），并提供 `scripts/start-backend.command` / `scripts/start-web.command` 双击启动器（内部 `eval brew shellenv` 兼容 Finder 启动）。
+- [文档] 新增 `docs/deploy-to-new-mac.md`，覆盖从空白 Mac -> Homebrew -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
+
+- [新功能] 资金面候选专家新增 per-dimension 工具手册 (`src/agent/candidate_experts_v2/tools_manifest/capital.yaml`)，覆盖 11 个白名单工具的 priority / when_to_use / typical_args / returns_summary / key_fields / combo_hints / cost / failure_modes 9 字段业务语义；YAML 在 `CapitalFlowExpert.__init__` 阶段加载并按 priority 渲染进 SYSTEM prompt，并对 whitelist / ToolRegistry / typical_args 参数名做三层一致性校验，typical_args 支持 `{today}` / `{seed_codes}` 运行时占位符替换。
+- [测试] 新增 `tests/test_tools_manifest.py`，覆盖 manifest 加载、白名单与 registry 交叉校验、参数名子集校验、占位符替换、Markdown 渲染顺序和最终 SYSTEM prompt 注入路径，共 16 个用例。
+
+- [新功能] 新增新机器部署脚本：`scripts/install-windows.ps1`（Windows 宿主启用 WSL2 并安装 Ubuntu）、`scripts/bootstrap-wsl.sh`（WSL 内一键装 Python 3.11 / Node 22 / uv / 依赖，自动剔除 graphiti、neo4j 行并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB）、`scripts/start-backend.sh` 与 `scripts/start-web.sh`（前台启动器）。
+- [文档] 新增 `docs/deploy-to-new-windows.md`，覆盖从空白 Windows -> WSL2 -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
+- [新功能] 新增 `src/agent/candidate_experts_v2` 多专家选股委员会骨架（LLM 驱动 + 工具白名单 enforcement + 跨 session 文件缓存），首发资金面专家 `capital_flow_expert`；默认开关 `AGENT_CANDIDATE_DISCOVERY_MODE=deterministic` 不影响现网，需显式切换 `llm_expert_committee` 才会启用。
+- [文档] 新增 Agent 选股阶段当前实现说明，梳理 `watchlist_scan` 阶段流水线、底层工具取证、Trace artifact 和 `NaN` 非标准 JSON 排障路径。
 - [改进] Agent Trace 最终报告新增 Markdown 导出按钮，便于保存和复盘本轮分析结果。
+- [改进] Agent Trace 与候选池页面统一为候选决策榜展示，默认突出建议动作、评分、核心依据和可展开证据，原始专家分组降级为折叠调试区。
+- [改进] 选股最终报告将高分 wait 拆分为条件入场、强观察和等待确认，并把标题分数标注为候选分，补充次日触发、禁止追高和失效条件。
+- [文档] 新增 Agent 选股 wait 过度保守校准方案，规划将强等待候选拆分为条件入场、强观察和普通等待，并优化候选分与报告渲染语义。
+- [新功能] Agent TuShare 工具补齐板块主题、消息事件、基本面和技术侧直连接口，并将 THS 板块资金流、结构化事件和 `daily_basic` 快照接入候选专家。
+- [新功能] 资金面候选专家补齐 TuShare 东财资金流、龙虎榜、涨停榜、连板天梯和热榜工具，并接入 L1 候选发现链路，所有新增 TuShare 工具均不做跨数据源 fallback。
+- [新功能] 新增 `get_tushare_moneyflow_ths` Agent 工具，并在 L1 资金面候选专家中优先使用 TuShare THS 个股资金流，不做跨数据源 fallback。
+- [文档] 新增 TuShare 候选专家工具补全记录，梳理资金、板块、消息、基本面和技术候选专家可复用的 TuShare 接口。
+- [修复] Agent Trace 选中具体账户时强制注入该账户持仓上下文，并在执行层为持仓快照和搜索工具补齐账户/代码名称约束，避免报告误用全账户汇总或代码名称错配。
+- [修复] `get_capital_flow` 在 StockAPI `codeFlow` fallback 上按接口文档使用 `pageSize=50`，并开放 `start_date/end_date/page_no/page_size` 参数，支持按指定日期窗口查询历史资金流。
+- [修复] `get_capital_flow` 明确以 Tushare `moneyflow` 为资金面主数据源，失败时回退 StockAPI `codeFlow`，避免私有网关正常时仍落到滞后历史窗口。
+- [新功能] `watchlist_scan` 新增均衡候选证据包，按策略、消息、资金、基本面各最多 2 只候选统一取证并落盘 `candidate_evidence.json` / `candidate_evidence.md`；候选级取证并行执行，重复候选按维度顺序跳过并继续补位，后续深挖优先复用已获取证据。
+- [修复] Tushare 官方接口和私有网关请求默认绕过本机代理，避免资金流 fallback 被 `127.0.0.1` 代理超时拖垮。
+- [修复] 统一 Tushare 查询入口改为优先使用官方 SDK 并显式设置 `pro._DataApi__http_url`，兼容私有网关调用方式，HTTP 轻量客户端仅作为兜底；SDK 超时隔离使用线程而非进程级信号，避免影响后端服务稳定性。
+- [修复] `get_capital_flow` 的 Tushare `moneyflow` 兜底不再先请求慢速交易日历，并为私有网关预留更长单次预算，避免 5 秒超时导致真实资金流数据被判失败。
+- [改进] 默认将 `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` 提升到 15 秒，并将 `watchlist_scan` 的 `AGENT_SELECTION_DEEP_DIVE_LIMIT` 下调到 2，减少资金流误超时并缩短整轮选股耗时。
+- [修复] `get_chip_distribution` 继续以 Tushare `cyq_chips` 为主链路，并修复 Tushare 子请求预算向下取整导致 `1.5s` 被截断为 `1s` 的超时误判；同时上调默认筹码预算以适配私有网关最近交易日查询耗时。
+- [修复] Tushare 私有网关查询改为进程内串行调用，并在 `get_capital_flow` 的 `moneyflow` 空表结果上自动重试一次，同时记录查询参数，避免并发 Trace 下偶发空表被误判为资金流缺失。
+- [修复] Tushare 默认 HTTP 入口统一切换为 `http://118.89.66.41:8010/`，并保留 `TUSHARE_HTTP_URL` 作为部署覆盖项。
+- [改进] 候选发现底层补齐更丰富的技术指标输出：AlphaSift/Sequoia 技术候选现在可携带 MA、MACD、RSI 与布林带位置等信息；同时修复 provider 侧 `_short_metric` 缺失导致技术专家链路报错的问题。
 - [文档] 新增 Agent 候选池多专家架构方案，明确当前串行候选召回与真正多专家候选生成的区别，并规划 AlphaSift、Sequoia、sector、消息和资金工具的复用路径。
 - [文档] 新增 Agent 候选池策略缺口与建设路线，梳理 AlphaSift、Sequoia、资金、基本面、消息和回评闭环的待办事项。
 - [文档] 新增消息事件 Graphiti 知识图谱方案，规划新闻入库、事件归一、成熟度追踪、验证事实、图谱候选生成和前端事件链路展示。

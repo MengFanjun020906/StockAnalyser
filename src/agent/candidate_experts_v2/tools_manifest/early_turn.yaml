@@ -1,0 +1,151 @@
+dimension: early_turn
+description: >-
+  低位启动专家可调用的工具集，覆盖位置、趋势、量价、资金与基础面验证。
+  目标不是找已经涨起来的强势股，而是识别仍处中低位、但开始出现转强拐点的候选。
+
+tools:
+  - tool: get_realtime_quote
+    priority: 10
+    when_to_use: >-
+      确认当前价格、涨跌幅、换手率和行情时效，是所有低位启动判断的基础。
+      先确认价格是否仍处中低位，再决定是否值得继续验证。
+    typical_args:
+      stock_code: "{seed_codes}"
+    returns_summary: >-
+      返回最新可用价、涨跌幅、换手率、量比、交易日与行情时效标签，可区分盘中与休市场景。
+    key_fields:
+      - price
+      - change_pct
+      - turnover_rate
+      - volume_ratio
+      - quote_trade_date
+      - price_label
+      - freshness_note
+    combo_hints:
+      - 与 analyze_trend / calculate_ma 联动，判断是否刚站回关键均线。
+      - 与 get_capital_flow 联动，判断“价格未大涨但资金已回流”。
+    cost: cheap
+    failure_modes:
+      - 非交易日返回最近可用价，不代表盘中异动。
+
+  - tool: analyze_trend
+    priority: 12
+    when_to_use: >-
+      判断趋势是否从空头/弱势转向中性或多头。低位启动候选至少要出现“下跌结束或弱转中”的迹象。
+    typical_args:
+      stock_code: "{seed_codes}"
+    returns_summary: >-
+      返回 trend_status、bias_ma5、支撑/压力位等综合趋势结论。
+    key_fields:
+      - trend_status
+      - bias_ma5
+      - support_levels
+      - resistance_levels
+    combo_hints:
+      - 弱势空头直接否决；弱转中性、刚站回 MA20、支撑抬高更适合进入候选。
+    cost: cheap
+    failure_modes:
+      - 历史数据不足时结论弱化。
+
+  - tool: calculate_ma
+    priority: 13
+    when_to_use: >-
+      当需要精确说明“刚站回 MA20 / MA60”或均线拐头时调用，用来补足趋势工具的细粒度解释。
+    typical_args:
+      stock_code: "{seed_codes}"
+      periods: "5,10,20,60,120"
+      days: 160
+    returns_summary: >-
+      返回多条均线的当前值与相对关系，适合判断是否处于低位修复的早期阶段。
+    key_fields:
+      - ma_values
+      - latest_price
+      - relations
+    combo_hints:
+      - “价格刚站回 MA20，但离 MA120 仍远”是低位启动的典型信号之一。
+    cost: cheap
+    failure_modes:
+      - 历史天数不足时长周期均线缺失。
+
+  - tool: get_volume_analysis
+    priority: 15
+    when_to_use: >-
+      判断是否出现首次放量、缩量回踩、量价修复。低位候选不能只有价格位置低，还要有量能配合。
+    typical_args:
+      stock_code: "{seed_codes}"
+      days: 30
+    returns_summary: >-
+      返回量价关系、放量/缩量特征与成交额变化。
+    key_fields:
+      - volume_ratio
+      - volume_trend
+      - amount
+      - price_volume_signal
+    combo_hints:
+      - 与 analyze_price_structure 联动，确认“平台内多次试探压力位但回落收敛”。
+    cost: cheap
+    failure_modes:
+      - 小盘股量能噪声大，需要结合价格结构一起看。
+
+  - tool: analyze_price_structure
+    priority: 16
+    when_to_use: >-
+      识别平台整理、前高压力、多次试探未破、下方承接是否稳定。
+      这是“潜在突破前夜”最关键的结构工具。
+    typical_args:
+      stock_code: "{seed_codes}"
+      days: 120
+      swing_window: 3
+    returns_summary: >-
+      返回价格结构、摆动高低点、BOS/CHOCH 等结构化信息。
+    key_fields:
+      - status
+      - chan
+      - smc
+    combo_hints:
+      - 如果多次试探同一压力位且回落幅度收敛，可视为筹码吸收。
+      - 每次冲高都长上影且迅速跌回，视为弱势反弹，不应入池。
+    cost: medium
+    failure_modes:
+      - 结构工具对极低流动性个股稳定性较差。
+
+  - tool: get_capital_flow
+    priority: 18
+    when_to_use: >-
+      验证是否存在“价格未充分启动，但主力资金已回流”的信号。
+      低位票若无资金回流，容易只是下跌中继。
+    typical_args:
+      stock_code: "{seed_codes}"
+    returns_summary: >-
+      返回当日主力净流入、5/10 日累计资金流及来源链路。
+    key_fields:
+      - latest_main_net_inflow
+      - cum_main_net_inflow_5d
+      - cum_main_net_inflow_10d
+      - source
+    combo_hints:
+      - 当日转正 + 5 日改善，比单日爆量更适合低位启动候选。
+    cost: medium
+    failure_modes:
+      - 非 A 股或资金流源超时时可能返回 partial/failed。
+
+  - tool: get_stock_info
+    priority: 22
+    when_to_use: >-
+      用于确认行业、基本面标签和估值不是明显高位透支。低位启动不等于纯技术反抽，需要基本面或行业逻辑不过分恶化。
+    typical_args:
+      stock_code: "{seed_codes}"
+    returns_summary: >-
+      返回行业/板块、基础估值和部分基本面信息。
+    key_fields:
+      - belong_boards
+      - pe_ttm
+      - pb
+      - roe
+      - revenue_growth
+      - profit_growth
+    combo_hints:
+      - 与 fundamental_snapshot 种子一起使用时，可验证“成长改善但价格未反映”。
+    cost: medium
+    failure_modes:
+      - 某些字段可能缺失，只能作为辅助验证，不应单独决定入池。
