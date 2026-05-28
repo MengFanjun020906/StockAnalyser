@@ -1684,6 +1684,8 @@ def _merge_capital_evidence(
             existing.setdefault("capital", []).extend(ev_list)
             target["llm_expert_evidence"] = existing
             target.setdefault("llm_expert_dimensions", []).append("capital")
+            stances = target.setdefault("llm_expert_stances", {})
+            stances["capital"] = str(getattr(llm_cand, "stance", "") or "neutral")
             matched += 1
         else:
             extras_appended.append(
@@ -1694,6 +1696,7 @@ def _merge_capital_evidence(
                     "reason": getattr(llm_cand, "reason", "") or "LLM capital-flow expert",
                     "llm_expert_evidence": {"capital": ev_list},
                     "llm_expert_dimensions": ["capital"],
+                    "llm_expert_stances": {"capital": str(getattr(llm_cand, "stance", "") or "neutral")},
                 }
             )
 
@@ -1760,6 +1763,8 @@ def _merge_early_turn_evidence(
             existing.setdefault("early_turn", []).extend(ev_list)
             target["llm_expert_evidence"] = existing
             target.setdefault("llm_expert_dimensions", []).append("early_turn")
+            stances = target.setdefault("llm_expert_stances", {})
+            stances["early_turn"] = str(getattr(llm_cand, "stance", "") or "neutral")
             if risk_list:
                 existing_risks = target.get("llm_expert_risks") or {}
                 existing_risks.setdefault("early_turn", []).extend(risk_list)
@@ -1774,6 +1779,7 @@ def _merge_early_turn_evidence(
                     "reason": getattr(llm_cand, "reason", "") or "LLM early-turn expert",
                     "llm_expert_evidence": {"early_turn": ev_list},
                     "llm_expert_dimensions": ["early_turn"],
+                    "llm_expert_stances": {"early_turn": str(getattr(llm_cand, "stance", "") or "neutral")},
                     "llm_expert_risks": {"early_turn": risk_list} if risk_list else {},
                 }
             )
@@ -1841,6 +1847,7 @@ def _packet_dimension(packet: Any) -> str:
 def _committee_candidate_score(item: Dict[str, Any]) -> float:
     base = _safe_float(item.get("signal_score")) or 0.0
     dims = list(dict.fromkeys(item.get("llm_expert_dimensions") or []))
+    stances = item.get("llm_expert_stances") or {}
     bonus = 0.0
     if "capital" in dims and "early_turn" in dims:
         bonus += 12.0
@@ -1848,7 +1855,14 @@ def _committee_candidate_score(item: Dict[str, Any]) -> float:
         bonus += 8.0
     elif "early_turn" in dims:
         bonus += 4.0
-    return round(base + bonus, 2)
+    # Stance 修正：oppose 扣分（专家基于工具证据的推理判断），invalid 轻扣
+    stance_penalty = 0.0
+    for dim_stance in stances.values():
+        if dim_stance == "oppose":
+            stance_penalty += 15.0
+        elif dim_stance == "invalid":
+            stance_penalty += 5.0
+    return round(max(0.0, base + bonus - stance_penalty), 2)
 
 
 def _sort_committee_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2508,6 +2522,25 @@ def _local_price_volume_seed_from_bars(symbol: str, df: Any, *, market_regime: O
     )
 
 
+def _extract_worth(raw_item: Dict[str, Any]) -> bool:
+    """从 LLM 返回的 decision 字典中提取 keep/reject 意图。
+
+    接受常见变体字段名，避免因 LLM 返回 decision/accept/keep 等非标准 key
+    而静默把所有种子判为 reject。字段全缺时默认保留（宁可多不少）。
+    """
+    for key in ("worth_deep_analysis", "decision", "accept", "keep", "include", "selected"):
+        val = raw_item.get(key)
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.strip().lower() in ("true", "yes", "keep", "accept", "1", "include", "selected")
+    return True  # 字段全缺默认保留
+
+
 def _seed_for_gate(seed: SeedItem) -> Dict[str, Any]:
     dimensions = sorted(
         {
@@ -2588,13 +2621,14 @@ def _run_seed_gate(
         _seed_log_preview(seed_list),
     )
     system_prompt = (
-        "你是 A 股候选种子池的轻量门卫。你的职责不是判断买卖方向，"
-        "只判断一个异常种子是否值得继续交给下游专家深挖。\n"
+        "你是 A 股候选种子池的轻量门卫。你的职责是判断种子的触发信号在逻辑上是否自洽、来源是否可信。\n"
+        "重要说明：你无法判断'这是否是真正的市场异常'——那需要完整历史数据。\n"
+        "你可以判断的是：信号描述是否自相矛盾、来源是否存在质量问题、触发条件是否在 hint 中有合理解释。\n"
         "硬规则：\n"
         "1. 不得新增输入列表之外的股票代码。\n"
         "2. 保留多来源多维度样本，不能只偏向涨停/热榜/强势突破。\n"
-        "3. 消息/热度/在线来源如果质量不稳，只能降低置信度，不能直接抹掉全部相关样本。\n"
-        "4. 输出只做噪音过滤和优先级，不输出买入/卖出建议。\n"
+        "3. 消息/热度/在线来源如果质量不稳，只能标记为低可信度，不能直接抹掉全部相关样本。\n"
+        "4. 输出只做信号自洽性过滤，不输出买入/卖出建议，不重新给分数。\n"
         "5. 严格输出 JSON，不要 Markdown。"
     )
     user_prompt = {
@@ -2608,8 +2642,7 @@ def _run_seed_gate(
                 {
                     "code": "600000",
                     "worth_deep_analysis": True,
-                    "reason": "一句话解释，说明是真异常还是噪音",
-                    "priority_score": 0,
+                    "reason": "30字内说明：信号逻辑是否自洽，或为何不值得深挖",
                 }
             ]
         },
@@ -2655,24 +2688,21 @@ def _run_seed_gate(
             })
             continue
         seed = by_code[code]
-        worth = bool(raw_item.get("worth_deep_analysis"))
-        score = _safe_float(raw_item.get("priority_score"))
+        worth = _extract_worth(raw_item)
         reason = str(raw_item.get("reason") or "").strip()
         decision = {
             "code": code,
             "worth_deep_analysis": worth,
             "reason": reason[:240],
-            "priority_score": score if score is not None else seed.priority_score,
+            "priority_score": seed.priority_score,
             "source": seed.source,
         }
         decisions.append(decision)
         seed.extras["seed_gate"] = {
             "worth_deep_analysis": worth,
             "reason": decision["reason"],
-            "priority_score": decision["priority_score"],
+            "priority_score": seed.priority_score,
         }
-        if score is not None:
-            seed.priority_score = round(max(0.0, min(100.0, score)), 2)
         if reason:
             seed.context_hint = reason[:240]
         if worth:

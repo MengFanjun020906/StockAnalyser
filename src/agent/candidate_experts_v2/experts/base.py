@@ -449,6 +449,17 @@ class BaseExpert:
             seed_sources=source_counts,
         )
 
+    def _compute_confidence_from_tool_coverage(self, candidate: "ExpertCandidateV2") -> float:
+        """根据证据工具覆盖率计算置信度，不依赖 LLM 猜测的数字。"""
+        evidence = candidate.evidence or []
+        if not evidence:
+            return 0.3
+        tools_used = len({ev.tool for ev in evidence if ev.tool})
+        base = min(0.9, 0.5 + tools_used * 0.15)
+        empty_summary = sum(1 for ev in evidence if not ev.summary)
+        penalty = empty_summary * 0.05
+        return round(max(0.2, base - penalty), 2)
+
     def _parse_candidates(self, payload: Dict[str, Any]) -> List[ExpertCandidateV2]:
         raw = payload.get("candidates") if isinstance(payload, dict) else None
         if not isinstance(raw, list):
@@ -506,6 +517,9 @@ class BaseExpert:
                 )
             except Exception as exc:
                 logger.debug("skip malformed candidate %s: %s", item, exc)
+        # 用工具覆盖率覆盖 LLM 生成的 confidence（LLM 没有全市场对比数据，生成的数字无依据）
+        for cand in parsed:
+            cand.confidence = self._compute_confidence_from_tool_coverage(cand)
         return parsed
 
     def _parse_data_quality(self, payload: Dict[str, Any]) -> ExpertDataQualityV2:
