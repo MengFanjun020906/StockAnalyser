@@ -85,8 +85,8 @@ SEED_SOURCE_ORDER = [
 ]
 SEED_BUILD_LIMIT = 60
 SEED_GATE_INPUT_LIMIT = 60
-SEED_GATE_OUTPUT_LIMIT = 24
-SEED_GATE_MIN_KEEP = 12
+SEED_GATE_OUTPUT_LIMIT = 12
+SEED_GATE_MIN_KEEP = 6
 SEED_GATE_TRIGGER_THRESHOLD = 30
 LOCAL_HARD_EXCLUSION_MIN_TRADING_DAYS = 60
 LOCAL_HARD_EXCLUSION_MIN_AVG_TURNOVER = 10_000_000.0
@@ -2699,6 +2699,32 @@ def _run_seed_gate(
             accepted_codes.add(seed.code)
             if len(accepted) >= min(min_keep, len(seed_list)):
                 break
+
+    # Source-diversity fill: ensure every active source has at least one slot.
+    accepted_sources = {seed.source for seed in accepted}
+    rejected_by_source: Dict[str, List[SeedItem]] = {}
+    for seed in seed_list:
+        if seed.code not in accepted_codes:
+            rejected_by_source.setdefault(seed.source, []).append(seed)
+    if len(accepted) < target_limit:
+        for src in SEED_SOURCE_ORDER:
+            if len(accepted) >= target_limit:
+                break
+            if src in accepted_sources or src not in rejected_by_source:
+                continue
+            candidates_for_src = sorted(
+                rejected_by_source[src],
+                key=lambda item: (-(_safe_float(item.priority_score or 0.0) or 0.0), str(item.code)),
+            )
+            best = candidates_for_src[0]
+            best.extras["seed_gate"] = {
+                "worth_deep_analysis": True,
+                "reason": "source_diversity_fill",
+                "priority_score": best.priority_score,
+            }
+            accepted.append(best)
+            accepted_codes.add(best.code)
+            accepted_sources.add(src)
 
     accepted.sort(key=lambda item: (-(_safe_float(item.priority_score or 0.0) or 0.0), str(item.code)))
     selected = accepted[:target_limit]
