@@ -313,13 +313,10 @@ def main() -> int:
         start_text = start.strftime("%Y-%m-%d")
         mode = f"full ({start_text}..{end_text})"
 
-    resume_target_date = get_global_max_date_in_db(db_path)
-    if resume_target_date is not None:
-        try:
-            if (end - date.fromisoformat(resume_target_date)).days > args.incremental_threshold:
-                resume_target_date = None
-        except ValueError:
-            resume_target_date = None
+    # Resume target is today's fetch end date, not the DB's current max date.
+    # Using the DB max date caused all symbols to be skipped on re-runs of the
+    # same day because every symbol already has max_date == DB max date.
+    resume_target_date = end_text
 
     import baostock as bs
     login = bs.login()
