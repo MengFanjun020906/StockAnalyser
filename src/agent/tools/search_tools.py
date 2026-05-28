@@ -364,8 +364,62 @@ score_stock_news_sentiment_tool = ToolDefinition(
 # search_comprehensive_intel
 # ============================================================
 
+def _preprocess_intel_with_llm(
+    raw_items: List[Dict[str, Any]],
+    stock_name: str,
+) -> Dict[str, Any]:
+    """Lightweight LLM pass to produce a fixed-schema intel summary."""
+    import json as _json
+
+    if not raw_items:
+        return {"items": [], "key_signals": [], "overall_sentiment": "unknown"}
+
+    compact = [
+        {
+            "dim": item.get("dim", ""),
+            "title": (item.get("title") or "")[:120],
+            "date": item.get("date") or "",
+            "source": item.get("source") or "",
+        }
+        for item in raw_items
+    ]
+
+    prompt = (
+        f'你是股票新闻解析助手。对以下关于"{stock_name}"的新闻标题列表，'
+        "输出JSON（无其他内容）：\n"
+        '{"items":[{"title":"原标题","date":"日期","source":"来源","dim":"维度",'
+        '"signal_type":"capital_flow|earnings|risk|announcement|policy|general",'
+        '"sentiment":"positive|negative|neutral","one_line":"一句话要点"}],'
+        '"key_signals":["最关键信号"],"overall_sentiment":"positive|negative|neutral|mixed"}\n\n'
+        f"新闻列表：\n{_json.dumps(compact, ensure_ascii=False)}"
+    )
+
+    try:
+        from src.agent.llm_adapter import LLMToolAdapter
+
+        resp = LLMToolAdapter().call_text(
+            [{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=800,
+            timeout=10.0,
+        )
+        text = (resp.content or "").strip()
+        if text.startswith("```"):
+            parts = text.split("```")
+            text = parts[1].lstrip("json").strip() if len(parts) > 1 else text
+        return _json.loads(text)
+    except Exception as exc:
+        logger.warning("Intel LLM preprocessing failed: %s", exc)
+
+    return {
+        "items": compact,
+        "key_signals": [],
+        "overall_sentiment": "unknown",
+    }
+
+
 def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict:
-    """Multi-dimensional intelligence search."""
+    """Multi-dimensional intelligence search with LLM-preprocessed structured output."""
     service = _get_search_service()
 
     if not service.is_available:
@@ -374,17 +428,14 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
     intel_results = service.search_comprehensive_intel(
         stock_code=stock_code,
         stock_name=stock_name,
-        max_searches=6,
+        max_searches=7,
     )
 
     if not intel_results:
         return {"error": "Comprehensive intel search returned no results"}
 
-    # Format into readable report
-    report = service.format_intel_report(intel_results, stock_name)
-
-    # Also return structured data
-    dimensions = {}
+    # Collect raw items across all dimensions for LLM preprocessing
+    raw_items: List[Dict[str, Any]] = []
     for dim_name, response in intel_results.items():
         if response and response.success:
             _persist_news_response(
@@ -393,22 +444,28 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
                 dimension=dim_name,
                 response=response,
             )
-            dimensions[dim_name] = {
-                "query": response.query,
-                "results_count": len(response.results),
-                "results": [
-                    {
-                        "title": r.title,
-                        "snippet": r.snippet,
-                        "source": r.source,
-                    }
-                    for r in response.results[:3]  # limit to 3 per dimension to save tokens
-                ],
-            }
+            for r in response.results[:4]:
+                raw_items.append({
+                    "dim": dim_name,
+                    "title": r.title,
+                    "date": r.published_date or "",
+                    "source": r.source,
+                    "snippet": (r.snippet or "")[:80],
+                })
+
+    # Lightweight LLM pass → fixed schema; fallback to raw compact list on failure
+    intel = _preprocess_intel_with_llm(raw_items, stock_name)
 
     return {
-        "report": report,
-        "dimensions": dimensions,
+        "stock_code": _canonical_search_code(stock_code),
+        "stock_name": stock_name,
+        "intel": intel,
+        "dimensions_searched": [
+            dim for dim, resp in intel_results.items() if resp and resp.success
+        ],
+        "dimensions_empty": [
+            dim for dim, resp in intel_results.items() if not (resp and resp.success)
+        ],
     }
 
 

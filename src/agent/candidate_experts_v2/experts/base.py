@@ -384,6 +384,10 @@ class BaseExpert:
                 "name": seed.name,
                 "source": seed.source,
                 "hint": seed.hint,
+                "priority_score": seed.priority_score,
+                "freshness": seed.freshness,
+                "trigger_signals": seed.trigger_signals[:5],
+                "context_hint": seed.context_hint,
             }
             for seed in seeds[:30]
         ]
@@ -490,8 +494,8 @@ class BaseExpert:
                         code=code,
                         name=str(item.get("name") or code),
                         market=str(item.get("market") or "cn"),
-                        score=float(item.get("score") or 50.0),
-                        confidence=float(item.get("confidence") or 0.5),
+                        score=float(item.get("score") if isinstance(item.get("score"), (int, float)) else 50.0),
+                        confidence=float(item.get("confidence") if isinstance(item.get("confidence"), (int, float)) else 0.5),
                         stance=str(item.get("stance") or "support"),  # type: ignore[arg-type]
                         setup_type=str(item.get("setup_type") or item.get("candidate_type") or "") or None,  # type: ignore[arg-type]
                         reason=str(item.get("reason") or ""),
