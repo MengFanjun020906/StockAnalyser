@@ -79,6 +79,26 @@ class HistoryLoaderTestCase(unittest.TestCase):
         self.assertEqual(source, "eastmoney")
         mock_fm.get_daily_data.assert_called_once_with("600519", days=60)
 
+    @patch("src.services.history_loader._get_fetcher_manager")
+    @patch("src.storage.get_db")
+    def test_can_skip_network_fallback_when_db_empty(self, mock_get_db, mock_get_fm):
+        from src.services.history_loader import load_history_df
+
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = []
+        mock_get_db.return_value = mock_db
+
+        df, source = load_history_df(
+            "000300",
+            days=260,
+            target_date=date(2026, 5, 26),
+            fallback_to_network=False,
+        )
+
+        self.assertIsNone(df)
+        self.assertEqual(source, "db_cache_miss")
+        mock_get_fm.assert_not_called()
+
     # ------------------------------------------------------------------
     # ContextVar integration
     # ------------------------------------------------------------------

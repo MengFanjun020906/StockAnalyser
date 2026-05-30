@@ -308,6 +308,7 @@ def _feature_row(symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
     macd_status = _macd_status(df["close"])
     rsi_value = _rsi(df["close"], 12)
     rsi_status = "oversold" if rsi_value < 30 else "overbought" if rsi_value > 70 else "neutral"
+    boll_mid, boll_upper, boll_lower, boll_bandwidth, boll_position = _bollinger_metrics(df["close"])
     signal_score = _signal_score(change_pct, change_60d, volume_ratio_20d, ma5, ma20, ma60, macd_status)
     return {
         "code": symbol,
@@ -325,9 +326,18 @@ def _feature_row(symbol: str, df: pd.DataFrame) -> Dict[str, Any]:
         "change_60d": change_60d,
         "ma_bullish": bool(pd.notna(ma5) and pd.notna(ma20) and close > ma5 > ma20),
         "price_above_ma20": bool(pd.notna(ma20) and close > ma20),
+        "ma5": ma5,
+        "ma20": ma20,
+        "ma60": ma60,
         "signal_score": signal_score,
         "macd_status": macd_status,
+        "rsi_value": rsi_value,
         "rsi_status": rsi_status,
+        "boll_mid": boll_mid,
+        "boll_upper": boll_upper,
+        "boll_lower": boll_lower,
+        "boll_bandwidth": boll_bandwidth,
+        "boll_position": boll_position,
         "breakout_20d_pct": breakout_20d_pct,
         "range_20d_pct": range_20d_pct,
         "volume_ratio_20d": volume_ratio_20d,
@@ -371,6 +381,28 @@ def _rsi(close: pd.Series, period: int) -> float:
     rsi = 100 - (100 / (1 + rs))
     value = rsi.iloc[-1]
     return float(value) if pd.notna(value) else 50.0
+
+
+def _bollinger_metrics(close: pd.Series, period: int = 20, width: float = 2.0) -> tuple[Any, Any, Any, Any, str]:
+    if len(close) < period:
+        return pd.NA, pd.NA, pd.NA, pd.NA, "unknown"
+    mid = close.rolling(period).mean().iloc[-1]
+    std = close.rolling(period).std(ddof=0).iloc[-1]
+    if pd.isna(mid) or pd.isna(std):
+        return pd.NA, pd.NA, pd.NA, pd.NA, "unknown"
+    upper = mid + width * std
+    lower = mid - width * std
+    last = close.iloc[-1]
+    bandwidth = (upper - lower) / mid * 100 if mid else pd.NA
+    if last >= upper:
+        position = "above_upper"
+    elif last <= lower:
+        position = "below_lower"
+    elif last >= mid:
+        position = "upper_half"
+    else:
+        position = "lower_half"
+    return mid, upper, lower, bandwidth, position
 
 
 def _signal_score(
@@ -539,7 +571,16 @@ def _candidate_payload(row: pd.Series, strategy: AlphaSiftStrategy) -> Dict[str,
             "pullback_to_ma20_pct",
             "consolidation_days_20d",
             "macd_status",
+            "rsi_value",
             "rsi_status",
+            "ma5",
+            "ma20",
+            "ma60",
+            "boll_mid",
+            "boll_upper",
+            "boll_lower",
+            "boll_bandwidth",
+            "boll_position",
             "screen_score",
         )
     }
@@ -596,6 +637,37 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
             "detail": f"AlphaSift YAML 多因子策略入池：{'、'.join(strategies)}",
         })
     technical_bits = []
+    ma5 = metrics.get("ma5")
+    ma20 = metrics.get("ma20")
+    ma60 = metrics.get("ma60")
+    if ma5 is not None and ma20 is not None:
+        ma_text = f"MA5={_short_metric(ma5)}；MA20={_short_metric(ma20)}"
+        if ma60 is not None:
+            ma_text += f"；MA60={_short_metric(ma60)}"
+        technical_bits.append(ma_text)
+    macd_status = str(metrics.get("macd_status") or "").strip()
+    rsi_status = str(metrics.get("rsi_status") or "").strip()
+    rsi_value = metrics.get("rsi_value")
+    boll_position = str(metrics.get("boll_position") or "").strip()
+    boll_bandwidth = metrics.get("boll_bandwidth")
+    if macd_status:
+        macd_label = {"bullish": "MACD 多头", "bearish": "MACD 空头", "neutral": "MACD 中性"}.get(macd_status, f"MACD={macd_status}")
+        technical_bits.append(macd_label)
+    if rsi_value is not None:
+        rsi_label = f"RSI={_short_metric(rsi_value)}"
+        if rsi_status and rsi_status != "neutral":
+            rsi_label += f"（{'超买' if rsi_status == 'overbought' else '超卖'}）"
+        technical_bits.append(rsi_label)
+    if boll_position:
+        boll_label = {
+            "above_upper": "布林上轨外运行",
+            "upper_half": "布林中上轨运行",
+            "lower_half": "布林中下轨运行",
+            "below_lower": "布林下轨外运行",
+        }.get(boll_position, f"布林位置={boll_position}")
+        if boll_bandwidth is not None:
+            boll_label += f"；带宽={_short_metric(boll_bandwidth)}%"
+        technical_bits.append(boll_label)
     for key, label in (
         ("breakout_20d_pct", "20 日突破幅度"),
         ("range_20d_pct", "20 日区间波动"),
@@ -606,7 +678,7 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
         if value is not None:
             technical_bits.append(f"{label}={value}")
     if technical_bits:
-        dimensions.append({"dimension": "technical", "label": "技术面", "detail": "；".join(technical_bits[:3])})
+        dimensions.append({"dimension": "technical", "label": "技术面", "detail": "；".join(technical_bits[:6])})
     capital_bits = []
     for key, label in (
         ("amount", "成交额"),
@@ -642,6 +714,18 @@ def _display_strategy_names(names: Iterable[Any]) -> List[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _short_metric(value: Any) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    if abs(number) >= 100_000_000:
+        return f"{number / 100_000_000:.2f}亿"
+    if abs(number) >= 10_000:
+        return f"{number / 10_000:.2f}万"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
 
 
 def _unique(items: Iterable[Any]) -> List[str]:

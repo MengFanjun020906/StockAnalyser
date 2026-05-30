@@ -4,6 +4,9 @@ import pandas as pd
 
 from scripts.update_sequoia_candidates import (
     db_summary,
+    filter_resume_symbols,
+    get_global_max_date_in_db,
+    load_symbol_max_dates,
     init_db,
     prune_symbol_row_limit,
     prune_to_latest_trading_days,
@@ -86,3 +89,25 @@ def test_update_sequoia_candidates_prunes_to_latest_dates_and_per_symbol_limit(t
 
     assert deleted_by_symbol == 2
     assert db_summary(str(db_path)) == (4, 2, "2026-01-04", "2026-01-05")
+
+
+def test_update_sequoia_candidates_resume_filters_completed_symbols(tmp_path):
+    db_path = tmp_path / "sequoia_v2.db"
+    init_db(str(db_path))
+    upsert_rows(
+        str(db_path),
+        [
+            ("600001", "2026-01-03", 10, 11, 9, 10.5, 1000, 10_000),
+            ("600002", "2026-01-02", 10, 11, 9, 10.5, 1000, 10_000),
+        ],
+    )
+
+    symbol_max_dates = load_symbol_max_dates(str(db_path))
+    pending, skipped = filter_resume_symbols(
+        ["600001", "600002", "600003"],
+        symbol_max_dates,
+        get_global_max_date_in_db(str(db_path)),
+    )
+
+    assert skipped == 1
+    assert pending == ["600002", "600003"]

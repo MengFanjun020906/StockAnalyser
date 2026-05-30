@@ -1,0 +1,192 @@
+dimension: quality_repair_desk
+description: >-
+  质量修复席位可调用的工具集。目标是核实「基本面改善 + 估值合理 + 价格结构不处于高位」，
+  寻找被市场错杀或尚未定价的基本面拐点机会。
+
+tools:
+  - tool: get_stock_info
+    priority: 5
+    when_to_use: >-
+      获取行业/板块归属、股本、上市日期。
+      判断公司所在行业是否处于景气周期，股本结构是否适合资金进入。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回行业、概念、流通股本、上市日期等基础信息。
+    key_fields:
+      - industry
+      - sector
+      - list_date
+      - float_share
+    combo_hints:
+      - 行业景气 + 小市值 = 修复弹性大。
+      - 超大盘股修复周期长，优先中小盘。
+    cost: cheap
+    failure_modes:
+      - 少数标的信息缺失。
+
+  - tool: get_tushare_daily_basic
+    priority: 8
+    when_to_use: >-
+      获取最新估值数据（PE/PB/PS）和换手率。
+      核查估值是否处于历史低位，是否满足"价值低估"前提。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 PE、PB、PS、市值、换手率、流通市值等日频指标。
+    key_fields:
+      - pe
+      - pb
+      - ps
+      - total_mv
+      - turnover_rate
+    combo_hints:
+      - PB < 1 或 PE 处于历史分位低位 = 低估信号。
+      - 换手率低 + 估值低 = 机构尚未发现，弹性大。
+    cost: cheap
+    failure_modes:
+      - 亏损股 PE 为负，需改用 PB/PS 判断。
+      - 金融股用 PB 比 PE 更有效。
+
+  - tool: get_tushare_financial_indicators
+    priority: 10
+    when_to_use: >-
+      核实核心盈利指标：ROE、净利润增速、毛利率趋势、营收增速。
+      这是质量修复的主要事实来源——必须确认改善趋势，不能仅靠估值低。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 ROE、净利润增速、营收增速、毛利率、净利率等盈利质量指标。
+    key_fields:
+      - roe
+      - netprofit_yoy
+      - revenue_yoy
+      - grossprofit_margin
+      - netprofit_margin
+    combo_hints:
+      - ROE 持续回升 + 净利润增速转正 = 基本面拐点核心信号。
+      - 毛利率改善 + 营收增速 > 净利润增速 = 规模效应尚待释放，空间仍在。
+    cost: medium
+    failure_modes:
+      - 季报数据有延迟（约45天），需关注披露时效。
+      - 并购/资产剥离会导致指标失真，需结合公告核查。
+
+  - tool: get_tushare_financial_statements
+    priority: 12
+    when_to_use: >-
+      核实资产负债表健康度：资产负债率、现金流、有息负债变化。
+      防止盈利改善是"假复苏"（应收账款激增 / 经营现金流为负）。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回资产负债率、有息负债、经营现金流、投资现金流等财务健康指标。
+    key_fields:
+      - debt_to_assets
+      - oper_cash_flow
+      - free_cash_flow
+    combo_hints:
+      - 净利润增长 + 经营现金流同步增长 = 利润质量高，真实修复。
+      - 净利润增长但经营现金流为负 = 利润虚增警示。
+    cost: medium
+    failure_modes:
+      - 部分季度数据缺失；非上市满一年的次新股数据不完整。
+
+  - tool: get_tushare_forecast
+    priority: 15
+    when_to_use: >-
+      查看业绩预告/快报：是否有正向预告或超预期信号。
+      这是质量修复席的"催化剂"来源，业绩预告往往是修复行情的触发器。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回最新业绩预告类型（预增/预减/扭亏/续亏）、预告净利润区间。
+    key_fields:
+      - type
+      - net_profit_min
+      - net_profit_max
+      - p_change_min
+    combo_hints:
+      - 预增/扭亏预告 + 低 PB = 价值发现机会。
+      - 续亏预告 = 质量修复无望，直接放 rejected。
+    cost: medium
+    failure_modes:
+      - 无业绩预告（未披露）时返回空，不代表负面，需结合财报判断。
+
+  - tool: get_tushare_express
+    priority: 18
+    when_to_use: >-
+      获取业绩快报：正式财报前的提前披露，通常比预告更精确。
+      若有快报，优先于预告作为业绩判断依据。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回快报营收、净利润及同比增速。
+    key_fields:
+      - revenue
+      - net_profit
+      - yoy_net_profit
+    combo_hints:
+      - 快报净利润大幅超预期 = 强催化，估值重定向信号。
+    cost: medium
+    failure_modes:
+      - 非所有公司都发布快报；时效上比快报晚于正式年报/季报。
+
+  - tool: get_tushare_dividend
+    priority: 22
+    when_to_use: >-
+      核查分红历史和当期分红预案。
+      持续高分红 + 股价低位 = 股息率保底，修复安全边际更高。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回历史分红记录、每股股息、分红比例、分红日期。
+    key_fields:
+      - div_proc
+      - cash_div
+      - cash_div_tax
+    combo_hints:
+      - 连续3年以上高分红 + PB < 1.5 = 价值修复安全边际厚。
+      - 无分红历史但大量资本支出 = 成长逻辑，需改用盈利增速判断。
+    cost: cheap
+    failure_modes:
+      - 上市未满3年无完整分红记录。
+
+  - tool: analyze_trend
+    priority: 26
+    when_to_use: >-
+      确认价格结构是否支持修复：趋势至少要从下行转平，不要在加速下跌中买。
+      质量修复席不要求强势趋势，但不能在"下跌加速"结构中建仓。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 trend_status、支撑/压力位、近期高低点走向。
+    key_fields:
+      - trend_status
+      - support_levels
+      - resistance_levels
+    combo_hints:
+      - trend_status = neutral/sideways + 基本面改善 = 价格结构可接受。
+      - trend_status = bearish + 下跌加速 = 基本面再好也不进。
+    cost: cheap
+    failure_modes:
+      - 历史数据不足时结论弱化。
+
+  - tool: analyze_price_structure
+    priority: 30
+    when_to_use: >-
+      确认价格处于低位或合理区间，没有追高风险。
+      质量修复席要求"价格给机会"，高位不做修复。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回区间位置、支撑压力位、平台结构描述。
+    key_fields:
+      - position_zone
+      - support_levels
+      - resistance_levels
+    combo_hints:
+      - position_zone = low/medium + 基本面改善 = 修复逻辑完整。
+      - position_zone = high = 质量席直接放 watch 或 rejected，不做追高修复。
+    cost: cheap
+    failure_modes:
+      - 新股历史不足，position_zone 可能返回 unknown。

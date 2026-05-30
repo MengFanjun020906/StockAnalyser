@@ -11,6 +11,7 @@ import logging
 import re
 import time
 import uuid
+import concurrent.futures
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -303,6 +304,7 @@ class LLMToolAdapter:
         tools: List[dict],
         provider: Optional[str] = None,
         timeout: Optional[float] = None,
+        response_format: Optional[dict] = None,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -315,7 +317,13 @@ class LLMToolAdapter:
         Returns:
             LLMResponse with either content (final answer) or tool_calls.
         """
-        return self.call_completion(messages, tools=tools, provider=provider, timeout=timeout)
+        return self.call_completion(
+            messages,
+            tools=tools,
+            provider=provider,
+            timeout=timeout,
+            response_format=response_format,
+        )
 
     def call_text(
         self,
@@ -325,6 +333,7 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        response_format: Optional[dict] = None,
     ) -> LLMResponse:
         """Send a text-only completion through the shared routing stack."""
         return self.call_completion(
@@ -334,6 +343,7 @@ class LLMToolAdapter:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            response_format=response_format,
         )
 
     def call_completion(
@@ -345,6 +355,7 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        response_format: Optional[dict] = None,
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
@@ -371,13 +382,14 @@ class LLMToolAdapter:
                     )
                     break
             try:
-                return self._call_litellm_model(
+                return self._call_litellm_model_with_hard_timeout(
                     messages,
                     tools or [],
                     model,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=remaining_timeout,
+                    response_format=response_format,
                 )
             except Exception as e:
                 if isinstance(e, _resolve_litellm_exception("RateLimitError")):
@@ -414,6 +426,54 @@ class LLMToolAdapter:
         logger.error(error_msg)
         return LLMResponse(content=error_msg, provider="error")
 
+    def _call_litellm_model_with_hard_timeout(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[dict],
+        model: str,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+        response_format: Optional[dict] = None,
+    ) -> LLMResponse:
+        """Call one model and enforce timeout around LiteLLM retries too.
+
+        LiteLLM's provider/router timeout can apply per retry/deployment, so a
+        nominal 8s timeout may block much longer when retries are configured.
+        Candidate desks need a hard wall-clock boundary so failures become
+        visible LLM errors before the outer seed guard marks an opaque timeout.
+        """
+        if timeout is None or timeout <= 0:
+            return self._call_litellm_model(
+                messages,
+                tools,
+                model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                response_format=response_format,
+            )
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            self._call_litellm_model,
+            messages,
+            tools,
+            model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            response_format=response_format,
+        )
+        try:
+            response = future.result(timeout=max(0.1, float(timeout)))
+            executor.shutdown(wait=False, cancel_futures=True)
+            return response
+        except concurrent.futures.TimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(f"LLM model {model} hard timeout after {timeout:.1f}s") from exc
+
     @staticmethod
     def _get_model_provider(model: str) -> str:
         """Return LiteLLM provider namespace for model fallback grouping."""
@@ -430,6 +490,7 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        response_format: Optional[dict] = None,
     ) -> LLMResponse:
         """Call a specific litellm model with OpenAI-format messages and tools."""
         openai_messages = self._convert_messages(messages)
@@ -450,8 +511,13 @@ class LLMToolAdapter:
         }
         if max_tokens is not None:
             call_kwargs["max_tokens"] = max_tokens
+        if response_format is not None:
+            call_kwargs["response_format"] = response_format
         if timeout is not None:
             call_kwargs["timeout"] = timeout
+            # Time-bounded agent paths should fail once and surface the cause;
+            # provider/router retry loops otherwise exceed the desk seed guard.
+            call_kwargs["num_retries"] = 0
 
         if extra:
             call_kwargs["extra_body"] = extra
@@ -498,12 +564,25 @@ class LLMToolAdapter:
             elif msg["role"] == "assistant" and msg.get("tool_calls"):
                 openai_tc = []
                 for tc in msg["tool_calls"]:
+                    # Accept both the flat shape ({"name", "arguments"}) used by
+                    # the main agent executor and the nested OpenAI shape
+                    # ({"function": {"name", "arguments"}}) emitted by the
+                    # candidate-expert committee. Mixing them previously raised
+                    # KeyError('name') on multi-round tool calls.
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+                    if fn is not None:
+                        tc_name = fn.get("name", "")
+                        tc_args = fn.get("arguments", {})
+                    else:
+                        tc_name = tc.get("name", "")
+                        tc_args = tc.get("arguments", {})
+                    tc_args_str = tc_args if isinstance(tc_args, str) else json.dumps(tc_args, ensure_ascii=False)
                     tc_dict: Dict[str, Any] = {
                         "id": tc.get("id", str(uuid.uuid4())[:8]),
                         "type": "function",
                         "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]),
+                            "name": tc_name,
+                            "arguments": tc_args_str,
                         },
                     }
                     sig = tc.get("thought_signature")

@@ -3,6 +3,8 @@ import sys
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 try:
     import litellm  # noqa: F401
 except ModuleNotFoundError:
@@ -17,13 +19,16 @@ except ModuleNotFoundError:
 from src.agent.executor import AgentExecutor
 from src.agent.llm_adapter import LLMResponse
 from src.agent.orchestrator import AgentOrchestrator
+from src.agent import stock_selection as stock_selection_module
 from src.agent.stock_selection import (
     SelectionRunContext,
+    _candidate_has_desk_tag,
     _compact_candidate_seed,
     _compact_tool_result_for_trace,
     _normalize_deep_dive_payload,
     _resolve_candidate_discovery_mode,
     _run_candidate_discovery_tool,
+    _select_deep_dive_targets,
     render_stock_selection_markdown,
     run_stock_selection_pipeline,
     should_run_stock_selection,
@@ -44,7 +49,6 @@ def _registry():
             "market": market,
             "candidates": [
                 {"code": "600001", "name": "测试一", "market": "cn", "source": "test"},
-                {"code": "600002", "name": "测试二", "market": "cn", "source": "test"},
             ][:limit],
         },
     ))
@@ -215,6 +219,139 @@ def _deep_dive_response(code, name=None, *, action_bias="wait"):
             "missing_evidence": [],
         },
     })
+
+
+@pytest.fixture(autouse=True)
+def _mock_thesis_desk_committee_discovery():
+    """Keep full-pipeline tests on the default thesis-desk path without running it."""
+
+    original = stock_selection_module._run_candidate_discovery_tool
+
+    def _consume_legacy_discovery_response(ctx, llm_adapter):
+        call_text = getattr(llm_adapter, "call_text", None)
+        if not callable(call_text):
+            return None
+        try:
+            response = call_text(
+                [
+                    {"role": "system", "content": "测试用三席位候选发现 mock。只输出 JSON。"},
+                    {"role": "user", "content": "{}"},
+                ],
+                timeout=None,
+            )
+        except (StopIteration, RuntimeError):
+            raise
+        except Exception:
+            return None
+        stock_selection_module._accumulate_usage(ctx, response)
+        parsed = stock_selection_module.try_parse_json(getattr(response, "content", "") or "")
+        return parsed if isinstance(parsed, dict) else None
+
+    def _mocked_run_candidate_discovery_tool(*, ctx, tool_registry, target_symbols, llm_adapter=None):
+        if ctx.candidate_discovery_mode != "thesis_desk_committee":
+            return original(
+                ctx=ctx,
+                tool_registry=tool_registry,
+                target_symbols=target_symbols,
+                llm_adapter=llm_adapter,
+            )
+
+        tool_seed = stock_selection_module._execute_tool(
+            ctx,
+            tool_registry,
+            "discover_watchlist_candidates",
+            {
+                "market": ctx.market,
+                "seed_symbols": target_symbols,
+                "limit": stock_selection_module.DISCOVERY_RECALL_LIMIT,
+            },
+        )
+        legacy_payload = _consume_legacy_discovery_response(ctx, llm_adapter)
+        tool_candidates = tool_seed.get("candidates") if isinstance(tool_seed, dict) else None
+        legacy_full = legacy_payload.get("full") if isinstance(legacy_payload, dict) else {}
+        legacy_candidates = legacy_full.get("candidates") if isinstance(legacy_full, dict) else None
+        candidates = tool_candidates if isinstance(tool_candidates, list) else None
+        if not isinstance(candidates, list):
+            candidates = legacy_candidates if isinstance(legacy_candidates, list) else []
+        elif isinstance(legacy_candidates, list):
+            legacy_by_code = {
+                str(item.get("code")): item
+                for item in legacy_candidates
+                if isinstance(item, dict) and item.get("code")
+            }
+            candidates = [
+                {
+                    **legacy_by_code.get(str(item.get("code")), {}),
+                    **item,
+                }
+                if isinstance(item, dict) else item
+                for item in candidates
+            ]
+        candidates = candidates if isinstance(candidates, list) else []
+        candidate_codes = [
+            str(item.get("code"))
+            for item in candidates
+            if isinstance(item, dict) and item.get("code")
+        ]
+        key_sources = list(dict.fromkeys(
+            str(item.get("source") or "thesis_desk_committee")
+            for item in candidates
+            if isinstance(item, dict)
+        ))[:5]
+        summary = dict(legacy_payload.get("summary") or {}) if isinstance(legacy_payload, dict) else {}
+        summary.update({
+            "strategy": ctx.candidate_strategy,
+            "candidate_codes": candidate_codes,
+            "candidate_source": "thesis_desk_committee",
+            "key_sources": key_sources,
+            "source_count": len(candidates),
+            "main_limitations": summary.get("main_limitations") or [],
+            "next_required_tools": [
+                "get_realtime_quote",
+                "analyze_trend",
+                "analyze_price_structure",
+                "get_capital_flow",
+                "search_comprehensive_intel",
+            ],
+        })
+        return {
+            "stage": "candidate_discovery",
+            "status": "ok" if candidates else "insufficient_candidates",
+            "strategy": ctx.candidate_strategy,
+            "market": ctx.market,
+            "candidate_count": len(candidates),
+            "candidate_source": "thesis_desk_committee",
+            "summary": summary,
+            "full": {
+                "candidates": candidates,
+                "excluded": [],
+                "tool_failures": [],
+                "missing_evidence": [],
+                "thesis_desk_committee": {
+                    "status": "ok" if candidates else "insufficient_candidates",
+                    "candidate_count": len(candidates),
+                    "degraded": False,
+                    "dimensions_covered": [
+                        "early_turn_desk",
+                        "momentum_desk",
+                        "quality_repair_desk",
+                    ],
+                },
+                "llm_expert_committee": {
+                    "status": "ok" if candidates else "insufficient_candidates",
+                    "candidate_count": len(candidates),
+                    "degraded": False,
+                    "delegate": "thesis_desk_committee",
+                },
+            },
+            "full_ref": "candidate_discovery.json",
+        }
+
+    with patch(
+        "src.agent.stock_selection._run_candidate_discovery_tool",
+        side_effect=_mocked_run_candidate_discovery_tool,
+    ):
+        yield
 
 
 def test_stock_selection_report_does_not_promote_weak_wait_or_candidate_score_to_top_pick():
@@ -724,8 +861,8 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert "核心推荐结论" in result.final_markdown
     assert "深挖结果与等待/排除决策" in result.final_markdown
     assert "Execute 证据摘要" in result.final_markdown
-    assert "候选池来源与入池理由" in result.final_markdown
-    assert "逐股维度证据展开" in result.final_markdown
+    assert "候选池来源与入池理由" in result.final_markdown or "候选池来源与入池理由" in result.appendix_markdown
+    assert "逐股维度证据展开" in result.final_markdown or "逐股维度证据展开" in result.appendix_markdown
     assert "600001 测试一" in result.final_markdown
     assert "MA5/MA20 多头" in result.final_markdown
     assert "跌破 9 元支撑" in result.final_markdown
@@ -910,8 +1047,8 @@ def test_stock_selection_reject_is_downgraded_when_candidate_pool_exists_with_da
     assert judge["primary_plan_verdict"] == "wait_for_more_data"
     assert judge["next_step"] == "render_final_report"
     assert "候选池已形成" in judge["decision_summary"]
-    assert "候选池来源与入池理由" in result.final_markdown
-    assert "AlphaSift 多因子策略入池" in result.final_markdown
+    assert "候选池来源与入池理由" in result.final_markdown or "候选池来源与入池理由" in result.appendix_markdown
+    assert "AlphaSift 多因子策略入池" in result.final_markdown or "AlphaSift 多因子策略入池" in result.appendix_markdown
 
 
 def test_stock_selection_expands_deep_dive_targets_for_rich_candidate_pool():
@@ -955,7 +1092,6 @@ def test_stock_selection_expands_deep_dive_targets_for_rich_candidate_pool():
         _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait", "main_supporting_evidence": ["一号证据"]}, "full": {"stock": {"code": "600001", "name": "测试一"}, "dimension_summary": {"technical": {"verdict": "support", "summary": "一号技术证据"}}, "missing_evidence": []}}),
         _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600002", "name": "测试二", "action_bias": "wait", "main_supporting_evidence": ["二号证据"]}, "full": {"stock": {"code": "600002", "name": "测试二"}, "dimension_summary": {"technical": {"verdict": "neutral", "summary": "二号技术证据"}}, "missing_evidence": []}}),
         _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600003", "name": "测试三", "action_bias": "wait", "main_supporting_evidence": ["三号证据"]}, "full": {"stock": {"code": "600003", "name": "测试三"}, "dimension_summary": {"technical": {"verdict": "neutral", "summary": "三号技术证据"}}, "missing_evidence": []}}),
-        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600004", "name": "测试四", "action_bias": "reject", "main_supporting_evidence": ["四号反证"]}, "full": {"stock": {"code": "600004", "name": "测试四"}, "dimension_summary": {"technical": {"verdict": "weaken", "summary": "四号技术反证"}}, "missing_evidence": []}}),
         _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
         _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
         _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
@@ -971,15 +1107,16 @@ def test_stock_selection_expands_deep_dive_targets_for_rich_candidate_pool():
     )
 
     assert result.success is True
-    assert result.final_report_json["single_stock_deep_dive"]["summary"]["target_count"] == 4
-    assert adapter.call_text.call_count == 9
+    assert result.final_report_json["single_stock_deep_dive"]["summary"]["target_count"] == 3
+    assert adapter.call_text.call_count == 8
+    deep_results = result.final_report_json["single_stock_deep_dive"]["full"]["results"]
+    assert [item["summary"]["code"] for item in deep_results] == ["600001", "600002", "600003"]
     assert "600001 测试一" in result.final_markdown
     assert "600002 测试二" in result.final_markdown
     assert "600003 测试三" in result.final_markdown
-    assert "600004" in result.final_markdown
 
 
-def test_stock_selection_deep_dive_uses_top_ranked_candidates_by_pool_order():
+def test_stock_selection_deep_dive_uses_screening_targets_before_pool_order():
     registry = _registry()
     registry.register(ToolDefinition(
         name="discover_watchlist_candidates",
@@ -1015,10 +1152,10 @@ def test_stock_selection_deep_dive_uses_top_ranked_candidates_by_pool_order():
                 {"code": "688266", "screening_result": "deep_dive", "score": 100},
             ]},
         }),
-        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "688127", "name": "蓝特光学", "action_bias": "wait"}, "full": {"stock": {"code": "688127", "name": "蓝特光学"}, "missing_evidence": []}}),
-        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "603629", "name": "利通电子", "action_bias": "wait"}, "full": {"stock": {"code": "603629", "name": "利通电子"}, "missing_evidence": []}}),
         _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "603256", "name": "宏和科技", "action_bias": "wait"}, "full": {"stock": {"code": "603256", "name": "宏和科技"}, "missing_evidence": []}}),
         _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "688266", "name": "泽璟制药-U", "action_bias": "wait"}, "full": {"stock": {"code": "688266", "name": "泽璟制药-U"}, "missing_evidence": []}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "688127", "name": "蓝特光学", "action_bias": "wait"}, "full": {"stock": {"code": "688127", "name": "蓝特光学"}, "missing_evidence": []}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "603629", "name": "利通电子", "action_bias": "wait"}, "full": {"stock": {"code": "603629", "name": "利通电子"}, "missing_evidence": []}}),
         _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
         _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
         _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
@@ -1035,7 +1172,34 @@ def test_stock_selection_deep_dive_uses_top_ranked_candidates_by_pool_order():
         )
 
     deep_results = result.final_report_json["single_stock_deep_dive"]["full"]["results"]
-    assert [item["summary"]["code"] for item in deep_results] == ["688127", "603629", "603256", "688266"]
+    assert [item["summary"]["code"] for item in deep_results] == ["603256", "688266", "688127", "603629"]
+
+
+def test_select_deep_dive_targets_tags_pool_fallback_provenance():
+    candidates = ["600001", "600002", "600003"]
+    screening_summary = {"deep_dive_targets": ["600002"]}
+    screening_full = {"shortlist": [{"code": "600002", "screening_result": "deep_dive", "score": 90}]}
+
+    ordered, provenance = _select_deep_dive_targets(
+        candidates=candidates,
+        screening_summary=screening_summary,
+        screening_full=screening_full,
+        limit=3,
+    )
+
+    assert ordered[0] == "600002"
+    assert provenance["600002"] == "screening"
+    # 筛选只放行一只，其余按候选池顺序兜底，必须标注 provenance。
+    assert provenance["600001"] == "pool_fallback"
+    assert provenance["600003"] == "pool_fallback"
+
+
+def test_candidate_has_desk_tag_detects_desk_fields():
+    assert _candidate_has_desk_tag({"primary_desk": "early_turn_desk"}) is True
+    assert _candidate_has_desk_tag({"setup_type": "trend_continuation"}) is True
+    assert _candidate_has_desk_tag({"desks": ["momentum_desk"]}) is True
+    assert _candidate_has_desk_tag({"setup_type": "unknown"}) is False
+    assert _candidate_has_desk_tag({"source": "alphasift"}) is False
 
 
 def test_stock_selection_recommendation_section_always_shows_deep_dived_candidates():
@@ -1974,13 +2138,14 @@ def test_selection_run_context_default_candidate_discovery_mode_is_deterministic
 
 
 def test_resolve_candidate_discovery_mode_falls_back_for_invalid_value():
-    assert _resolve_candidate_discovery_mode(None) == "deterministic"
-    assert _resolve_candidate_discovery_mode("") == "deterministic"
+    assert _resolve_candidate_discovery_mode(None) == "thesis_desk_committee"
+    assert _resolve_candidate_discovery_mode("") == "thesis_desk_committee"
+    assert _resolve_candidate_discovery_mode("deterministic") == "deterministic"
     assert _resolve_candidate_discovery_mode("llm_expert_committee") == "llm_expert_committee"
-    assert _resolve_candidate_discovery_mode("nonsense_value") == "deterministic"
+    assert _resolve_candidate_discovery_mode("nonsense_value") == "thesis_desk_committee"
 
 
-def test_run_candidate_discovery_tool_uses_committee_when_mode_is_llm():
+def test_run_candidate_discovery_tool_exits_when_mode_is_not_thesis_desk():
     events: list = []
     ctx = SelectionRunContext(
         run_id="r",
@@ -1988,7 +2153,42 @@ def test_run_candidate_discovery_tool_uses_committee_when_mode_is_llm():
         candidate_discovery_mode="llm_expert_committee",
         progress_callback=lambda evt: events.append(evt),
     )
-    committee_payload = {"status": "ok", "candidates": [{"code": "000001", "name": "测试"}]}
+    with patch(
+        "src.agent.candidate_experts_v2.committee.run_committee_discovery",
+        side_effect=AssertionError("committee should not run"),
+    ) as mocked:
+        result = _run_candidate_discovery_tool(
+            ctx=ctx,
+            tool_registry=_registry(),
+            target_symbols=["000001"],
+        )
+    assert result["status"] == "skipped"
+    assert result["candidate_count"] == 0
+    assert result["full"]["required_candidate_discovery_mode"] == "thesis_desk_committee"
+    assert result["full"]["actual_candidate_discovery_mode"] == "llm_expert_committee"
+    mocked.assert_not_called()
+    event_types = [e.get("type") or e.get("event") for e in events if isinstance(e, dict)]
+    assert event_types == ["selection_candidate_discovery_mode"]
+
+
+def test_run_candidate_discovery_tool_uses_committee_when_mode_is_thesis_desk():
+    events: list = []
+    ctx = SelectionRunContext(
+        run_id="r",
+        user_message="m",
+        candidate_discovery_mode="thesis_desk_committee",
+        progress_callback=lambda evt: events.append(evt),
+    )
+    committee_payload = {
+        "status": "ok",
+        "candidates": [{"code": "000001", "name": "测试"}],
+        "seed_pool_summary": {
+            "seed_count": 3,
+            "seed_sources": {"user_watchlist": 1, "low_base_structure": 2},
+            "total_limit": 40,
+            "preview": [{"code": "000001", "source": "user_watchlist"}],
+        },
+    }
     with patch(
         "src.agent.candidate_experts_v2.committee.run_committee_discovery",
         return_value=committee_payload,
@@ -2000,19 +2200,50 @@ def test_run_candidate_discovery_tool_uses_committee_when_mode_is_llm():
         )
     assert result is committee_payload
     assert mocked.called
-    mode_events = [
-        e for e in events
-        if e.get("type") == "selection_candidate_discovery_mode" or e.get("event") == "selection_candidate_discovery_mode"
+    assert result["seed_pool_summary"]["seed_count"] == 3
+    event_types = [e.get("type") or e.get("event") for e in events if isinstance(e, dict)]
+    assert event_types[:3] == [
+        "selection_candidate_discovery_mode",
+        "selection_seed_pool_built",
+        "selection_seed_gate_done",
     ]
-    assert mode_events, f"expected selection_candidate_discovery_mode event in {events!r}"
+    seed_event = next(e for e in events if e.get("type") == "selection_seed_pool_built")
+    assert seed_event["payload"]["seed_pool_summary"]["seed_count"] >= 1
+    assert seed_event["payload"]["seed_pool_diagnostics"]
+    assert "seed_market_regime" in seed_event["payload"]
+    gate_event = next(e for e in events if e.get("type") == "selection_seed_gate_done")
+    assert gate_event["payload"]["seed_pool_summary"]["seed_count"] == 3
 
 
-def test_run_candidate_discovery_tool_falls_back_to_deterministic_when_committee_raises():
+def test_fallback_candidate_discovery_preserves_seed_pool_metadata():
+    from src.agent.stock_selection import _fallback_candidate_discovery
+
+    ctx = SelectionRunContext(run_id="r", user_message="m", candidate_discovery_mode="llm_expert_committee")
+    seed_result = {
+        "candidates": [{"code": "000001", "name": "测试", "source": "user_watchlist"}],
+        "seed_pool_summary": {"seed_count": 1, "seed_sources": {"user_watchlist": 1}},
+        "seed_pool_summary_before_gate": {"seed_count": 2},
+        "seed_gate": {"status": "ok", "kept_count": 1, "rejected_count": 1},
+        "seed_pool_diagnostics": [{"source": "user_watchlist", "status": "ok", "count": 1}],
+        "seed_pool_hard_exclusion": {"excluded_count": 0},
+        "seed_source_quality": {"user_watchlist": {"status": "ok"}},
+        "seed_market_regime": {"regime": "range_bound"},
+    }
+
+    payload = _fallback_candidate_discovery(ctx, seed_result)
+
+    assert payload["seed_pool_summary"]["seed_count"] == 1
+    assert payload["full"]["seed_gate"]["status"] == "ok"
+    assert payload["full"]["seed_pool_diagnostics"][0]["source"] == "user_watchlist"
+    assert payload["full"]["seed_market_regime"]["regime"] == "range_bound"
+
+
+def test_run_candidate_discovery_tool_returns_failed_payload_when_thesis_committee_raises():
     events: list = []
     ctx = SelectionRunContext(
         run_id="r",
         user_message="m",
-        candidate_discovery_mode="llm_expert_committee",
+        candidate_discovery_mode="thesis_desk_committee",
         progress_callback=lambda evt: events.append(evt),
     )
     with patch(
@@ -2024,10 +2255,9 @@ def test_run_candidate_discovery_tool_falls_back_to_deterministic_when_committee
             tool_registry=_registry(),
             target_symbols=[],
         )
-    # deterministic path returned by the stub registry
     assert isinstance(result, dict)
-    assert any("600001" == c.get("code") for c in result.get("candidates", []))
-    # at least one event payload should indicate fallback=True
+    assert result.get("status") == "failed"
+    assert result.get("candidates") == []
     flat = []
     for evt in events:
         payload = evt.get("payload") if isinstance(evt, dict) else None
@@ -2035,4 +2265,80 @@ def test_run_candidate_discovery_tool_falls_back_to_deterministic_when_committee
             flat.append(payload)
         if isinstance(evt, dict):
             flat.append(evt)
-    assert any(item.get("fallback") is True for item in flat), f"expected fallback event, got {events!r}"
+    assert any(item.get("fallback") is False for item in flat), f"expected non-fallback event, got {events!r}"
+
+
+def test_stock_selection_fails_fast_when_thesis_desk_discovery_fails():
+    adapter = MagicMock()
+    adapter.call_text.side_effect = AssertionError("downstream stages should not run")
+    failed_discovery = {
+        "stage": "candidate_discovery",
+        "status": "failed",
+        "market": "cn",
+        "candidates": [],
+        "candidate_count": 0,
+        "candidate_source": "thesis_desk_committee",
+        "error": "thesis_desk_committee returned no candidates",
+        "seed_pool_summary": {"seed_count": 20},
+        "thesis_desk_packets": [
+            {
+                "expert": "early_turn_desk",
+                "status": "timeout",
+                "errors": ["early_turn_desk seed 600001 timeout after 3.0s"],
+            }
+        ],
+        "discovery_steps": [
+            {
+                "source": "thesis_desk_committee",
+                "status": "failed",
+                "error": "thesis_desk_committee returned no candidates",
+                "fallback": False,
+            }
+        ],
+    }
+
+    with patch(
+        "src.agent.stock_selection._run_candidate_discovery_tool",
+        return_value=failed_discovery,
+    ):
+        result = run_stock_selection_pipeline(
+            task="帮我选股",
+            agent_user_context=_context(),
+            tool_registry=_registry(),
+            llm_adapter=adapter,
+            run_id="test-thesis-fail-fast",
+        )
+
+    assert result.success is False
+    assert result.error
+    assert "三席位候选发现失败" in result.error
+    assert "early_turn_desk seed 600001 timeout" in result.error
+    assert result.context.next_step == "stop_candidate_discovery_failed"
+    assert "candidate_screening" not in result.context.stages
+    assert "single_stock_deep_dive" not in result.context.stages
+    assert result.final_report_json["partial_failure"]["status"] == "failed_candidate_discovery"
+    assert result.final_report_json["partial_failure"]["fallback"] is False
+
+
+def test_stock_selection_pipeline_exits_when_candidate_mode_is_not_thesis_desk():
+    registry = _registry()
+    adapter = MagicMock()
+
+    result = run_stock_selection_pipeline(
+        task="帮我选一下可以入手的股票",
+        agent_user_context=_context(),
+        tool_registry=registry,
+        llm_adapter=adapter,
+        run_id="test-non-thesis-exit",
+        candidate_discovery_mode="deterministic",
+    )
+
+    assert result.success is True
+    assert result.context.next_step == "stop_non_thesis_desk_mode"
+    discovery = result.final_report_json["candidate_discovery"]
+    assert discovery["status"] == "skipped"
+    assert discovery["summary"]["candidate_codes"] == []
+    assert discovery["full"]["blocked"] is True
+    assert discovery["full"]["required_candidate_discovery_mode"] == "thesis_desk_committee"
+    assert result.tool_calls_log == []
+    adapter.call_text.assert_not_called()

@@ -12,6 +12,8 @@ from src.schemas.agent_context import (
     PositionContext,
     ReportContext,
 )
+from src.data.stock_index_loader import get_index_stock_name
+from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
 
 def build_agent_user_context_from_portfolio_snapshot(
@@ -71,6 +73,7 @@ def build_agent_user_context_from_portfolio_snapshot(
                     unrealized_pnl=_optional_float(raw_position.get("unrealized_pnl_base")),
                     unrealized_pnl_pct=_optional_float(raw_position.get("unrealized_pnl_pct")),
                     position_pct=_position_pct(market_value, total_equity),
+                    stock_name=_resolve_stock_name(symbol, raw_position.get("stock_name") or raw_position.get("name")),
                     notes=_position_notes(raw_position),
                 )
             )
@@ -176,6 +179,17 @@ def _position_notes(raw_position: Dict[str, Any]) -> Optional[str]:
     if source:
         parts.append(f"price_source={source}")
     return "; ".join(parts) if parts else None
+
+
+def _resolve_stock_name(symbol: str, current_name: Any = None) -> Optional[str]:
+    code = str(symbol or "").strip()
+    current = str(current_name or "").strip()
+    if is_meaningful_stock_name(current, code):
+        return current
+    for name in (STOCK_NAME_MAP.get(code), get_index_stock_name(code)):
+        if is_meaningful_stock_name(name, code):
+            return str(name)
+    return current or None
 
 
 __all__ = [

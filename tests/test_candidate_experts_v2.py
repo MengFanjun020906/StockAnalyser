@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for src.agent.candidate_experts_v2 skeleton + capital_flow expert.
+"""Tests for src.agent.candidate_experts_v2 skeleton.
 
 Covers:
 - schemas round-trip (no v1 compatibility shim required)
@@ -7,7 +7,6 @@ Covers:
 - runtime parallel: success / failure / timeout packets
 - BaseExpert bounded loop: tool whitelist enforcement, tool_call cap,
   no-tool partial/invalid, malformed JSON failure
-- CapitalFlowExpert: tool list, dimension, end-to-end happy path with fake LLM
 """
 
 from __future__ import annotations
@@ -31,15 +30,8 @@ from src.agent.candidate_experts_v2.experts.base import (
     LLMToolCall,
     LLMTurn,
 )
-from src.agent.candidate_experts_v2.experts.capital_flow import (
-    CAPITAL_FLOW_TOOLS,
-    CapitalFlowExpert,
-)
-from src.agent.candidate_experts_v2.experts.early_turn import (
-    EARLY_TURN_TOOLS,
-    EarlyTurnExpert,
-)
-
+from src.agent.candidate_experts_v2.experts.desk_base import BaseDeskExpert
+from src.agent.candidate_experts_v2.schemas import FeatureFlag, FeatureRow
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -264,6 +256,156 @@ def test_base_expert_happy_path_with_tool_call(tmp_path, monkeypatch):
     assert any(c["status"] == "ok" for c in pkt.tool_calls)
 
 
+def test_base_desk_expert_runs_and_saves_one_prompt_per_seed(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+
+    class _PerSeedLLM:
+        def __init__(self) -> None:
+            self.prompts: List[str] = []
+
+        def __call__(self, messages, tool_decls):  # noqa: D401
+            prompt = str(messages[-1]["content"])
+            self.prompts.append(prompt)
+            code = "600000" if "600000" in prompt else "000001"
+            return LLMTurn(
+                text=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "code": code,
+                                "name": code,
+                                "market": "cn",
+                                "setup_type": "early_turn",
+                                "stance": "support",
+                                "reason": "single seed decision",
+                                "evidence": [{"tool": "manual_check", "summary": "ok"}],
+                            }
+                        ],
+                        "rejected": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    llm = _PerSeedLLM()
+    desk = BaseDeskExpert(
+        allowed_tools=(),
+        tool_registry={},
+        tool_decls=[],
+        llm=llm,
+        system_prompt="test desk",
+    )
+    rows = [
+        FeatureRow(
+            code="600000",
+            name="浦发银行",
+            recall_sources=["daily_screener"],
+            flags=[FeatureFlag(detector="unit:a", kind="pattern", summary="A")],
+        ),
+        FeatureRow(
+            code="000001",
+            name="平安银行",
+            recall_sources=["fundamental_snapshot"],
+            flags=[FeatureFlag(detector="unit:b", kind="fundamental", summary="B")],
+        ),
+    ]
+
+    packet = desk.run_desk(rows, market="cn", regime="unknown")
+
+    assert len(llm.prompts) == 2
+    assert '"code": "600000"' in llm.prompts[0]
+    assert '"code": "000001"' not in llm.prompts[0]
+    assert '"code": "000001"' in llm.prompts[1]
+    assert [candidate.code for candidate in packet.candidates] == ["600000", "000001"]
+    dumped = packet.model_dump(mode="json")
+    assert len(dumped["per_seed_packets"]) == 2
+    assert len(list(tmp_path.glob("*.json"))) == 2
+
+
+def test_base_desk_expert_fails_and_stops_after_per_seed_timeouts(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+
+    class _SlowLLM:
+        def __call__(self, messages, tool_decls):  # noqa: D401
+            time.sleep(2.0)
+            return LLMTurn(text='{"candidates": []}')
+
+    desk = BaseDeskExpert(
+        allowed_tools=(),
+        tool_registry={},
+        tool_decls=[],
+        llm=_SlowLLM(),
+        system_prompt="test desk",
+        max_llm_rounds=1,
+    )
+    rows = [
+        FeatureRow(code="600000", name="浦发银行", recall_sources=["daily_screener"]),
+        FeatureRow(code="000001", name="平安银行", recall_sources=["daily_screener"]),
+        FeatureRow(code="000002", name="万科A", recall_sources=["daily_screener"]),
+    ]
+
+    started = time.time()
+    packet = desk.run_desk(
+        rows,
+        market="cn",
+        regime="unknown",
+        per_seed_timeout_s=1.0,
+        max_consecutive_seed_timeouts=2,
+    )
+
+    assert time.time() - started < 3.0
+    assert packet.status == "failed"
+    assert packet.seed_summary.seed_count == 3
+    dumped = packet.model_dump(mode="json")
+    assert [item["status"] for item in dumped["per_seed_packets"]] == [
+        "timeout",
+        "timeout",
+        "unavailable",
+    ]
+    assert "consecutive_seed_timeouts" in json.dumps(packet.diagnostics, ensure_ascii=False)
+    assert len(list(tmp_path.glob("*.json"))) == 3
+
+
+def test_base_desk_expert_stops_after_consecutive_seed_llm_failures(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+
+    class _FailingLLM:
+        def __call__(self, messages, tool_decls):  # noqa: D401
+            raise RuntimeError("provider hard timeout")
+
+    desk = BaseDeskExpert(
+        allowed_tools=(),
+        tool_registry={},
+        tool_decls=[],
+        llm=_FailingLLM(),
+        system_prompt="test desk",
+        max_llm_rounds=1,
+    )
+    rows = [
+        FeatureRow(code="600000", name="浦发银行", recall_sources=["daily_screener"]),
+        FeatureRow(code="000001", name="平安银行", recall_sources=["daily_screener"]),
+        FeatureRow(code="000002", name="万科A", recall_sources=["daily_screener"]),
+    ]
+
+    packet = desk.run_desk(
+        rows,
+        market="cn",
+        regime="unknown",
+        per_seed_timeout_s=5.0,
+        max_consecutive_seed_timeouts=2,
+    )
+
+    assert packet.status == "failed"
+    dumped = packet.model_dump(mode="json")
+    assert [item["status"] for item in dumped["per_seed_packets"]] == [
+        "failed",
+        "failed",
+        "unavailable",
+    ]
+    assert "consecutive_seed_failures" in json.dumps(packet.diagnostics, ensure_ascii=False)
+    assert "provider hard timeout" in json.dumps(packet.errors, ensure_ascii=False)
+
+
 def test_base_expert_rejects_non_whitelisted_tool(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
     tool_registry = {
@@ -352,131 +494,3 @@ def test_base_expert_tool_call_cap(tmp_path, monkeypatch):
     pkt = expert.run([SeedItem(code="600000")], use_cache=False)
     assert call_count["n"] == 2
     assert any(d.get("status") == "tool_call_cap_reached" for d in pkt.diagnostics)
-
-
-# ---------------------------------------------------------------------------
-# CapitalFlowExpert
-# ---------------------------------------------------------------------------
-
-
-def test_capital_flow_expert_whitelist_and_dimension():
-    expert = CapitalFlowExpert(
-        tool_registry={},
-        tool_decls=[],
-        llm=_ScriptedLLM([LLMTurn(text='{"candidates": []}')]),
-    )
-    assert expert.dimension == "capital"
-    assert "get_tushare_moneyflow_ths" in expert.allowed_tools
-    assert "get_fundamental_indicators" not in expert.allowed_tools
-
-
-def test_capital_flow_expert_runs_with_capital_tool(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
-    tool_registry = {
-        name: (lambda **kw: {"status": "ok", "items": []})
-        for name in CAPITAL_FLOW_TOOLS
-    }
-    tool_registry["get_tushare_moneyflow_ths"] = lambda **kw: {
-        "status": "ok",
-        "items": [{"code": "600000", "net_inflow": 100_000_000}],
-    }
-    tool_decls = [
-        {"type": "function", "function": {"name": name}}
-        for name in CAPITAL_FLOW_TOOLS
-    ]
-    llm = _ScriptedLLM(
-        [
-            LLMTurn(tool_calls=[LLMToolCall(name="get_tushare_moneyflow_ths", call_id="c1")]),
-            LLMTurn(
-                text=json.dumps(
-                    {
-                        "candidates": [
-                            {
-                                "code": "600000",
-                                "name": "浦发银行",
-                                "score": 80,
-                                "confidence": 0.65,
-                                "reason": "主力净流入靠前",
-                                "evidence": [
-                                    {
-                                        "tool": "get_tushare_moneyflow_ths",
-                                        "summary": "近一日主力净流入靠前",
-                                        "metrics": {"net_inflow": 100_000_000},
-                                    }
-                                ],
-                            }
-                        ]
-                    }
-                )
-            ),
-        ]
-    )
-    expert = CapitalFlowExpert(tool_registry=tool_registry, tool_decls=tool_decls, llm=llm)
-    pkt = expert.run([SeedItem(code="600000", source="limit_up_pool")], use_cache=False)
-    assert pkt.expert == "capital_flow_expert"
-    assert pkt.status == "ok"
-    assert pkt.candidates[0].code == "600000"
-    assert pkt.candidates[0].evidence[0].tool == "get_tushare_moneyflow_ths"
-
-
-def test_early_turn_expert_whitelist_and_dimension():
-    expert = EarlyTurnExpert(
-        tool_registry={},
-        tool_decls=[],
-        llm=_ScriptedLLM([LLMTurn(text='{"candidates": []}')]),
-    )
-    assert expert.dimension == "early_turn"
-    assert "analyze_trend" in expert.allowed_tools
-    assert "get_tushare_moneyflow_ths" not in expert.allowed_tools
-
-
-def test_early_turn_expert_runs_with_structure_tools(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
-    tool_registry = {
-        name: (lambda **kw: {"status": "ok"})
-        for name in EARLY_TURN_TOOLS
-    }
-    tool_registry["analyze_trend"] = lambda **kw: {
-        "trend_status": "弱转中性",
-        "support_levels": [10.2],
-        "resistance_levels": [11.0],
-    }
-    tool_decls = [
-        {"type": "function", "function": {"name": name}}
-        for name in EARLY_TURN_TOOLS
-    ]
-    llm = _ScriptedLLM(
-        [
-            LLMTurn(tool_calls=[LLMToolCall(name="analyze_trend", call_id="c1")]),
-            LLMTurn(
-                text=json.dumps(
-                    {
-                        "candidates": [
-                            {
-                                "code": "600000",
-                                "name": "浦发银行",
-                                "score": 78,
-                                "confidence": 0.66,
-                                "reason": "仍处中低位，趋势弱转中性，适合作为低位启动候选继续观察。",
-                                "evidence": [
-                                    {
-                                        "tool": "analyze_trend",
-                                        "summary": "趋势由弱转中性",
-                                        "metrics": {"trend_status": "弱转中性"},
-                                    }
-                                ],
-                            }
-                        ]
-                    }
-                )
-            ),
-        ]
-    )
-    expert = EarlyTurnExpert(tool_registry=tool_registry, tool_decls=tool_decls, llm=llm)
-    pkt = expert.run([SeedItem(code="600000", source="low_base_structure")], use_cache=False)
-    assert pkt.expert == "early_turn_expert"
-    assert pkt.status == "ok"
-    assert pkt.candidates[0].code == "600000"
-    assert pkt.candidates[0].evidence[0].tool == "analyze_trend"
-    assert pkt.seed_summary.seed_count == 1
-    assert pkt.seed_summary.accepted_count == 1

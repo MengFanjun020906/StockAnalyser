@@ -881,7 +881,7 @@ def _resolve_timeout(value: Optional[float]) -> float:
             except ValueError:
                 raw = None
     if raw is None:
-        raw = 20.0
+        raw = 60.0
     return max(1.0, float(raw))
 
 

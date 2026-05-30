@@ -313,7 +313,8 @@ def _run_single_symbol_strategy(strategy_name: str, symbol: str, df: pd.DataFram
 
     if not matched:
         return None
-    return _candidate_payload(symbol, strategy_name, df.iloc[-1], score, metrics)
+    common_metrics = _common_technical_metrics(df)
+    return _candidate_payload(symbol, strategy_name, df.iloc[-1], score, {**common_metrics, **metrics})
 
 
 def _run_rps_breakout(bars: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -343,9 +344,41 @@ def _run_rps_breakout(bars: pd.DataFrame) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for _, row in selected.iterrows():
         score = min(99.0, 76 + float(row["rps"] - 90) * 1.5)
+        symbol = str(row["symbol"])
+        symbol_df = bars[bars["symbol"] == symbol].copy()
+        common_metrics = _common_technical_metrics(symbol_df)
         metrics = {"rps": row["rps"], "pct_change_120": row["pct_change"] * 100, "roll_high_120": row["roll_high"]}
-        candidates.append(_candidate_payload(str(row["symbol"]), "rps_breakout", row, score, metrics))
+        candidates.append(_candidate_payload(symbol, "rps_breakout", row, score, {**common_metrics, **metrics}))
     return candidates
+
+
+def _common_technical_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    if df.empty:
+        return {}
+    work = df.copy()
+    work["ma5"] = work["close"].rolling(5).mean()
+    work["ma20"] = work["close"].rolling(20).mean()
+    work["ma60"] = work["close"].rolling(60).mean()
+    work["vol_ma20"] = work["volume"].rolling(20).mean()
+    last = work.iloc[-1]
+    macd_status = _macd_status(work["close"])
+    rsi_value = _rsi(work["close"], 12)
+    rsi_status = "oversold" if rsi_value < 30 else "overbought" if rsi_value > 70 else "neutral"
+    boll_mid, boll_upper, boll_lower, boll_bandwidth, boll_position = _bollinger_metrics(work["close"])
+    return _jsonable_metrics({
+        "ma5": last.get("ma5"),
+        "ma20": last.get("ma20"),
+        "ma60": last.get("ma60"),
+        "volume_ratio": _safe_ratio(last.get("volume"), last.get("vol_ma20")),
+        "macd_status": macd_status,
+        "rsi_value": rsi_value,
+        "rsi_status": rsi_status,
+        "boll_mid": boll_mid,
+        "boll_upper": boll_upper,
+        "boll_lower": boll_lower,
+        "boll_bandwidth": boll_bandwidth,
+        "boll_position": boll_position,
+    })
 
 
 def _candidate_payload(
@@ -417,6 +450,36 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
             "detail": f"Sequoia 形态/动量策略入池：{'、'.join(strategies)}",
         })
     technical_bits = []
+    ma5 = metrics.get("ma5")
+    ma20 = metrics.get("ma20")
+    ma60 = metrics.get("ma60")
+    if ma5 is not None and ma20 is not None:
+        ma_text = f"MA5={_short_metric(ma5)}；MA20={_short_metric(ma20)}"
+        if ma60 is not None:
+            ma_text += f"；MA60={_short_metric(ma60)}"
+        technical_bits.append(ma_text)
+    macd_status = str(metrics.get("macd_status") or "").strip()
+    rsi_status = str(metrics.get("rsi_status") or "").strip()
+    rsi_value = metrics.get("rsi_value")
+    boll_position = str(metrics.get("boll_position") or "").strip()
+    boll_bandwidth = metrics.get("boll_bandwidth")
+    if macd_status:
+        technical_bits.append({"bullish": "MACD 多头", "bearish": "MACD 空头", "neutral": "MACD 中性"}.get(macd_status, f"MACD={macd_status}"))
+    if rsi_value is not None:
+        rsi_label = f"RSI={_short_metric(rsi_value)}"
+        if rsi_status and rsi_status != "neutral":
+            rsi_label += f"（{'超买' if rsi_status == 'overbought' else '超卖'}）"
+        technical_bits.append(rsi_label)
+    if boll_position:
+        boll_label = {
+            "above_upper": "布林上轨外运行",
+            "upper_half": "布林中上轨运行",
+            "lower_half": "布林中下轨运行",
+            "below_lower": "布林下轨外运行",
+        }.get(boll_position, f"布林位置={boll_position}")
+        if boll_bandwidth is not None:
+            boll_label += f"；带宽={_short_metric(boll_bandwidth)}%"
+        technical_bits.append(boll_label)
     for key, label in (
         ("high_20", "20 日高点"),
         ("volume_ratio", "量比"),
@@ -429,7 +492,7 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
         if value is not None:
             technical_bits.append(f"{label}={value}")
     if technical_bits:
-        dimensions.append({"dimension": "technical", "label": "技术面", "detail": "；".join(technical_bits[:3])})
+        dimensions.append({"dimension": "technical", "label": "技术面", "detail": "；".join(technical_bits[:6])})
     capital_bits = []
     for key, label in (("turnover", "成交额"), ("volume_ratio", "量比")):
         value = metrics.get(key)
@@ -462,6 +525,18 @@ def _display_strategy_names(names: Iterable[Any]) -> List[str]:
     return result
 
 
+def _short_metric(value: Any) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return str(value)
+    if abs(number) >= 100_000_000:
+        return f"{number / 100_000_000:.2f}亿"
+    if abs(number) >= 10_000:
+        return f"{number / 10_000:.2f}万"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
 def _safe_ratio(numerator: Any, denominator: Any) -> float:
     try:
         denominator_f = float(denominator)
@@ -470,6 +545,54 @@ def _safe_ratio(numerator: Any, denominator: Any) -> float:
         return float(numerator) / denominator_f
     except Exception:
         return 0.0
+
+
+def _macd_status(close: pd.Series) -> str:
+    if len(close) < 35:
+        return "neutral"
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=26, adjust=False).mean()
+    dif = ema_fast - ema_slow
+    dea = dif.ewm(span=9, adjust=False).mean()
+    latest = float(dif.iloc[-1] - dea.iloc[-1])
+    prev = float(dif.iloc[-2] - dea.iloc[-2])
+    if latest > 0 and latest >= prev:
+        return "bullish"
+    if latest < 0 and latest <= prev:
+        return "bearish"
+    return "neutral"
+
+
+def _rsi(close: pd.Series, period: int) -> float:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    value = rsi.iloc[-1]
+    return float(value) if pd.notna(value) else 50.0
+
+
+def _bollinger_metrics(close: pd.Series, period: int = 20, width: float = 2.0) -> tuple[Any, Any, Any, Any, str]:
+    if len(close) < period:
+        return pd.NA, pd.NA, pd.NA, pd.NA, "unknown"
+    mid = close.rolling(period).mean().iloc[-1]
+    std = close.rolling(period).std(ddof=0).iloc[-1]
+    if pd.isna(mid) or pd.isna(std):
+        return pd.NA, pd.NA, pd.NA, pd.NA, "unknown"
+    upper = mid + width * std
+    lower = mid - width * std
+    last = close.iloc[-1]
+    bandwidth = (upper - lower) / mid * 100 if mid else pd.NA
+    if last >= upper:
+        position = "above_upper"
+    elif last <= lower:
+        position = "below_lower"
+    elif last >= mid:
+        position = "upper_half"
+    else:
+        position = "lower_half"
+    return mid, upper, lower, bandwidth, position
 
 
 def _bounded_ratio(numerator: Any, denominator: Any, *, cap: float) -> float:

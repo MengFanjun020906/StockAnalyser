@@ -42,6 +42,14 @@ from src.agent.candidate_experts_v2.schemas import (
 logger = logging.getLogger(__name__)
 
 
+FINAL_JSON_REMINDER = (
+    "你已经收到工具结果。现在停止调用工具，只输出一个合法 JSON object；"
+    "不要输出 Markdown、解释、代码块或自然语言前后缀。"
+    "顶层只能包含 data_quality、candidates、rejected 三个字段；"
+    "单只股票结论必须放进 candidates 或 rejected 数组元素里，禁止把单只股票对象直接放在顶层。"
+)
+
+
 ToolFn = Callable[..., Any]
 
 
@@ -72,6 +80,18 @@ Args:
 Returns:
     LLMTurn describing the model's response.
 """
+
+
+def _registry_lookup(tool_registry: Any, name: str) -> Any:
+    """Best-effort lookup that works for both ToolRegistry and plain dict."""
+    if hasattr(tool_registry, "get"):
+        try:
+            return tool_registry.get(name)
+        except TypeError:
+            pass
+    if isinstance(tool_registry, dict):
+        return tool_registry.get(name)
+    return None
 
 
 def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
@@ -305,6 +325,7 @@ class BaseExpert:
                             "content": json.dumps(result_payload, ensure_ascii=False, default=str),
                         }
                     )
+                messages.append({"role": "user", "content": FINAL_JSON_REMINDER})
                 continue  # let LLM see tool results in next round
 
             # No tool calls -> treat as final answer

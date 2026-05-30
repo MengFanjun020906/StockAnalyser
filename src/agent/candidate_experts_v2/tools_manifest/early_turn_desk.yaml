@@ -1,0 +1,183 @@
+dimension: early_turn_desk
+description: >-
+  低位启动席位可调用的工具集。目标是核实「位置仍低 + 出现转强拐点」，
+  不追高、不要求资金已大规模进入。
+
+tools:
+  - tool: analyze_price_structure
+    priority: 5
+    when_to_use: >-
+      核实位置分位（高/中/低位）、关键支撑/压力位、是否处于平台整理区间。
+      这是低位启动的首要事实核查，比 FactSheet 的 range_pct 更精确。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回区间位置、支撑压力位、平台结构描述。
+    key_fields:
+      - position_zone
+      - support_levels
+      - resistance_levels
+      - platform_range
+    combo_hints:
+      - 与 calculate_ma 联动：位置低 + MA5/10/20 刚开始走平/上翘 = 拐点信号。
+      - 与 get_volume_analysis 联动：低位 + 近期量比放大 = 主动性买入信号。
+    cost: cheap
+    failure_modes:
+      - 新股/次新历史不足，position_zone 可能返回 unknown。
+
+  - tool: calculate_ma
+    priority: 8
+    when_to_use: >-
+      判断均线是否从死叉/下行开始走平、上翘，或股价是否首次站回 MA10/20。
+      转强拐点的核心技术标志。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 MA5/10/20/60 当前值及斜率方向，以及股价与各均线的偏离度。
+    key_fields:
+      - ma5
+      - ma10
+      - ma20
+      - ma_alignment
+      - bias_ma20
+    combo_hints:
+      - MA20 由下行转走平，且股价首次站上 MA20 = 典型拐点信号。
+    cost: cheap
+    failure_modes:
+      - 历史数据不足 20 日时 ma20 为空。
+
+  - tool: get_volume_analysis
+    priority: 10
+    when_to_use: >-
+      验证量能结构：放量突破或回踩不破时缩量、量比异常放大。
+      「无量反弹」或「缩量不破」是关键区分点。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回近期量比、成交量趋势、量价配合评估。
+    key_fields:
+      - volume_ratio
+      - volume_trend
+      - volume_price_fit
+    combo_hints:
+      - 放量突破 + 量比 > 1.5 = 有效突破信号。
+      - 回踩缩量 + 不破支撑 = 洗盘而非破位。
+    cost: cheap
+    failure_modes:
+      - 停牌期间数据缺失。
+
+  - tool: analyze_trend
+    priority: 12
+    when_to_use: >-
+      确认下跌趋势是否已结束，趋势从空头/弱势转向中性或初步多头。
+      低位启动至少要出现「下跌结束或弱转中」的迹象。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 trend_status、MA5 偏离度、近期高低点走向。
+    key_fields:
+      - trend_status
+      - bias_ma5
+      - support_levels
+    combo_hints:
+      - trend_status 从 bearish 转 neutral/sideways = 拐点候选。
+    cost: cheap
+    failure_modes:
+      - 历史数据不足时结论弱化。
+
+  - tool: get_capital_flow
+    priority: 18
+    when_to_use: >-
+      核实资金方向：主力/大单净流入/净流出。低位启动席不要求资金已大量进入，
+      但「持续净流出」是否决信号。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回近 N 日主力净流入额、方向及占成交额比例。
+    key_fields:
+      - main_net_inflow
+      - direction
+      - net_ratio
+    combo_hints:
+      - 资金 unknown/neutral 时可以 support（干净低位本就资金未进）。
+      - 持续净流出 + 放量下跌 = 否决。
+    cost: medium
+    failure_modes:
+      - 非交易日无数据；Tushare 免费额度耗尽时返回空。
+
+  - tool: get_chip_distribution
+    priority: 20
+    when_to_use: >-
+      分析筹码分布：是否有底部横盘换手（廉价筹码集中）、上方套牢盘压力。
+      低位启动的「吸筹」证据来源。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回筹码集中度、底部筹码占比、套牢盘比例。
+    key_fields:
+      - chip_concentration
+      - bottom_chip_ratio
+      - cost_distribution
+    combo_hints:
+      - 底部筹码集中 + 成本集中在低位 = 主力吸筹迹象。
+    cost: medium
+    failure_modes:
+      - 部分数据源不提供实时筹码。
+
+  - tool: get_realtime_quote
+    priority: 22
+    when_to_use: >-
+      快速确认当前价格是否仍处低位、今日涨跌幅和换手率，
+      防止 FactSheet 数据滞后。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回最新可用价、涨跌幅、换手率、量比、行情时效。
+    key_fields:
+      - price
+      - change_pct
+      - turnover_rate
+      - volume_ratio
+    combo_hints:
+      - 今日放量上涨 + 换手率温和 = 主动性买入而非追高。
+    cost: cheap
+    failure_modes:
+      - 休市返回最近可用价，不代表盘中异动。
+
+  - tool: get_stock_info
+    priority: 30
+    when_to_use: >-
+      获取行业/板块归属、股本、上市日期。
+      验证板块是否处于强势，判断公司是否符合低位启动的「合理基本面背景」。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回行业、概念、流通股本、上市日期等基础信息。
+    key_fields:
+      - industry
+      - sector
+      - list_date
+    combo_hints:
+      - 板块处于弱势时，低位启动需更强的个股转强证据。
+    cost: cheap
+    failure_modes:
+      - 少数标的信息缺失。
+
+  - tool: analyze_pattern
+    priority: 35
+    when_to_use: >-
+      识别底部形态：双底、头肩底、W底、横盘整理后放量突破等。
+      形态确认可提升低位拐点判断的置信度。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回识别到的形态名称、可信度、关键价位。
+    key_fields:
+      - pattern_name
+      - confidence
+      - key_levels
+    combo_hints:
+      - 形态 + 均线拐点 + 量能配合 = 三重确认。
+    cost: medium
+    failure_modes:
+      - 震荡市无明显形态时返回 unknown。

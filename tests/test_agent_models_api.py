@@ -1341,5 +1341,55 @@ class AgentTraceRunRequestCandidateDiscoveryModeTestCase(unittest.TestCase):
             )
 
 
+class TraceArtifactWriterSeedPoolTestCase(unittest.TestCase):
+    def test_seed_pool_and_gate_events_write_incremental_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = _build_config(database_path=os.path.join(tmpdir, "stock_analysis.db"))
+            request = agent.AgentTraceRunRequest(message="下周可入手股票")
+            with patch("api.v1.endpoints.agent.get_config", return_value=config):
+                writer = agent.TraceArtifactWriter("trace-seed-test")
+                writer.initialize(request=request, context={})
+                writer.append_event({
+                    "type": "selection_seed_pool_built",
+                    "payload": {
+                        "phase": "built",
+                        "seed_pool_summary": {
+                            "seed_count": 2,
+                            "seed_sources": {"local_price_volume": 1, "user_watchlist": 1},
+                        },
+                        "seed_pool_diagnostics": [
+                            {"source": "local_price_volume", "status": "ok", "count": 1}
+                        ],
+                        "seed_pool_hard_exclusion": {"excluded_count": 0},
+                        "seed_source_quality": {"local_price_volume": {"status": "ok"}},
+                    },
+                })
+                writer.append_event({
+                    "type": "selection_seed_gate_done",
+                    "payload": {
+                        "status": "ok",
+                        "phase": "gate",
+                        "seed_pool_summary_before_gate": {"seed_count": 2},
+                        "seed_pool_summary": {"seed_count": 1},
+                        "seed_gate": {"status": "ok", "kept_count": 1, "rejected_count": 1},
+                        "candidate_count": 1,
+                        "candidate_source": "llm_expert_committee",
+                    },
+                })
+
+                with open(os.path.join(writer.path, "seed_pool.json"), encoding="utf-8") as fh:
+                    seed_pool = json.load(fh)
+                with open(os.path.join(writer.path, "seed_gate.json"), encoding="utf-8") as fh:
+                    seed_gate = json.load(fh)
+                with open(os.path.join(writer.path, "events.ndjson"), encoding="utf-8") as fh:
+                    event_types = [json.loads(line)["type"] for line in fh if line.strip()]
+
+        self.assertEqual(event_types, ["selection_seed_pool_built", "selection_seed_gate_done"])
+        self.assertEqual(seed_pool["seed_pool_summary"]["seed_count"], 2)
+        self.assertEqual(seed_pool["seed_pool_diagnostics"][0]["source"], "local_price_volume")
+        self.assertEqual(seed_gate["seed_gate"]["kept_count"], 1)
+        self.assertEqual(seed_gate["candidate_source"], "llm_expert_committee")
+
+
 if __name__ == "__main__":
     unittest.main()

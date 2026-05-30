@@ -152,16 +152,17 @@
 
 已有能力：
 
-- `get_capital_flow` 已覆盖个股主力净流入、5/10 日流入；当前默认使用 StockAPI 历史资金流 `codeFlow`，不再默认调用东方财富个股资金流端点。
+- `get_capital_flow` 已覆盖个股主力净流入、5/10 日流入；当前默认使用 Tushare `moneyflow`，失败时回退 StockAPI 历史资金流 `codeFlow`，不再默认调用东方财富个股资金流端点。
 - `get_market_capital_flow` 已覆盖市场资金快照、个股/行业/概念资金流排名。
 - `get_northbound_capital_flow` 已覆盖北向资金摘要和近期历史。
 - `get_margin_trading_summary` 已覆盖融资融券余额、融资买入和交易所两融摘要。
+- `llm_expert_committee` 种子池已将 `hsgt_top10` 北向/互联互通个股成交、`margin_detail` 融资融券明细、`block_trade` 大宗交易接为独立 seed source；对应工具为 `get_tushare_hsgt_top10`、`get_tushare_margin_detail`、`get_tushare_block_trade`，并补充 `get_tushare_moneyflow_hsgt` 与 `get_tushare_moneyflow_mkt_dc` 作为北向和大盘资金背景。
 
 不足：
 
 - 当前主要针对 A 股个股，不覆盖 ETF、指数、港股、美股。
 - ETF 申赎、期权/期货持仓等风险偏好指标仍未封装。
-- 个股资金流当前依赖 StockAPI 历史资金流，盘中实时性受接口 15:30 更新节奏限制；未配置 token 时只能查滞后历史窗口且每日请求次数很少，不覆盖 ETF、指数、港股、美股。
+- 个股资金流当前优先依赖 Tushare `moneyflow`，fallback 到 StockAPI 历史资金流时仍受其 15:30 更新节奏限制；未配置 token 时 fallback 只能查滞后历史窗口且每日请求次数很少，不覆盖 ETF、指数、港股、美股。
 
 影响：
 
@@ -477,7 +478,7 @@
 | 全球经济日历 | Trading Economics | `https://api.tradingeconomics.com/calendar?c=...` | `TRADING_ECONOMICS_API_KEY` | 最接近真正经济日历：国家、指标、重要性、实际值、预期值、前值 |
 | 美股新闻/经济日历备用 | Finnhub | `https://finnhub.io/api/v1/news?category=general&token=...`、`/calendar/economic`、`/company-news`、`/news-sentiment` | `FINNHUB_API_KEY` | 可选备用，适合美股和全球市场新闻 |
 | 多资产行情备用 | Twelve Data | `https://api.twelvedata.com/time_series?symbol=...&interval=1day&apikey=...` 或 `/quote` | `TWELVEDATA_API_KEY` | 可选备用，覆盖外汇、指数、商品，需确认套餐权限 |
-| A 股公告、解禁、减持、监管 | Tushare Pro | `POST http://api.tushare.pro`，body 传 `api_name/token/params/fields` | `TUSHARE_TOKEN` | 仓库已有 Tushare 配置入口，适合补结构化 A 股事件 |
+| A 股公告、解禁、减持、监管 | Tushare Pro | `POST http://118.89.66.41:8010/`，body 传 `api_name/token/params/fields` | `TUSHARE_TOKEN` | 仓库已有 Tushare 配置入口，适合补结构化 A 股事件 |
 | 结构化冲突事件库 | ACLED | `https://acleddata.com/api/acled/read?_format=json&...` | `ACLED_USERNAME` / `ACLED_PASSWORD` 或 myACLED token | 可选；不是金融新闻源，适合高置信冲突事件校验 |
 
 ### 8.2 工具 → 数据源映射
@@ -490,11 +491,11 @@
 | `get_macro_calendar` | Trading Economics；中国侧补 Tushare | Trading Economics `/calendar?c=...`；Tushare `cn_schedule` | `TRADING_ECONOMICS_API_KEY`、`TUSHARE_TOKEN` | P1/P2。用于议息、CPI、PMI、非农等事件窗口 |
 | `get_policy_event_digest` | GDELT / SearchService + 官方 RSS | GDELT 固定政策关键词；SearchService 搜索政府、央行、监管源 | 复用现有搜索 key | 国内政策没有统一稳定官方 API，第一版建议用搜索/RSS 聚合 |
 | `get_rate_fx_commodity_snapshot` | yfinance + Alpha Vantage + Twelve Data | yfinance symbols；Alpha macro/commodity；Twelve Data `/quote` | `ALPHAVANTAGE_API_KEY`、`TWELVEDATA_API_KEY` 可选 | 可与 `get_cross_asset_risk_signals` 共用底层 quote 适配 |
-| `get_company_event_timeline` | Tushare `anns_d` | `POST http://api.tushare.pro`，`api_name=anns_d` | `TUSHARE_TOKEN` | 结构化公司公告、标题、日期、PDF URL |
-| `get_regulatory_risk_events` | Tushare `stk_alert`、`stk_shock`、`pledge_stat`、`anns_d` 关键词 | `POST http://api.tushare.pro` | `TUSHARE_TOKEN` | 汇总风险提示、异常波动、质押、监管问询/处罚/诉讼类公告 |
-| `get_unlock_and_reduction_schedule` | Tushare `share_float`、`stk_holdertrade` | `POST http://api.tushare.pro` | `TUSHARE_TOKEN` | 限售解禁 + 股东增减持，是单股硬风险优先级最高的一组 |
-| `get_etf_flow_snapshot` | Tushare `fund_share`、`fund_daily`、`etf_basic`；可选 `rt_etf_sz_iopv` | `POST http://api.tushare.pro` | `TUSHARE_TOKEN`；实时接口可能需单独权限 | 基金份额变化可近似 ETF 申赎，实时 IOPV/申赎数据视权限接入 |
-| `get_derivatives_position_snapshot` | Tushare `opt_basic`、`opt_daily`、`fut_holding`、`fut_daily` | `POST http://api.tushare.pro` | `TUSHARE_TOKEN`；部分接口需积分/权限 | 期权行情、期货持仓排名和主力合约行情 |
+| `get_company_event_timeline` | Tushare `anns_d` | `POST http://118.89.66.41:8010/`，`api_name=anns_d` | `TUSHARE_TOKEN` | 结构化公司公告、标题、日期、PDF URL |
+| `get_regulatory_risk_events` | Tushare `stk_alert`、`stk_shock`、`pledge_stat`、`anns_d` 关键词 | `POST http://118.89.66.41:8010/` | `TUSHARE_TOKEN` | 汇总风险提示、异常波动、质押、监管问询/处罚/诉讼类公告 |
+| `get_unlock_and_reduction_schedule` | Tushare `share_float`、`stk_holdertrade` | `POST http://118.89.66.41:8010/` | `TUSHARE_TOKEN` | 限售解禁 + 股东增减持，是单股硬风险优先级最高的一组 |
+| `get_etf_flow_snapshot` | Tushare `fund_share`、`fund_daily`、`etf_basic`；可选 `rt_etf_sz_iopv` | `POST http://118.89.66.41:8010/` | `TUSHARE_TOKEN`；实时接口可能需单独权限 | 基金份额变化可近似 ETF 申赎，实时 IOPV/申赎数据视权限接入 |
+| `get_derivatives_position_snapshot` | Tushare `opt_basic`、`opt_daily`、`fut_holding`、`fut_daily` | `POST http://118.89.66.41:8010/` | `TUSHARE_TOKEN`；部分接口需积分/权限 | 期权行情、期货持仓排名和主力合约行情 |
 | `map_event_to_sectors` | 本地映射表 + LLM 解释 | 无外部 API | 不需要 | 输入来自 GDELT/情绪工具，输出受益/受损板块和置信度 |
 | `stress_test_portfolio_by_event` | 组合持仓 + 板块归属 + 事件敏感度矩阵 | 无外部 API | 不需要 | 用现有 `get_portfolio_snapshot` 和本地映射矩阵计算持仓冲击排序 |
 | `get_market_liquidity_status` | 现有 `get_market_indices` + 历史成交额 | 内部 DataFetcher / market stats | 不需要 | P2。用全市场成交额与 5/20 日均值判断流动性收缩或放大 |
@@ -505,7 +506,7 @@
 
 **P1 工具（跨资产风险信号）先复用 yfinance，再配置 Alpha Vantage 增强**——YfinanceFetcher 已经存在且能处理任意 Yahoo Finance symbol，只需要新增一个 `get_cross_asset_quotes(symbols: list)` 方法；Alpha Vantage 可补 WTI、Brent、美债收益率、宏观指标和市场状态。
 
-**A 股结构化事件优先用 Tushare Pro**——公告、解禁、减持、异常波动、质押、ETF、期权、期货持仓都可以走 `POST http://api.tushare.pro`，仓库已有 `TUSHARE_TOKEN` 配置入口，适合补成稳定工具。
+**A 股结构化事件优先用 Tushare Pro**——公告、解禁、减持、异常波动、质押、ETF、期权、期货持仓都可以走 `POST http://118.89.66.41:8010/`，仓库已有 `TUSHARE_TOKEN` 配置入口，适合补成稳定工具。
 
 **Trading Economics 和 ACLED 属于增强源**——Trading Economics 适合做真正经济日历；ACLED 适合做结构化冲突事件校验，但不是金融新闻源，且需要单独账号/授权。
 
@@ -558,7 +559,7 @@ CROSS_ASSET_SYMBOLS = {
 Tushare Pro 统一 HTTP 入口：
 
 ```http
-POST http://api.tushare.pro
+POST http://118.89.66.41:8010/
 Content-Type: application/json
 
 {
@@ -593,6 +594,10 @@ AkShare 已有但未被 Agent 工具使用的接口：
 | `stock_market_fund_flow` / `stock_fund_flow_*` | 市场和板块资金流 | `get_market_capital_flow` |
 | `stock_hsgt_*` | 北向资金净流入 | `get_northbound_capital_flow` |
 | `stock_margin_sse` / `stock_margin_szse` | 融资融券余额 | `get_margin_trading_summary` |
+| Tushare `moneyflow_hsgt` / `hsgt_top10` | 北向资金背景与个股十大成交 | `get_tushare_moneyflow_hsgt` / `get_tushare_hsgt_top10` |
+| Tushare `moneyflow_mkt_dc` | 大盘主力资金流 | `get_tushare_moneyflow_mkt_dc` |
+| Tushare `margin_detail` | 个股融资融券明细 | `get_tushare_margin_detail` |
+| Tushare `block_trade` | 大宗交易 | `get_tushare_block_trade` |
 | `macro_china_cpi` / `macro_china_pmi` | 中国宏观数据 | `get_macro_calendar` |
 | `macro_usa_cpi` / `macro_usa_nfp` | 美国宏观数据 | `get_macro_calendar` |
 | `futures_main_sina` | 商品期货主力合约 | `get_cross_asset_risk_signals` 备选 |

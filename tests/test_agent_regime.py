@@ -182,8 +182,12 @@ def test_market_history_prefers_tushare_index_daily_fast_path():
     import pandas as pd
     from src.agent.tools import market_tools
 
+    class FakeTushareHttpClient:
+        def query(self, *args, **kwargs):
+            return pd.DataFrame(rows)
+
     with patch("data_provider.tushare_client.get_tushare_token", return_value="token"), \
-         patch("data_provider.tushare_client.query_tushare_api", return_value=pd.DataFrame(rows)), \
+         patch("data_provider.tushare_client.build_tushare_http_client", return_value=FakeTushareHttpClient()), \
          patch("src.services.history_loader.load_history_df") as fallback_loader:
         history, source = market_tools._load_market_history("000300", 260)
 
@@ -191,6 +195,18 @@ def test_market_history_prefers_tushare_index_daily_fast_path():
     assert history[0]["date"] == "2026-05-15"
     assert history[0]["close"] == 101
     fallback_loader.assert_not_called()
+
+
+def test_market_history_skips_stock_fallback_for_supported_index():
+    from src.agent.tools import market_tools
+
+    with patch("src.agent.tools.market_tools._load_index_history_from_tushare", return_value=([], "tushare:index_daily_failed")), \
+         patch("src.services.history_loader.load_history_df", return_value=(None, "db_cache_miss")) as fallback_loader:
+        history, source = market_tools._load_market_history("000300", 260)
+
+    assert history == []
+    assert source == "tushare:index_daily_failed;db_cache_miss"
+    fallback_loader.assert_called_once_with("000300", days=260, fallback_to_network=False)
 
 
 def test_detect_market_regime_tool_returns_structured_timeout_diagnostics():

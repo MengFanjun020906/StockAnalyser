@@ -252,6 +252,7 @@ describe('AgentTracePage', () => {
         max_total_equity_exposure_pct: 80,
         max_acceptable_drawdown_pct: 15,
         default_stop_loss_pct: 8,
+        candidate_discovery_mode: 'thesis_desk_committee',
       }));
     });
     expect(screen.getByText('trace-12345678123412341234123456789abc')).toBeInTheDocument();
@@ -264,7 +265,10 @@ describe('AgentTracePage', () => {
     expect(screen.getByRole('heading', { name: '最终结论' })).toBeInTheDocument();
     expect(screen.getByText('持有，但不急着加仓')).toBeInTheDocument();
     expect(screen.getByText('分析完成')).toBeInTheDocument();
-    const createObjectURL = vi.fn((_object: Blob | MediaSource) => 'blob:agent-report');
+    const createObjectURL = vi.fn((blob: Blob | MediaSource) => {
+      expect(blob).toBeInstanceOf(Blob);
+      return 'blob:agent-report';
+    });
     const revokeObjectURL = vi.fn();
     Object.defineProperty(window.URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(window.URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
@@ -988,29 +992,32 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('主题观察 (1)')).toBeInTheDocument();
     expect(screen.getByText('人工智能')).toBeInTheDocument();
     expect(screen.getByText('AI 应用订单与算力投入持续升温')).toBeInTheDocument();
-    expect(screen.getByText('按专家维度分组的候选')).toBeInTheDocument();
+    expect(screen.getByText('候选入池榜')).toBeInTheDocument();
+    expect(screen.getByText('专家维度与原始候选分组')).toBeInTheDocument();
     expect(screen.getAllByText('策略候选').length).toBeGreaterThan(0);
     expect(screen.getAllByText('技术面候选').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('资金面候选').length).toBeGreaterThan(0);
+    expect(screen.queryByText('资金面候选')).not.toBeInTheDocument();
     expect(screen.getAllByText('情绪/热点候选').length).toBeGreaterThan(0);
     expect(screen.queryByText('为什么后续工具查这些股票')).not.toBeInTheDocument();
     expect(screen.queryByText('入池候选与理由')).not.toBeInTheDocument();
     expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
-    expect(screen.getByText('候选池列表 (3)')).toBeInTheDocument();
-    expect(screen.getAllByText('强势板块').length).toBeGreaterThan(0);
+    expect(screen.queryByText('候选池列表 (3)')).not.toBeInTheDocument();
+    expect(screen.getAllByText(/强势板块/).length).toBeGreaterThan(0);
     expect(screen.getAllByText('600001').length).toBeGreaterThan(0);
     expect(screen.getAllByText('测试一').length).toBeGreaterThan(0);
     expect(screen.getAllByText('301183').length).toBeGreaterThan(0);
     expect(screen.getAllByText('东田微').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('评分 92.5').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('92.5').length).toBeGreaterThan(0);
     expect(screen.getAllByText('共振 +7.05').length).toBeGreaterThan(0);
     expect(screen.getAllByText('新进入').length).toBeGreaterThan(0);
     expect(screen.getAllByText('存在反证').length).toBeGreaterThan(0);
     expect(screen.getAllByText('多专家候选共振').length).toBeGreaterThan(0);
     expect(screen.getAllByText('AlphaSift 多因子：volume_breakout').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/AlphaSift YAML 多因子策略入池/).length).toBeGreaterThan(0);
-    expect(screen.getAllByText('海龟突破').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('RPS 强势突破').length).toBeGreaterThan(0);
+    fireEvent.click(screen.getAllByRole('button', { name: '证据' })[0]);
+    expect(screen.getAllByText(/证据拆解/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/海龟突破/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/RPS 强势突破/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Sequoia 形态\/动量策略入池/).length).toBeGreaterThan(0);
     expect(screen.getAllByText('策略').length).toBeGreaterThan(0);
     expect(screen.getAllByText('技术面').length).toBeGreaterThan(0);
@@ -1023,6 +1030,47 @@ describe('AgentTracePage', () => {
     expect(screen.queryByText('ma_volume')).not.toBeInTheDocument();
     expect(screen.queryByText('turtle_trade')).not.toBeInTheDocument();
     expect(screen.queryByText('rps_breakout')).not.toBeInTheDocument();
+  });
+
+  it('forces portfolio context injection when a specific account is selected', async () => {
+    mocks.getAccounts.mockResolvedValue({
+      accounts: [{ id: 3, name: '5w账户', market: 'cn', baseCurrency: 'CNY', isActive: true }],
+    });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-account-context',
+        content: '持仓建议',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'mimo',
+        mode: 'planning_execute',
+        tool_calls: [],
+        planner: { intent: 'position_review' },
+        context_summary: { account_count: 1, position_count: 1 },
+        debate: null,
+      },
+    ]));
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue('5w账户')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: /注入持仓/ }));
+    expect(screen.getByRole('checkbox', { name: /注入持仓/ })).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    await waitFor(() => {
+      expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        account_id: 3,
+        inject_portfolio_context: true,
+      }));
+    });
   });
 
   it('keeps expert_graph status without treating validation expert_state as L1 discovery', async () => {
@@ -1323,13 +1371,378 @@ describe('AgentTracePage', () => {
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     expect(await screen.findByText('选股结论')).toBeInTheDocument();
-    expect(await screen.findByText('兜底观察池')).toBeInTheDocument();
-    expect(screen.getByText('兜底观察池 (1)')).toBeInTheDocument();
+    expect(await screen.findByText('兜底观察池 (1)')).toBeInTheDocument();
     expect(screen.getByText(/不是策略、资金或消息面筛选结果/)).toBeInTheDocument();
     expect(screen.getAllByText('688981').length).toBeGreaterThan(0);
     expect(screen.getAllByText('中芯国际').length).toBeGreaterThan(0);
     expect(screen.queryByText('策略候选')).not.toBeInTheDocument();
     expect(screen.queryByText(/固定种子池兜底，仅用于保证后续取证链路可运行$/)).not.toBeInTheDocument();
+  });
+
+  it('groups candidates by raw expert packets instead of merged candidate dimensions', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-expert-groups',
+        content: '选股结论',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'deepseek/deepseek-chat',
+        mode: 'planning_execute',
+        tool_calls: [
+          {
+            step: 1,
+            tool: 'discover_watchlist_candidates',
+            arguments: { market: 'cn', seed_symbols: [], limit: 8 },
+            success: true,
+            duration: 0.2,
+            result_length: 1000,
+            result_json: {
+              status: 'ok',
+              candidate_source: 'expert_graph_discovery',
+              candidate_count: 1,
+              candidates: [
+                {
+                  code: '600001',
+                  name: '测试一',
+                  source: 'multi_expert_recall',
+                  candidate_experts: ['technical_candidate_expert', 'sector_theme_expert'],
+                  candidate_dimensions: ['technical', 'sentiment'],
+                  reason_dimensions: [
+                    { dimension: 'strategy', label: '策略', detail: 'Sequoia 形态/动量策略入池：海龟突破、RPS 强势突破' },
+                    { dimension: 'technical', label: '技术面', detail: '形态/趋势信号满足候选条件；RPS=94.2' },
+                    { dimension: 'capital', label: '资金面', detail: '流动性代理：成交额=1.50亿' },
+                  ],
+                  signal_score: 92.5,
+                },
+              ],
+              expert_packets: [
+                {
+                  expert: 'strategy_factor_expert',
+                  dimension: 'strategy',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [{ code: '301183', name: '东田微', source: 'alphasift:volume_breakout', reason: 'AlphaSift 放量突破策略入池。' }],
+                  themes: [],
+                },
+                {
+                  expert: 'technical_candidate_expert',
+                  dimension: 'technical',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [{ code: '600001', name: '测试一', source: 'sequoia:turtle_trade', reason: 'Sequoia 技术形态候选。' }],
+                  themes: [],
+                },
+                {
+                  expert: 'capital_flow_expert',
+                  dimension: 'capital',
+                  status: 'empty',
+                  data_quality: { freshness: 'daily', warnings: ['Capital-flow full-market discovery is not wired yet'] },
+                  candidates: [],
+                  themes: [],
+                },
+              ],
+              quality: { candidate_count: 1, hard_strategy_trunk_missing: false, hard_exclusion_count: 0, fallback_count: 0, multi_source_count: 1, dimension_counts: { technical: 1 }, expert_counts: { technical_candidate_expert: 1 }, lifecycle_counts: { new: 1 } },
+            },
+          },
+        ],
+        stock_selection: null,
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    renderPage();
+
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
+    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('专家维度与原始候选分组')).toBeInTheDocument();
+    expect(screen.getByText('候选入池榜')).toBeInTheDocument();
+    expect(screen.getByText('策略候选')).toBeInTheDocument();
+    expect(screen.getByText('技术面候选')).toBeInTheDocument();
+    expect(screen.queryByText('资金面候选')).not.toBeInTheDocument();
+    expect(screen.getByText('301183')).toBeInTheDocument();
+    expect(screen.getByText('东田微')).toBeInTheDocument();
+    expect(screen.getAllByText('600001').length).toBeGreaterThan(0);
+  });
+
+  it('dedupes expert grouped candidates across dimensions so resonance names do not repeat in every bucket', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-expert-groups-dedupe',
+        content: '选股结论',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'deepseek/deepseek-chat',
+        mode: 'planning_execute',
+        tool_calls: [
+          {
+            step: 1,
+            tool: 'discover_watchlist_candidates',
+            arguments: { market: 'cn', seed_symbols: [], limit: 8 },
+            success: true,
+            duration: 0.2,
+            result_length: 1000,
+            result_json: {
+              status: 'ok',
+              candidate_source: 'expert_graph_discovery',
+              candidate_count: 3,
+              candidates: [
+                {
+                  code: '600001',
+                  name: '测试一',
+                  source: 'multi_expert_recall',
+                  candidate_experts: ['strategy_factor_expert', 'technical_candidate_expert', 'fundamental_expert'],
+                  candidate_dimensions: ['strategy', 'technical', 'fundamental'],
+                  reason_dimensions: [
+                    { dimension: 'strategy', label: '策略', detail: 'AlphaSift 策略共振' },
+                    { dimension: 'technical', label: '技术面', detail: '形态突破' },
+                    { dimension: 'fundamental', label: '基本面', detail: '质量因子较高' },
+                  ],
+                  signal_score: 100,
+                },
+                {
+                  code: '600002',
+                  name: '测试二',
+                  source: 'sequoia:turtle_trade',
+                  candidate_experts: ['technical_candidate_expert'],
+                  candidate_dimensions: ['technical'],
+                  signal_score: 90,
+                },
+                {
+                  code: '600003',
+                  name: '测试三',
+                  source: 'fundamental:quality_snapshot',
+                  candidate_experts: ['fundamental_expert'],
+                  candidate_dimensions: ['fundamental'],
+                  signal_score: 88,
+                },
+              ],
+              expert_packets: [
+                {
+                  expert: 'strategy_factor_expert',
+                  dimension: 'strategy',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [{ code: '600001', name: '测试一', source: 'alphasift:balanced_alpha', reason: '策略候选' }],
+                  themes: [],
+                },
+                {
+                  expert: 'technical_candidate_expert',
+                  dimension: 'technical',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [
+                    { code: '600001', name: '测试一', source: 'sequoia:turtle_trade', reason: '技术候选' },
+                    { code: '600002', name: '测试二', source: 'sequoia:rps_breakout', reason: '技术候选 2' },
+                  ],
+                  themes: [],
+                },
+                {
+                  expert: 'fundamental_expert',
+                  dimension: 'fundamental',
+                  status: 'ok',
+                  data_quality: { freshness: 'daily', warnings: [] },
+                  candidates: [
+                    { code: '600001', name: '测试一', source: 'fundamental:quality_snapshot', reason: '基本面候选' },
+                    { code: '600003', name: '测试三', source: 'fundamental:quality_snapshot', reason: '基本面候选 2' },
+                  ],
+                  themes: [],
+                },
+              ],
+            },
+          },
+        ],
+        stock_selection: null,
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    renderPage();
+
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
+    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('专家维度与原始候选分组')).toBeInTheDocument();
+    expect(screen.getByText('候选入池榜')).toBeInTheDocument();
+    expect(screen.getByText('策略候选')).toBeInTheDocument();
+    expect(screen.getByText('技术面候选')).toBeInTheDocument();
+    expect(screen.getByText('基本面候选')).toBeInTheDocument();
+    expect(screen.getAllByText('测试一').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('测试二').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('测试三').length).toBeGreaterThan(0);
+  });
+
+  it('renders thesis desk seed pool and per-desk packets from stock selection artifact', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-thesis-desks',
+        content: '选股结论',
+        error: null,
+        total_steps: 1,
+        total_tokens: 10,
+        provider: 'agent',
+        model: 'deepseek/deepseek-chat',
+        mode: 'planning_execute',
+        tool_calls: [],
+        stock_selection: {
+          enabled: true,
+          success: true,
+          final_report_json: {
+            orchestration_mode: 'legacy',
+            candidate_discovery: {
+              status: 'ok',
+              full: {
+                candidates: [
+                  { code: '600001', name: '测试一', candidate_source: 'thesis_desk_committee', reason: '聚合后进入候选' },
+                ],
+                seed_pool_summary: {
+                  seed_count: 20,
+                  total_limit: 20,
+                  seed_sources: { daily_screener: 12, alphasift: 8 },
+                  signal_dimensions: { technical: 11, fundamental: 4 },
+                  preview: [
+                    { code: '600001', name: '测试一', source: 'daily_screener', priority_score: 98, trigger_signals: [{ summary: '放量突破' }] },
+                    { code: '600002', name: '测试二', source: 'alphasift', priority_score: 91, trigger_signals: [{ summary: '质量修复' }] },
+                  ],
+                },
+                thesis_desk_packets: [
+                  {
+                    expert: 'early_turn_desk',
+                    status: 'ok',
+                    seed_summary: { seed_count: 16, accepted_count: 1, rejected_count: 0 },
+                    elapsed_ms: 120,
+                    candidates: [{ code: '600001', name: '测试一', stance: 'support', setup_type: 'early_turn', reason: '低位启动确认' }],
+                    rejected: [],
+                    tool_calls: [{ tool: 'analyze_trend' }],
+                    per_seed_packets: [
+                      {
+                        status: 'ok',
+                        elapsed_ms: 80,
+                        candidates: [{ code: '600001', name: '测试一' }],
+                        rejected: [],
+                        tool_calls: [{ tool: 'analyze_trend' }],
+                        diagnostics: [{ source: 'desk_single_seed_checkpoint', status: 'saved', code: '600001' }],
+                        errors: [],
+                      },
+                    ],
+                    diagnostics: [],
+                    errors: [],
+                  },
+                  {
+                    expert: 'momentum_desk',
+                    status: 'ok',
+                    seed_summary: { seed_count: 16, accepted_count: 1, rejected_count: 0 },
+                    candidates: [{ code: '600002', name: '测试二', stance: 'watch', setup_type: 'trend_continuation', reason: '动量仍在' }],
+                    rejected: [],
+                    tool_calls: [],
+                    per_seed_packets: [
+                      {
+                        status: 'timeout',
+                        elapsed_ms: 1000,
+                        candidates: [],
+                        rejected: [],
+                        tool_calls: [],
+                        diagnostics: [{ source: 'desk_single_seed_timeout', status: 'timeout', code: '600003' }],
+                        errors: ['momentum_desk seed 600003 timeout after 1.0s'],
+                      },
+                    ],
+                    diagnostics: [],
+                    errors: [],
+                  },
+                  {
+                    expert: 'quality_repair_desk',
+                    status: 'empty',
+                    seed_summary: { seed_count: 10, accepted_count: 0, rejected_count: 0 },
+                    candidates: [],
+                    rejected: [],
+                    tool_calls: [],
+                    diagnostics: [{ source: 'desk_filter', status: 'no_eligible_rows' }],
+                    errors: [],
+                  },
+                ],
+                thesis_desk_committee: { status: 'ok', degraded: false, diagnostics: [] },
+              },
+            },
+          },
+          selection_context: {},
+        },
+        runtime_config: { agent_orchestration_mode: 'legacy' },
+      },
+    ]));
+
+    renderPage();
+
+    const promptInput = await screen.findByDisplayValue(/帮我选一下下周可以入手的股票/);
+    fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('P4 三席位可观察性')).toBeInTheDocument();
+    expect(screen.getByText('Seed 20 / 20')).toBeInTheDocument();
+    expect(screen.getByText('Seed Preview (2)')).toBeInTheDocument();
+    expect(screen.getByText('低位启动席')).toBeInTheDocument();
+    expect(screen.getByText('动量席')).toBeInTheDocument();
+    expect(screen.getByText('质量修复席')).toBeInTheDocument();
+    expect(screen.getByText('低位启动确认')).toBeInTheDocument();
+    expect(screen.getByText('动量仍在')).toBeInTheDocument();
+    expect(screen.getByText('600003')).toBeInTheDocument();
+    expect(screen.getByText('momentum_desk seed 600003 timeout after 1.0s')).toBeInTheDocument();
+    expect(screen.getByText('本席位未输出候选。')).toBeInTheDocument();
+  });
+
+  it('sends thesis desk candidate discovery mode in payload', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-candidate-mode',
+        content: '选股结论',
+        error: null,
+        total_steps: 0,
+        total_tokens: 0,
+        provider: 'agent',
+        model: 'mimo-v2.5',
+        mode: 'planning_execute',
+        tool_calls: [],
+        agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+        context_summary: { account_count: 0, position_count: 0, accounts: [], investor: null },
+        stock_selection: null,
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    ]));
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: /展开配置/ }));
+    const select = await screen.findByLabelText('候选发现模式');
+    expect((select as HTMLSelectElement).value).toBe('thesis_desk_committee');
+
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+
+    await waitFor(() => {
+      expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        candidate_discovery_mode: 'thesis_desk_committee',
+      }));
+    });
   });
 });
 

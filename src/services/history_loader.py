@@ -158,12 +158,14 @@ def load_history_df(
     stock_code: str,
     days: int = 60,
     target_date: Optional[date] = None,
+    fallback_to_network: bool = True,
 ) -> Tuple[Optional[pd.DataFrame], str]:
     """Load K-line history, DB first with DataFetcherManager fallback.
 
     Returns ``(df, source)`` where *source* is ``"db_cache"`` on DB hit or the
-    actual provider name on network fallback.  Returns ``(None, "none")`` when
-    both paths fail.
+    actual provider name on network fallback.  Returns ``(None, "db_cache_miss")``
+    when network fallback is disabled and cache misses, or ``(None, "none")``
+    when both paths fail.
     """
     from src.storage import get_db
 
@@ -193,6 +195,9 @@ def load_history_df(
             return df, "db_cache"
     except Exception as e:
         logger.debug("load_history_df(%s): DB read failed: %s", stock_code, e)
+
+    if not fallback_to_network:
+        return None, "db_cache_miss"
 
     # --- 2. Network fallback via singleton DataFetcherManager -------------
     try:

@@ -106,7 +106,7 @@ class AgentTraceRunRequest(BaseModel):
     max_acceptable_drawdown_pct: Optional[float] = Field(default=None, ge=0, le=100)
     default_stop_loss_pct: Optional[float] = Field(default=None, ge=0, le=100)
     investor_notes: Optional[str] = None
-    candidate_discovery_mode: Optional[Literal["deterministic", "llm_expert_committee"]] = None
+    candidate_discovery_mode: Optional[Literal["deterministic", "llm_expert_committee", "thesis_desk_committee"]] = None
 
     @property
     def effective_skills(self) -> Optional[List[str]]:
@@ -1750,6 +1750,38 @@ class TraceArtifactWriter:
             return
         self._events.append(event)
         _append_trace_event(self.path / "events.ndjson", event)
+        self._write_incremental_artifact_from_event(event)
+
+    def _write_incremental_artifact_from_event(self, event: Dict[str, Any]) -> None:
+        event_type = str(event.get("type") or event.get("event") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event_type == "selection_seed_pool_built":
+            _write_trace_json(
+                self.path / "seed_pool.json",
+                {
+                    "event_type": event_type,
+                    "phase": payload.get("phase") or "built",
+                    "seed_pool_summary": payload.get("seed_pool_summary"),
+                    "seed_pool_diagnostics": payload.get("seed_pool_diagnostics"),
+                    "seed_pool_hard_exclusion": payload.get("seed_pool_hard_exclusion"),
+                    "seed_source_quality": payload.get("seed_source_quality"),
+                    "seed_market_regime": payload.get("seed_market_regime"),
+                },
+            )
+        elif event_type == "selection_seed_gate_done":
+            _write_trace_json(
+                self.path / "seed_gate.json",
+                {
+                    "event_type": event_type,
+                    "phase": payload.get("phase") or "gate",
+                    "status": payload.get("status"),
+                    "seed_pool_summary_before_gate": payload.get("seed_pool_summary_before_gate"),
+                    "seed_pool_summary": payload.get("seed_pool_summary"),
+                    "seed_gate": payload.get("seed_gate"),
+                    "candidate_count": payload.get("candidate_count"),
+                    "candidate_source": payload.get("candidate_source"),
+                },
+            )
 
     def finalize(
         self,

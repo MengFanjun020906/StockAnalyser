@@ -2,7 +2,7 @@
 """Tests for src.agent.candidate_experts_v2.tools_manifest.
 
 Covers:
-- YAML loader returns a valid DimensionManifest for the shipped capital.yaml.
+- YAML loader returns a valid DimensionManifest for the shipped desk manifests.
 - Whitelist cross-check: extra manifest tool raises; missing-from-manifest warns.
 - ToolRegistry cross-check: unknown tool name raises.
 - typical_args param-name validation: unknown key raises; missing parameters
@@ -11,18 +11,17 @@ Covers:
   preserved as literal `{key}`.
 - Renderer: produces a Markdown block sorted by (priority, tool) with all
   required sections (何时调用 / 典型参数 / 返回概要 / 关键字段 / 组合提示 / 失败模式).
-- build_capital_system_prompt injects the manifest block into the template.
+- build_early_turn_desk_system_prompt injects the manifest block into the template.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from src.agent.candidate_experts_v2.experts.capital_flow import CAPITAL_FLOW_TOOLS
+from src.agent.candidate_experts_v2.experts.early_turn_desk import EARLY_TURN_DESK_TOOLS
 from src.agent.candidate_experts_v2.prompts._renderer import render_manifest_block
-from src.agent.candidate_experts_v2.prompts.capital import (
-    CAPITAL_SYSTEM_PROMPT_TEMPLATE,
-    build_capital_system_prompt,
+from src.agent.candidate_experts_v2.prompts.early_turn_desk import (
+    build_early_turn_desk_system_prompt,
 )
 from src.agent.candidate_experts_v2.tools_manifest import (
     DimensionManifest,
@@ -39,20 +38,18 @@ from src.agent.candidate_experts_v2.tools_manifest import (
 # ---------------------------------------------------------------------------
 
 
-def test_load_capital_manifest_returns_validated_dimension_manifest():
-    m = load_manifest("capital")
+def test_load_early_turn_desk_manifest_returns_validated_dimension_manifest():
+    m = load_manifest("early_turn_desk")
     assert isinstance(m, DimensionManifest)
-    assert m.dimension == "capital"
-    assert len(m.tools) == len(CAPITAL_FLOW_TOOLS)
+    assert m.dimension == "early_turn_desk"
     names = {e.tool for e in m.tools}
-    assert names == set(CAPITAL_FLOW_TOOLS)
+    assert names == set(EARLY_TURN_DESK_TOOLS)
 
 
-def test_load_capital_manifest_all_priorities_in_range_and_unique():
-    m = load_manifest("capital")
+def test_load_early_turn_desk_manifest_all_priorities_in_range():
+    m = load_manifest("early_turn_desk")
     priorities = [e.priority for e in m.tools]
     assert all(1 <= p <= 99 for p in priorities)
-    # priority does NOT need to be unique by design, but cost must be in enum
     assert all(e.cost in {"cheap", "medium", "expensive"} for e in m.tools)
 
 
@@ -78,7 +75,7 @@ def _entry(tool: str, **kwargs) -> ManifestEntry:
 
 
 def _manifest(entries):
-    return DimensionManifest(dimension="capital", tools=entries)
+    return DimensionManifest(dimension="early_turn_desk", tools=entries)
 
 
 class _StubToolDef:
@@ -141,17 +138,18 @@ def test_validate_manifest_warns_on_whitelist_tool_missing_from_manifest(caplog)
     assert any("missing entries for whitelist tools" in r.message for r in caplog.records)
 
 
-def test_validate_full_capital_manifest_against_real_registry():
-    """The shipped capital.yaml must validate against the real ToolRegistry."""
+def test_validate_full_early_turn_desk_manifest_against_real_registry():
+    """The shipped early_turn_desk.yaml must validate against the real ToolRegistry."""
+    from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
     from src.agent.tools.data_tools import ALL_DATA_TOOLS
     from src.agent.tools.registry import ToolRegistry
 
     reg = ToolRegistry()
-    for t in ALL_DATA_TOOLS:
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS:
         reg.register(t)
 
-    m = load_manifest("capital")
-    validate_manifest(m, whitelist=CAPITAL_FLOW_TOOLS, tool_registry=reg)
+    m = load_manifest("early_turn_desk")
+    validate_manifest(m, whitelist=EARLY_TURN_DESK_TOOLS, tool_registry=reg)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +191,7 @@ def test_render_manifest_block_orders_by_priority_then_tool():
 
 
 def test_render_manifest_block_includes_all_required_sections():
-    m = load_manifest("capital")
+    m = load_manifest("early_turn_desk")
     out = render_manifest_block(m, variables={"today": "20260523", "seed_codes": "600000"})
     assert "**何时调用**" in out
     assert "**典型参数**" in out
@@ -201,41 +199,31 @@ def test_render_manifest_block_includes_all_required_sections():
     assert "**关键字段**" in out
     assert "**组合提示**" in out
     assert "**失败模式**" in out
-    # All 11 tools rendered
-    for name in CAPITAL_FLOW_TOOLS:
+    # All early_turn_desk tools rendered
+    for name in EARLY_TURN_DESK_TOOLS:
         assert f"`{name}`" in out
 
 
 # ---------------------------------------------------------------------------
-# build_capital_system_prompt
+# build_early_turn_desk_system_prompt
 # ---------------------------------------------------------------------------
 
 
-def test_build_capital_system_prompt_injects_manifest_block():
-    prompt = build_capital_system_prompt(
+def test_build_early_turn_desk_system_prompt_injects_manifest_block():
+    prompt = build_early_turn_desk_system_prompt(
         variables={"today": "20260523", "seed_codes": "600519,000001"}
     )
     assert "## 工具手册" in prompt
     # Manifest block is substituted (no unresolved template placeholder)
     assert "{tool_manifest_block}" not in prompt
-    # Runtime variables substituted
-    assert "20260523" in prompt
-    assert "600519" in prompt
     # JSON output schema preserved
     assert '"candidates"' in prompt
-    assert '"data_quality"' in prompt
+    assert "## JSON response contract" in prompt
+    assert "### Few-shot: 有合格候选" in prompt
+    assert "### Few-shot: 没有合格候选" in prompt
 
 
-def test_build_capital_system_prompt_preserves_literal_placeholders_when_no_vars():
-    prompt = build_capital_system_prompt()
-    # When no variables passed, {today}/{seed_codes} remain literal in tool args
-    assert "{today}" in prompt or "{seed_codes}" in prompt
-
-
-def test_capital_template_contains_only_one_format_placeholder():
-    """Sanity: the template must escape every literal `{` except the manifest slot."""
-    # str.format on the template with the slot should succeed
-    rendered = CAPITAL_SYSTEM_PROMPT_TEMPLATE.format(tool_manifest_block="<BLOCK>")
-    assert "<BLOCK>" in rendered
-    # And the rendered output should still contain the JSON example braces
-    assert '"data_quality"' in rendered
+def test_build_early_turn_desk_system_prompt_no_vars():
+    prompt = build_early_turn_desk_system_prompt()
+    # prompt builds without error even with no variables
+    assert len(prompt) > 100

@@ -10,8 +10,9 @@
 stock_selection.py
   └─ _run_candidate_discovery_tool()
        └─ run_committee_discovery()          ← 入口（committee.py）
-            ├─ _build_seed_pool()            ← 确定性种子池（4路来源，无LLM）
-            └─ CapitalFlowExpert.run(seeds)  ← LLM 专家（此处扩展）
+            ├─ _build_seed_pool_result()     ← 确定性共享种子池（本地扫描为主，在线源补充）
+            ├─ _run_seed_gate()              ← LLM 门卫：只做噪音过滤，不调用工具/不新增代码
+            └─ run_experts_parallel()        ← LLM 专家并行输出 packet
                  └─ BaseExpert 有界工具调用循环
 ```
 
@@ -21,7 +22,7 @@ stock_selection.py
 src/agent/candidate_experts_v2/
 ├── __init__.py                  # 只导出 schemas
 ├── schemas.py                   # SeedItem / ExpertCandidateV2 / ExpertPacketV2
-├── committee.py                 # run_committee_discovery 入口、_build_seed_pool
+├── committee.py                 # run_committee_discovery 入口、seed pool builder、LLM gate
 ├── experts/
 │   ├── base.py                  # BaseExpert：有界工具调用循环（不动）
 │   └── capital_flow.py          # CapitalFlowExpert：资金面具体实现
@@ -56,9 +57,24 @@ class SeedItem(BaseModel):
     code: str          # 股票代码，如 "600519"
     name: str = ""     # 股票名称
     market: str = "cn"
-    source: SeedSource # 来源：user_watchlist / limit_up_pool / hot_rank / alphasift / sequoia
-    hint: str = ""     # 给 LLM 的上下文提示，如 "涨停,连板=3"
+    source: SeedSource # 来源：user_watchlist / local_price_volume / limit_up_pool / hot_rank / sector_theme / event_impact / news_momentum / alphasift / sequoia / fundamental_snapshot / low_base_structure / fallback
+    hint: str = ""     # 给 LLM 的上下文提示，如 "20日放量突破"
+    trigger_signals: List[Dict] # dimension / signal_type / value / threshold / deviation
+    priority_score: float       # 种子阶段优先分，只表示深挖优先级
+    freshness: str              # 数据新鲜度，如 request / 2026-05-22 / latest_local
+    context_hint: str           # 给专家的简短上下文
 ```
+
+共享种子池的工程边界：
+
+- `_build_seed_pool_result()` 返回 `SeedPoolBuildResult`，包含 `seeds`、`diagnostics`、`source_quality`、`hard_exclusion` 和 `market_regime`。
+- 本地确定性来源是底座：`local_price_volume` 会先对本地 `stock_daily` 全市场做硬排除，再按 OR 逻辑探测价量、突破、均线、缩量蓄势、缺口、低位转强等多维异常；`alphasift`、`sequoia`、`fundamental_snapshot`、`low_base_structure` 是本地/预计算补充来源。
+- 在线或缓存增强来源用于补充信息丰富性：资金异动榜 `capital_flow_anomaly`、龙虎榜 `dragon_tiger`、日度估值流动性 `valuation_liquidity`、涨停榜、热榜，以及 `discover_watchlist_candidates(auto)` 里的板块/消息/事件候选。单一在线源失败不能覆盖本地确定性结果。
+- 单个来源失败只写入 `source_quality` / `diagnostics`，不能清空整个种子池。
+- LLM 门卫只在 seed 数量超过阈值时启用；它只接收 seed 摘要，不接收工具声明，只能 keep/reject/rerank 输入代码，不能新增代码，也不能输出买卖建议。
+- 门卫失败时保留确定性种子池继续进入专家并行阶段，避免 LLM 异常导致空池。
+- 共享种子池会输出结构化日志：每个 source 的 `status/count/error`、source cap 后的最终 `sources/preview`、LLM 门卫前后 `count/sources/rejected_preview`，以及专家合并后的 top codes。排查空池或误杀时先看这些日志，再看 Trace artifact。
+- Trace 事件顺序固定为 `selection_candidate_discovery_mode` → `selection_seed_pool_built` → `selection_seed_gate_done` → `selection_candidate_discovery_done` → 后续 `tool_start/tool_done`。其中 `selection_seed_pool_built` 会即时落盘 `seed_pool.json`，`selection_seed_gate_done` 会即时落盘 `seed_gate.json`，最终 `candidate_discovery.json` 也会保留 seed pool / gate 字段，便于从“种子池构建、门卫过滤、候选发现完成”三层排查。
 
 ### ExpertCandidateV2（输出）
 

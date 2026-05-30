@@ -10,6 +10,8 @@ Tools:
 """
 
 import logging
+import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, timedelta
@@ -22,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 _fetcher_manager_singleton = None
 _fetcher_manager_lock = Lock()
+_tushare_trade_date_cache: Dict[Tuple[int, int, int, int, str, bool], List[str]] = {}
+_tushare_trade_date_cache_lock = Lock()
 _DAILY_HISTORY_DEFAULT_DAYS = 60
 _DAILY_HISTORY_MAX_DAYS = 365
 
@@ -564,6 +568,8 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
     """Get chip distribution data."""
     manager = _get_fetcher_manager()
     fast_result: Optional[dict] = None
+    timeout = _get_agent_timeout_attr("agent_chip_distribution_timeout_seconds", 3.0)
+    started_at = time.time()
     if len("".join(ch for ch in str(stock_code or "") if ch.isdigit())) == 6:
         try:
             from src.config import get_config
@@ -581,25 +587,29 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
         if fast_result.get("status") == "ok":
             return fast_result
 
-    timeout = _get_agent_timeout_attr("agent_chip_distribution_timeout_seconds", 3.0)
+    remaining_timeout = max(0.0, timeout - (time.time() - started_at))
     if hasattr(manager, "get_chip_distribution_context"):
         ctx, err, cost_ms = _run_manager_task_with_timeout(
             manager,
             lambda: manager.get_chip_distribution_context(stock_code),
-            timeout,
+            remaining_timeout,
             "chip_distribution",
         )
         if err or not isinstance(ctx, dict):
+            source_chain = list(fast_result.get("source_chain", [])) if fast_result else []
+            errors = list(fast_result.get("errors", [])) if fast_result else []
+            errors.append(str(err or "chip distribution unavailable"))
+            source_chain.append({
+                "provider": "chip_distribution",
+                "result": "timeout" if err and "timeout" in str(err).lower() else "failed",
+                "duration_ms": cost_ms,
+            })
             return {
                 "stock_code": stock_code,
                 "status": "timeout" if err and "timeout" in str(err).lower() else "failed",
                 "error_summary": str(err or "chip distribution unavailable"),
-                "errors": [str(err or "chip distribution unavailable")],
-                "source_chain": [{
-                    "provider": "chip_distribution",
-                    "result": "timeout" if err and "timeout" in str(err).lower() else "failed",
-                    "duration_ms": cost_ms,
-                }],
+                "errors": errors,
+                "source_chain": source_chain,
                 "profit_ratio": None,
                 "avg_cost": None,
                 "cost_90_low": None,
@@ -631,10 +641,11 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
                 "concentration_70": None,
             }
     else:
+        remaining_timeout = max(0.0, timeout - (time.time() - started_at))
         chip, err, cost_ms = _run_manager_task_with_timeout(
             manager,
             lambda: manager.get_chip_distribution(stock_code),
-            timeout,
+            remaining_timeout,
             "chip_distribution",
         )
         if err:
@@ -941,16 +952,53 @@ ALL_DATA_TOOLS = [
 # get_capital_flow
 # ============================================================
 
-def _handle_get_capital_flow(stock_code: str) -> dict:
+def _normalize_stockapi_date_arg(value: Optional[str], field_name: str) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError(f"{field_name} must be YYYY-MM-DD or YYYYMMDD")
+
+
+def _normalize_stockapi_page_arg(value: Any, default: int, minimum: int = 1, maximum: int = 200) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        normalized = default
+    return max(minimum, min(maximum, normalized))
+
+
+def _handle_get_capital_flow(
+    stock_code: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    page_no: int = 1,
+    page_size: int = 50,
+) -> dict:
     """Get main-force capital flow data for a stock."""
     manager = _get_fetcher_manager()
     try:
+        normalized_start_date = _normalize_stockapi_date_arg(start_date, "start_date")
+        normalized_end_date = _normalize_stockapi_date_arg(end_date, "end_date")
+        normalized_page_no = _normalize_stockapi_page_arg(page_no, default=1)
+        normalized_page_size = _normalize_stockapi_page_arg(page_size, default=50)
         try:
             from src.config import get_config
             timeout = float(getattr(get_config(), "agent_capital_flow_timeout_seconds", 3.0))
         except Exception:
             timeout = 3.0
-        ctx = manager.get_capital_flow_context(stock_code, budget_seconds=timeout)
+        ctx = manager.get_capital_flow_context(
+            stock_code,
+            budget_seconds=timeout,
+            start_date=normalized_start_date,
+            end_date=normalized_end_date,
+            page_no=normalized_page_no,
+            page_size=normalized_page_size,
+        )
     except Exception as exc:
         logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
         return {
@@ -972,26 +1020,19 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
     sector_rankings = data.get("sector_rankings") or {}
     errors = ctx.get("errors") or []
     source_chain = list(ctx.get("source_chain", []))
-    if not any(value is not None for value in stock_flow.values()):
-        tushare_flow = _query_tushare_stock_moneyflow(stock_code)
-        if tushare_flow.get("status") == "ok":
-            stock_flow = {
-                "main_net_inflow": tushare_flow.get("main_net_inflow"),
-                "inflow_5d": tushare_flow.get("inflow_5d"),
-                "inflow_10d": tushare_flow.get("inflow_10d"),
-                "latest_date": tushare_flow.get("latest_date"),
-                "source_update": tushare_flow.get("source_update"),
-            }
-            status = "ok"
-            source_chain.extend(tushare_flow.get("source_chain", []))
-            errors = []
-        else:
-            source_chain.extend(tushare_flow.get("source_chain", []))
-            errors = list(errors) + list(tushare_flow.get("errors", []))
     error_summary = None
     if errors:
         joined_errors = " | ".join(str(item) for item in errors if str(item).strip())
-        if "stockapi_codeFlow" in joined_errors:
+        if "timeout" in joined_errors.lower() or "timed out" in joined_errors.lower():
+            error_summary = "capital-flow endpoint timeout"
+        elif "tushare_moneyflow" in joined_errors:
+            if "empty_data" in joined_errors:
+                error_summary = "Tushare moneyflow returned no capital-flow rows for the queried window"
+            elif "invalid_date" in joined_errors:
+                error_summary = "Tushare moneyflow query window is invalid"
+            else:
+                error_summary = "Tushare moneyflow capital-flow endpoint failed"
+        elif "stockapi_codeFlow" in joined_errors:
             if "empty_data" in joined_errors:
                 error_summary = "StockAPI codeFlow returned no capital-flow rows for the queried window"
             else:
@@ -1000,14 +1041,18 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
             error_summary = "Eastmoney capital-flow endpoint unreachable"
         elif "RemoteDisconnected" in joined_errors or "remote end closed" in joined_errors.lower():
             error_summary = "Eastmoney capital-flow endpoint disconnected"
-        elif "timeout" in joined_errors.lower():
-            error_summary = "capital-flow endpoint timeout"
         else:
             error_summary = str(errors[0])
 
     return {
         "stock_code": stock_code,
         "status": status,
+        "query": {
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+            "page_no": normalized_page_no,
+            "page_size": normalized_page_size,
+        },
         "main_net_inflow": stock_flow.get("main_net_inflow"),
         "inflow_5d": stock_flow.get("inflow_5d"),
         "inflow_10d": stock_flow.get("inflow_10d"),
@@ -1035,6 +1080,34 @@ get_capital_flow_tool = ToolDefinition(
             name="stock_code",
             type="string",
             description="A-share stock code, e.g., '600519'",
+        ),
+        ToolParameter(
+            name="start_date",
+            type="string",
+            description="Optional capital-flow start date, YYYY-MM-DD or YYYYMMDD. Tushare moneyflow runs first; if omitted, the tool uses the latest completed trading-day window.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="end_date",
+            type="string",
+            description="Optional capital-flow end date, YYYY-MM-DD or YYYYMMDD. Before 15:30 the default end date is the previous trading day.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="page_no",
+            type="integer",
+            description="Optional StockAPI codeFlow pageNo used only by fallback requests, default 1.",
+            required=False,
+            default=1,
+        ),
+        ToolParameter(
+            name="page_size",
+            type="integer",
+            description="Optional StockAPI codeFlow pageSize used only by fallback requests, default 50 and clamped to 1-200.",
+            required=False,
+            default=50,
         ),
     ],
     handler=_handle_get_capital_flow,
@@ -1076,20 +1149,60 @@ def _normalize_tushare_date(value: Any) -> str:
     return text.replace("-", "")[:8]
 
 
+def _normalize_ts_code_to_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if "." in text:
+        text = text.split(".", 1)[0]
+    return "".join(ch for ch in text if ch.isdigit())
+
+
 def _safe_number(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(str(value).replace(",", "").strip())
+        text = str(value).replace(",", "").strip()
+        if not text or text.lower() == "nan":
+            return None
+        return float(text)
     except Exception:
         return None
 
 
+def _clean_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() == "nan":
+        return ""
+    return text
+
+
 def _latest_tushare_trade_date(update_hour: int = 16, update_minute: int = 0) -> str:
+    dates = _recent_tushare_trade_dates(update_hour=update_hour, update_minute=update_minute, max_dates=1)
+    if dates:
+        return dates[0]
+
+
+def _recent_tushare_trade_dates(
+    update_hour: int = 16,
+    update_minute: int = 0,
+    max_dates: int = 4,
+    lookback_days: int = 30,
+) -> List[str]:
     now = datetime.now()
     cutoff = now.replace(hour=update_hour, minute=update_minute, second=0, microsecond=0)
+    cache_key = (
+        int(update_hour),
+        int(update_minute),
+        int(max_dates),
+        int(lookback_days),
+        now.date().isoformat(),
+        bool(now >= cutoff),
+    )
+    with _tushare_trade_date_cache_lock:
+        cached = _tushare_trade_date_cache.get(cache_key)
+    if cached is not None:
+        return list(cached)
     end_day = now.date() if now >= cutoff else (now.date() - timedelta(days=1))
-    start_day = end_day - timedelta(days=30)
+    start_day = end_day - timedelta(days=max(lookback_days, max_dates * 3))
     cal = _tushare_query(
         "trade_cal",
         {
@@ -1101,10 +1214,44 @@ def _latest_tushare_trade_date(update_hour: int = 16, update_minute: int = 0) ->
         limit=40,
         timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
     )
-    for row in reversed(cal.get("items") or []):
+    dates: List[str] = []
+    for row in cal.get("items") or []:
         if str(row.get("is_open")) in {"1", "1.0", "True", "true"}:
-            return str(row.get("cal_date") or "").replace("-", "")[:8]
-    return end_day.strftime("%Y%m%d")
+            trade_date = str(row.get("cal_date") or "").replace("-", "")[:8]
+            if trade_date:
+                dates.append(trade_date)
+    if dates:
+        resolved_dates = sorted(set(dates), reverse=True)[:max(1, int(max_dates))]
+        with _tushare_trade_date_cache_lock:
+            _tushare_trade_date_cache[cache_key] = list(resolved_dates)
+        return resolved_dates
+
+    fallback_dates: List[str] = []
+    day = end_day
+    while len(fallback_dates) < max(1, int(max_dates)) and day >= start_day:
+        if day.weekday() < 5:
+            fallback_dates.append(day.strftime("%Y%m%d"))
+        day = day - timedelta(days=1)
+    with _tushare_trade_date_cache_lock:
+        _tushare_trade_date_cache[cache_key] = list(fallback_dates)
+    return fallback_dates
+
+
+def _latest_weekday_date(update_hour: int = 16, update_minute: int = 0) -> str:
+    dates = _recent_weekday_dates(update_hour=update_hour, update_minute=update_minute, max_dates=1)
+    return dates[0]
+
+
+def _recent_weekday_dates(update_hour: int = 16, update_minute: int = 0, max_dates: int = 4) -> List[str]:
+    now = datetime.now()
+    cutoff = now.replace(hour=update_hour, minute=update_minute, second=0, microsecond=0)
+    day = now.date() if now >= cutoff else (now.date() - timedelta(days=1))
+    dates: List[str] = []
+    while len(dates) < max(1, int(max_dates)):
+        if day.weekday() < 5:
+            dates.append(day.strftime("%Y%m%d"))
+        day = day - timedelta(days=1)
+    return dates
 
 
 def _tushare_query(
@@ -1126,7 +1273,12 @@ def _tushare_query(
         if value is not None and str(value).strip() != ""
     }
     try:
-        df = query_tushare_api(api_name, params=effective_params, fields=fields, timeout=int(max(1, request_timeout)))
+        df = query_tushare_api(
+            api_name,
+            params=effective_params,
+            fields=fields,
+            timeout=int(max(1, math.ceil(float(request_timeout)))),
+        )
     except Exception as exc:
         duration_ms = int((time.time() - started_at) * 1000)
         logger.warning("Tushare %s failed: %s", api_name, exc)
@@ -1139,6 +1291,7 @@ def _tushare_query(
                 "result": "timeout" if "timeout" in str(exc).lower() or "timed out" in str(exc).lower() else "failed",
                 "duration_ms": duration_ms,
                 "endpoint": get_tushare_http_url(),
+                "params": effective_params,
             }],
             "errors": [str(exc)],
         }
@@ -1154,6 +1307,7 @@ def _tushare_query(
                 "result": "empty",
                 "duration_ms": duration_ms,
                 "endpoint": get_tushare_http_url(),
+                "params": effective_params,
             }],
             "errors": [],
         }
@@ -1168,6 +1322,80 @@ def _tushare_query(
             "result": "ok",
             "duration_ms": duration_ms,
             "endpoint": get_tushare_http_url(),
+            "params": effective_params,
+        }],
+        "errors": [],
+    }
+
+
+def _tushare_query_all_rows(
+    api_name: str,
+    params: Optional[Dict[str, Any]] = None,
+    fields: str = "",
+    timeout: Optional[float] = None,
+) -> dict:
+    from data_provider.tushare_client import get_tushare_http_url, query_tushare_api
+
+    started_at = time.time()
+    request_timeout = timeout
+    if request_timeout is None:
+        request_timeout = _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)
+    effective_params = {
+        key: value
+        for key, value in (params or {}).items()
+        if value is not None and str(value).strip() != ""
+    }
+    try:
+        df = query_tushare_api(
+            api_name,
+            params=effective_params,
+            fields=fields,
+            timeout=int(max(1, math.ceil(float(request_timeout)))),
+        )
+    except Exception as exc:
+        duration_ms = int((time.time() - started_at) * 1000)
+        logger.warning("Tushare %s failed: %s", api_name, exc)
+        return {
+            "status": "timeout" if "timeout" in str(exc).lower() or "timed out" in str(exc).lower() else "failed",
+            "api_name": api_name,
+            "items": [],
+            "source_chain": [{
+                "provider": f"tushare:{api_name}",
+                "result": "timeout" if "timeout" in str(exc).lower() or "timed out" in str(exc).lower() else "failed",
+                "duration_ms": duration_ms,
+                "endpoint": get_tushare_http_url(),
+                "params": effective_params,
+            }],
+            "errors": [str(exc)],
+        }
+
+    duration_ms = int((time.time() - started_at) * 1000)
+    if df is None or df.empty:
+        return {
+            "status": "empty",
+            "api_name": api_name,
+            "items": [],
+            "source_chain": [{
+                "provider": f"tushare:{api_name}",
+                "result": "empty",
+                "duration_ms": duration_ms,
+                "endpoint": get_tushare_http_url(),
+                "params": effective_params,
+            }],
+            "errors": [],
+        }
+    items = df.to_dict(orient="records")
+    return {
+        "status": "ok",
+        "api_name": api_name,
+        "items": items,
+        "total_rows": int(len(df)),
+        "source_chain": [{
+            "provider": f"tushare:{api_name}",
+            "result": "ok",
+            "duration_ms": duration_ms,
+            "endpoint": get_tushare_http_url(),
+            "params": effective_params,
         }],
         "errors": [],
     }
@@ -1176,48 +1404,76 @@ def _tushare_query(
 def _query_tushare_chip_distribution(stock_code: str) -> dict:
     """Fast-path chip distribution through Tushare cyq_chips."""
     started_at = time.time()
-    trade_date = _latest_tushare_trade_date(update_hour=19, update_minute=0)
+    # Avoid a blocking trade_cal preflight here: cyq_chips itself is enough to
+    # tell whether the latest completed weekday has data, and private gateways
+    # often make trade_cal slower than the actual target endpoint.
+    trade_dates = _recent_weekday_dates(update_hour=19, update_minute=0, max_dates=4)
     ts_code = _to_tushare_ts_code(stock_code)
-    timeout = _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)
-    chips = _tushare_query(
-        "cyq_chips",
-        {"ts_code": ts_code, "start_date": trade_date, "end_date": trade_date},
-        "ts_code,trade_date,price,percent",
-        limit=200,
-        timeout=timeout,
-    )
-    if chips.get("status") != "ok":
-        chips["stock_code"] = stock_code
-        return chips
-    daily = _tushare_query(
-        "daily",
-        {"ts_code": ts_code, "start_date": trade_date, "end_date": trade_date},
-        "ts_code,trade_date,close",
-        limit=1,
-        timeout=timeout,
-    )
-    if daily.get("status") != "ok" or not daily.get("items"):
-        return {
-            "stock_code": stock_code,
-            "status": "failed",
-            "error_summary": "Tushare daily close is unavailable for chip metrics",
-            "errors": ["tushare:daily unavailable for cyq_chips"],
-            "source_chain": list(chips.get("source_chain", [])) + list(daily.get("source_chain", [])),
-        }
+    timeout = max(2.0, _get_agent_timeout_attr("agent_chip_distribution_timeout_seconds", 3.0))
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    last_status = "failed"
+    rows: List[Tuple[float, float]] = []
+    current_price: Optional[float] = None
+    trade_date = trade_dates[0] if trade_dates else _latest_weekday_date(update_hour=19, update_minute=0)
 
-    current_price = _safe_number(daily["items"][0].get("close"))
-    rows = [
-        (_safe_number(row.get("price")), _safe_number(row.get("percent")))
-        for row in chips.get("items") or []
-    ]
-    rows = [(price, weight) for price, weight in rows if price is not None and weight is not None and weight > 0]
+    for candidate_date in trade_dates:
+        trade_date = candidate_date
+        chips = _tushare_query(
+            "cyq_chips",
+            {"ts_code": ts_code, "start_date": candidate_date, "end_date": candidate_date},
+            "ts_code,trade_date,price,percent",
+            limit=200,
+            timeout=timeout,
+        )
+        source_chain.extend(chips.get("source_chain", []))
+        errors.extend(chips.get("errors", []))
+        if chips.get("status") != "ok":
+            last_status = chips.get("status") or "failed"
+            if chips.get("status") in {"failed", "timeout"}:
+                break
+            continue
+
+        daily = _tushare_query(
+            "daily",
+            {"ts_code": ts_code, "start_date": candidate_date, "end_date": candidate_date},
+            "ts_code,trade_date,close",
+            limit=1,
+            timeout=timeout,
+        )
+        source_chain.extend(daily.get("source_chain", []))
+        errors.extend(daily.get("errors", []))
+        if daily.get("status") != "ok" or not daily.get("items"):
+            errors.append(f"tushare:daily unavailable for cyq_chips:{candidate_date}")
+            last_status = daily.get("status") or "failed"
+            if daily.get("status") in {"failed", "timeout"}:
+                break
+            continue
+
+        current_price = _safe_number(daily["items"][0].get("close"))
+        rows = [
+            (_safe_number(row.get("price")), _safe_number(row.get("percent")))
+            for row in chips.get("items") or []
+        ]
+        rows = [(price, weight) for price, weight in rows if price is not None and weight is not None and weight > 0]
+        if not rows or current_price is None:
+            errors.append(f"tushare:cyq_chips unusable rows:{candidate_date}")
+            last_status = "failed"
+            continue
+        break
+
     if not rows or current_price is None:
+        error_summary = "Tushare cyq_chips returned no usable chip rows"
+        if last_status == "timeout":
+            error_summary = "Tushare cyq_chips timed out"
+        elif last_status == "failed":
+            error_summary = "Tushare cyq_chips failed"
         return {
             "stock_code": stock_code,
-            "status": "failed",
-            "error_summary": "Tushare cyq_chips returned unusable chip rows",
-            "errors": ["tushare:cyq_chips unusable rows"],
-            "source_chain": list(chips.get("source_chain", [])) + list(daily.get("source_chain", [])),
+            "status": "timeout" if last_status == "timeout" else "failed",
+            "error_summary": error_summary,
+            "errors": errors or ["tushare:cyq_chips unavailable"],
+            "source_chain": source_chain,
         }
 
     rows.sort(key=lambda item: item[0])
@@ -1259,30 +1515,52 @@ def _query_tushare_chip_distribution(stock_code: str) -> dict:
         "cost_70_low": round(cost_70_low, 4),
         "cost_70_high": round(cost_70_high, 4),
         "concentration_70": round(concentration(cost_70_low, cost_70_high), 4),
-        "source_chain": list(chips.get("source_chain", [])) + list(daily.get("source_chain", [])) + [{
+        "source_chain": source_chain + [{
             "provider": "tushare:cyq_chips_metrics",
             "result": "ok",
             "duration_ms": int((time.time() - started_at) * 1000),
+            "trade_date": trade_date,
         }],
         "errors": [],
     }
 
 
-def _query_tushare_stock_moneyflow(stock_code: str) -> dict:
+def _query_tushare_stock_moneyflow(stock_code: str, timeout_seconds: Optional[float] = None) -> dict:
     """Fallback stock capital flow through Tushare moneyflow."""
     ts_code = _to_tushare_ts_code(stock_code)
-    latest = _latest_tushare_trade_date(update_hour=15, update_minute=30)
+    latest = _latest_weekday_date(update_hour=15, update_minute=30)
     start = (datetime.strptime(latest, "%Y%m%d") - timedelta(days=20)).strftime("%Y%m%d")
-    result = _tushare_query(
-        "moneyflow",
-        {"ts_code": ts_code, "start_date": start, "end_date": latest},
-        (
-            "ts_code,trade_date,buy_lg_amount,sell_lg_amount,"
-            "buy_elg_amount,sell_elg_amount,net_mf_amount"
-        ),
-        limit=20,
-        timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
+    timeout = max(0.0, float(
+        timeout_seconds
+        if timeout_seconds is not None
+        else 3.0
+    ))
+    fields = (
+        "ts_code,trade_date,buy_lg_amount,sell_lg_amount,"
+        "buy_elg_amount,sell_elg_amount,net_mf_amount"
     )
+    params = {"ts_code": ts_code, "start_date": start, "end_date": latest}
+    if timeout <= 0:
+        return {
+            "stock_code": stock_code,
+            "status": "timeout",
+            "api_name": "moneyflow",
+            "errors": ["tushare:moneyflow fallback budget exhausted"],
+            "source_chain": [{
+                "provider": "tushare:moneyflow",
+                "result": "timeout",
+                "duration_ms": 0,
+                "params": params,
+            }],
+        }
+    result = _tushare_query("moneyflow", params, fields, limit=20, timeout=timeout)
+    if result.get("status") == "empty":
+        # The private gateway can occasionally return an empty frame under load.
+        # Retry once on the same serialized Tushare path before declaring missing data.
+        retry_result = _tushare_query("moneyflow", params, fields, limit=20, timeout=timeout)
+        retry_result["source_chain"] = list(result.get("source_chain", [])) + list(retry_result.get("source_chain", []))
+        retry_result["errors"] = list(result.get("errors", [])) + list(retry_result.get("errors", []))
+        result = retry_result
     if result.get("status") != "ok":
         result["stock_code"] = stock_code
         return result
@@ -1323,6 +1601,1939 @@ def _query_tushare_stock_moneyflow(stock_code: str) -> dict:
         "source_chain": result.get("source_chain", []),
         "errors": [],
     }
+
+
+def _handle_get_tushare_moneyflow_ths(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get THS stock money-flow ranking from Tushare without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    trade_dates = [requested_date] if requested_date else _recent_tushare_trade_dates(
+        update_hour=15,
+        update_minute=30,
+        max_dates=4,
+        lookback_days=20,
+    )
+    if not trade_dates:
+        trade_dates = [_latest_weekday_date(update_hour=15, update_minute=30)]
+
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = (
+        "trade_date,ts_code,name,pct_change,latest,net_amount,net_d5_amount,"
+        "buy_lg_amount,buy_lg_amount_rate,buy_md_amount,buy_md_amount_rate,"
+        "buy_sm_amount,buy_sm_amount_rate"
+    )
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    last_result: dict = {}
+
+    for candidate_date in trade_dates:
+        result = _tushare_query_all_rows(
+            "moneyflow_ths",
+            {"trade_date": candidate_date},
+            fields,
+            timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
+        )
+        source_chain.extend(result.get("source_chain", []))
+        errors.extend(result.get("errors", []))
+        last_result = result
+        if result.get("status") != "ok":
+            if requested_date or result.get("status") in {"failed", "timeout"}:
+                break
+            continue
+
+        raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+        normalized_items: List[Dict[str, Any]] = []
+        for item in raw_items:
+            symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+            if target_symbol and symbol != target_symbol:
+                continue
+            net_amount = _safe_number(item.get("net_amount"))
+            net_d5_amount = _safe_number(item.get("net_d5_amount"))
+            buy_lg_amount = _safe_number(item.get("buy_lg_amount"))
+            buy_md_amount = _safe_number(item.get("buy_md_amount"))
+            buy_sm_amount = _safe_number(item.get("buy_sm_amount"))
+            normalized_items.append({
+                "trade_date": str(item.get("trade_date") or candidate_date),
+                "code": symbol,
+                "ts_code": str(item.get("ts_code") or "").strip(),
+                "name": str(item.get("name") or symbol).strip(),
+                "latest": _safe_number(item.get("latest")),
+                "change_ratio": _safe_number(item.get("pct_change")),
+                "pct_change": _safe_number(item.get("pct_change")),
+                # Tushare moneyflow_ths amount fields are in 10k yuan; expose yuan.
+                "net_inflow": net_amount * 10000.0 if net_amount is not None else None,
+                "net_5d_inflow": net_d5_amount * 10000.0 if net_d5_amount is not None else None,
+                "large_net_inflow": buy_lg_amount * 10000.0 if buy_lg_amount is not None else None,
+                "large_net_inflow_rate": _safe_number(item.get("buy_lg_amount_rate")),
+                "medium_net_inflow": buy_md_amount * 10000.0 if buy_md_amount is not None else None,
+                "medium_net_inflow_rate": _safe_number(item.get("buy_md_amount_rate")),
+                "small_net_inflow": buy_sm_amount * 10000.0 if buy_sm_amount is not None else None,
+                "small_net_inflow_rate": _safe_number(item.get("buy_sm_amount_rate")),
+                "source": "tushare:moneyflow_ths",
+            })
+
+        normalized_items.sort(
+            key=lambda item: (
+                float(item.get("net_inflow") or 0.0),
+                float(item.get("net_5d_inflow") or 0.0),
+                str(item.get("code") or ""),
+            ),
+            reverse=True,
+        )
+        items = normalized_items[:effective_limit]
+        return {
+            "status": "ok" if items else "empty",
+            "api_name": "moneyflow_ths",
+            "trade_date": candidate_date,
+            "stock_code": stock_code,
+            "items": items,
+            "total_rows": int(result.get("total_rows") or len(raw_items)),
+            "source_chain": source_chain,
+            "errors": errors,
+        }
+
+    return {
+        "status": last_result.get("status") or "failed",
+        "api_name": "moneyflow_ths",
+        "trade_date": trade_dates[0] if trade_dates else requested_date,
+        "stock_code": stock_code,
+        "items": [],
+        "source_chain": source_chain,
+        "errors": errors or [f"tushare:moneyflow_ths unavailable for {trade_dates[0] if trade_dates else requested_date}"],
+    }
+
+
+get_tushare_moneyflow_ths_tool = ToolDefinition(
+    name="get_tushare_moneyflow_ths",
+    description=(
+        "Get Tushare THS stock money-flow ranking without fallback. Returns top stocks by "
+        "same-day main net inflow and 5-day net inflow. Amount fields are normalized to yuan."
+    ),
+    parameters=[
+        ToolParameter(
+            name="trade_date",
+            type="string",
+            description="Optional trade date YYYYMMDD or YYYY-MM-DD. Blank uses the latest completed trading date.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Optional A-share stock code to filter, e.g. 600519 or 600519.SH. Blank returns ranking rows.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max rows to return (default: 30, max: 200).",
+            required=False,
+            default=30,
+        ),
+    ],
+    handler=_handle_get_tushare_moneyflow_ths,
+    category="data",
+)
+
+
+def _tushare_recent_date_query(
+    api_name: str,
+    *,
+    requested_date: str,
+    fields: str,
+    param_builder: Optional[Callable[[str], Dict[str, Any]]] = None,
+    max_dates: int = 4,
+    lookback_days: int = 20,
+    update_hour: int = 15,
+    update_minute: int = 30,
+    timeout: Optional[float] = None,
+) -> Tuple[str, dict, List[Dict[str, Any]], List[str]]:
+    trade_dates = [requested_date] if requested_date else _recent_tushare_trade_dates(
+        update_hour=update_hour,
+        update_minute=update_minute,
+        max_dates=max_dates,
+        lookback_days=lookback_days,
+    )
+    if not trade_dates:
+        trade_dates = [_latest_weekday_date(update_hour=update_hour, update_minute=update_minute)]
+
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    last_result: dict = {}
+    selected_date = trade_dates[0]
+    for candidate_date in trade_dates:
+        selected_date = candidate_date
+        params = {"trade_date": candidate_date}
+        if param_builder is not None:
+            params.update(param_builder(candidate_date))
+        result = _tushare_query_all_rows(
+            api_name,
+            params,
+            fields,
+            timeout=timeout if timeout is not None else _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
+        )
+        source_chain.extend(result.get("source_chain", []))
+        errors.extend(result.get("errors", []))
+        last_result = result
+        if result.get("status") == "ok":
+            return candidate_date, result, source_chain, errors
+        if requested_date or result.get("status") in {"failed", "timeout"}:
+            break
+    if not last_result:
+        last_result = {"status": "failed", "items": []}
+    return selected_date, last_result, source_chain, errors
+
+
+def _parse_limit_streak(value: Any) -> Optional[float]:
+    number = _safe_number(value)
+    if number is not None:
+        return number
+    text = _clean_text(value)
+    if not text:
+        return None
+    match = re.search(r"(\d+)\s*天\s*(\d+)\s*板", text)
+    if match:
+        return float(match.group(2))
+    if "首板" in text:
+        return 1.0
+    return None
+
+
+def _normalize_tushare_concepts(value: Any) -> List[str]:
+    text = _clean_text(value)
+    if not text:
+        return []
+    stripped = text.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            import ast
+
+            parsed = ast.literal_eval(stripped)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item or "").strip()]
+        except Exception:
+            pass
+    return [part.strip() for part in re.split(r"[,，;；、]+", text) if part.strip()]
+
+
+def _handle_get_tushare_moneyflow_dc(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Eastmoney stock money-flow ranking from Tushare without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = (
+        "trade_date,ts_code,name,pct_change,close,net_amount,net_amount_rate,"
+        "buy_elg_amount,buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
+        "buy_md_amount,buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "moneyflow_dc",
+        requested_date=requested_date,
+        fields=fields,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "moneyflow_dc",
+            "trade_date": selected_date,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:moneyflow_dc unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        net_amount = _safe_number(item.get("net_amount"))
+        buy_elg_amount = _safe_number(item.get("buy_elg_amount"))
+        buy_lg_amount = _safe_number(item.get("buy_lg_amount"))
+        buy_md_amount = _safe_number(item.get("buy_md_amount"))
+        buy_sm_amount = _safe_number(item.get("buy_sm_amount"))
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": _clean_text(item.get("name")) or symbol,
+            "latest": _safe_number(item.get("close")),
+            "close": _safe_number(item.get("close")),
+            "change_ratio": _safe_number(item.get("pct_change")),
+            "pct_change": _safe_number(item.get("pct_change")),
+            # Tushare moneyflow_dc amount fields are in 10k yuan; expose yuan.
+            "net_inflow": net_amount * 10000.0 if net_amount is not None else None,
+            "net_inflow_rate": _safe_number(item.get("net_amount_rate")),
+            "extra_large_net_inflow": buy_elg_amount * 10000.0 if buy_elg_amount is not None else None,
+            "extra_large_net_inflow_rate": _safe_number(item.get("buy_elg_amount_rate")),
+            "large_net_inflow": buy_lg_amount * 10000.0 if buy_lg_amount is not None else None,
+            "large_net_inflow_rate": _safe_number(item.get("buy_lg_amount_rate")),
+            "medium_net_inflow": buy_md_amount * 10000.0 if buy_md_amount is not None else None,
+            "medium_net_inflow_rate": _safe_number(item.get("buy_md_amount_rate")),
+            "small_net_inflow": buy_sm_amount * 10000.0 if buy_sm_amount is not None else None,
+            "small_net_inflow_rate": _safe_number(item.get("buy_sm_amount_rate")),
+            "source": "tushare:moneyflow_dc",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("net_inflow") or 0.0),
+            float(item.get("extra_large_net_inflow") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "moneyflow_dc",
+        "trade_date": selected_date,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_moneyflow_dc_tool = ToolDefinition(
+    name="get_tushare_moneyflow_dc",
+    description=(
+        "Get Tushare Eastmoney stock money-flow ranking without fallback. Returns main-force "
+        "net inflow plus order-size buckets. Amount fields are normalized to yuan."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_moneyflow_dc,
+    category="data",
+)
+
+
+def _handle_get_tushare_dragon_tiger_list(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare dragon-tiger stock list without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = (
+        "trade_date,ts_code,name,close,pct_change,turnover_rate,amount,"
+        "l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,reason"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "top_list",
+        requested_date=requested_date,
+        fields=fields,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "top_list",
+            "trade_date": selected_date,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:top_list unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": _clean_text(item.get("name")) or symbol,
+            "latest": _safe_number(item.get("close")),
+            "close": _safe_number(item.get("close")),
+            "change_ratio": _safe_number(item.get("pct_change")),
+            "pct_change": _safe_number(item.get("pct_change")),
+            "turnover_ratio": _safe_number(item.get("turnover_rate")),
+            "turnover_rate": _safe_number(item.get("turnover_rate")),
+            "amount": _safe_number(item.get("amount")),
+            "buy_amount": _safe_number(item.get("l_buy")),
+            "sell_amount": _safe_number(item.get("l_sell")),
+            "dragon_tiger_amount": _safe_number(item.get("l_amount")),
+            "net_inflow": _safe_number(item.get("net_amount")),
+            "net_rate": _safe_number(item.get("net_rate")),
+            "amount_rate": _safe_number(item.get("amount_rate")),
+            "reason": _clean_text(item.get("reason")),
+            "source": "tushare:top_list",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("net_inflow") or 0.0),
+            float(item.get("amount") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "top_list",
+        "trade_date": selected_date,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_dragon_tiger_list_tool = ToolDefinition(
+    name="get_tushare_dragon_tiger_list",
+    description=(
+        "Get Tushare dragon-tiger daily stock list without fallback. Returns buy/sell/net "
+        "amounts, turnover and listing reasons."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_dragon_tiger_list,
+    category="data",
+)
+
+
+def _handle_get_tushare_dragon_tiger_inst(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare dragon-tiger institution/seat detail without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = "trade_date,ts_code,exalter,side,buy,buy_rate,sell,sell_rate,net_buy,reason"
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "top_inst",
+        requested_date=requested_date,
+        fields=fields,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "top_inst",
+            "trade_date": selected_date,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:top_inst unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for item in raw_items:
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        if not symbol:
+            continue
+        buy_amount = _safe_number(item.get("buy")) or 0.0
+        sell_amount = _safe_number(item.get("sell")) or 0.0
+        net_buy = _safe_number(item.get("net_buy"))
+        if net_buy is None:
+            net_buy = buy_amount - sell_amount
+        bucket = grouped.setdefault(symbol, {
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": symbol,
+            "seat_count": 0,
+            "institution_seat_count": 0,
+            "buy_amount": 0.0,
+            "sell_amount": 0.0,
+            "net_inflow": 0.0,
+            "top_seats": [],
+            "reason": _clean_text(item.get("reason")),
+            "source": "tushare:top_inst",
+        })
+        exalter = _clean_text(item.get("exalter"))
+        bucket["seat_count"] += 1
+        if "机构专用" in exalter:
+            bucket["institution_seat_count"] += 1
+        bucket["buy_amount"] += buy_amount
+        bucket["sell_amount"] += sell_amount
+        bucket["net_inflow"] += float(net_buy)
+        if len(bucket["top_seats"]) < 5:
+            bucket["top_seats"].append({
+                "exalter": exalter,
+                "side": _clean_text(item.get("side")),
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "net_buy": float(net_buy),
+                "reason": _clean_text(item.get("reason")),
+            })
+        if not bucket.get("reason") and _clean_text(item.get("reason")):
+            bucket["reason"] = _clean_text(item.get("reason"))
+
+    normalized_items = list(grouped.values())
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("net_inflow") or 0.0),
+            float(item.get("buy_amount") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "top_inst",
+        "trade_date": selected_date,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_dragon_tiger_inst_tool = ToolDefinition(
+    name="get_tushare_dragon_tiger_inst",
+    description=(
+        "Get Tushare dragon-tiger seat/institution detail without fallback. Rows are grouped "
+        "by stock and expose aggregated buy/sell/net amounts plus top seats."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max stocks to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_dragon_tiger_inst,
+    category="data",
+)
+
+
+def _handle_get_tushare_limit_list_ths(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare THS limit-up/down list without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = (
+        "trade_date,ts_code,name,price,pct_chg,open_num,lu_desc,limit_type,tag,status,"
+        "limit_order,limit_amount,turnover_rate,turnover"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "limit_list_ths",
+        requested_date=requested_date,
+        fields=fields,
+        timeout=max(8.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "limit_list_ths",
+            "trade_date": selected_date,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:limit_list_ths unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        tag = _clean_text(item.get("tag"))
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": _clean_text(item.get("name")) or symbol,
+            "latest": _safe_number(item.get("price")),
+            "price": _safe_number(item.get("price")),
+            "change_ratio": _safe_number(item.get("pct_chg")),
+            "pct_change": _safe_number(item.get("pct_chg")),
+            "open_times": _safe_number(item.get("open_num")),
+            "bomb_num": _safe_number(item.get("open_num")),
+            "reason": _clean_text(item.get("lu_desc")),
+            "limit_type": _clean_text(item.get("limit_type")),
+            "tag": tag,
+            "status_label": _clean_text(item.get("status")),
+            "limit_order": _safe_number(item.get("limit_order")),
+            "ceiling_amount": _safe_number(item.get("limit_amount")),
+            "turnover_rate": _safe_number(item.get("turnover_rate")),
+            "turnover_ratio": _safe_number(item.get("turnover_rate")),
+            "amount": _safe_number(item.get("turnover")),
+            "limit_up_streak": _parse_limit_streak(tag),
+            "source": "tushare:limit_list_ths",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("limit_up_streak") or 0.0),
+            float(item.get("ceiling_amount") or 0.0),
+            float(item.get("change_ratio") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "limit_list_ths",
+        "trade_date": selected_date,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_limit_list_ths_tool = ToolDefinition(
+    name="get_tushare_limit_list_ths",
+    description=(
+        "Get Tushare THS limit-up/down list without fallback. Returns limit streak tag, "
+        "sealing amount, open count, reason and turnover fields."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_limit_list_ths,
+    category="data",
+)
+
+
+def _handle_get_tushare_limit_list_d(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare daily limit-up/down list without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = (
+        "trade_date,ts_code,industry,name,close,pct_chg,amount,fd_amount,"
+        "first_time,last_time,open_times,up_stat,limit_times,limit"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "limit_list_d",
+        requested_date=requested_date,
+        fields=fields,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "limit_list_d",
+            "trade_date": selected_date,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:limit_list_d unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": _clean_text(item.get("name")) or symbol,
+            "industry": _clean_text(item.get("industry")),
+            "latest": _safe_number(item.get("close")),
+            "close": _safe_number(item.get("close")),
+            "change_ratio": _safe_number(item.get("pct_chg")),
+            "pct_change": _safe_number(item.get("pct_chg")),
+            "amount": _safe_number(item.get("amount")),
+            "ceiling_amount": _safe_number(item.get("fd_amount")),
+            "first_limit_time": _clean_text(item.get("first_time")),
+            "last_limit_time": _clean_text(item.get("last_time")),
+            "open_times": _safe_number(item.get("open_times")),
+            "bomb_num": _safe_number(item.get("open_times")),
+            "up_stat": _clean_text(item.get("up_stat")),
+            "limit_up_streak": _safe_number(item.get("limit_times")),
+            "limit_status": _clean_text(item.get("limit")),
+            "source": "tushare:limit_list_d",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("limit_up_streak") or 0.0),
+            float(item.get("ceiling_amount") or 0.0),
+            float(item.get("amount") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "limit_list_d",
+        "trade_date": selected_date,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_limit_list_d_tool = ToolDefinition(
+    name="get_tushare_limit_list_d",
+    description=(
+        "Get Tushare daily limit-up/down list without fallback. Returns amount, sealing "
+        "amount, open count, first/last limit time and streak fields."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_limit_list_d,
+    category="data",
+)
+
+
+def _handle_get_tushare_limit_step(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare continuous limit-up ladder without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    fields = "ts_code,name,trade_date,nums"
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "limit_step",
+        requested_date=requested_date,
+        fields=fields,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "limit_step",
+            "trade_date": selected_date,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:limit_step unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": _clean_text(item.get("name")) or symbol,
+            "limit_up_streak": _safe_number(item.get("nums")),
+            "source": "tushare:limit_step",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("limit_up_streak") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "limit_step",
+        "trade_date": selected_date,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_limit_step_tool = ToolDefinition(
+    name="get_tushare_limit_step",
+    description="Get Tushare continuous limit-up ladder without fallback.",
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_limit_step,
+    category="data",
+)
+
+
+def _handle_get_tushare_hot_rank(
+    source: str = "ths",
+    trade_date: str = "",
+    data_type: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare THS/DC hot rank without fallback."""
+    source_key = str(source or "ths").strip().lower()
+    if source_key not in {"ths", "dc"}:
+        return {"status": "failed", "api_name": "tushare_hot_rank", "items": [], "errors": [f"unsupported source: {source}"]}
+    api_name = "dc_hot" if source_key == "dc" else "ths_hot"
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    requested_data_type = _clean_text(data_type)
+    default_data_type = "A股市场" if api_name == "dc_hot" else "热股"
+    target_data_type = requested_data_type or default_data_type
+    fields = (
+        "trade_date,data_type,ts_code,ts_name,rank,pct_change,current_price,"
+        "hot,concept,rank_reason,rank_time"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        api_name,
+        requested_date=requested_date,
+        fields=fields,
+        max_dates=5,
+        lookback_days=30,
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": api_name,
+            "trade_date": selected_date,
+            "data_type": target_data_type,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:{api_name} unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    latest_rank_time = ""
+    for item in raw_items:
+        item_data_type = _clean_text(item.get("data_type"))
+        if target_data_type and item_data_type != target_data_type:
+            continue
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        rank_time = _clean_text(item.get("rank_time"))
+        if rank_time > latest_rank_time:
+            latest_rank_time = rank_time
+
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+    for item in raw_items:
+        item_data_type = _clean_text(item.get("data_type"))
+        if target_data_type and item_data_type != target_data_type:
+            continue
+        symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+        if target_symbol and symbol != target_symbol:
+            continue
+        if not symbol or not (_clean_text(item.get("ts_code")).upper().endswith((".SH", ".SZ", ".BJ"))):
+            continue
+        rank_time = _clean_text(item.get("rank_time"))
+        rank = _safe_number(item.get("rank"))
+        current = {
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "data_type": item_data_type,
+            "code": symbol,
+            "ts_code": _clean_text(item.get("ts_code")),
+            "name": _clean_text(item.get("ts_name")) or symbol,
+            "rank": rank,
+            "popularity": max(0.0, 101.0 - rank) if rank is not None else None,
+            "change_ratio": _safe_number(item.get("pct_change")),
+            "pct_change": _safe_number(item.get("pct_change")),
+            "latest": _safe_number(item.get("current_price")),
+            "current_price": _safe_number(item.get("current_price")),
+            "hot": _safe_number(item.get("hot")),
+            "concepts": _normalize_tushare_concepts(item.get("concept")),
+            "reason": _clean_text(item.get("rank_reason")),
+            "rank_time": rank_time,
+            "source": f"tushare:{api_name}",
+        }
+        existing = by_symbol.get(symbol)
+        if existing is None:
+            by_symbol[symbol] = current
+            continue
+        current_rank = float(current.get("rank") or 10_000)
+        existing_rank = float(existing.get("rank") or 10_000)
+        if current_rank < existing_rank or (current_rank == existing_rank and rank_time > str(existing.get("rank_time") or "")):
+            by_symbol[symbol] = current
+
+    normalized_items = list(by_symbol.values())
+    normalized_items.sort(
+        key=lambda item: (
+            -(float(item.get("rank") or 10_000.0)),
+            float(item.get("hot") or 0.0),
+            str(item.get("code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": api_name,
+        "trade_date": selected_date,
+        "data_type": target_data_type,
+        "rank_time": latest_rank_time,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_hot_rank_tool = ToolDefinition(
+    name="get_tushare_hot_rank",
+    description=(
+        "Get Tushare THS or Eastmoney hot stock ranking without fallback. Defaults to "
+        "THS 热股 or Eastmoney A股市场 and keeps the latest rank_time slice."
+    ),
+    parameters=[
+        ToolParameter(name="source", type="string", description="ths or dc (default: ths).", required=False, default="ths"),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="data_type", type="string", description="Optional data_type, e.g. 热股 or A股市场.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_hot_rank,
+    category="data",
+)
+
+
+def _to_yuan_from_100m(value: Any) -> Optional[float]:
+    number = _safe_number(value)
+    return number * 100_000_000.0 if number is not None else None
+
+
+def _handle_get_tushare_moneyflow_ind_ths(
+    trade_date: str = "",
+    ts_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare THS industry money-flow ranking without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_code = _clean_text(ts_code).upper()
+    fields = (
+        "trade_date,ts_code,industry,lead_stock,close,pct_change,company_num,"
+        "pct_change_stock,close_price,net_buy_amount,net_sell_amount,net_amount"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "moneyflow_ind_ths",
+        requested_date=requested_date,
+        fields=fields,
+        param_builder=lambda _date: {"ts_code": target_code},
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "moneyflow_ind_ths",
+            "trade_date": selected_date,
+            "ts_code": target_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:moneyflow_ind_ths unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        board_code = _clean_text(item.get("ts_code")).upper()
+        if target_code and board_code != target_code:
+            continue
+        net_inflow = _to_yuan_from_100m(item.get("net_amount"))
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "ts_code": board_code,
+            "name": _clean_text(item.get("industry")) or board_code,
+            "industry": _clean_text(item.get("industry")),
+            "lead_stock": _clean_text(item.get("lead_stock")),
+            "close": _safe_number(item.get("close")),
+            "change_ratio": _safe_number(item.get("pct_change")),
+            "pct_change": _safe_number(item.get("pct_change")),
+            "company_num": _safe_number(item.get("company_num")),
+            "lead_stock_pct_change": _safe_number(item.get("pct_change_stock")),
+            "lead_stock_price": _safe_number(item.get("close_price")),
+            "net_buy_amount": _to_yuan_from_100m(item.get("net_buy_amount")),
+            "net_sell_amount": _to_yuan_from_100m(item.get("net_sell_amount")),
+            "net_inflow": net_inflow,
+            "net_amount_billion": _safe_number(item.get("net_amount")),
+            "source": "tushare:moneyflow_ind_ths",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("net_inflow") or 0.0),
+            float(item.get("change_ratio") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "moneyflow_ind_ths",
+        "trade_date": selected_date,
+        "ts_code": target_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_moneyflow_ind_ths_tool = ToolDefinition(
+    name="get_tushare_moneyflow_ind_ths",
+    description=(
+        "Get Tushare THS industry money-flow ranking without fallback. Amount fields from "
+        "Tushare are converted from 100m yuan to yuan."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional THS board code, e.g. 881267.TI.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_moneyflow_ind_ths,
+    category="data",
+)
+
+
+def _handle_get_tushare_moneyflow_ind_dc(
+    trade_date: str = "",
+    ts_code: str = "",
+    content_type: str = "行业",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare Eastmoney industry/concept money-flow ranking without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_code = _clean_text(ts_code).upper()
+    target_type = _clean_text(content_type)
+    fields = (
+        "trade_date,content_type,ts_code,name,pct_change,close,net_amount,net_amount_rate,"
+        "buy_elg_amount,buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,"
+        "buy_md_amount,buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate,"
+        "buy_sm_amount_stock,rank"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "moneyflow_ind_dc",
+        requested_date=requested_date,
+        fields=fields,
+        param_builder=lambda _date: {
+            "ts_code": target_code,
+            "content_type": target_type,
+        },
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "moneyflow_ind_dc",
+            "trade_date": selected_date,
+            "ts_code": target_code,
+            "content_type": target_type,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:moneyflow_ind_dc unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        board_code = _clean_text(item.get("ts_code")).upper()
+        item_type = _clean_text(item.get("content_type"))
+        if target_code and board_code != target_code:
+            continue
+        if target_type and item_type != target_type:
+            continue
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "content_type": item_type,
+            "ts_code": board_code,
+            "name": _clean_text(item.get("name")) or board_code,
+            "change_ratio": _safe_number(item.get("pct_change")),
+            "pct_change": _safe_number(item.get("pct_change")),
+            "close": _safe_number(item.get("close")),
+            "net_inflow": _safe_number(item.get("net_amount")),
+            "net_inflow_rate": _safe_number(item.get("net_amount_rate")),
+            "extra_large_net_inflow": _safe_number(item.get("buy_elg_amount")),
+            "extra_large_net_inflow_rate": _safe_number(item.get("buy_elg_amount_rate")),
+            "large_net_inflow": _safe_number(item.get("buy_lg_amount")),
+            "large_net_inflow_rate": _safe_number(item.get("buy_lg_amount_rate")),
+            "medium_net_inflow": _safe_number(item.get("buy_md_amount")),
+            "medium_net_inflow_rate": _safe_number(item.get("buy_md_amount_rate")),
+            "small_net_inflow": _safe_number(item.get("buy_sm_amount")),
+            "small_net_inflow_rate": _safe_number(item.get("buy_sm_amount_rate")),
+            "top_net_inflow_stock": _clean_text(item.get("buy_sm_amount_stock")),
+            "rank": _safe_number(item.get("rank")),
+            "source": "tushare:moneyflow_ind_dc",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("net_inflow") or 0.0),
+            float(item.get("net_inflow_rate") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "moneyflow_ind_dc",
+        "trade_date": selected_date,
+        "ts_code": target_code,
+        "content_type": target_type,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_moneyflow_ind_dc_tool = ToolDefinition(
+    name="get_tushare_moneyflow_ind_dc",
+    description=(
+        "Get Tushare Eastmoney industry/concept/region board money-flow ranking without fallback. "
+        "Amount fields are exposed in yuan as returned by Tushare."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional DC board code.", required=False, default=""),
+        ToolParameter(name="content_type", type="string", description="行业/概念/地域 (default: 行业).", required=False, default="行业"),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_moneyflow_ind_dc,
+    category="data",
+)
+
+
+def _handle_get_tushare_moneyflow_cnt_ths(
+    trade_date: str = "",
+    ts_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare THS concept money-flow ranking without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_code = _clean_text(ts_code).upper()
+    fields = (
+        "trade_date,ts_code,name,lead_stock,close_price,pct_change,industry_index,"
+        "company_num,pct_change_stock,net_buy_amount,net_sell_amount,net_amount"
+    )
+    selected_date, result, source_chain, errors = _tushare_recent_date_query(
+        "moneyflow_cnt_ths",
+        requested_date=requested_date,
+        fields=fields,
+        param_builder=lambda _date: {"ts_code": target_code},
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "moneyflow_cnt_ths",
+            "trade_date": selected_date,
+            "ts_code": target_code,
+            "items": [],
+            "source_chain": source_chain,
+            "errors": errors or [f"tushare:moneyflow_cnt_ths unavailable for {selected_date}"],
+        }
+
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        board_code = _clean_text(item.get("ts_code")).upper()
+        if target_code and board_code != target_code:
+            continue
+        normalized_items.append({
+            "trade_date": str(item.get("trade_date") or selected_date),
+            "ts_code": board_code,
+            "name": _clean_text(item.get("name")) or board_code,
+            "lead_stock": _clean_text(item.get("lead_stock")),
+            "lead_stock_price": _safe_number(item.get("close_price")),
+            "change_ratio": _safe_number(item.get("pct_change")),
+            "pct_change": _safe_number(item.get("pct_change")),
+            "industry_index": _safe_number(item.get("industry_index")),
+            "company_num": _safe_number(item.get("company_num")),
+            "lead_stock_pct_change": _safe_number(item.get("pct_change_stock")),
+            "net_buy_amount": _to_yuan_from_100m(item.get("net_buy_amount")),
+            "net_sell_amount": _to_yuan_from_100m(item.get("net_sell_amount")),
+            "net_inflow": _to_yuan_from_100m(item.get("net_amount")),
+            "net_amount_billion": _safe_number(item.get("net_amount")),
+            "source": "tushare:moneyflow_cnt_ths",
+        })
+    normalized_items.sort(
+        key=lambda item: (
+            float(item.get("net_inflow") or 0.0),
+            float(item.get("change_ratio") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+        reverse=True,
+    )
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "moneyflow_cnt_ths",
+        "trade_date": selected_date,
+        "ts_code": target_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_tushare_moneyflow_cnt_ths_tool = ToolDefinition(
+    name="get_tushare_moneyflow_cnt_ths",
+    description=(
+        "Get Tushare THS concept board money-flow ranking without fallback. Amount fields "
+        "from Tushare are converted from 100m yuan to yuan."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional THS concept board code, e.g. 885748.TI.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_moneyflow_cnt_ths,
+    category="data",
+)
+
+
+def _handle_get_tushare_ths_member(
+    ts_code: str = "",
+    stock_code: str = "",
+    limit: int = 50,
+) -> dict:
+    """Get Tushare THS board members without fallback."""
+    target_board = _clean_text(ts_code).upper()
+    target_stock = _to_tushare_ts_code(stock_code) if stock_code else ""
+    if not target_board and not target_stock:
+        return {
+            "status": "failed",
+            "api_name": "ths_member",
+            "ts_code": target_board,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": [],
+            "errors": ["ths_member requires ts_code or stock_code"],
+        }
+    effective_limit = max(1, min(int(limit or 50), 200))
+    result = _tushare_query_all_rows(
+        "ths_member",
+        {"ts_code": target_board, "con_code": target_stock},
+        "ts_code,con_code,con_name,weight,in_date,out_date,is_new",
+        timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
+    )
+    if result.get("status") != "ok":
+        return {
+            "status": result.get("status") or "failed",
+            "api_name": "ths_member",
+            "ts_code": target_board,
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": result.get("source_chain", []),
+            "errors": result.get("errors") or [f"tushare:ths_member unavailable for {target_board or target_stock}"],
+        }
+    raw_items = [item for item in (result.get("items") or []) if isinstance(item, dict)]
+    normalized_items = []
+    for item in raw_items:
+        con_code = _clean_text(item.get("con_code")).upper()
+        if target_stock and con_code != target_stock:
+            continue
+        symbol = _normalize_ts_code_to_symbol(con_code)
+        normalized_items.append({
+            "ts_code": _clean_text(item.get("ts_code")).upper(),
+            "code": symbol,
+            "con_code": con_code,
+            "name": _clean_text(item.get("con_name")) or symbol,
+            "weight": _safe_number(item.get("weight")),
+            "in_date": _clean_text(item.get("in_date")),
+            "out_date": _clean_text(item.get("out_date")),
+            "is_new": _clean_text(item.get("is_new")),
+            "source": "tushare:ths_member",
+        })
+    items = normalized_items[:effective_limit]
+    return {
+        "status": "ok" if items else "empty",
+        "api_name": "ths_member",
+        "ts_code": target_board,
+        "stock_code": stock_code,
+        "items": items,
+        "total_rows": int(result.get("total_rows") or len(raw_items)),
+        "source_chain": result.get("source_chain", []),
+        "errors": result.get("errors", []),
+    }
+
+
+get_tushare_ths_member_tool = ToolDefinition(
+    name="get_tushare_ths_member",
+    description="Get Tushare THS concept/industry board constituents without fallback.",
+    parameters=[
+        ToolParameter(name="ts_code", type="string", description="THS board index code, e.g. 885800.TI.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 50, max: 200).", required=False, default=50),
+    ],
+    handler=_handle_get_tushare_ths_member,
+    category="data",
+)
+
+
+def _default_recent_date_range(days: int = 30) -> Tuple[str, str]:
+    end = datetime.now().date()
+    start = end - timedelta(days=max(1, int(days or 30)))
+    return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+
+def _handle_get_tushare_announcements(
+    stock_code: str = "",
+    ann_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    start, end = _default_recent_date_range(7)
+    result = _tushare_query(
+        "anns_d",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "ann_date": _normalize_tushare_date(ann_date),
+            "start_date": _normalize_tushare_date(start_date) or ("" if ann_date else start),
+            "end_date": _normalize_tushare_date(end_date) or ("" if ann_date else end),
+        },
+        "ann_date,ts_code,name,title,url,rec_time",
+        limit,
+        timeout=max(5.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_announcements_tool = ToolDefinition(
+    name="get_tushare_announcements",
+    description="Get Tushare listed-company announcements (anns_d) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="ann_date", type="string", description="Optional announcement date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional announcement start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional announcement end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_announcements,
+    category="data",
+)
+
+
+def _handle_get_tushare_stock_alerts(
+    stock_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    start, end = _default_recent_date_range(30)
+    result = _tushare_query(
+        "stk_alert",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "trade_date": _normalize_tushare_date(trade_date),
+            "start_date": _normalize_tushare_date(start_date) or ("" if trade_date else start),
+            "end_date": _normalize_tushare_date(end_date) or ("" if trade_date else end),
+        },
+        "ts_code,name,start_date,end_date,type",
+        limit,
+        timeout=max(8.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_stock_alerts_tool = ToolDefinition(
+    name="get_tushare_stock_alerts",
+    description="Get Tushare exchange key-warning stock alerts (stk_alert) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_stock_alerts,
+    category="data",
+)
+
+
+def _handle_get_tushare_stock_shock(
+    stock_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    severity: str = "normal",
+    limit: int = 30,
+) -> dict:
+    api_name = "stk_high_shock" if str(severity or "").strip().lower() in {"high", "serious", "severe"} else "stk_shock"
+    start, end = _default_recent_date_range(30)
+    result = _tushare_query(
+        api_name,
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "trade_date": _normalize_tushare_date(trade_date),
+            "start_date": _normalize_tushare_date(start_date) or ("" if trade_date else start),
+            "end_date": _normalize_tushare_date(end_date) or ("" if trade_date else end),
+        },
+        "ts_code,trade_date,name,trade_market,reason,period",
+        limit,
+        timeout=max(8.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+    )
+    result["stock_code"] = stock_code
+    result["severity"] = severity
+    return result
+
+
+get_tushare_stock_shock_tool = ToolDefinition(
+    name="get_tushare_stock_shock",
+    description="Get Tushare abnormal or severe-abnormal stock movement records without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="severity", type="string", description="normal or high (default: normal).", required=False, default="normal"),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_stock_shock,
+    category="data",
+)
+
+
+def _handle_get_tushare_pledge_stat(stock_code: str, end_date: str = "", limit: int = 30) -> dict:
+    result = _tushare_query(
+        "pledge_stat",
+        {"ts_code": _to_tushare_ts_code(stock_code), "end_date": _normalize_tushare_date(end_date)},
+        "ts_code,end_date,pledge_count,unrest_pledge,rest_pledge,total_share,pledge_ratio",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_pledge_stat_tool = ToolDefinition(
+    name="get_tushare_pledge_stat",
+    description="Get Tushare stock pledge summary (pledge_stat) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 000014.", required=True),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_pledge_stat,
+    category="data",
+)
+
+
+def _handle_get_tushare_share_float(
+    stock_code: str = "",
+    ann_date: str = "",
+    float_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    default_start, default_end = _default_recent_date_range(90)
+    normalized_ann_date = _normalize_tushare_date(ann_date)
+    normalized_float_date = _normalize_tushare_date(float_date)
+    normalized_start_date = _normalize_tushare_date(start_date)
+    normalized_end_date = _normalize_tushare_date(end_date)
+    if not stock_code and not normalized_ann_date and not normalized_float_date and not normalized_start_date and not normalized_end_date:
+        normalized_start_date = default_start
+        normalized_end_date = default_end
+    result = _tushare_query(
+        "share_float",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "ann_date": normalized_ann_date,
+            "float_date": normalized_float_date,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+        },
+        "ts_code,ann_date,float_date,float_share,float_ratio,holder_name,share_type",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_share_float_tool = ToolDefinition(
+    name="get_tushare_share_float",
+    description="Get Tushare share-unlock records (share_float) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="ann_date", type="string", description="Optional announcement date.", required=False, default=""),
+        ToolParameter(name="float_date", type="string", description="Optional unlock date.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_share_float,
+    category="data",
+)
+
+
+def _handle_get_tushare_holder_trade(
+    stock_code: str = "",
+    ann_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    trade_type: str = "",
+    holder_type: str = "",
+    limit: int = 30,
+) -> dict:
+    default_start, default_end = _default_recent_date_range(180)
+    normalized_ann_date = _normalize_tushare_date(ann_date)
+    normalized_start_date = _normalize_tushare_date(start_date)
+    normalized_end_date = _normalize_tushare_date(end_date)
+    if not stock_code and not normalized_ann_date and not normalized_start_date and not normalized_end_date:
+        normalized_start_date = default_start
+        normalized_end_date = default_end
+    result = _tushare_query(
+        "stk_holdertrade",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "ann_date": normalized_ann_date,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+            "trade_type": _clean_text(trade_type).upper(),
+            "holder_type": _clean_text(holder_type).upper(),
+        },
+        "ts_code,ann_date,holder_name,holder_type,in_de,change_vol,change_ratio,after_share,after_ratio,avg_price,total_share,begin_date,close_date",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_holder_trade_tool = ToolDefinition(
+    name="get_tushare_holder_trade",
+    description="Get Tushare stockholder increase/decrease records (stk_holdertrade) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="ann_date", type="string", description="Optional announcement date.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="trade_type", type="string", description="Optional trade type IN or DE.", required=False, default=""),
+        ToolParameter(name="holder_type", type="string", description="Optional holder type C/P/G.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_holder_trade,
+    category="data",
+)
+
+
+def _handle_get_tushare_repurchase(
+    stock_code: str = "",
+    ann_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    default_start, default_end = _default_recent_date_range(180)
+    normalized_ann_date = _normalize_tushare_date(ann_date)
+    normalized_start_date = _normalize_tushare_date(start_date)
+    normalized_end_date = _normalize_tushare_date(end_date)
+    if not stock_code and not normalized_ann_date and not normalized_start_date and not normalized_end_date:
+        normalized_start_date = default_start
+        normalized_end_date = default_end
+    result = _tushare_query(
+        "repurchase",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "ann_date": normalized_ann_date,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+        },
+        "ts_code,ann_date,end_date,proc,exp_date,vol,amount,high_limit,low_limit",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_repurchase_tool = ToolDefinition(
+    name="get_tushare_repurchase",
+    description="Get Tushare stock repurchase records (repurchase) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="ann_date", type="string", description="Optional announcement date.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_repurchase,
+    category="data",
+)
+
+
+def _handle_get_tushare_pledge_detail(stock_code: str, limit: int = 30) -> dict:
+    result = _tushare_query(
+        "pledge_detail",
+        {"ts_code": _to_tushare_ts_code(stock_code)},
+        (
+            "ts_code,ann_date,holder_name,pledge_amount,start_date,end_date,is_release,"
+            "release_date,pledgor,holding_amount,pledged_amount,p_total_ratio,h_total_ratio,is_buyback"
+        ),
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_pledge_detail_tool = ToolDefinition(
+    name="get_tushare_pledge_detail",
+    description="Get Tushare stock pledge-detail records without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 600519."),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_pledge_detail,
+    category="data",
+)
+
+
+def _handle_get_tushare_daily_basic(
+    stock_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    normalized_trade_date = _normalize_tushare_date(trade_date)
+    normalized_start_date = _normalize_tushare_date(start_date)
+    normalized_end_date = _normalize_tushare_date(end_date)
+    if not stock_code and not normalized_trade_date and not normalized_start_date and not normalized_end_date:
+        normalized_trade_date = _latest_tushare_trade_date(update_hour=19, update_minute=0)
+    result = _tushare_query(
+        "daily_basic",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "trade_date": normalized_trade_date,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+        },
+        (
+            "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,pe,pe_ttm,"
+            "pb,ps,ps_ttm,dv_ratio,dv_ttm,total_share,float_share,free_share,total_mv,circ_mv"
+        ),
+        limit,
+        timeout=max(8.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_daily_basic_tool = ToolDefinition(
+    name="get_tushare_daily_basic",
+    description="Get Tushare daily valuation/trading indicators (daily_basic) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_daily_basic,
+    category="data",
+)
+
+
+def _handle_get_tushare_financial_indicators(stock_code: str, period: str = "", limit: int = 5) -> dict:
+    result = _tushare_query(
+        "fina_indicator",
+        {"ts_code": _to_tushare_ts_code(stock_code), "period": _normalize_tushare_date(period)},
+        (
+            "ts_code,ann_date,end_date,eps,dt_eps,total_revenue_ps,revenue_ps,bps,ocfps,"
+            "netprofit_margin,grossprofit_margin,roe,roe_waa,roe_dt,roa,roic,"
+            "debt_to_assets,current_ratio,quick_ratio,assets_turn,inv_turn,ar_turn"
+        ),
+        limit,
+    )
+    result["stock_code"] = stock_code
+    result["period"] = period
+    return result
+
+
+get_tushare_financial_indicators_tool = ToolDefinition(
+    name="get_tushare_financial_indicators",
+    description="Get Tushare financial indicator rows (fina_indicator) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 600519."),
+        ToolParameter(name="period", type="string", description="Optional report period YYYYMMDD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 5, max: 200).", required=False, default=5),
+    ],
+    handler=_handle_get_tushare_financial_indicators,
+    category="data",
+)
+
+
+def _handle_get_tushare_forecast(stock_code: str = "", period: str = "", limit: int = 30) -> dict:
+    normalized_period = _normalize_tushare_date(period)
+    if not stock_code:
+        return {
+            "status": "failed",
+            "api_name": "forecast",
+            "stock_code": stock_code,
+            "period": period,
+            "items": [],
+            "source_chain": [],
+            "errors": ["forecast requires stock_code for the current Tushare gateway"],
+        }
+    result = _tushare_query(
+        "forecast",
+        {"ts_code": _to_tushare_ts_code(stock_code), "period": normalized_period},
+        "ts_code,ann_date,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,last_parent_net,first_ann_date,summary,change_reason",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    result["period"] = period
+    return result
+
+
+get_tushare_forecast_tool = ToolDefinition(
+    name="get_tushare_forecast",
+    description="Get Tushare earnings forecast rows (forecast) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code.", required=True),
+        ToolParameter(name="period", type="string", description="Optional report period YYYYMMDD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_forecast,
+    category="data",
+)
+
+
+def _handle_get_tushare_express(stock_code: str = "", period: str = "", limit: int = 30) -> dict:
+    normalized_period = _normalize_tushare_date(period)
+    if not stock_code:
+        return {
+            "status": "failed",
+            "api_name": "express",
+            "stock_code": stock_code,
+            "period": period,
+            "items": [],
+            "source_chain": [],
+            "errors": ["express requires stock_code for the current Tushare gateway"],
+        }
+    result = _tushare_query(
+        "express",
+        {"ts_code": _to_tushare_ts_code(stock_code), "period": normalized_period},
+        (
+            "ts_code,ann_date,end_date,revenue,operate_profit,total_profit,n_income,total_assets,"
+            "total_hldr_eqy_exc_min_int,diluted_eps,diluted_roe,yoy_net_profit,bps,yoy_sales,"
+            "yoy_op,yoy_tp,yoy_dedu_np,yoy_eps,yoy_roe,growth_assets,yoy_equity,growth_bps,"
+            "or_last_year,op_last_year,tp_last_year,np_last_year,eps_last_year,open_net_assets,"
+            "open_bps,perf_summary,is_audit,remark"
+        ),
+        limit,
+    )
+    result["stock_code"] = stock_code
+    result["period"] = period
+    return result
+
+
+get_tushare_express_tool = ToolDefinition(
+    name="get_tushare_express",
+    description="Get Tushare earnings express rows (express) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code.", required=True),
+        ToolParameter(name="period", type="string", description="Optional report period YYYYMMDD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_express,
+    category="data",
+)
+
+
+def _handle_get_tushare_dividend(stock_code: str = "", ann_date: str = "", record_date: str = "", limit: int = 30) -> dict:
+    normalized_ann_date = _normalize_tushare_date(ann_date)
+    normalized_record_date = _normalize_tushare_date(record_date)
+    if not stock_code and not normalized_ann_date and not normalized_record_date:
+        return {
+            "status": "failed",
+            "api_name": "dividend",
+            "stock_code": stock_code,
+            "items": [],
+            "source_chain": [],
+            "errors": ["dividend requires stock_code, ann_date, or record_date for the current Tushare gateway"],
+        }
+    result = _tushare_query(
+        "dividend",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
+            "ann_date": normalized_ann_date,
+            "record_date": normalized_record_date,
+        },
+        "ts_code,end_date,ann_date,div_proc,stk_div,stk_bo_rate,stk_co_rate,cash_div,cash_div_tax,record_date,ex_date,pay_date,div_listdate,imp_ann_date,base_date,base_share",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_dividend_tool = ToolDefinition(
+    name="get_tushare_dividend",
+    description="Get Tushare dividend and bonus-share records (dividend) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
+        ToolParameter(name="ann_date", type="string", description="Optional announcement date.", required=False, default=""),
+        ToolParameter(name="record_date", type="string", description="Optional record date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_dividend,
+    category="data",
+)
+
+
+def _handle_get_tushare_adj_factor(
+    stock_code: str,
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    result = _tushare_query(
+        "adj_factor",
+        {
+            "ts_code": _to_tushare_ts_code(stock_code),
+            "trade_date": _normalize_tushare_date(trade_date),
+            "start_date": _normalize_tushare_date(start_date),
+            "end_date": _normalize_tushare_date(end_date),
+        },
+        "ts_code,trade_date,adj_factor",
+        limit,
+    )
+    result["stock_code"] = stock_code
+    return result
+
+
+get_tushare_adj_factor_tool = ToolDefinition(
+    name="get_tushare_adj_factor",
+    description="Get Tushare adjustment factors (adj_factor) without fallback.",
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 600519."),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_adj_factor,
+    category="data",
+)
+
+
+def _to_tushare_index_code(index_code: str) -> str:
+    raw = str(index_code or "").strip().upper()
+    if "." in raw:
+        return raw
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return raw
+    if digits.startswith(("399", "159")):
+        return f"{digits}.SZ"
+    return f"{digits}.SH"
+
+
+def _handle_get_tushare_index_daily(
+    index_code: str = "000300",
+    ts_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    resolved_index_code = _clean_text(ts_code) or _clean_text(index_code) or "000300"
+    result = _tushare_query(
+        "index_daily",
+        {
+            "ts_code": _to_tushare_index_code(resolved_index_code),
+            "trade_date": _normalize_tushare_date(trade_date),
+            "start_date": _normalize_tushare_date(start_date),
+            "end_date": _normalize_tushare_date(end_date),
+        },
+        "ts_code,trade_date,close,open,high,low,pre_close,change,pct_chg,vol,amount",
+        limit,
+    )
+    result["index_code"] = resolved_index_code
+    return result
+
+
+get_tushare_index_daily_tool = ToolDefinition(
+    name="get_tushare_index_daily",
+    description="Get Tushare index daily bars (index_daily) without fallback.",
+    parameters=[
+        ToolParameter(name="index_code", type="string", description="Index code, e.g. 000300 or 000300.SH.", required=False, default="000300"),
+        ToolParameter(name="ts_code", type="string", description="Optional Tushare index ts_code alias, e.g. 000300.SH.", required=False, default=""),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_index_daily,
+    category="data",
+)
+
+
+def _handle_get_tushare_trade_calendar(
+    exchange: str = "SSE",
+    start_date: str = "",
+    end_date: str = "",
+    is_open: str = "",
+    limit: int = 60,
+) -> dict:
+    start, end = _default_recent_date_range(30)
+    result = _tushare_query(
+        "trade_cal",
+        {
+            "exchange": _clean_text(exchange) or "SSE",
+            "start_date": _normalize_tushare_date(start_date) or start,
+            "end_date": _normalize_tushare_date(end_date) or end,
+            "is_open": _clean_text(is_open),
+        },
+        "exchange,cal_date,is_open,pretrade_date",
+        limit,
+    )
+    return result
+
+
+get_tushare_trade_calendar_tool = ToolDefinition(
+    name="get_tushare_trade_calendar",
+    description="Get Tushare trading calendar rows (trade_cal) without fallback.",
+    parameters=[
+        ToolParameter(name="exchange", type="string", description="Exchange code, default SSE.", required=False, default="SSE"),
+        ToolParameter(name="start_date", type="string", description="Optional start date.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date.", required=False, default=""),
+        ToolParameter(name="is_open", type="string", description="Optional open flag, 0 or 1.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 60, max: 200).", required=False, default=60),
+    ],
+    handler=_handle_get_tushare_trade_calendar,
+    category="data",
+)
 
 
 def _handle_get_market_capital_flow(top_n: int = 5) -> dict:
@@ -1383,6 +3594,269 @@ get_northbound_capital_flow_tool = ToolDefinition(
         ),
     ],
     handler=_handle_get_northbound_capital_flow,
+    category="data",
+)
+
+
+def _handle_get_tushare_moneyflow_hsgt(trade_date: str = "", limit: int = 10) -> dict:
+    """Get Tushare Stock Connect aggregate money flow without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 10), 60))
+    fields = "trade_date,ggt_ss,ggt_sz,hgt,sgt,north_money,south_money"
+    if requested_date:
+        result = _tushare_query(
+            "moneyflow_hsgt",
+            {"trade_date": requested_date},
+            fields,
+            limit=effective_limit,
+        )
+    else:
+        end_date = _recent_tushare_trade_dates(
+            update_hour=18,
+            update_minute=0,
+            max_dates=1,
+            lookback_days=20,
+        )[0]
+        start_date = (
+            datetime.strptime(end_date, "%Y%m%d") - timedelta(days=effective_limit * 3)
+        ).strftime("%Y%m%d")
+        result = _tushare_query(
+            "moneyflow_hsgt",
+            {"start_date": start_date, "end_date": end_date},
+            fields,
+            limit=effective_limit,
+        )
+    items: List[Dict[str, Any]] = []
+    for row in result.get("items") or []:
+        if not isinstance(row, dict):
+            continue
+        items.append({
+            "trade_date": str(row.get("trade_date") or "").replace("-", "")[:8],
+            "north_money": _safe_number(row.get("north_money")),
+            "south_money": _safe_number(row.get("south_money")),
+            "hgt": _safe_number(row.get("hgt")),
+            "sgt": _safe_number(row.get("sgt")),
+            "ggt_ss": _safe_number(row.get("ggt_ss")),
+            "ggt_sz": _safe_number(row.get("ggt_sz")),
+            "source": "tushare:moneyflow_hsgt",
+        })
+    items.sort(key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+    result.update({
+        "api_name": "moneyflow_hsgt",
+        "trade_date": requested_date,
+        "items": items[:effective_limit],
+    })
+    return result
+
+
+get_tushare_moneyflow_hsgt_tool = ToolDefinition(
+    name="get_tushare_moneyflow_hsgt",
+    description=(
+        "Get Tushare Stock Connect aggregate money flow (moneyflow_hsgt) without fallback. "
+        "Use it to judge northbound/southbound market liquidity context."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Recent rows to return when trade_date is omitted (default: 10, max: 60).", required=False, default=10),
+    ],
+    handler=_handle_get_tushare_moneyflow_hsgt,
+    category="data",
+)
+
+
+def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) -> dict:
+    """Get Tushare DC broad-market money flow without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    effective_limit = max(1, min(int(limit or 10), 60))
+    fields = (
+        "trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,"
+        "net_amount,net_amount_rate,buy_elg_amount,buy_elg_amount_rate,"
+        "buy_lg_amount,buy_lg_amount_rate,buy_md_amount,buy_md_amount_rate,"
+        "buy_sm_amount,buy_sm_amount_rate"
+    )
+    if requested_date:
+        result = _tushare_query(
+            "moneyflow_mkt_dc",
+            {"trade_date": requested_date},
+            fields,
+            limit=effective_limit,
+        )
+    else:
+        end_date = _recent_tushare_trade_dates(
+            update_hour=18,
+            update_minute=0,
+            max_dates=1,
+            lookback_days=20,
+        )[0]
+        start_date = (
+            datetime.strptime(end_date, "%Y%m%d") - timedelta(days=effective_limit * 3)
+        ).strftime("%Y%m%d")
+        result = _tushare_query(
+            "moneyflow_mkt_dc",
+            {"start_date": start_date, "end_date": end_date},
+            fields,
+            limit=effective_limit,
+        )
+    items: List[Dict[str, Any]] = []
+    for row in result.get("items") or []:
+        if not isinstance(row, dict):
+            continue
+        items.append({
+            "trade_date": str(row.get("trade_date") or "").replace("-", "")[:8],
+            "close_sh": _safe_number(row.get("close_sh")),
+            "pct_change_sh": _safe_number(row.get("pct_change_sh")),
+            "close_sz": _safe_number(row.get("close_sz")),
+            "pct_change_sz": _safe_number(row.get("pct_change_sz")),
+            "net_amount": _safe_number(row.get("net_amount")),
+            "net_amount_rate": _safe_number(row.get("net_amount_rate")),
+            "extra_large_net_inflow": _safe_number(row.get("buy_elg_amount")),
+            "extra_large_net_inflow_rate": _safe_number(row.get("buy_elg_amount_rate")),
+            "large_net_inflow": _safe_number(row.get("buy_lg_amount")),
+            "large_net_inflow_rate": _safe_number(row.get("buy_lg_amount_rate")),
+            "medium_net_inflow": _safe_number(row.get("buy_md_amount")),
+            "medium_net_inflow_rate": _safe_number(row.get("buy_md_amount_rate")),
+            "small_net_inflow": _safe_number(row.get("buy_sm_amount")),
+            "small_net_inflow_rate": _safe_number(row.get("buy_sm_amount_rate")),
+            "source": "tushare:moneyflow_mkt_dc",
+        })
+    items.sort(key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+    result.update({
+        "api_name": "moneyflow_mkt_dc",
+        "trade_date": requested_date,
+        "items": items[:effective_limit],
+    })
+    return result
+
+
+get_tushare_moneyflow_mkt_dc_tool = ToolDefinition(
+    name="get_tushare_moneyflow_mkt_dc",
+    description=(
+        "Get Tushare DC broad-market money flow (moneyflow_mkt_dc) without fallback. "
+        "Use it to judge whether market-level main capital supports stock selection."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Recent rows to return when trade_date is omitted (default: 10, max: 60).", required=False, default=10),
+    ],
+    handler=_handle_get_tushare_moneyflow_mkt_dc,
+    category="data",
+)
+
+
+def _handle_get_tushare_hsgt_top10(
+    trade_date: str = "",
+    stock_code: str = "",
+    market_type: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare Stock Connect top traded stocks without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    trade_dates = [requested_date] if requested_date else _recent_tushare_trade_dates(
+        update_hour=18,
+        update_minute=0,
+        max_dates=4,
+        lookback_days=20,
+    )
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_symbol = _normalize_ts_code_to_symbol(stock_code)
+    requested_market = str(market_type or "").strip()
+    market_types = [requested_market] if requested_market else ["1", "3"]
+    fields = "trade_date,ts_code,name,close,change,rank,market_type,amount,net_amount,buy,sell"
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    last_status = "failed"
+
+    for candidate_date in trade_dates:
+        raw_items: List[Dict[str, Any]] = []
+        for current_market_type in market_types:
+            result = _tushare_query_all_rows(
+                "hsgt_top10",
+                {"trade_date": candidate_date, "market_type": current_market_type},
+                fields,
+            )
+            source_chain.extend(result.get("source_chain", []))
+            errors.extend(result.get("errors", []))
+            last_status = str(result.get("status") or last_status)
+            if result.get("status") == "ok":
+                raw_items.extend([row for row in result.get("items") or [] if isinstance(row, dict)])
+            elif requested_date and result.get("status") in {"failed", "timeout"}:
+                break
+        if not raw_items:
+            if requested_date or last_status in {"failed", "timeout"}:
+                break
+            continue
+
+        normalized_items: List[Dict[str, Any]] = []
+        for item in raw_items:
+            symbol = _normalize_ts_code_to_symbol(item.get("ts_code"))
+            if target_symbol and symbol != target_symbol:
+                continue
+            amount = _safe_number(item.get("amount"))
+            net_amount = _safe_number(item.get("net_amount"))
+            buy = _safe_number(item.get("buy"))
+            sell = _safe_number(item.get("sell"))
+            normalized_items.append({
+                "trade_date": str(item.get("trade_date") or candidate_date),
+                "code": symbol,
+                "ts_code": str(item.get("ts_code") or "").strip(),
+                "name": str(item.get("name") or symbol).strip(),
+                "close": _safe_number(item.get("close")),
+                "change": _safe_number(item.get("change")),
+                "rank": _safe_number(item.get("rank")),
+                "market_type": str(item.get("market_type") or "").strip(),
+                # Tushare hsgt_top10 amount fields are in 10k yuan; expose yuan.
+                "amount": amount * 10000.0 if amount is not None else None,
+                "net_amount": net_amount * 10000.0 if net_amount is not None else None,
+                "buy": buy * 10000.0 if buy is not None else None,
+                "sell": sell * 10000.0 if sell is not None else None,
+                "source": "tushare:hsgt_top10",
+            })
+        normalized_items.sort(
+            key=lambda item: (
+                abs(float(item.get("net_amount") or 0.0)),
+                float(item.get("amount") or 0.0),
+                str(item.get("code") or ""),
+            ),
+            reverse=True,
+        )
+        items = normalized_items[:effective_limit]
+        return {
+            "status": "ok" if items else "empty",
+            "api_name": "hsgt_top10",
+            "trade_date": candidate_date,
+            "stock_code": stock_code,
+            "market_type": market_type,
+            "items": items,
+            "total_rows": len(raw_items),
+            "source_chain": source_chain,
+            "errors": errors,
+        }
+
+    return {
+        "status": last_status,
+        "api_name": "hsgt_top10",
+        "trade_date": trade_dates[0] if trade_dates else requested_date,
+        "stock_code": stock_code,
+        "market_type": market_type,
+        "items": [],
+        "source_chain": source_chain,
+        "errors": errors or [f"tushare:hsgt_top10 unavailable for {trade_dates[0] if trade_dates else requested_date}"],
+    }
+
+
+get_tushare_hsgt_top10_tool = ToolDefinition(
+    name="get_tushare_hsgt_top10",
+    description=(
+        "Get Tushare Stock Connect top traded stocks (hsgt_top10) without fallback. "
+        "Use it as stock-level northbound/southbound seed evidence."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code to filter.", required=False, default=""),
+        ToolParameter(name="market_type", type="string", description="Optional Tushare market_type, e.g. 1 for 沪股通, 3 for 深股通.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_hsgt_top10,
     category="data",
 )
 
@@ -1487,10 +3961,242 @@ get_margin_trading_summary_tool = ToolDefinition(
 )
 
 
+def _handle_get_tushare_margin_detail(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare stock-level margin detail without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    trade_dates = [requested_date] if requested_date else _recent_tushare_trade_dates(
+        update_hour=18,
+        update_minute=0,
+        max_dates=4,
+        lookback_days=20,
+    )
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_ts_code = _to_tushare_ts_code(stock_code) if stock_code else ""
+    fields = "trade_date,ts_code,name,rzye,rqye,rzmre,rqyl,rzche,rqchl,rzrqye"
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    last_status = "failed"
+
+    for candidate_date in trade_dates:
+        result = _tushare_query_all_rows(
+            "margin_detail",
+            {"trade_date": candidate_date, "ts_code": target_ts_code},
+            fields,
+        )
+        source_chain.extend(result.get("source_chain", []))
+        errors.extend(result.get("errors", []))
+        last_status = str(result.get("status") or last_status)
+        if result.get("status") != "ok":
+            if requested_date or result.get("status") in {"failed", "timeout"}:
+                break
+            continue
+
+        items: List[Dict[str, Any]] = []
+        for row in result.get("items") or []:
+            if not isinstance(row, dict):
+                continue
+            symbol = _normalize_ts_code_to_symbol(row.get("ts_code"))
+            items.append({
+                "trade_date": str(row.get("trade_date") or candidate_date),
+                "code": symbol,
+                "ts_code": str(row.get("ts_code") or "").strip(),
+                "name": str(row.get("name") or symbol).strip(),
+                "financing_balance": _safe_number(row.get("rzye")),
+                "short_balance": _safe_number(row.get("rqye")),
+                "financing_buy": _safe_number(row.get("rzmre")),
+                "short_volume": _safe_number(row.get("rqyl")),
+                "financing_repay": _safe_number(row.get("rzche")),
+                "short_repay_volume": _safe_number(row.get("rqchl")),
+                "margin_balance": _safe_number(row.get("rzrqye")),
+                "source": "tushare:margin_detail",
+            })
+        items.sort(
+            key=lambda item: (
+                float(item.get("financing_buy") or 0.0),
+                float(item.get("financing_balance") or 0.0),
+                str(item.get("code") or ""),
+            ),
+            reverse=True,
+        )
+        items = items[:effective_limit]
+        return {
+            "status": "ok" if items else "empty",
+            "api_name": "margin_detail",
+            "trade_date": candidate_date,
+            "stock_code": stock_code,
+            "items": items,
+            "total_rows": int(result.get("total_rows") or len(items)),
+            "source_chain": source_chain,
+            "errors": errors,
+        }
+
+    return {
+        "status": last_status,
+        "api_name": "margin_detail",
+        "trade_date": trade_dates[0] if trade_dates else requested_date,
+        "stock_code": stock_code,
+        "items": [],
+        "source_chain": source_chain,
+        "errors": errors or [f"tushare:margin_detail unavailable for {trade_dates[0] if trade_dates else requested_date}"],
+    }
+
+
+get_tushare_margin_detail_tool = ToolDefinition(
+    name="get_tushare_margin_detail",
+    description=(
+        "Get Tushare stock-level margin financing detail (margin_detail) without fallback. "
+        "Use it for leveraged-liquidity seed discovery and risk checks."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code to filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_margin_detail,
+    category="data",
+)
+
+
+def _handle_get_tushare_block_trade(
+    trade_date: str = "",
+    stock_code: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare block trades without fallback."""
+    requested_date = _normalize_tushare_date(trade_date)
+    trade_dates = [requested_date] if requested_date else _recent_tushare_trade_dates(
+        update_hour=18,
+        update_minute=0,
+        max_dates=4,
+        lookback_days=20,
+    )
+    effective_limit = max(1, min(int(limit or 30), 200))
+    target_ts_code = _to_tushare_ts_code(stock_code) if stock_code else ""
+    fields = "trade_date,ts_code,name,price,vol,amount,buyer,seller"
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    last_status = "failed"
+
+    for candidate_date in trade_dates:
+        result = _tushare_query_all_rows(
+            "block_trade",
+            {"trade_date": candidate_date, "ts_code": target_ts_code},
+            fields,
+        )
+        source_chain.extend(result.get("source_chain", []))
+        errors.extend(result.get("errors", []))
+        last_status = str(result.get("status") or last_status)
+        if result.get("status") != "ok":
+            if requested_date or result.get("status") in {"failed", "timeout"}:
+                break
+            continue
+
+        items: List[Dict[str, Any]] = []
+        for row in result.get("items") or []:
+            if not isinstance(row, dict):
+                continue
+            symbol = _normalize_ts_code_to_symbol(row.get("ts_code"))
+            amount = _safe_number(row.get("amount"))
+            items.append({
+                "trade_date": str(row.get("trade_date") or candidate_date),
+                "code": symbol,
+                "ts_code": str(row.get("ts_code") or "").strip(),
+                "name": str(row.get("name") or symbol).strip(),
+                "price": _safe_number(row.get("price")),
+                "volume": _safe_number(row.get("vol")),
+                # Tushare block_trade amount is in 10k yuan; expose yuan.
+                "amount": amount * 10000.0 if amount is not None else None,
+                "buyer": str(row.get("buyer") or "").strip(),
+                "seller": str(row.get("seller") or "").strip(),
+                "source": "tushare:block_trade",
+            })
+        items.sort(
+            key=lambda item: (
+                float(item.get("amount") or 0.0),
+                str(item.get("code") or ""),
+            ),
+            reverse=True,
+        )
+        items = items[:effective_limit]
+        return {
+            "status": "ok" if items else "empty",
+            "api_name": "block_trade",
+            "trade_date": candidate_date,
+            "stock_code": stock_code,
+            "items": items,
+            "total_rows": int(result.get("total_rows") or len(items)),
+            "source_chain": source_chain,
+            "errors": errors,
+        }
+
+    return {
+        "status": last_status,
+        "api_name": "block_trade",
+        "trade_date": trade_dates[0] if trade_dates else requested_date,
+        "stock_code": stock_code,
+        "items": [],
+        "source_chain": source_chain,
+        "errors": errors or [f"tushare:block_trade unavailable for {trade_dates[0] if trade_dates else requested_date}"],
+    }
+
+
+get_tushare_block_trade_tool = ToolDefinition(
+    name="get_tushare_block_trade",
+    description=(
+        "Get Tushare block-trade records (block_trade) without fallback. "
+        "Use it to find high-conviction block transaction seed candidates."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="stock_code", type="string", description="Optional A-share stock code to filter.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_block_trade,
+    category="data",
+)
+
+
 ALL_DATA_TOOLS.extend([
+    get_tushare_moneyflow_ind_ths_tool,
+    get_tushare_moneyflow_ind_dc_tool,
+    get_tushare_moneyflow_cnt_ths_tool,
+    get_tushare_ths_member_tool,
+    get_tushare_announcements_tool,
+    get_tushare_stock_alerts_tool,
+    get_tushare_stock_shock_tool,
+    get_tushare_pledge_stat_tool,
+    get_tushare_pledge_detail_tool,
+    get_tushare_share_float_tool,
+    get_tushare_holder_trade_tool,
+    get_tushare_repurchase_tool,
+    get_tushare_daily_basic_tool,
+    get_tushare_financial_indicators_tool,
+    get_tushare_forecast_tool,
+    get_tushare_express_tool,
+    get_tushare_dividend_tool,
+    get_tushare_adj_factor_tool,
+    get_tushare_index_daily_tool,
+    get_tushare_trade_calendar_tool,
+    get_tushare_moneyflow_ths_tool,
+    get_tushare_moneyflow_dc_tool,
+    get_tushare_dragon_tiger_list_tool,
+    get_tushare_dragon_tiger_inst_tool,
+    get_tushare_limit_list_ths_tool,
+    get_tushare_limit_list_d_tool,
+    get_tushare_limit_step_tool,
+    get_tushare_hot_rank_tool,
     get_market_capital_flow_tool,
     get_northbound_capital_flow_tool,
+    get_tushare_moneyflow_hsgt_tool,
+    get_tushare_moneyflow_mkt_dc_tool,
+    get_tushare_hsgt_top10_tool,
     get_margin_trading_summary_tool,
+    get_tushare_margin_detail_tool,
+    get_tushare_block_trade_tool,
 ])
 
 

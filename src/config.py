@@ -173,6 +173,39 @@ def parse_env_float(
     return parsed
 
 
+def parse_env_optional_float(
+    value: Optional[str],
+    *,
+    field_name: str,
+    minimum: Optional[float] = None,
+) -> Optional[float]:
+    """Parse a float env value where empty/unset → None (feature disabled).
+
+    Invalid (non-numeric) values warn and fall back to None rather than raising.
+    """
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a valid number; treating as unset (disabled)",
+            field_name,
+            value,
+        )
+        return None
+    if minimum is not None and parsed < minimum:
+        logger.warning(
+            "%s=%r is below minimum %s; clamping to %s",
+            field_name,
+            parsed,
+            minimum,
+            minimum,
+        )
+        parsed = minimum
+    return parsed
+
+
 def normalize_news_strategy_profile(value: Optional[str]) -> str:
     """Normalize news strategy profile to known values."""
     candidate = (value or "short").strip().lower()
@@ -616,7 +649,7 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
-    tushare_http_url: str = "http://api.tushare.pro"
+    tushare_http_url: str = "http://118.89.66.41:8010/"
     stockapi_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
@@ -719,19 +752,24 @@ class Config:
     agent_nl_routing: bool = False  # Enable natural language routing in bot dispatcher
     agent_arch: str = "single"     # Agent architecture: 'single' (legacy) or 'multi' (orchestrator)
     agent_orchestration_mode: str = "legacy"  # Watchlist orchestration: legacy | expert_graph
+    agent_candidate_discovery_mode: str = "thesis_desk_committee"  # Watchlist candidate discovery: thesis_desk_committee only during P4 tuning
     agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
-    agent_candidate_expert_timeout_seconds: float = 20.0  # Max seconds for one L1 candidate expert discovery packet
-    agent_selection_deep_dive_limit: int = 6  # Max L1 candidates that enter stock-level deep-dive evidence collection
+    agent_candidate_expert_timeout_seconds: float = 60.0  # Max seconds for one L1 candidate expert discovery packet
+    agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
+    agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
+    agent_veto_gate_enabled: bool = True  # Enable shared bearish red-line veto gate (thesis_desk_committee); default only hard_risk_flags trigger
+    agent_veto_violent_outflow_threshold: Optional[float] = None  # Net-outflow % to flag capital_violent_outflow; None disables (never triggers)
+    agent_veto_breakdown_accel_threshold: Optional[float] = None  # 5-day drop % to flag breakdown_accelerating; None disables (never triggers)
     agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
     agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
     agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
     agent_candidate_enforce_name_code_match: bool = True  # Exclude candidates whose provided name conflicts with stock master data
     agent_candidate_pool_db_path: str = ""  # Optional SQLite path for persisted candidate-pool runs; empty reuses DATABASE_PATH
     agent_fundamental_candidate_db_path: str = ""  # Optional SQLite path for precomputed fundamental candidate snapshots
-    agent_stock_info_boards_timeout_seconds: float = 1.0  # Max seconds for optional stock board membership enrichment
-    agent_chip_distribution_timeout_seconds: float = 3.0  # Max seconds for chip distribution data-source probing
+    agent_stock_info_boards_timeout_seconds: float = 3.0  # Max seconds for optional stock board membership enrichment
+    agent_chip_distribution_timeout_seconds: float = 12.0  # Max seconds for chip distribution data-source probing
     agent_sector_rankings_timeout_seconds: float = 3.0  # Max seconds for sector ranking data-source probing
     agent_regime_component_timeout_seconds: float = 8.0  # Max seconds for one market-regime auxiliary component
     agent_tushare_tool_timeout_seconds: float = 5.0  # Max seconds for one Tushare Agent tool request
@@ -903,11 +941,11 @@ class Config:
     # 全局总开关；关闭时返回 not_supported 并保持主流程无变化
     enable_fundamental_pipeline: bool = True
     # 基本面阶段总预算（秒）
-    fundamental_stage_timeout_seconds: float = 1.5
+    fundamental_stage_timeout_seconds: float = 8.0
     # 单能力源调用超时（秒）
-    fundamental_fetch_timeout_seconds: float = 0.8
+    fundamental_fetch_timeout_seconds: float = 3.0
     # Agent 显式资金流工具超时（秒）；资金流端点常慢于基本面聚合预算
-    agent_capital_flow_timeout_seconds: float = 3.0
+    agent_capital_flow_timeout_seconds: float = 15.0
     # 单能力失败重试次数（已包含首次）
     fundamental_retry_max: int = 1
     # 基本面上下文短 TTL（秒）
@@ -979,6 +1017,7 @@ class Config:
     _VALID_AGENT_ARCH = {"single", "multi"}
     _VALID_AGENT_ANALYSIS_MODE = {"normal", "planning_execute"}
     _VALID_AGENT_ORCHESTRATION_MODES = {"legacy", "expert_graph"}
+    _VALID_CANDIDATE_DISCOVERY_MODES = {"deterministic", "llm_expert_committee", "thesis_desk_committee"}
     _VALID_ORCHESTRATOR_MODES = {"quick", "standard", "full", "specialist"}
     _VALID_SKILL_ROUTING = {"auto", "manual"}
     _WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS = frozenset(
@@ -1013,6 +1052,12 @@ class Config:
                 self.agent_orchestration_mode, self._VALID_AGENT_ORCHESTRATION_MODES,
             )
             object.__setattr__(self, "agent_orchestration_mode", "legacy")
+        if self.agent_candidate_discovery_mode not in self._VALID_CANDIDATE_DISCOVERY_MODES:
+            _log.warning(
+                "Invalid AGENT_CANDIDATE_DISCOVERY_MODE=%r, falling back to 'thesis_desk_committee'. Valid: %s",
+                self.agent_candidate_discovery_mode, self._VALID_CANDIDATE_DISCOVERY_MODES,
+            )
+            object.__setattr__(self, "agent_candidate_discovery_mode", "thesis_desk_committee")
         if self.agent_orchestrator_mode in {"strategy", "skill"}:
             _log.info(
                 "AGENT_ORCHESTRATOR_MODE=%s is deprecated; normalizing to 'specialist'",
@@ -1344,7 +1389,7 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
-            tushare_http_url=(os.getenv('TUSHARE_HTTP_URL') or "http://api.tushare.pro").strip(),
+            tushare_http_url=(os.getenv('TUSHARE_HTTP_URL') or "http://118.89.66.41:8010/").strip(),
             stockapi_token=os.getenv('STOCKAPI_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
@@ -1431,6 +1476,7 @@ class Config:
             agent_nl_routing=os.getenv('AGENT_NL_ROUTING', 'false').lower() == 'true',
             agent_arch=os.getenv('AGENT_ARCH', 'single').lower(),
             agent_orchestration_mode=os.getenv('AGENT_ORCHESTRATION_MODE', 'legacy').strip().lower(),
+            agent_candidate_discovery_mode=os.getenv('AGENT_CANDIDATE_DISCOVERY_MODE', 'thesis_desk_committee').strip().lower(),
             agent_orchestrator_mode=os.getenv('AGENT_ORCHESTRATOR_MODE', 'standard').lower(),
             agent_orchestrator_timeout_s=parse_env_int(
                 os.getenv('AGENT_ORCHESTRATOR_TIMEOUT_S'),
@@ -1446,16 +1492,34 @@ class Config:
             ),
             agent_candidate_expert_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS'),
-                20.0,
+                60.0,
                 field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
             agent_selection_deep_dive_limit=parse_env_int(
                 os.getenv('AGENT_SELECTION_DEEP_DIVE_LIMIT'),
-                6,
+                4,
                 field_name='AGENT_SELECTION_DEEP_DIVE_LIMIT',
                 minimum=1,
                 maximum=20,
+            ),
+            agent_deep_dive_setup_router_enabled=parse_env_bool(
+                os.getenv('AGENT_DEEP_DIVE_SETUP_ROUTER_ENABLED'),
+                True,
+            ),
+            agent_veto_gate_enabled=parse_env_bool(
+                os.getenv('AGENT_VETO_GATE_ENABLED'),
+                True,
+            ),
+            agent_veto_violent_outflow_threshold=parse_env_optional_float(
+                os.getenv('AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD'),
+                field_name='AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD',
+                minimum=0.0,
+            ),
+            agent_veto_breakdown_accel_threshold=parse_env_optional_float(
+                os.getenv('AGENT_VETO_BREAKDOWN_ACCEL_THRESHOLD'),
+                field_name='AGENT_VETO_BREAKDOWN_ACCEL_THRESHOLD',
+                minimum=0.0,
             ),
             agent_candidate_blacklist_codes=[
                 code.strip() for code in os.getenv('AGENT_CANDIDATE_BLACKLIST_CODES', '').split(',') if code.strip()
@@ -1480,13 +1544,13 @@ class Config:
             agent_fundamental_candidate_db_path=os.getenv('AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH', '').strip(),
             agent_stock_info_boards_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS'),
-                1.0,
+                3.0,
                 field_name='AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
             agent_chip_distribution_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS'),
-                3.0,
+                12.0,
                 field_name='AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
@@ -1695,19 +1759,19 @@ class Config:
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv('FUNDAMENTAL_STAGE_TIMEOUT_SECONDS'),
-                1.5,
+                8.0,
                 field_name='FUNDAMENTAL_STAGE_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
             fundamental_fetch_timeout_seconds=parse_env_float(
                 os.getenv('FUNDAMENTAL_FETCH_TIMEOUT_SECONDS'),
-                0.8,
+                3.0,
                 field_name='FUNDAMENTAL_FETCH_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
             agent_capital_flow_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS'),
-                3.0,
+                15.0,
                 field_name='AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),

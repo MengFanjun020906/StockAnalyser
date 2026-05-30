@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.evidence import build_evidence_cards_for_stock
 from src.agent.evidence.adapter import cards_to_json
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 SELECTION_INTENT = "watchlist_scan"
 DEFAULT_CANDIDATE_LIMIT = 8
-DISCOVERY_RECALL_LIMIT = 24
+DISCOVERY_RECALL_LIMIT = 20
 DEFAULT_DEEP_DIVE_LIMIT = 8
 MIN_RICH_REPORT_DEEP_DIVE_TARGETS = 3
 FAILED_TOOL_STATUSES = {"failed", "error", "tool_failed", "timeout"}
@@ -180,6 +180,7 @@ class StockSelectionResult:
     context: Optional[SelectionRunContext] = None
     final_report_json: Dict[str, Any] = field(default_factory=dict)
     final_markdown: str = ""
+    appendix_markdown: str = ""
     tool_calls_log: List[Dict[str, Any]] = field(default_factory=list)
     total_tokens: int = 0
     models_used: List[str] = field(default_factory=list)
@@ -193,6 +194,7 @@ class StockSelectionResult:
             "selection_context": self.context.to_dict(include_full=True) if self.context else None,
             "final_report_json": self.final_report_json,
             "final_markdown": self.final_markdown,
+            "appendix_markdown": self.appendix_markdown,
             "tool_calls_log": self.tool_calls_log,
             "total_tokens": self.total_tokens,
             "models_used": _unique_text_items(self.models_used),
@@ -246,17 +248,42 @@ def run_stock_selection_pipeline(
     try:
         _emit(progress_callback, "selection_start", message="开始五阶段选股流水线。")
 
+        if ctx.candidate_discovery_mode != "thesis_desk_committee":
+            ctx.next_step = "stop_non_thesis_desk_mode"
+            blocked_payload = _non_thesis_desk_mode_exit_payload(ctx)
+            ctx.set_stage("candidate_discovery", blocked_payload)
+            _emit(
+                progress_callback,
+                "selection_candidate_discovery_mode",
+                payload={
+                    "mode": ctx.candidate_discovery_mode,
+                    "required_mode": "thesis_desk_committee",
+                    "fallback": False,
+                    "blocked": True,
+                    "reason": "current development run only allows thesis_desk_committee",
+                },
+            )
+            _emit(
+                progress_callback,
+                "selection_candidate_discovery_done",
+                payload=ctx.stages["candidate_discovery"].to_dict(include_full=False),
+            )
+            result.success = True
+            result.final_report_json = _build_final_report_json(ctx)
+            _enforce_report_stock_identity(ctx, result.final_report_json)
+            result.final_markdown = render_stock_selection_markdown(result.final_report_json)
+            _apply_report_split(result)
+            _finalize_result(result)
+            return result
+
         discovery_seed = _run_candidate_discovery_tool(
             ctx=ctx,
             tool_registry=tool_registry,
             target_symbols=list(agent_user_context.report.target_symbols or []),
             llm_adapter=llm_adapter,
         )
-        if ctx.candidate_discovery_mode == "llm_expert_committee":
-            # Capital expert already filtered the seed pool; skip the redundant
-            # second-layer LLM rewrite whose candidate list would be overwritten
-            # by _merge_discovery_candidates anyway.
-            discovery_payload = _fallback_candidate_discovery(ctx, discovery_seed)
+        if ctx.candidate_discovery_mode in {"llm_expert_committee", "thesis_desk_committee"}:
+            discovery_payload = discovery_seed
         else:
             discovery_payload = _call_stage_json(
                 ctx=ctx,
@@ -280,6 +307,12 @@ def run_stock_selection_pipeline(
         _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
         ctx.set_stage("candidate_discovery", discovery_payload)
         _emit(progress_callback, "selection_candidate_discovery_done", payload=ctx.stages["candidate_discovery"].to_dict(include_full=False))
+        if ctx.stages["candidate_discovery"].status == "failed":
+            error = _candidate_discovery_failure_message(ctx.stage_full("candidate_discovery"))
+            _complete_failed_candidate_discovery_result(ctx=ctx, result=result, error=error)
+            _finalize_result(result)
+            _emit(progress_callback, "selection_error", message=error, payload=result.final_report_json)
+            return result
 
         ctx.market_regime = _run_market_regime_tool(ctx=ctx, tool_registry=tool_registry)
         _emit(progress_callback, "selection_market_regime_done", payload=_summarize_market_regime(ctx.market_regime))
@@ -297,6 +330,7 @@ def run_stock_selection_pipeline(
             result.final_report_json = _build_final_report_json(ctx)
             _enforce_report_stock_identity(ctx, result.final_report_json)
             result.final_markdown = render_stock_selection_markdown(result.final_report_json)
+            _apply_report_split(result)
             _finalize_result(result)
             return result
 
@@ -304,6 +338,7 @@ def run_stock_selection_pipeline(
             ctx=ctx,
             tool_registry=tool_registry,
             discovery_full=ctx.stage_full("candidate_discovery"),
+            canonical_codes=candidates,
         )
         _enforce_stage_stock_identity(ctx, balanced_payload, "balanced_candidate_evidence")
         ctx.set_stage("balanced_candidate_evidence", balanced_payload)
@@ -326,6 +361,8 @@ def run_stock_selection_pipeline(
                 "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
                 "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
                 "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                "candidate_evidence_table": _screening_candidate_evidence_table(ctx),
+                "candidate_evidence_data": _screening_candidate_evidence_data(ctx),
                 "market_regime": _summarize_market_regime(ctx.market_regime),
                 "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
                 "base_evidence": _compact_base_evidence(base_evidence),
@@ -338,7 +375,18 @@ def run_stock_selection_pipeline(
         _emit(progress_callback, "selection_candidate_screening_done", payload=ctx.stages["candidate_screening"].to_dict(include_full=False))
 
         deep_dive_limit = _selection_deep_dive_limit()
-        deep_targets = candidates[:deep_dive_limit] if candidates else []
+        deep_targets, deep_dive_provenance = _select_deep_dive_targets(
+            candidates=candidates,
+            screening_summary=ctx.stage_summary("candidate_screening"),
+            screening_full=ctx.stage_full("candidate_screening"),
+            limit=deep_dive_limit,
+        )
+        setup_router_enabled = _deep_dive_setup_router_enabled()
+        candidate_records = (
+            _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
+            if setup_router_enabled
+            else {}
+        )
         deep_dive_outputs: List[Dict[str, Any]] = []
         for code in deep_targets:
             detailed_evidence = _balanced_raw_evidence_for_code(ctx, code)
@@ -359,25 +407,32 @@ def run_stock_selection_pipeline(
                 detailed_evidence=detailed_evidence,
                 evidence_cards=evidence_cards,
             )
+            deep_dive_payload_in: Dict[str, Any] = {
+                "user_message": task,
+                "stock_code": code,
+                "stock_name": stock_name,
+                "account_summary": ctx.account_summary,
+                "investor_profile": ctx.investor_profile,
+                "screening_summary": ctx.stage_summary("candidate_screening"),
+                "market_regime": _summarize_market_regime(ctx.market_regime),
+                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                "stock_evidence": prompt_evidence,
+            }
+            if setup_router_enabled:
+                deep_dive_payload_in.update(
+                    _deep_dive_setup_fields(candidate_records.get(code), market=ctx.market)
+                )
             deep_payload = _call_stage_json(
                 ctx=ctx,
                 llm_adapter=llm_adapter,
                 stage_name=f"single_stock_deep_dive:{code}",
-                prompt=build_deep_dive_prompt({
-                    "user_message": task,
-                    "stock_code": code,
-                    "stock_name": stock_name,
-                    "account_summary": ctx.account_summary,
-                    "investor_profile": ctx.investor_profile,
-                    "screening_summary": ctx.stage_summary("candidate_screening"),
-                    "market_regime": _summarize_market_regime(ctx.market_regime),
-                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-                    "stock_evidence": prompt_evidence,
-                }),
+                prompt=build_deep_dive_prompt(deep_dive_payload_in),
                 fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
                 timeout_seconds=timeout_seconds,
             )
             _attach_evidence_cards(deep_payload, evidence_cards)
+            if deep_dive_provenance.get(code) == "pool_fallback":
+                _mark_deep_dive_pool_fallback(deep_payload)
             _enforce_stage_stock_identity(ctx, deep_payload, f"single_stock_deep_dive:{code}")
             deep_dive_outputs.append(deep_payload)
 
@@ -468,6 +523,7 @@ def run_stock_selection_pipeline(
         result.final_report_json = _build_final_report_json(ctx)
         _enforce_report_stock_identity(ctx, result.final_report_json)
         result.final_markdown = render_stock_selection_markdown(result.final_report_json)
+        _apply_report_split(result)
         _finalize_result(result)
         _emit(progress_callback, "selection_done", final_action=(ctx.stage_summary("judge_decision") or {}).get("final_action"))
         return result
@@ -673,6 +729,8 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
+        "<!-- APPENDIX_SEPARATOR -->",
+        "",
         "## 附录一、候选池来源与入池理由",
         "",
         "这部分用于追溯候选为什么进池，不代表买入结论。",
@@ -767,25 +825,42 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+APPENDIX_SEPARATOR = "<!-- APPENDIX_SEPARATOR -->"
+
+
+def _split_report_appendix(full_markdown: str) -> tuple:
+    """Split full markdown into (main_report, appendix) on the separator marker."""
+    if APPENDIX_SEPARATOR in full_markdown:
+        parts = full_markdown.split(APPENDIX_SEPARATOR, 1)
+        return parts[0].rstrip(), parts[1].strip()
+    return full_markdown, ""
+
+
+def _apply_report_split(result: StockSelectionResult) -> None:
+    main, appendix = _split_report_appendix(result.final_markdown)
+    result.final_markdown = main
+    result.appendix_markdown = appendix
+
+
 def _resolve_orchestration_mode(value: Optional[str]) -> str:
     raw = (value or os.getenv("AGENT_ORCHESTRATION_MODE") or "legacy").strip().lower()
     return raw if raw in {"legacy", "expert_graph"} else "legacy"
 
 
 def _resolve_candidate_discovery_mode(value: Optional[str]) -> str:
-    """Resolve candidate-discovery mode: request value > env > default deterministic.
+    """Resolve candidate-discovery mode: request value > env > default thesis desk.
 
-    Invalid values silently fall back to ``deterministic`` so a bad UI toggle or
-    misconfigured env var never blocks the pipeline.
+    Current development runs focus on the P4 three-desk path; legacy modes are
+    accepted for traceability but are stopped by a guard before candidate work.
     """
-    raw = (value or os.getenv("AGENT_CANDIDATE_DISCOVERY_MODE") or "deterministic").strip().lower()
-    if raw in {"deterministic", "llm_expert_committee"}:
+    raw = (value or os.getenv("AGENT_CANDIDATE_DISCOVERY_MODE") or "thesis_desk_committee").strip().lower()
+    if raw in {"deterministic", "llm_expert_committee", "thesis_desk_committee"}:
         return raw
     logger.warning(
-        "Invalid candidate_discovery_mode=%r; falling back to 'deterministic'",
+        "Invalid candidate_discovery_mode=%r; falling back to 'thesis_desk_committee'",
         value,
     )
-    return "deterministic"
+    return "thesis_desk_committee"
 
 
 def _maybe_run_expert_graph(
@@ -858,6 +933,68 @@ def _complete_failed_selection_result(
     }
     _enforce_report_stock_identity(ctx, result.final_report_json)
     result.final_markdown = render_stock_selection_markdown(result.final_report_json)
+    _apply_report_split(result)
+
+
+def _candidate_discovery_failure_message(discovery_full: Dict[str, Any]) -> str:
+    """Build a visible fail-fast error for thesis-desk candidate discovery."""
+
+    base = str(discovery_full.get("error") or "").strip()
+    errors: List[str] = []
+    for packet in discovery_full.get("thesis_desk_packets") or []:
+        if not isinstance(packet, dict):
+            continue
+        expert = str(packet.get("expert") or "").strip()
+        for err in _as_text_list(packet.get("errors")):
+            errors.append(f"{expert}: {err}" if expert else err)
+    for step in discovery_full.get("discovery_steps") or []:
+        if isinstance(step, dict) and step.get("error"):
+            errors.append(str(step.get("error")))
+    message_parts = [part for part in [base, "; ".join(dict.fromkeys(errors))] if part]
+    detail = "；".join(message_parts) if message_parts else "三席位候选发现失败，未形成 L1 候选。"
+    return f"三席位候选发现失败，已终止后续筛选/深挖：{_truncate(detail, 360)}"
+
+
+def _complete_failed_candidate_discovery_result(
+    *,
+    ctx: SelectionRunContext,
+    result: StockSelectionResult,
+    error: str,
+) -> None:
+    """Fail fast when thesis desks do not produce candidates."""
+
+    ctx.next_step = "stop_candidate_discovery_failed"
+    ctx.set_stage("judge_decision", {
+        "stage": "judge_decision",
+        "status": "failed",
+        "summary": {
+            "primary_plan_verdict": "reject",
+            "final_action": "wait",
+            "decision_summary": error,
+            "next_step": ctx.next_step,
+        },
+        "full": {
+            "winner": "risk_control",
+            "accepted_arguments": [],
+            "rejected_arguments": ["三席位未形成 L1 候选时继续深挖或生成买入结论"],
+            "required_plan_changes": ["修复三席位失败原因后重新运行"],
+            "risk_controls": ["本轮不进入筛选、深挖、组合配置"],
+            "failure": {"error": error, "fallback": False},
+        },
+        "full_ref": "judge_decision.json",
+    })
+    result.success = False
+    result.error = error
+    result.final_report_json = _build_final_report_json(ctx)
+    result.final_report_json["partial_failure"] = {
+        "status": "failed_candidate_discovery",
+        "error": error,
+        "next_step": ctx.next_step,
+        "fallback": False,
+    }
+    _enforce_report_stock_identity(ctx, result.final_report_json)
+    result.final_markdown = render_stock_selection_markdown(result.final_report_json)
+    _apply_report_split(result)
 
 
 def _ensure_failure_judge_stage(ctx: SelectionRunContext, error: str) -> None:
@@ -1293,7 +1430,9 @@ def _run_candidate_discovery_tool(
         "selection_candidate_discovery_mode",
         payload={"mode": mode, "fallback": False},
     )
-    if mode == "llm_expert_committee":
+    if mode != "thesis_desk_committee":
+        return _non_thesis_desk_mode_exit_payload(ctx)
+    if mode == "thesis_desk_committee":
         try:
             from src.agent.candidate_experts_v2.committee import run_committee_discovery
             from datetime import datetime
@@ -1302,12 +1441,32 @@ def _run_candidate_discovery_tool(
                 llm_adapter = getattr(tool_registry, "llm_adapter", None)
             # Wrap LLMToolAdapter into the LLMCallable signature expected by committee
             committee_llm: Any = llm_adapter
+            try:
+                per_desk_llm_timeout = float(
+                    getattr(
+                        Config.get_instance(),
+                        "agent_candidate_expert_timeout_seconds",
+                        60.0,
+                    )
+                )
+            except Exception:
+                per_desk_llm_timeout = 60.0
             call_with_tools_fn = getattr(llm_adapter, "call_with_tools", None)
             if call_with_tools_fn is not None and not callable(llm_adapter):
                 from src.agent.candidate_experts_v2.experts.base import LLMToolCall, LLMTurn
 
                 def _committee_llm_callable(messages, tool_decls_inner):
-                    resp = call_with_tools_fn(messages, tool_decls_inner)
+                    response_format = (
+                        {"type": "json_object"}
+                        if any(str(msg.get("role") or "") == "tool" for msg in messages or [])
+                        else None
+                    )
+                    resp = call_with_tools_fn(
+                        messages,
+                        tool_decls_inner,
+                        timeout=per_desk_llm_timeout,
+                        response_format=response_format,
+                    )
                     tc_list = []
                     for tc in (getattr(resp, "tool_calls", None) or []):
                         tc_list.append(
@@ -1317,7 +1476,10 @@ def _run_candidate_discovery_tool(
                                 call_id=str(getattr(tc, "id", "") or ""),
                             )
                         )
-                    return LLMTurn(tool_calls=tc_list, text=str(getattr(resp, "content", "") or ""))
+                    content = str(getattr(resp, "content", "") or "")
+                    if getattr(resp, "provider", "") == "error" and not tc_list:
+                        raise RuntimeError(content or "LLM provider returned error")
+                    return LLMTurn(tool_calls=tc_list, text=content)
 
                 committee_llm = _committee_llm_callable
             tool_decls = []
@@ -1327,6 +1489,13 @@ def _run_candidate_discovery_tool(
                     tool_decls = list_decls() or []
                 except Exception:
                     tool_decls = []
+            if not tool_decls:
+                to_openai_tools = getattr(tool_registry, "to_openai_tools", None)
+                if callable(to_openai_tools):
+                    try:
+                        tool_decls = to_openai_tools() or []
+                    except Exception:
+                        tool_decls = []
             # Build a plain dict[str, callable] from ToolRegistry for BaseExpert
             # (BaseExpert expects tool_registry.get(name) to return a callable)
             committee_tool_registry: Any = tool_registry
@@ -1340,13 +1509,27 @@ def _run_candidate_discovery_tool(
                     }
                 except Exception:
                     pass
-            from src.agent.candidate_experts_v2.committee import _build_seed_pool
+            from src.agent.candidate_experts_v2.committee import _build_seed_pool_result
             today_str = datetime.now().strftime("%Y%m%d")
-            prebuilt_seeds = _build_seed_pool(
+            seed_pool_result = _build_seed_pool_result(
                 market=ctx.market,
                 seed_symbols=target_symbols,
                 tool_registry=tool_registry,  # original ToolRegistry with .execute()
                 today=today_str,
+                total_limit=20,
+            )
+            _emit(
+                ctx.progress_callback,
+                "selection_seed_pool_built",
+                payload=_compact_seed_pool_build_result(seed_pool_result),
+            )
+            seed_count_for_timeout = max(1, len(getattr(seed_pool_result, "seeds", []) or []))
+            committee_timeout_s = max(
+                300.0,
+                min(
+                    3600.0,
+                    per_desk_llm_timeout * seed_count_for_timeout * 3,
+                ),
             )
             payload = run_committee_discovery(
                 market=ctx.market,
@@ -1356,29 +1539,49 @@ def _run_candidate_discovery_tool(
                 llm_adapter=committee_llm,
                 today=today_str,
                 tool_decls=tool_decls,
-                prebuilt_seeds=prebuilt_seeds,
+                seed_pool_result=seed_pool_result,
+                overall_timeout_s=committee_timeout_s,
             )
-            if isinstance(payload, dict):
-                return payload
-            logger.warning(
-                "committee discovery returned %s; falling back to deterministic",
-                type(payload).__name__,
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"committee discovery returned {type(payload).__name__}")
+            _emit(
+                ctx.progress_callback,
+                "selection_seed_gate_done",
+                payload=_compact_seed_gate_result(payload),
             )
+            return payload
         except Exception as exc:
             logger.warning(
-                "committee discovery failed: %s; falling back to deterministic",
+                "committee discovery failed: %s; treating as failure",
                 exc,
             )
             _emit(
                 ctx.progress_callback,
                 "selection_candidate_discovery_mode",
                 payload={
-                    "mode": "deterministic",
-                    "fallback": True,
+                    "mode": "thesis_desk_committee",
+                    "fallback": False,
                     "requested_mode": "llm_expert_committee",
                     "error": str(exc),
                 },
             )
+            return {
+                "status": "failed",
+                "market": ctx.market,
+                "candidates": [],
+                "candidate_count": 0,
+                "candidate_source": mode,
+                "discovery_steps": [
+                    {
+                        "source": mode,
+                        "status": "failed",
+                        "dimension": "committee",
+                        "error": str(exc),
+                    }
+                ],
+                "next_required_tools": [],
+                "error": str(exc),
+            }
     return _execute_tool(ctx, tool_registry, "discover_watchlist_candidates", args)
 
 
@@ -1466,15 +1669,52 @@ def _build_balanced_candidate_evidence_stage(
     ctx: SelectionRunContext,
     tool_registry: ToolRegistry,
     discovery_full: Dict[str, Any],
+    canonical_codes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     candidates = discovery_full.get("candidates") if isinstance(discovery_full, dict) else []
     candidates = [item for item in candidates or [] if isinstance(item, dict)]
-    selected = _select_balanced_candidate_items(candidates)
+
+    items_by_code: Dict[str, Dict[str, Any]] = {}
+    for item in candidates:
+        code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+        if code and code not in items_by_code:
+            items_by_code[code] = item
+
+    normalized_canonical: List[str] = []
+    for code in canonical_codes or []:
+        normalized = _normalize_stock_identity_code(code)
+        if normalized and normalized in items_by_code and normalized not in normalized_canonical:
+            normalized_canonical.append(normalized)
+    canonical_items = [items_by_code[code] for code in normalized_canonical]
+    desk_converged = bool(canonical_items) and any(
+        _candidate_has_desk_tag(item) for item in canonical_items
+    )
+
+    if desk_converged:
+        selected = []
+        for item in canonical_items:
+            enriched = dict(item)
+            enriched["_balanced_bucket"] = _candidate_bucket(item)
+            selected.append(enriched)
+        selection_mode = "canonical_desk_shortlist"
+        header_note = (
+            "本证据包对席位已收敛的候选入池榜逐只建立证据，"
+            "与候选池、筛选、深挖共用同一份名单；JSON 为后续规划真源，Markdown 仅用于 Trace 展示。"
+        )
+    else:
+        selected = _select_balanced_candidate_items(candidates)
+        selection_mode = "balanced_buckets_fallback"
+        header_note = (
+            "本证据包按策略、消息、资金、基本面四类均衡抽取候选，"
+            "同一股票只保留首次命中的类别并继续向后补位；"
+            "JSON 为后续规划真源，Markdown 仅用于 Trace 展示。"
+        )
+
     evidence_items: List[Dict[str, Any]] = []
     markdown_lines = [
         "# 候选证据包",
         "",
-        "本证据包按策略、消息、资金、基本面四类来源各保留最多 2 只候选；JSON 为后续规划真源，Markdown 仅用于 Trace 展示。",
+        header_note,
         "",
         "| 类别 | 股票 | 入池理由 | 技术 | 资金 | 消息 | 基本面 | 缺口 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -1515,11 +1755,12 @@ def _build_balanced_candidate_evidence_stage(
         bucket_counts[packet["bucket"]] = bucket_counts.get(packet["bucket"], 0) + 1
     return {
         "stage": "balanced_candidate_evidence",
-        "status": "ok" if evidence_items else "insufficient_candidates",
+        "status": "ok" if evidence_items else "failed",
         "summary": {
             "target_count": len(evidence_items),
             "targets": [item["code"] for item in evidence_items],
             "bucket_counts": bucket_counts,
+            "selection_mode": selection_mode,
             "schema_version": "candidate_evidence.v1",
             "json_ref": "candidate_evidence.json",
             "markdown_ref": "candidate_evidence.md",
@@ -1528,6 +1769,8 @@ def _build_balanced_candidate_evidence_stage(
         "full": {
             "schema_version": "candidate_evidence.v1",
             "selection_policy": {
+                "mode": selection_mode,
+                "canonical_codes": normalized_canonical,
                 "buckets": [{"key": key, "label": label, "limit": BALANCED_CANDIDATES_PER_BUCKET} for key, label in BALANCED_CANDIDATE_BUCKETS],
                 "max_candidates": len(BALANCED_CANDIDATE_BUCKETS) * BALANCED_CANDIDATES_PER_BUCKET,
                 "dedupe": "first bucket wins; later buckets skip selected codes",
@@ -1667,6 +1910,21 @@ def _candidate_original_order(candidates: List[Dict[str, Any]], target: Dict[str
         return candidates.index(target)
     except ValueError:
         return 0
+
+
+def _candidate_has_desk_tag(item: Dict[str, Any]) -> bool:
+    """席位是否给候选打过标签：有 primary_desk 或确定性的 setup_type 即视为已收敛。"""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("primary_desk") or "").strip():
+        return True
+    setup = str(item.get("setup_type") or "").strip().lower()
+    if setup and setup != "unknown":
+        return True
+    desks = item.get("desks")
+    if isinstance(desks, (list, tuple)) and any(str(d or "").strip() for d in desks):
+        return True
+    return False
 
 
 def _candidate_bucket(item: Dict[str, Any]) -> str:
@@ -2035,6 +2293,13 @@ def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT
         "market": seed_result.get("market"),
         "candidate_source": seed_result.get("candidate_source"),
         "candidate_count": seed_result.get("candidate_count") or len(candidates),
+        "seed_pool_summary": seed_result.get("seed_pool_summary"),
+        "seed_pool_summary_before_gate": seed_result.get("seed_pool_summary_before_gate"),
+        "seed_gate": seed_result.get("seed_gate"),
+        "seed_pool_diagnostics": seed_result.get("seed_pool_diagnostics"),
+        "seed_pool_hard_exclusion": seed_result.get("seed_pool_hard_exclusion"),
+        "seed_source_quality": seed_result.get("seed_source_quality"),
+        "seed_market_regime": seed_result.get("seed_market_regime"),
         "candidates": compact_candidates,
         "expert_packets": compact_expert_packets,
         "quality_summary": seed_result.get("quality_summary"),
@@ -2044,6 +2309,111 @@ def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT
         "theme_observations": _compact_theme_observations(seed_result),
         "errors": _as_text_list(seed_result.get("errors"))[:6],
     }
+
+
+def _compact_seed_pool_build_result(build_result: Any) -> Dict[str, Any]:
+    seeds = list(getattr(build_result, "seeds", []) or [])
+    total_limit = int(getattr(build_result, "total_limit", 0) or len(seeds) or 0)
+    return _sanitize_non_finite_numbers({
+        "status": "ok",
+        "phase": "built",
+        "seed_pool_summary": _summarize_seed_items(seeds, total_limit=total_limit),
+        "seed_pool_diagnostics": _compact_seed_pool_diagnostics(getattr(build_result, "diagnostics", []) or []),
+        "seed_pool_hard_exclusion": getattr(build_result, "hard_exclusion", {}) or {},
+        "seed_source_quality": getattr(build_result, "source_quality", {}) or {},
+        "seed_market_regime": getattr(build_result, "market_regime", {}) or {},
+    })
+
+
+def _compact_seed_gate_result(seed_result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(seed_result, dict):
+        return {"status": "invalid", "phase": "gate"}
+    gate = seed_result.get("seed_gate") if isinstance(seed_result.get("seed_gate"), dict) else {}
+    return _sanitize_non_finite_numbers({
+        "status": gate.get("status") or "not_run",
+        "phase": "gate",
+        "seed_pool_summary_before_gate": seed_result.get("seed_pool_summary_before_gate"),
+        "seed_pool_summary": seed_result.get("seed_pool_summary"),
+        "seed_gate": {
+            "status": gate.get("status"),
+            "elapsed_ms": gate.get("elapsed_ms"),
+            "kept_count": gate.get("kept_count"),
+            "rejected_count": gate.get("rejected_count"),
+            "diagnostics": _compact_seed_pool_diagnostics(gate.get("diagnostics") or []),
+            "decisions": _compact_seed_gate_decisions(gate.get("decisions") or []),
+            "error": gate.get("error"),
+        },
+        "candidate_count": seed_result.get("candidate_count"),
+        "candidate_source": seed_result.get("candidate_source"),
+    })
+
+
+def _summarize_seed_items(seeds: Sequence[Any], *, total_limit: int) -> Dict[str, Any]:
+    source_counts: Dict[str, int] = {}
+    dimension_counts: Dict[str, int] = {}
+    preview: List[Dict[str, Any]] = []
+    for seed in seeds:
+        source = str(getattr(seed, "source", "") or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+        trigger_signals = getattr(seed, "trigger_signals", None)
+        trigger_signals = trigger_signals if isinstance(trigger_signals, list) else []
+        for signal in trigger_signals:
+            if not isinstance(signal, dict):
+                continue
+            dimension = str(signal.get("dimension") or "").strip()
+            if dimension:
+                dimension_counts[dimension] = dimension_counts.get(dimension, 0) + 1
+        if len(preview) < 20:
+            preview.append({
+                "code": getattr(seed, "code", ""),
+                "name": getattr(seed, "name", ""),
+                "source": source,
+                "hint": _truncate(str(getattr(seed, "hint", "") or ""), 120),
+                "priority_score": getattr(seed, "priority_score", None),
+                "freshness": getattr(seed, "freshness", None),
+                "trigger_signals": trigger_signals[:4],
+            })
+    return {
+        "seed_count": len(seeds),
+        "seed_sources": source_counts,
+        "signal_dimensions": dimension_counts,
+        "total_limit": total_limit,
+        "preview": preview,
+    }
+
+
+def _compact_seed_pool_diagnostics(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    diagnostics: List[Dict[str, Any]] = []
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        diagnostics.append({
+            "source": item.get("source"),
+            "status": item.get("status"),
+            "count": item.get("count"),
+            "freshness": item.get("freshness"),
+            "error": _truncate(str(item.get("error") or ""), 240),
+            "detail": _truncate(str(item.get("detail") or item.get("message") or ""), 240),
+        })
+    return diagnostics
+
+
+def _compact_seed_gate_decisions(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    decisions: List[Dict[str, Any]] = []
+    for item in value[:30]:
+        if not isinstance(item, dict):
+            continue
+        decisions.append({
+            "code": item.get("code"),
+            "decision": item.get("decision") or item.get("action"),
+            "reason": _truncate(str(item.get("reason") or ""), 160),
+            "rank": item.get("rank"),
+        })
+    return decisions
 
 
 def _compact_reason_dimensions(value: Any) -> List[Dict[str, Any]]:
@@ -2105,6 +2475,47 @@ def _compact_theme_observations(seed_result: Dict[str, Any]) -> List[Dict[str, A
                 elif item:
                     observations.append({"theme": str(item), "summary": ""})
     return observations[:6]
+
+
+def _screening_candidate_evidence_table(ctx: SelectionRunContext) -> str:
+    """Return the candidate evidence markdown table for the screening prompt."""
+    full = ctx.stage_full("balanced_candidate_evidence")
+    md = full.get("candidate_evidence_md") if isinstance(full, dict) else ""
+    return str(md or "")
+
+
+def _screening_candidate_evidence_data(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    """Return compact per-candidate schema data for the screening prompt.
+
+    Includes dimension summaries and key metrics so the screening LLM can
+    actually assess each candidate's evidence coverage, rather than seeing
+    only metadata references it cannot read.
+    """
+    full = ctx.stage_full("balanced_candidate_evidence")
+    candidates = full.get("candidates") if isinstance(full, dict) else []
+    if not isinstance(candidates, list):
+        return []
+    compact: List[Dict[str, Any]] = []
+    for packet in candidates:
+        if not isinstance(packet, dict):
+            continue
+        schema = packet.get("schema") if isinstance(packet.get("schema"), dict) else {}
+        entry: Dict[str, Any] = {
+            "code": packet.get("code"),
+            "name": packet.get("name"),
+            "bucket": packet.get("bucket_label") or packet.get("bucket"),
+            "candidate_reason": packet.get("candidate_reason"),
+            "candidate_score": packet.get("candidate_score"),
+            "missing_evidence": packet.get("missing_evidence") or [],
+        }
+        for dim in ("base", "technical", "capital_flow", "news_event", "fundamental", "chip", "risk"):
+            dim_data = schema.get(dim)
+            if isinstance(dim_data, dict):
+                entry[dim] = {k: v for k, v in dim_data.items() if k != "errors"}
+            else:
+                entry[dim] = {"status": "missing", "summary": "数据缺失"}
+        compact.append(entry)
+    return compact
 
 
 def _compact_evidence_ledger_for_prompt(ctx: SelectionRunContext) -> Dict[str, Any]:
@@ -2325,7 +2736,7 @@ def _tool_failures_from_evidence(evidence: Dict[str, Any]) -> List[Dict[str, Any
 def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[str, Any]) -> Dict[str, Any]:
     candidates = seed_result.get("candidates") if isinstance(seed_result, dict) else []
     candidates = candidates if isinstance(candidates, list) else []
-    return {
+    payload = {
         "stage": "candidate_discovery",
         "status": "ok" if candidates else "insufficient_candidates",
         "strategy": ctx.candidate_strategy,
@@ -2352,6 +2763,82 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
         },
         "full_ref": "candidate_discovery.json",
     }
+    if isinstance(seed_result, dict):
+        for key in (
+            "seed_pool_summary",
+            "seed_pool_summary_before_gate",
+            "seed_gate",
+            "seed_pool_diagnostics",
+            "seed_pool_hard_exclusion",
+            "seed_source_quality",
+            "seed_market_regime",
+            "recall_diagnostics",
+            "recall_sources",
+            "recall_total_in",
+            "recall_total_kept",
+            "thesis_desk_packets",
+            "thesis_desk_diagnostics",
+            "thesis_desk_committee",
+            "thesis_desk_committee_elapsed_ms",
+            "llm_expert_committee",
+            "error",
+        ):
+            value = seed_result.get(key)
+            if value not in (None, [], {}):
+                payload[key] = value
+                payload["full"][key] = value
+        # Surface a top-level degraded/status so the frontend banner can flag a
+        # silent desk fallback without digging into the sub-dicts.
+        desk_diag = (
+            seed_result.get("thesis_desk_committee")
+            or seed_result.get("llm_expert_committee")
+        )
+        if isinstance(desk_diag, dict):
+            degraded = bool(desk_diag.get("degraded")) or bool(seed_result.get("error"))
+            payload["degraded"] = degraded
+            payload["full"]["degraded"] = degraded
+            desk_status = desk_diag.get("status")
+            dims = desk_diag.get("dimensions_covered")
+            if dims is not None:
+                payload["dimensions_covered"] = dims
+                payload["full"]["dimensions_covered"] = dims
+            if desk_status and payload.get("status") == "ok" and degraded:
+                payload["status"] = "partial"
+    return payload
+
+
+def _non_thesis_desk_mode_exit_payload(ctx: SelectionRunContext) -> Dict[str, Any]:
+    reason = (
+        "当前调试阶段只允许 thesis_desk_committee（三席位）候选发现模式；"
+        f"本次请求模式为 {ctx.candidate_discovery_mode or 'deterministic'}，已在候选发现前停止。"
+    )
+    return {
+        "stage": "candidate_discovery",
+        "status": "skipped",
+        "strategy": ctx.candidate_strategy,
+        "market": ctx.market,
+        "candidate_count": 0,
+        "candidate_source": "mode_guard",
+        "summary": {
+            "strategy": ctx.candidate_strategy,
+            "candidate_codes": [],
+            "key_sources": [],
+            "main_limitations": [reason],
+            "next_required_tools": [],
+            "next_step": "stop_non_thesis_desk_mode",
+        },
+        "full": {
+            "candidates": [],
+            "excluded": [],
+            "tool_failures": [],
+            "missing_evidence": ["thesis_desk_committee mode not selected"],
+            "required_candidate_discovery_mode": "thesis_desk_committee",
+            "actual_candidate_discovery_mode": ctx.candidate_discovery_mode,
+            "blocked": True,
+            "reason": reason,
+        },
+        "full_ref": "candidate_discovery.json",
+    }
 
 
 def _merge_discovery_candidates(payload: Dict[str, Any], seed_result: Dict[str, Any]) -> None:
@@ -2369,7 +2856,19 @@ def _merge_discovery_candidates(payload: Dict[str, Any], seed_result: Dict[str, 
         ]
         summary["candidate_source"] = seed_result.get("candidate_source") or summary.get("candidate_source")
         summary["source_count"] = len(seed_candidates)
-        for key in ("expert_packets", "quality", "hard_exclusion", "capacity", "themes", "discovery_steps", "candidate_pool_run_id"):
+        for key in (
+            "expert_packets",
+            "quality",
+            "hard_exclusion",
+            "capacity",
+            "themes",
+            "discovery_steps",
+            "candidate_pool_run_id",
+            "thesis_desk_packets",
+            "thesis_desk_diagnostics",
+            "thesis_desk_committee",
+            "llm_expert_committee",
+        ):
             if key in seed_result and key not in full:
                 full[key] = seed_result.get(key)
 
@@ -2916,6 +3415,29 @@ def _attach_evidence_cards(payload: Dict[str, Any], cards: List[Any]) -> None:
     full["evidence_card_count"] = len(cards)
 
 
+_DEEP_DIVE_POOL_FALLBACK_NOTE = "进入深挖：筛选未通过，按候选池顺序兜底"
+
+
+def _mark_deep_dive_pool_fallback(payload: Dict[str, Any]) -> None:
+    """Tag a deep-dive payload that only entered via candidate-pool order fallback.
+
+    Why: 当筛选阶段没有显式放行足够标的时，深挖会按候选池顺序兜底补足，
+    报告需要写明这一 provenance，避免读者误以为这些标的通过了筛选。
+    """
+    if not isinstance(payload, dict):
+        return
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary["deep_dive_provenance"] = "pool_fallback"
+        summary["deep_dive_provenance_note"] = _DEEP_DIVE_POOL_FALLBACK_NOTE
+    full = payload.get("full")
+    if not isinstance(full, dict):
+        full = {}
+        payload["full"] = full
+    full["deep_dive_provenance"] = "pool_fallback"
+    full["deep_dive_provenance_note"] = _DEEP_DIVE_POOL_FALLBACK_NOTE
+
+
 def _candidate_codes(full: Dict[str, Any], *, limit: int) -> List[str]:
     candidates = full.get("candidates") if isinstance(full, dict) else []
     codes: List[str] = []
@@ -2930,16 +3452,176 @@ def _candidate_codes(full: Dict[str, Any], *, limit: int) -> List[str]:
     return codes
 
 
+_DEEP_DIVE_SETUP_TYPES = {
+    "trend_continuation",
+    "early_turn",
+    "theme_follow",
+    "quality_repair",
+    "capital_momentum",
+    "unknown",
+}
+
+# 召回 source → setup_type 的过渡期映射（P1：上游尚未产出 setup_type 时使用）。
+_SETUP_BY_SOURCE = {
+    "low_base_structure": "early_turn",
+    "limit_up_pool": "capital_momentum",
+    "dragon_tiger": "capital_momentum",
+    "capital_flow_anomaly": "capital_momentum",
+    "hot_rank": "capital_momentum",
+    "margin_financing": "capital_momentum",
+    "block_trade": "capital_momentum",
+    "northbound_stock_connect": "capital_momentum",
+    "strong_sector": "theme_follow",
+    "sector_theme": "theme_follow",
+    "event_impact": "theme_follow",
+    "news_momentum": "theme_follow",
+    "fundamental_snapshot": "quality_repair",
+    "valuation_liquidity": "quality_repair",
+    "daily_screener": "trend_continuation",
+    "alphasift": "trend_continuation",
+    "sequoia": "trend_continuation",
+}
+
+# 关键词兜底：source 不具指向性时，从策略标签/理由维度文本里推断。
+_SETUP_KEYWORDS = (
+    ("early_turn", ("低位", "启动", "转强", "拐点", "超跌", "洗盘", "错杀", "low_base", "early_turn")),
+    ("capital_momentum", ("涨停", "连板", "龙虎", "封板", "主力", "游资", "北向", "limit", "dragon", "moneyflow")),
+    ("theme_follow", ("板块", "题材", "补涨", "概念", "sector", "theme")),
+    ("quality_repair", ("业绩", "估值", "盈利", "景气", "基本面", "亏损收窄", "修复", "fundamental", "valuation")),
+    ("trend_continuation", ("趋势", "突破", "均线", "放量", "强势", "海龟", "旗形", "rps", "breakout", "延续")),
+)
+
+
+def _candidate_records_by_code(full: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    records: Dict[str, Dict[str, Any]] = {}
+    candidates = full.get("candidates") if isinstance(full, dict) else []
+    for item in candidates or []:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        if code and code not in records:
+            records[code] = item
+    return records
+
+
+def _infer_setup_type(candidate: Dict[str, Any]) -> str:
+    """P1 过渡期推断：优先用上游显式 setup_type，否则由 source/策略标签推断，
+    无法判断时返回 unknown（深挖落到保守通用 playbook）。"""
+    explicit = str(candidate.get("setup_type") or "").strip().lower()
+    if explicit in _DEEP_DIVE_SETUP_TYPES and explicit != "unknown":
+        return explicit
+    source = str(candidate.get("source") or "").strip().lower()
+    mapped = _SETUP_BY_SOURCE.get(source)
+    if mapped:
+        return mapped
+    text_parts: List[str] = []
+    for key in ("strategy_tags", "matched_strategies", "recall_sources"):
+        text_parts.extend(_as_text_list(candidate.get(key)))
+    text_parts.append(str(candidate.get("reason") or ""))
+    dims = candidate.get("reason_dimensions")
+    if isinstance(dims, dict):
+        text_parts.extend(str(v) for v in dims.keys())
+    blob = " ".join(text_parts).lower()
+    for setup, keywords in _SETUP_KEYWORDS:
+        if any(kw in blob for kw in keywords):
+            return setup
+    return "unknown"
+
+
+def _deep_dive_setup_fields(candidate: Optional[Dict[str, Any]], *, market: str) -> Dict[str, Any]:
+    """Build the routing fields injected into the deep-dive payload (flag-on)."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    fields: Dict[str, Any] = {
+        "setup_router_enabled": True,
+        "setup_type": _infer_setup_type(candidate),
+        "market": str(candidate.get("market") or market or "cn").strip().lower() or "cn",
+    }
+    subtype = str(candidate.get("setup_subtype") or "").strip().lower()
+    if subtype:
+        fields["setup_subtype"] = subtype
+    for key in ("fact_sheet", "conflict_flags"):
+        value = candidate.get(key)
+        if value:
+            fields[key] = value
+    upstream = candidate.get("llm_expert_evidence")
+    if upstream:
+        fields["upstream_evidence"] = upstream
+    return fields
+
+
+
 def _deep_dive_targets(summary: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
+    shortlist = full.get("shortlist") if isinstance(full, dict) else []
+    scored: List[tuple] = []
+    for item in shortlist or []:
+        if isinstance(item, dict) and item.get("screening_result") == "deep_dive" and item.get("code"):
+            scored.append((item.get("score") or 0, str(item["code"])))
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [code for _, code in scored]
     targets = summary.get("deep_dive_targets") if isinstance(summary, dict) else []
     if isinstance(targets, list) and targets:
         return [str(item) for item in targets if item]
+    return []
+
+
+def _monitor_targets(summary: Dict[str, Any], full: Dict[str, Any]) -> List[str]:
     shortlist = full.get("shortlist") if isinstance(full, dict) else []
-    codes = []
+    scored: List[tuple] = []
     for item in shortlist or []:
-        if isinstance(item, dict) and item.get("screening_result") == "deep_dive" and item.get("code"):
-            codes.append(str(item["code"]))
-    return codes
+        if isinstance(item, dict) and item.get("screening_result") == "monitor" and item.get("code"):
+            scored.append((item.get("score") or 0, str(item["code"])))
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [code for _, code in scored]
+    targets = summary.get("monitor_targets") if isinstance(summary, dict) else []
+    if isinstance(targets, list) and targets:
+        return [str(item) for item in targets if item]
+    return []
+
+
+def _select_deep_dive_targets(
+    *,
+    candidates: List[str],
+    screening_summary: Dict[str, Any],
+    screening_full: Dict[str, Any],
+    limit: int,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Choose deep-dive targets from screening results before pool order.
+
+    Returns the ordered codes and a provenance map: ``screening`` for codes the
+    screening stage explicitly routed to deep dive/monitor, ``pool_fallback`` for
+    codes pulled in by candidate-pool order because screening surfaced too few.
+    """
+    normalized_limit = max(0, int(limit or 0))
+    if normalized_limit <= 0:
+        return [], {}
+
+    rejected_codes = _screening_rejected_codes(screening_full)
+    ordered: List[str] = []
+    provenance: Dict[str, str] = {}
+
+    def add(code: Any, source: str) -> bool:
+        normalized = _normalize_stock_identity_code(code)
+        if not normalized or normalized in rejected_codes or normalized in provenance:
+            return False
+        ordered.append(normalized)
+        provenance[normalized] = source
+        return len(ordered) >= normalized_limit
+
+    for code in _deep_dive_targets(screening_summary, screening_full):
+        if add(code, "screening"):
+            return ordered, provenance
+
+    for code in _monitor_targets(screening_summary, screening_full):
+        if add(code, "screening"):
+            return ordered, provenance
+
+    for code in candidates:
+        if add(code, "pool_fallback"):
+            return ordered, provenance
+
+    return ordered, provenance
 
 
 def _selection_deep_dive_limit() -> int:
@@ -2953,6 +3635,17 @@ def _selection_deep_dive_limit() -> int:
     except (TypeError, ValueError):
         value = DEFAULT_DEEP_DIVE_LIMIT
     return max(1, min(20, value))
+
+
+def _deep_dive_setup_router_enabled() -> bool:
+    try:
+        config = Config.get_instance()
+        return bool(getattr(config, "agent_deep_dive_setup_router_enabled", True))
+    except Exception:
+        raw = os.getenv("AGENT_DEEP_DIVE_SETUP_ROUTER_ENABLED")
+        if raw is None or str(raw).strip() == "":
+            return True
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_float(name: str, default: float, *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
@@ -4045,8 +4738,48 @@ def _humanize_token(token: str) -> str:
     return text
 
 
+_KV_PATTERN = re.compile(
+    r"(?:估值|value)\s*=\s*([\d.]+)\s*[;；]\s*threshold\s*=\s*([\d.]+)\s*[;；]\s*deviation\s*=\s*([-\d.eE]+)"
+)
+_DICT_PATTERN = re.compile(r"\{['\"](?:card_id|dimension|interpretation)['\"].*?\}")
+_RAW_METRIC_DICT = re.compile(r"估值\s*=\s*\{[^}]+\}(?:\s*[;；]\s*threshold\s*=\s*\{[^}]*\})?")
+
+
+def _humanize_kv_patterns(text: str) -> str:
+    """Replace residual value=X；threshold=Y；deviation=Z and raw dict patterns in report text."""
+    def _replace_kv(m: re.Match) -> str:
+        v, t, d = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        return f"当前值{v:.1f}（阈值{t:.1f}，偏离{d:+.1f}%）"
+
+    text = _KV_PATTERN.sub(_replace_kv, text)
+
+    def _replace_dict(m: re.Match) -> str:
+        try:
+            import ast
+            d = ast.literal_eval(m.group(0))
+            if isinstance(d, dict):
+                return str(d.get("interpretation") or d.get("detail") or d.get("summary") or m.group(0))
+        except Exception:
+            pass
+        return m.group(0)
+
+    text = _DICT_PATTERN.sub(_replace_dict, text)
+    text = _RAW_METRIC_DICT.sub("基本面指标", text)
+    return text
+
+
 def _translate_report_text(value: Any) -> str:
-    text = str(value or "")
+    if isinstance(value, dict):
+        text = str(
+            value.get("interpretation")
+            or value.get("detail")
+            or value.get("summary")
+            or value.get("text")
+            or value.get("reason")
+            or ""
+        )
+    else:
+        text = str(value or "")
     if not text:
         return ""
     replacements = {
@@ -4063,6 +4796,7 @@ def _translate_report_text(value: Any) -> str:
             text = text.replace(raw, label)
         else:
             text = text.replace(raw, "")
+    text = _humanize_kv_patterns(text)
     text = re.sub(r"[、,，；;]\s*[、,，；;]+", "；", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip(" ；;、,，")
@@ -4160,7 +4894,23 @@ def _verdict_label(value: Any) -> str:
 
 def _as_text_list(value: Any) -> List[str]:
     if isinstance(value, list):
-        return [str(item) for item in value if item]
+        result: List[str] = []
+        for item in value:
+            if not item:
+                continue
+            if isinstance(item, dict):
+                text = (
+                    item.get("interpretation")
+                    or item.get("detail")
+                    or item.get("summary")
+                    or item.get("text")
+                    or item.get("reason")
+                )
+                if text:
+                    result.append(str(text))
+                    continue
+            result.append(str(item))
+        return result
     if value:
         return [str(value)]
     return []
@@ -4220,7 +4970,16 @@ def _format_pct(value: Any) -> str:
 
 
 def _markdown_cell(value: Any) -> str:
+    if isinstance(value, dict):
+        value = (
+            value.get("interpretation")
+            or value.get("detail")
+            or value.get("summary")
+            or value.get("text")
+            or str(value)
+        )
     text = str(value if value is not None else "-")
+    text = _humanize_kv_patterns(text)
     return text.replace("|", "\\|").replace("\n", " ")
 
 

@@ -41,6 +41,7 @@ export interface AgentTraceRunRequest {
   max_acceptable_drawdown_pct?: number;
   default_stop_loss_pct?: number;
   investor_notes?: string;
+  candidate_discovery_mode?: 'deterministic' | 'llm_expert_committee' | 'thesis_desk_committee';
 }
 
 export interface AgentTraceEvent {

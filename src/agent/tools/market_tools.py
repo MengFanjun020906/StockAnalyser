@@ -15,7 +15,7 @@ import concurrent.futures
 import time
 from datetime import datetime, timedelta
 from threading import Thread
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from src.agent.candidate_experts import CandidateExpertOrchestrator, apply_hard_exclusion
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
@@ -791,7 +791,7 @@ def _fetch_sector_constituents(
     limit: int,
     *,
     include_diagnostics: bool = False,
-) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
     diagnostics: List[Dict[str, Any]] = []
     try:
         import akshare as ak
@@ -1880,19 +1880,28 @@ def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict
 
     from src.services.history_loader import load_history_df
 
-    df, source = load_history_df(index_code, days=lookback_days)
-    if df is None or df.empty:
-        return [], source
-    rows = df.tail(lookback_days).to_dict(orient="records")
-    for row in rows:
-        if "date" in row:
-            row["date"] = str(row["date"])
-    return rows, source
+    fallback_to_network = not _is_supported_cn_index_proxy(index_code)
+    df, source = load_history_df(index_code, days=lookback_days, fallback_to_network=fallback_to_network)
+    if df is not None and not df.empty:
+        rows = df.tail(lookback_days).to_dict(orient="records")
+        for row in rows:
+            if "date" in row:
+                row["date"] = str(row["date"])
+        return rows, source
+
+    sdk_source = ""
+    if fallback_to_network:
+        sdk_rows, sdk_source = _load_index_history_from_tushare_sdk(index_code, lookback_days)
+        if sdk_rows:
+            return sdk_rows, sdk_source
+
+    sources = [s for s in [fast_source, source, sdk_source] if s]
+    return [], ";".join(sources) if sources else "all_sources_failed"
 
 
 def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
     try:
-        from data_provider.tushare_client import get_tushare_token, query_tushare_api
+        from data_provider.tushare_client import build_tushare_http_client, get_tushare_token
     except Exception:
         return [], ""
     if not get_tushare_token():
@@ -1902,18 +1911,16 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
     end_day = datetime.now().date()
     start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
     try:
-        df = query_tushare_api(
+        client = build_tushare_http_client(timeout=5)
+        df = client.query(
             "index_daily",
-            params={
-                "ts_code": ts_code,
-                "start_date": start_day.strftime("%Y%m%d"),
-                "end_date": end_day.strftime("%Y%m%d"),
-            },
             fields="ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
-            timeout=5,
+            ts_code=ts_code,
+            start_date=start_day.strftime("%Y%m%d"),
+            end_date=end_day.strftime("%Y%m%d"),
         )
     except Exception as exc:
-        logger.debug("Tushare index_daily failed for %s: %s", ts_code, exc)
+        logger.warning("Tushare HTTP index_daily failed for %s: %s", ts_code, exc)
         return [], "tushare:index_daily_failed"
     if df is None or df.empty:
         return [], "tushare:index_daily_empty"
@@ -1937,6 +1944,48 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
     return rows[-lookback_days:], "tushare:index_daily"
 
 
+def _load_index_history_from_tushare_sdk(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    """Fallback: use tushare SDK (pro_api) when the HTTP client fails."""
+    try:
+        from data_provider.tushare_client import build_tushare_sdk_client
+    except Exception:
+        return [], ""
+
+    ts_code = _normalize_index_ts_code(index_code)
+    end_day = datetime.now().date()
+    start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
+    try:
+        _ts, pro = build_tushare_sdk_client()
+        df = pro.index_daily(
+            ts_code=ts_code,
+            start_date=start_day.strftime("%Y%m%d"),
+            end_date=end_day.strftime("%Y%m%d"),
+        )
+    except Exception as exc:
+        logger.warning("Tushare SDK index_daily failed for %s: %s", ts_code, exc)
+        return [], "tushare_sdk:index_daily_failed"
+    if df is None or df.empty:
+        return [], "tushare_sdk:index_daily_empty"
+
+    rows: List[Dict[str, Any]] = []
+    for row in df.to_dict(orient="records"):
+        trade_date = str(row.get("trade_date") or "")
+        if len(trade_date) == 8 and trade_date.isdigit():
+            trade_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
+        rows.append({
+            "date": trade_date,
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("vol"),
+            "amount": row.get("amount"),
+            "pct_chg": row.get("pct_chg"),
+        })
+    rows = sorted(rows, key=lambda item: str(item.get("date") or ""))
+    return rows[-lookback_days:], "tushare_sdk:index_daily"
+
+
 def _normalize_index_ts_code(index_code: str) -> str:
     raw = str(index_code or "000300").strip().upper()
     if raw.endswith((".SH", ".SZ")):
@@ -1946,9 +1995,24 @@ def _normalize_index_ts_code(index_code: str) -> str:
     if raw.startswith("SZ"):
         return f"{raw[2:]}.SZ"
     code = re.sub(r"\D", "", raw) or "000300"
-    if code in {"000001", "000016", "000300", "000688"}:
+    sh_indices = {"000001", "000016", "000300", "000688", "000852", "000905"}
+    if code in sh_indices:
         return f"{code}.SH"
     return f"{code}.SZ"
+
+
+def _is_supported_cn_index_proxy(index_code: str) -> bool:
+    ts_code = _normalize_index_ts_code(index_code)
+    return ts_code in {
+        "000001.SH",
+        "000016.SH",
+        "000300.SH",
+        "000688.SH",
+        "000852.SH",
+        "000905.SH",
+        "399001.SZ",
+        "399006.SZ",
+    }
 
 
 def _handle_detect_market_regime(
@@ -1969,7 +2033,7 @@ def _handle_detect_market_regime(
 
     lookback = max(120, min(int(lookback_days or 260), 520))
     component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 8.0)
-    auxiliary_timeout = max(1.0, min(3.0, component_timeout))
+    auxiliary_timeout = max(3.0, component_timeout * 0.75)
     history_result, history_err, history_ms = _run_with_timeout(
         lambda: _load_market_history(index_code or "000300", lookback),
         component_timeout,
@@ -1983,6 +2047,8 @@ def _handle_detect_market_regime(
         if history_err:
             data_errors.append(f"market_history: {history_err}")
     bars = coerce_bars(history_rows)
+    if not bars and not history_err and history_source not in {"", "none"}:
+        data_errors.append(f"market_history: {history_source}")
     try:
         from src.storage import get_db
 
@@ -2010,7 +2076,7 @@ def _handle_detect_market_regime(
             _handle_get_northbound_capital_flow,
         )
 
-        short_optional_timeout = max(1.0, min(1.5, auxiliary_timeout))
+        short_optional_timeout = max(3.0, auxiliary_timeout * 0.6)
         component_tasks.update({
             "market_flow": (lambda: _handle_get_market_capital_flow(top_n=5), short_optional_timeout),
             "northbound": (lambda: _handle_get_northbound_capital_flow(limit=10), auxiliary_timeout),
@@ -2123,7 +2189,29 @@ def _handle_detect_market_regime(
         },
     })
 
-    if persist and db is not None and payload["status"] != "insufficient_data":
+    if payload["status"] == "insufficient_data" and previous:
+        prev_regime = previous.get("regime") or (previous.get("payload") or {}).get("regime")
+        if prev_regime:
+            prev_payload = previous.get("payload") or previous
+            payload["status"] = "stale_fallback"
+            payload["regime"] = prev_regime
+            for key in ("volatility_bucket", "atr_percentile", "wyckoff_phase",
+                        "sentiment_score", "composite_score", "position_guidance"):
+                if key in prev_payload and (key not in payload or payload.get(key) is None):
+                    payload[key] = prev_payload[key]
+            payload["stale_source"] = "persisted_state"
+            payload["stale_note"] = (
+                "Fresh market data unavailable; returning last persisted regime. "
+                "Treat position_guidance as conservative until fresh data confirms."
+            )
+            logger.warning(
+                "detect_market_regime: insufficient fresh data, falling back to persisted state "
+                "(regime=%s, persisted_at=%s)",
+                prev_regime,
+                previous.get("updated_at") or previous.get("timestamp") or "unknown",
+            )
+
+    if persist and db is not None and payload["status"] not in ("insufficient_data", "stale_fallback"):
         try:
             db.save_market_regime_state(market_key, payload)
             payload["persisted"] = True
@@ -2236,7 +2324,7 @@ def _handle_discover_watchlist_candidates(
 
     if source_mode == "auto":
         orchestrator = CandidateExpertOrchestrator(
-            timeout_s=_get_agent_timeout_attr("agent_candidate_expert_timeout_seconds", 20.0),
+            timeout_s=_get_agent_timeout_attr("agent_candidate_expert_timeout_seconds", 60.0),
             max_candidates_to_deep_dive=effective_limit,
         )
         expert_result = orchestrator.discover(

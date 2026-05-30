@@ -589,6 +589,7 @@ def run_agent_loop(
     thinking_labels: Optional[Dict[str, str]] = None,
     max_wall_clock_seconds: Optional[float] = None,
     tool_call_timeout_seconds: Optional[float] = None,
+    tool_argument_guard: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
 
@@ -760,6 +761,7 @@ def run_agent_loop(
 
         if response.tool_calls:
             # ---- tool execution branch ----
+            response.tool_calls = _apply_tool_argument_guard(response.tool_calls, tool_argument_guard)
             logger.info(
                 "Agent requesting %d tool call(s): %s",
                 len(response.tool_calls),
@@ -892,6 +894,30 @@ def run_agent_loop(
         error=f"Agent exceeded max steps ({max_steps}). Try increasing AGENT_MAX_STEPS if analysis tasks are complex.",
         messages=messages,
     )
+
+
+# ============================================================
+# Tool argument guard
+# ============================================================
+
+def _apply_tool_argument_guard(
+    tool_calls,
+    guard: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]],
+):
+    if guard is None:
+        return tool_calls
+
+    guarded = []
+    for call in tool_calls:
+        arguments = dict(getattr(call, "arguments", {}) or {})
+        try:
+            next_arguments = guard(call.name, arguments)
+        except Exception as exc:
+            logger.warning("Tool argument guard failed for %s: %s", call.name, exc)
+            next_arguments = arguments
+        call.arguments = dict(next_arguments or {})
+        guarded.append(call)
+    return guarded
 
 
 # ============================================================
