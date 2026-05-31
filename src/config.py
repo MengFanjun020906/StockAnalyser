@@ -770,9 +770,9 @@ class Config:
     agent_fundamental_candidate_db_path: str = ""  # Optional SQLite path for precomputed fundamental candidate snapshots
     agent_stock_info_boards_timeout_seconds: float = 3.0  # Max seconds for optional stock board membership enrichment
     agent_chip_distribution_timeout_seconds: float = 12.0  # Max seconds for chip distribution data-source probing
-    agent_sector_rankings_timeout_seconds: float = 3.0  # Max seconds for sector ranking data-source probing
-    agent_regime_component_timeout_seconds: float = 8.0  # Max seconds for one market-regime auxiliary component
-    agent_tushare_tool_timeout_seconds: float = 5.0  # Max seconds for one Tushare Agent tool request
+    agent_sector_rankings_timeout_seconds: float = 10.0  # Max seconds for sector ranking data-source probing
+    agent_regime_component_timeout_seconds: float = 25.0  # Max seconds for one market-regime auxiliary component
+    agent_tushare_tool_timeout_seconds: float = 20.0  # Max seconds for one Tushare Agent tool request
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
     agent_deep_research_budget: int = 30000  # Max token budget for deep research
     agent_deep_research_timeout: int = 180  # Max seconds for /research command before returning timeout
@@ -1556,19 +1556,19 @@ class Config:
             ),
             agent_sector_rankings_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS'),
-                3.0,
+                10.0,
                 field_name='AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
             agent_regime_component_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS'),
-                8.0,
+                25.0,
                 field_name='AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
             agent_tushare_tool_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS'),
-                5.0,
+                20.0,
                 field_name='AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),

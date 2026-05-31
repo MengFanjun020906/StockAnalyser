@@ -1911,7 +1911,9 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
     end_day = datetime.now().date()
     start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
     try:
-        client = build_tushare_http_client(timeout=5)
+        client = build_tushare_http_client(
+            timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 20.0)
+        )
         df = client.query(
             "index_daily",
             fields="ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
@@ -2032,8 +2034,8 @@ def _handle_detect_market_regime(
         }
 
     lookback = max(120, min(int(lookback_days or 260), 520))
-    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 8.0)
-    auxiliary_timeout = max(3.0, component_timeout * 0.75)
+    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 25.0)
+    auxiliary_timeout = max(3.0, component_timeout)
     history_result, history_err, history_ms = _run_with_timeout(
         lambda: _load_market_history(index_code or "000300", lookback),
         component_timeout,
@@ -2076,9 +2078,8 @@ def _handle_detect_market_regime(
             _handle_get_northbound_capital_flow,
         )
 
-        short_optional_timeout = max(3.0, auxiliary_timeout * 0.6)
         component_tasks.update({
-            "market_flow": (lambda: _handle_get_market_capital_flow(top_n=5), short_optional_timeout),
+            "market_flow": (lambda: _handle_get_market_capital_flow(top_n=5), auxiliary_timeout),
             "northbound": (lambda: _handle_get_northbound_capital_flow(limit=10), auxiliary_timeout),
             "margin": (lambda: _handle_get_margin_trading_summary(limit=10), auxiliary_timeout),
         })
