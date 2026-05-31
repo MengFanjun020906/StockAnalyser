@@ -28,6 +28,17 @@ _tushare_trade_date_cache: Dict[Tuple[int, int, int, int, str, bool], List[str]]
 _tushare_trade_date_cache_lock = Lock()
 _DAILY_HISTORY_DEFAULT_DAYS = 60
 _DAILY_HISTORY_MAX_DAYS = 365
+_TUSHARE_NEWS_SOURCES = {
+    "sina",
+    "wallstreetcn",
+    "10jqka",
+    "eastmoney",
+    "yuncaijing",
+    "fenghuang",
+    "jinrongjie",
+    "cls",
+    "yicai",
+}
 
 
 def _run_manager_task_with_timeout(
@@ -2904,6 +2915,118 @@ def _default_recent_date_range(days: int = 30) -> Tuple[str, str]:
     return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
 
+def _today_news_window() -> Tuple[str, str]:
+    now = datetime.now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_tushare_news_src(src: str) -> str:
+    value = str(src or "").strip().lower()
+    if value not in _TUSHARE_NEWS_SOURCES:
+        raise ValueError(
+            "unsupported Tushare news src: "
+            f"{src!r}; expected one of {sorted(_TUSHARE_NEWS_SOURCES)}"
+        )
+    return value
+
+
+def _compact_tushare_news_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    title = str(item.get("title") or "").strip()
+    content = str(item.get("content") or "").strip()
+    channels = item.get("channels")
+    if isinstance(channels, str):
+        channels_value: Any = channels.strip()
+    else:
+        channels_value = channels
+    if len(title) > 160:
+        title = title[:160] + "...[truncated]"
+    if len(content) > 500:
+        content = content[:500] + "...[truncated]"
+    return {
+        "datetime": item.get("datetime"),
+        "title": title,
+        "content": content,
+        "channels": channels_value,
+    }
+
+
+def _handle_get_tushare_today_news(src: str = "sina", limit: int = 50) -> dict:
+    """Get current-day Tushare flash news for one source.
+
+    The tool intentionally does not expose arbitrary historical date windows:
+    downstream agents use it as a same-day news snapshot, while Tushare token
+    and endpoint resolution remain centralized in data_provider.tushare_client.
+    """
+
+    try:
+        normalized_src = _normalize_tushare_news_src(src)
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "api_name": "news",
+            "src": src,
+            "items": [],
+            "errors": [str(exc)],
+        }
+
+    row_limit = max(1, min(int(limit or 50), 1500))
+    start_date, end_date = _today_news_window()
+    result = _tushare_query_all_rows(
+        "news",
+        {
+            "src": normalized_src,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        "datetime,content,title,channels",
+        timeout=max(5.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+    )
+    result["src"] = normalized_src
+    result["start_date"] = start_date
+    result["end_date"] = end_date
+    if isinstance(result.get("items"), list):
+        result["items"] = [
+            _compact_tushare_news_item(item)
+            for item in result["items"][:row_limit]
+            if isinstance(item, dict)
+        ]
+    result["limit"] = row_limit
+    return result
+
+
+get_tushare_today_news_tool = ToolDefinition(
+    name="get_tushare_today_news",
+    description=(
+        "Get current-day flash news from Tushare Pro news API. "
+        "The tool always queries today's 00:00:00 through now and never "
+        "accepts historical windows."
+    ),
+    parameters=[
+        ToolParameter(
+            name="src",
+            type="string",
+            description=(
+                "Tushare news source: sina, wallstreetcn, 10jqka, eastmoney, "
+                "yuncaijing, fenghuang, jinrongjie, cls, or yicai."
+            ),
+            required=False,
+            enum=sorted(_TUSHARE_NEWS_SOURCES),
+            default="sina",
+        ),
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max current-day news rows to return (default: 50, max: 1500).",
+            required=False,
+            default=50,
+        ),
+    ],
+    handler=_handle_get_tushare_today_news,
+    category="data",
+)
+
+
 def _handle_get_tushare_announcements(
     stock_code: str = "",
     ann_date: str = "",
@@ -4165,6 +4288,7 @@ ALL_DATA_TOOLS.extend([
     get_tushare_moneyflow_ind_dc_tool,
     get_tushare_moneyflow_cnt_ths_tool,
     get_tushare_ths_member_tool,
+    get_tushare_today_news_tool,
     get_tushare_announcements_tool,
     get_tushare_stock_alerts_tool,
     get_tushare_stock_shock_tool,

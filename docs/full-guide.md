@@ -294,6 +294,7 @@ daily_stock_analysis/
 | `ENABLE_REALTIME_QUOTE` | 启用实时行情（关闭后使用历史收盘价分析） | `true` | 可选 |
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | 盘中实时技术面：启用时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘 | `true` | 可选 |
 | `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Agent 层单次 Tushare 工具请求超时；基础数据、筹码、两融、资金流和板块排行快路径共用 | `20.0` | 可选 |
+| `get_tushare_today_news` | Agent 工具：调用 Tushare `news` 获取当日新闻快讯，时间窗口固定为今天 `00:00:00` 到当前时刻；支持 `sina`、`wallstreetcn`、`10jqka`、`eastmoney`、`yuncaijing`、`fenghuang`、`jinrongjie`、`cls`、`yicai` 来源；需 Tushare 单独开通 news 权限 | - | 工具 |
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |

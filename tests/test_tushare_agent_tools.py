@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """Contract tests for Tushare-backed Agent data tools."""
 
+from datetime import datetime
 from unittest.mock import patch
 
 import pandas as pd
 
 from src.agent.tools.data_tools import (
+    ALL_DATA_TOOLS,
     _handle_get_margin_trading_summary,
     _handle_get_tushare_block_trade,
     _handle_get_tushare_dragon_tiger_inst,
@@ -44,6 +46,7 @@ from src.agent.tools.data_tools import (
     _handle_get_tushare_daily_bars,
     _handle_get_tushare_financial_statements,
     _handle_get_tushare_reference_events,
+    _handle_get_tushare_today_news,
 )
 
 
@@ -720,6 +723,62 @@ def test_get_tushare_event_fundamental_and_technical_tools_query_expected_apis()
     assert index_daily["api_name"] == "index_daily"
     assert index_daily_alias["index_code"] == "000300.SH"
     assert trade_cal["api_name"] == "trade_cal"
+
+
+def test_get_tushare_today_news_uses_current_day_window_and_is_registered():
+    calls = []
+
+    def fake_news_query(api_name, params=None, fields="", timeout=30):
+        calls.append({"api_name": api_name, "params": params or {}, "fields": fields, "timeout": timeout})
+        return pd.DataFrame([
+            {
+                "datetime": "2026-05-31 09:31:00",
+                "title": "A股早盘快讯",
+                "content": "今日市场快讯内容" * 80,
+                "channels": "7*24",
+            },
+            {
+                "datetime": "2026-05-31 09:32:00",
+                "title": "第二条快讯",
+                "content": "第二条内容",
+                "channels": "财经",
+            },
+        ])
+
+    fixed_now = datetime(2026, 5, 31, 17, 58, 30)
+    with patch("src.agent.tools.data_tools.datetime") as mock_datetime, \
+            patch("data_provider.tushare_client.query_tushare_api", side_effect=fake_news_query), \
+            patch("data_provider.tushare_client.get_tushare_http_url", return_value="http://unit/"):
+        mock_datetime.now.return_value = fixed_now
+        result = _handle_get_tushare_today_news(src="sina", limit=1)
+
+    assert result["status"] == "ok"
+    assert result["api_name"] == "news"
+    assert result["src"] == "sina"
+    assert result["start_date"] == "2026-05-31 00:00:00"
+    assert result["end_date"] == "2026-05-31 17:58:30"
+    assert result["limit"] == 1
+    assert len(result["items"]) == 1
+    assert len(result["items"][0]["content"]) < 530
+    assert calls[0]["api_name"] == "news"
+    assert calls[0]["params"] == {
+        "src": "sina",
+        "start_date": "2026-05-31 00:00:00",
+        "end_date": "2026-05-31 17:58:30",
+    }
+    assert calls[0]["fields"] == "datetime,content,title,channels"
+    assert "get_tushare_today_news" in {tool.name for tool in ALL_DATA_TOOLS}
+
+
+def test_get_tushare_today_news_rejects_unsupported_source_without_query():
+    with patch("data_provider.tushare_client.query_tushare_api") as query:
+        result = _handle_get_tushare_today_news(src="bad_source", limit=1)
+
+    assert result["status"] == "failed"
+    assert result["api_name"] == "news"
+    assert result["items"] == []
+    assert "unsupported Tushare news src" in result["errors"][0]
+    query.assert_not_called()
 
 
 def test_get_margin_trading_summary_uses_tushare_margin():

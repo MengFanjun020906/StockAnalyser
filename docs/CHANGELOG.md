@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [新功能] Agent 新增 Tushare `get_tushare_today_news` 当日新闻快讯工具，固定查询今天 `00:00:00` 到当前时刻的 `news` 数据，并复用 `TUSHARE_TOKEN`/`TUSHARE_HTTP_URL` 环境配置。
 - [改进] `detect_market_regime` 准确性优先：上调市场环境辅助组件默认预算，`AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` 从 `8.0` 调至 `25.0`、`AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` 从 `3.0` 调至 `10.0`、`AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` 从 `5.0` 调至 `20.0`；指数历史快路径和北向/两融/市场资金/板块排行均使用完整组件预算，降低短超时导致辅助输入缺失的概率。
 - [文档] 补充选股链路重构方案的深入探究层设计：将选股候选深挖从通用 `planning_prompts.py`/个股分析 prompt 中拆出，明确最多 3 只、最少 1 只的深挖目标选择、默认 3 次单股 prompt 调用、输入 payload、输出 schema 与报告消费规则。
 - [修复] 放宽 `get_stock_info` 默认超时预算：基本面阶段总预算从 1.5s 调整为 8s，单源 fetch 从 0.8s 调整为 3s，所属板块补充从 1s 调整为 3s，降低 AkShare/efinance 慢响应导致的 `partial` 与板块缺失。
