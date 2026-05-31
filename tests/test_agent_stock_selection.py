@@ -449,10 +449,10 @@ def test_stock_selection_report_does_not_promote_weak_wait_or_candidate_score_to
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 三、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
 
     assert "| 首选标的 | 暂无可入手标的 |" in markdown
-    assert "## 二、深挖结果与等待/排除决策" in recommendation_section
+    assert "## 三、深挖结果与等待/排除决策" in recommendation_section
     assert "### ⏳ 等待确认 1：000568 泸州老窖" in recommendation_section
     assert "### 🥇 首选：000568 泸州老窖" not in recommendation_section
     assert "| 理想入场区间 | 当前不形成可执行买点，仅保留观察条件 |" not in recommendation_section
@@ -522,10 +522,10 @@ def test_stock_selection_final_markdown_keeps_debate_auxiliary():
 
     markdown = render_stock_selection_markdown(report)
 
-    conclusion_block = markdown.split("## 六、辅助审查摘要", 1)[0]
+    conclusion_block = markdown.split("## 七、辅助审查摘要", 1)[0]
     assert "组合主结论：候选质量尚可但等待回踩确认。" in conclusion_block
     assert "如果它进入核心原因" not in conclusion_block
-    assert "## 六、辅助审查摘要" in markdown
+    assert "## 七、辅助审查摘要" in markdown
     assert "反方审查与 Judge 裁决" not in markdown
     assert "风险三" in markdown
     assert "风险四" not in markdown
@@ -641,7 +641,7 @@ def test_wait_recommendation_hides_low_signal_template_rows_but_keeps_specific_r
         },
         "adversarial_review": {"summary": {}, "full": {}},
         "judge_decision": {"summary": {"primary_plan_verdict": "wait_for_more_data", "final_action": "wait", "decision_summary": "等待确认"}, "full": {}},
-    }).split("## 三、Execute 证据摘要", 1)[0]
+    }).split("## 四、Execute 证据摘要", 1)[0]
 
     assert "当前不形成可执行买点，仅保留观察条件" not in rows
     assert "| 首仓比例 | 0% |" not in rows
@@ -824,6 +824,8 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
             },
             "full_ref": None,
         }),
+        _json_response({"stage": "meta_orchestrator", "status": "ok", "summary": {"package_count": 1, "asset_regimes": [{"code": "600001", "asset_regime": "Unknown"}], "market_context_note": "趋势市但需等待确认", "main_constraints": [{"code": "600001", "constraint_type": "invalidation_level", "reason": "9"}]}, "full": {"packages": [{"stock": {"code": "600001", "name": "测试一", "market": "cn"}, "meta_analysis": {"asset_regime": "Unknown"}, "hard_constraints_for_pricing_agent": {"invalidation_level": {"price": 9, "reason": "跌破 9 元支撑"}, "mean_reversion_anchor": {"price": 10, "reason": "回踩确认"}, "max_chase_premium": {"value": "2.0%", "reason": "11"}, "risk_constraints": []}, "required_pricing_scenarios": [{"scenario_name": "Breakout_Continuation", "condition": "回踩确认", "required_output": "条件开仓"}]}]}}),
+        _json_response({"stage": "pricing_agent", "status": "ok", "summary": {"priced_count": 1, "tradable_count": 0, "main_pricing_constraints": ["9"], "pricing_note": "等待确认"}, "full": {"if_then_order_matrix": [{"code": "600001", "name": "测试一", "asset_regime": "Unknown", "selected_scenario": "Breakout_Continuation", "scenarios": [{"scenario_name": "Breakout_Continuation", "condition": "回踩确认", "action": "wait", "execution_mode": "plain_wait", "entry_zone": "回踩确认", "stop_loss": "9", "failure_condition": "跌破 9 元支撑", "risk_reward_comment": "等待确认", "constraints_used": ["9"]}]}]}}),
         _json_response({
             "stage": "portfolio_allocation",
             "status": "ok",
@@ -869,8 +871,8 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert "capital_flow" in result.final_markdown
     assert result.context.stage_summary("judge_decision")["final_action"] == "wait"
     assert result.context.stages["candidate_discovery"].full_ref == "candidate_discovery.json"
-    assert adapter.call_text.call_count == 6
-    assert result.total_tokens == 6
+    assert adapter.call_text.call_count == 8
+    assert result.total_tokens == 8
     assert any(call["tool"] == "discover_watchlist_candidates" for call in result.tool_calls_log)
     assert any(call["tool"] == "detect_market_regime" for call in result.tool_calls_log)
     assert result.final_report_json["market_regime"]["regime"] == "trending_up"
@@ -943,6 +945,115 @@ def test_stock_selection_prompts_use_compact_evidence_cards_not_raw_previews():
     assert any('"raw_policy"' in prompt for prompt in prompts)
 
 
+def test_stock_selection_runs_meta_and_pricing_stages_before_allocation():
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一", "setup_type": "trend_continuation", "primary_desk": "momentum_desk", "desks": ["momentum_desk", "quality_repair_desk"], "reason": "动量席位认为突破有效", "risks": ["质量席位担心高位衰竭"]}]}}),
+        _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["600001"]}, "full": {"shortlist": [{"code": "600001", "name": "测试一", "screening_result": "deep_dive"}]}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait", "action_strength": "medium", "ideal_entry_zone": "回踩 10 元确认", "no_chase_line": "高于 10.6 不追", "stop_loss": "跌破 9.7", "main_risks": ["高位衰竭"]}, "full": {"stock": {"code": "600001", "name": "测试一", "market": "cn"}, "entry_quality": {"ideal_entry_zone": "回踩 10 元确认", "no_chase_line": "高于 10.6 不追", "stop_loss": "跌破 9.7", "failure_condition": "放量跌破突破位"}}}),
+        _json_response({
+            "stage": "meta_orchestrator",
+            "status": "ok",
+            "summary": {"package_count": 1, "asset_regimes": [{"code": "600001", "asset_regime": "Right_Side_Momentum_High_Exhaustion_Risk"}], "market_context_note": "趋势市但不追高", "main_constraints": [{"code": "600001", "constraint_type": "invalidation_level", "reason": "跌破 9.7"}]},
+            "full": {"packages": [{"stock": {"code": "600001", "name": "测试一", "market": "cn"}, "meta_analysis": {"asset_regime": "Right_Side_Momentum_High_Exhaustion_Risk", "factual_consensus": ["回踩 10 元确认"], "strategic_divergence": "动量看多，质量担心高位", "dominant_thesis": "momentum_desk", "opposing_theses": ["quality_repair_desk"]}, "market_context": {"market_regime": "trending_up", "volatility_bucket": "normal", "risk_level": "medium", "regime_weight_adjustment": "趋势市保留动量", "market_context_warnings": []}, "hard_constraints_for_pricing_agent": {"invalidation_level": {"price": 9.7, "source": "deep_dive", "reason": "跌破 9.7"}, "mean_reversion_anchor": {"price": 10.0, "source": "deep_dive", "reason": "回踩 10 元确认"}, "max_chase_premium": {"value": "2.0%", "source": "quality_repair_desk", "reason": "高于 10.6 不追"}, "risk_constraints": [{"constraint": "高位衰竭", "source": "quality_repair_desk"}]}, "required_pricing_scenarios": [{"scenario_name": "Breakout_Continuation", "condition": "站稳 9.7", "required_output": "条件开仓"}, {"scenario_name": "Fakeout_Exhaustion", "condition": "跌破 9.7", "required_output": "退出"}, {"scenario_name": "Mean_Reversion_Pullback", "condition": "回踩 10", "required_output": "低吸"}]}]},
+        }),
+        _json_response({
+            "stage": "pricing_agent",
+            "status": "ok",
+            "summary": {"priced_count": 1, "tradable_count": 1, "main_pricing_constraints": ["跌破 9.7"], "pricing_note": "只给条件单"},
+            "full": {"if_then_order_matrix": [{"code": "600001", "name": "测试一", "asset_regime": "Right_Side_Momentum_High_Exhaustion_Risk", "data_status": "ok", "selected_scenario": "Breakout_Continuation", "scenarios": [{"scenario_name": "Breakout_Continuation", "condition": "站稳 9.7 后回踩确认", "action": "wait", "execution_mode": "conditional_open", "entry_zone": "10.0-10.2", "stop_loss": "跌破 9.7", "failure_condition": "放量跌破 9.7", "risk_reward_comment": "需复核 ATR", "constraints_used": ["invalidation_level"]}], "pricing_warnings": []}]},
+        }),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "遵守条件单", "positions_plan_brief": [{"code": "600001", "action": "wait"}]}, "full": {"positions_plan": [{"rank": 1, "code": "600001", "name": "测试一", "action": "wait", "execution_mode": "conditional_open", "initial_position_pct": 0, "entry_condition": "站稳 9.7 后回踩确认", "stop_loss_condition": "跌破 9.7", "review_trigger": "明日"}], "execution_matrix": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "需确认条件单"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept_with_changes", "final_action": "wait", "decision_summary": "等待条件触发", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="帮我选一下下周可以入手的股票",
+        agent_user_context=_context(),
+        tool_registry=_registry_with_candidates([{"code": "600001", "name": "测试一", "market": "cn", "source": "test"}]),
+        llm_adapter=adapter,
+        run_id="test-meta-pricing",
+    )
+
+    assert result.success is True
+    assert result.final_report_json["meta_orchestrator"]["summary"]["package_count"] == 1
+    assert result.final_report_json["pricing_agent"]["summary"]["priced_count"] == 1
+    assert result.context.stages["meta_orchestrator"].full_ref == "meta_orchestrator.json"
+    assert result.context.stages["pricing_agent"].full_ref == "pricing_agent.json"
+    prompts = [call.args[0][1]["content"] for call in adapter.call_text.call_args_list]
+    assert any("Meta-Agent / Orchestrator" in prompt for prompt in prompts)
+    assert any("点位计算 Agent / 条件单计算层" in prompt for prompt in prompts)
+    assert any("Meta/点位计算字段语义" in prompt for prompt in prompts)
+    assert "## 二、Meta-Agent 选股链路" in result.final_markdown
+    assert "字段说明" in result.final_markdown
+    assert "Right_Side_Momentum_High_Exhaustion_Risk" in result.final_markdown
+    assert "点位计算 If-Then 条件单" in result.final_markdown
+    assert "Meta 场景约束" in result.final_markdown
+    assert "点位计算条件单" in result.final_markdown
+    assert "Pricing If-Then" not in result.final_markdown
+
+
+def test_meta_and_point_calc_prompt_payloads_are_capped_and_ranked():
+    ctx = SelectionRunContext(run_id="test-compact-meta-point", user_message="选股")
+    packages = []
+    matrix = []
+    for idx in range(6):
+        code = f"60000{idx}"
+        packages.append({
+            "stock": {"code": code, "name": f"测试{idx}", "market": "cn"},
+            "meta_analysis": {
+                "asset_regime": "Right_Side_Momentum",
+                "factual_consensus": [f"事实{idx}-{n}" for n in range(6)],
+                "strategic_divergence": "分歧" * 200,
+            },
+            "market_context": {"market_regime": "trending_up"},
+            "hard_constraints_for_pricing_agent": {
+                "invalidation_level": {"price": 9 + idx, "reason": "跌破失效"},
+                "risk_constraints": [{"constraint": f"风险{n}"} for n in range(8)],
+            },
+            "required_pricing_scenarios": [
+                {"scenario_name": f"S{n}", "condition": "条件" * 80, "required_output": "输出" * 80}
+                for n in range(5)
+            ],
+        })
+        execution_mode = "conditional_open" if idx == 4 else "plain_wait"
+        matrix.append({
+            "code": code,
+            "name": f"测试{idx}",
+            "asset_regime": "Right_Side_Momentum",
+            "data_status": "ok",
+            "selected_scenario": "S0",
+            "scenarios": [
+                {
+                    "scenario_name": f"S{n}",
+                    "action": "wait",
+                    "execution_mode": execution_mode,
+                    "condition": "条件" * 80,
+                    "entry_zone": "10-10.2",
+                    "stop_loss": "9.7",
+                    "failure_condition": "跌破 9.7",
+                    "risk_reward_comment": "复核 ATR",
+                    "constraints_used": [f"c{x}" for x in range(6)],
+                }
+                for n in range(5)
+            ],
+        })
+    ctx.set_stage("meta_orchestrator", {"stage": "meta_orchestrator", "status": "ok", "full": {"packages": packages}})
+    ctx.set_stage("pricing_agent", {"stage": "pricing_agent", "status": "ok", "full": {"if_then_order_matrix": matrix}})
+
+    compact_meta = stock_selection_module._compact_meta_packages_for_prompt(ctx)
+    compact_matrix = stock_selection_module._compact_pricing_matrix_for_prompt(ctx)
+
+    assert len(compact_meta) == 5
+    assert len(compact_matrix) == 5
+    assert compact_meta[0]["stock"]["code"] == "600004"
+    assert compact_matrix[0]["code"] == "600004"
+    assert all(len(item["required_pricing_scenarios"]) <= 3 for item in compact_meta)
+    assert all(len(item["scenarios"]) <= 3 for item in compact_matrix)
+    assert all(len(scenario["constraints_used"]) <= 4 for item in compact_matrix for scenario in item["scenarios"])
+
+
 def test_stock_selection_emits_tool_events_for_trace_stream():
     adapter = MagicMock()
     adapter.call_text.side_effect = [
@@ -1008,6 +1119,8 @@ def test_stock_selection_reject_is_downgraded_when_candidate_pool_exists_with_da
             "summary": {"code": "600001", "name": "测试一", "action_bias": "wait", "action_strength": "weak", "key_reason": "资金面待确认"},
             "full": {"stock": {"code": "600001", "name": "测试一"}, "action_bias": "wait", "missing_evidence": ["capital_flow", "fundamental"]},
         }),
+        _json_response({"stage": "meta_orchestrator", "status": "partial", "summary": {"package_count": 1, "asset_regimes": [{"code": "600001", "asset_regime": "Unknown"}], "market_context_note": "证据缺口较多", "main_constraints": []}, "full": {"packages": [{"stock": {"code": "600001", "name": "测试一", "market": "cn"}, "meta_analysis": {"asset_regime": "Unknown"}, "hard_constraints_for_pricing_agent": {"risk_constraints": [{"constraint": "资金面待确认", "source": "deep_dive"}]}, "required_pricing_scenarios": []}]}}),
+        _json_response({"stage": "pricing_agent", "status": "partial", "summary": {"priced_count": 1, "tradable_count": 0, "main_pricing_constraints": ["资金面待确认"], "pricing_note": "不形成条件开仓"}, "full": {"if_then_order_matrix": [{"code": "600001", "name": "测试一", "asset_regime": "Unknown", "selected_scenario": "Mean_Reversion_Pullback", "scenarios": [{"scenario_name": "Mean_Reversion_Pullback", "condition": "资金确认后复查", "action": "monitor", "execution_mode": "plain_wait", "entry_zone": "等待", "stop_loss": "跌破支撑", "failure_condition": "资金继续缺失", "risk_reward_comment": "证据不足", "constraints_used": ["资金面待确认"]}]}]}}),
         _json_response({
             "stage": "portfolio_allocation",
             "status": "ok",
@@ -1108,7 +1221,7 @@ def test_stock_selection_expands_deep_dive_targets_for_rich_candidate_pool():
 
     assert result.success is True
     assert result.final_report_json["single_stock_deep_dive"]["summary"]["target_count"] == 3
-    assert adapter.call_text.call_count == 8
+    assert adapter.call_text.call_count == 10
     deep_results = result.final_report_json["single_stock_deep_dive"]["full"]["results"]
     assert [item["summary"]["code"] for item in deep_results] == ["600001", "600002", "600003"]
     assert "600001 测试一" in result.final_markdown
@@ -1233,9 +1346,9 @@ def test_stock_selection_recommendation_section_always_shows_deep_dived_candidat
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 三、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
 
-    assert "## 二、深挖结果与等待/排除决策" in recommendation_section
+    assert "## 三、深挖结果与等待/排除决策" in recommendation_section
     assert "### 👀 强观察 1：688127 蓝特光学（候选分 100）" in recommendation_section
     assert "### 👀 强观察 2：603629 利通电子（候选分 100）" in recommendation_section
     assert "### 👀 强观察 3：603256 宏和科技（候选分 100）" in recommendation_section
@@ -1313,9 +1426,9 @@ def test_stock_selection_wait_with_conditions_renders_conditional_entry():
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 三、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
 
-    assert "## 二、推荐排序与入场决策" in recommendation_section
+    assert "## 三、推荐排序与入场决策" in recommendation_section
     assert "| 首选标的 | 688266 泽璟制药-U |" in markdown
     assert "### ⚡ 条件入场 1：688266 泽璟制药-U（候选分 96）" in recommendation_section
     assert "| 看盘动作 | 条件入场，不是无条件追买 |" in recommendation_section
@@ -1360,7 +1473,7 @@ def test_stock_selection_high_score_without_exit_condition_renders_strong_watch(
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 三、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
 
     assert "### 👀 强观察 1：688127 蓝特光学（候选分 92）" in recommendation_section
     assert "| 看盘动作 | 强观察，暂不形成交易脚本 |" in recommendation_section
@@ -1502,6 +1615,8 @@ def test_stock_selection_applies_judge_monitor_override_to_portfolio_plan():
         _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["300572"]}, "full": {"candidates": [{"code": "300572", "name": "安车检测"}]}}),
         _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["300572"]}, "full": {"shortlist": [{"code": "300572", "name": "安车检测", "screening_result": "deep_dive"}]}}),
         _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "300572", "name": "安车检测", "action_bias": "wait", "action_strength": "weak"}, "full": {"stock": {"code": "300572", "name": "安车检测"}, "missing_evidence": ["fundamental"]}}),
+        _json_response({"stage": "meta_orchestrator", "status": "partial", "summary": {"package_count": 1, "asset_regimes": [{"code": "300572", "asset_regime": "Unknown"}], "market_context_note": "基本面缺口", "main_constraints": []}, "full": {"packages": [{"stock": {"code": "300572", "name": "安车检测", "market": "cn"}, "meta_analysis": {"asset_regime": "Unknown"}, "hard_constraints_for_pricing_agent": {"risk_constraints": [{"constraint": "fundamental missing", "source": "deep_dive"}]}, "required_pricing_scenarios": []}]}}),
+        _json_response({"stage": "pricing_agent", "status": "partial", "summary": {"priced_count": 1, "tradable_count": 0, "main_pricing_constraints": ["fundamental missing"], "pricing_note": "仅监控"}, "full": {"if_then_order_matrix": [{"code": "300572", "name": "安车检测", "asset_regime": "Unknown", "selected_scenario": "Mean_Reversion_Pullback", "scenarios": [{"scenario_name": "Mean_Reversion_Pullback", "condition": "基本面补齐后复查", "action": "monitor", "execution_mode": "plain_wait", "entry_zone": "等待", "stop_loss": "跌破 30", "failure_condition": "基本面证据继续缺失", "risk_reward_comment": "仅监控", "constraints_used": ["fundamental missing"]}]}]}}),
         _json_response({
             "stage": "portfolio_allocation",
             "status": "ok",
@@ -2213,6 +2328,27 @@ def test_run_candidate_discovery_tool_uses_committee_when_mode_is_thesis_desk():
     assert "seed_market_regime" in seed_event["payload"]
     gate_event = next(e for e in events if e.get("type") == "selection_seed_gate_done")
     assert gate_event["payload"]["seed_pool_summary"]["seed_count"] == 3
+
+
+def test_seed_pool_total_limit_preserves_user_watchlist_without_online_sources():
+    from src.agent.candidate_experts_v2.committee import _build_seed_pool_result
+
+    class _NoOnlineRegistry:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("online sources should not run when user seeds fill total_limit")
+
+    result = _build_seed_pool_result(
+        market="cn",
+        seed_symbols=["600519"],
+        tool_registry=_NoOnlineRegistry(),
+        today="20260529",
+        total_limit=1,
+    )
+
+    assert [seed.code for seed in result.seeds] == ["600519"]
+    assert result.seeds[0].source == "user_watchlist"
+    assert result.diagnostics[0]["source"] == "user_watchlist"
+    assert result.diagnostics[0]["count"] == 1
 
 
 def test_fallback_candidate_discovery_preserves_seed_pool_metadata():

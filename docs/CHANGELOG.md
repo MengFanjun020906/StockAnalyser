@@ -9,7 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] 三席位 LLM 首轮输入改用压缩版 `SeedFactPacket`，保留结构、支撑压力、趋势、均线、量能、资金、板块和基本面等决策事实，同时让 LLM fallback 共享超时预算，避免单个慢模型吃完整个 60s 后导致席位连续失败熔断；Trace probe 会回挂落盘的 `seed_facts.json`，用于真实复跑排障。
 - [新功能] Agent 新增 Tushare `get_tushare_today_news` 当日新闻快讯工具，固定查询今天 `00:00:00` 到当前时刻的 `news` 数据，并复用 `TUSHARE_TOKEN`/`TUSHARE_HTTP_URL` 环境配置。
+- [新功能] 选股流水线接入 `meta_orchestrator` 与 `pricing_agent` 两个真实阶段：三席位深挖后生成资产定性、硬约束与必算场景包，再由点位计算层输出 If-Then 条件单矩阵并传递给组合配置、反方审查、Judge 和最终报告。
+- [改进] 选股 `final.md` 改为面向 Meta-Agent 链路展示：新增“三席位 → Meta 约束包 → 点位计算 If-Then 条件单”专章，显式解释 Meta 字段语义、硬约束、必算场景、入场区间、止盈止损和缺失证据；深挖/报告标的数量收敛为 1-5 只。
+- [文档] 明确 Meta-Agent 后续运行顺序：Meta → 点位计算 → 组合规划 → 反方审查 → Judge 为 5 次串行 LLM stage 调用，`final.md` 只读取已落盘 JSON 做确定性渲染。
+- [改进] 选股 Meta-Agent 后续阶段新增 prompt 控长保护：下游只接收最多 5 只股票、每只最多 3 个必算场景的压缩约束包和条件单矩阵，并按可执行性稳定排序，避免完整 Meta/深挖结果撑爆模型上下文。
+- [改进] 暂停三席位主链路主动使用 `moneyflow_ths`：种子池资金异常源和动量席工具白名单不再调用 THS 个股资金流；单票资金验证继续走 `get_capital_flow`，由 Tushare `moneyflow` 失败后回退 StockAPI `codeFlow`。
+- [改进] StockAPI 历史资金流 fallback 支持 `STOCKAPI_URL` 覆盖 codeFlow 地址，默认仍为 `https://www.stockapi.com.cn/v1/base/codeFlow`。
+- [改进] L1 三席位种子池新增 `AGENT_SEED_POOL_TOTAL_LIMIT` 上限配置，默认 20 保持原行为；单票真实 smoke 或排障时可临时设为 1-3，避免候选事实包补数拖慢 Meta/点位计算闭环验证。
+- [修复] 三席位种子池恢复 `user_watchlist` 最高优先级，显式传入的 `target_symbols` 会先进入 seed pool；当 `AGENT_SEED_POOL_TOTAL_LIMIT` 已被用户 seed 填满时不再继续拉在线候选源，保证单票排障稳定命中指定股票。
+- [修复] 三席位最终 JSON 解析兼容真实模型输出的短前后缀文本，自动提取首尾大括号中的 JSON object；纯自然语言仍按 `final_output_not_json` 失败处理。
+- [文档] 补充选股链路 Meta-Agent / Orchestrator 架构：明确三席位报告如何被整理成资产定性、市场环境过滤、硬约束与必算场景包，并定义点位计算层只做 If-Then 条件单计算的职责边界。
+- [改进] 三席位选股链路新增 `SeedFactPacket` 前置并行取数层，按 `(seed,tool)` 构建共享 facts JSON，并把压缩后的模型输入版 `seed_facts.json` 写入 Trace 便于定位取数慢、缺失或失败，避免原始工具数据撑爆后续模型上下文。
 - [改进] `detect_market_regime` 准确性优先：上调市场环境辅助组件默认预算，`AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` 从 `8.0` 调至 `25.0`、`AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` 从 `3.0` 调至 `10.0`、`AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` 从 `5.0` 调至 `20.0`；指数历史快路径和北向/两融/市场资金/板块排行均使用完整组件预算，降低短超时导致辅助输入缺失的概率。
 - [文档] 补充选股链路重构方案的深入探究层设计：将选股候选深挖从通用 `planning_prompts.py`/个股分析 prompt 中拆出，明确最多 3 只、最少 1 只的深挖目标选择、默认 3 次单股 prompt 调用、输入 payload、输出 schema 与报告消费规则。
 - [修复] 放宽 `get_stock_info` 默认超时预算：基本面阶段总预算从 1.5s 调整为 8s，单源 fetch 从 0.8s 调整为 3s，所属板块补充从 1s 调整为 3s，降低 AkShare/efinance 慢响应导致的 `partial` 与板块缺失。
@@ -69,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增 macOS 一键部署：`scripts/install-mac.sh`（自动检测 Intel / Apple Silicon，装 Xcode CLT + Homebrew + `python@3.11` + `node@22` + `uv` + 项目依赖，剔除 graphiti / neo4j 并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB），并提供 `scripts/start-backend.command` / `scripts/start-web.command` 双击启动器（内部 `eval brew shellenv` 兼容 Finder 启动）。
 - [文档] 新增 `docs/deploy-to-new-mac.md`，覆盖从空白 Mac -> Homebrew -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
 
-- [新功能] 资金面候选专家新增 per-dimension 工具手册 (`src/agent/candidate_experts_v2/tools_manifest/capital.yaml`)，覆盖 11 个白名单工具的 priority / when_to_use / typical_args / returns_summary / key_fields / combo_hints / cost / failure_modes 9 字段业务语义；YAML 在 `CapitalFlowExpert.__init__` 阶段加载并按 priority 渲染进 SYSTEM prompt，并对 whitelist / ToolRegistry / typical_args 参数名做三层一致性校验，typical_args 支持 `{today}` / `{seed_codes}` 运行时占位符替换。
+- [新功能] 资金面候选专家新增 per-dimension 工具手册 (`src/agent/candidate_experts_v2/tools_manifest/capital.yaml`)，覆盖 11 个白名单工具的 priority / when_to_use / typical_args / returns_summary / key_fields / combo_hints / cost / failure_modes 9 字段业务语义；YAML 在 `CapitalFlowExpert.__init__` 阶段加载并按 priority 渲染进 SYSTEM prompt，并对 whitelist / ToolRegistry / typical_args 参数名做三层一致性校验，typical_args 支持 `{today}` / `{seed_codes}` 运行时占位符替换；`get_tushare_moneyflow_ths` 保留为手动工具但不在主链路主动调用。
 - [测试] 新增 `tests/test_tools_manifest.py`，覆盖 manifest 加载、白名单与 registry 交叉校验、参数名子集校验、占位符替换、Markdown 渲染顺序和最终 SYSTEM prompt 注入路径，共 16 个用例。
 
 - [新功能] 新增新机器部署脚本：`scripts/install-windows.ps1`（Windows 宿主启用 WSL2 并安装 Ubuntu）、`scripts/bootstrap-wsl.sh`（WSL 内一键装 Python 3.11 / Node 22 / uv / 依赖，自动剔除 graphiti、neo4j 行并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB）、`scripts/start-backend.sh` 与 `scripts/start-web.sh`（前台启动器）。
@@ -82,7 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 新增 Agent 选股 wait 过度保守校准方案，规划将强等待候选拆分为条件入场、强观察和普通等待，并优化候选分与报告渲染语义。
 - [新功能] Agent TuShare 工具补齐板块主题、消息事件、基本面和技术侧直连接口，并将 THS 板块资金流、结构化事件和 `daily_basic` 快照接入候选专家。
 - [新功能] 资金面候选专家补齐 TuShare 东财资金流、龙虎榜、涨停榜、连板天梯和热榜工具，并接入 L1 候选发现链路，所有新增 TuShare 工具均不做跨数据源 fallback。
-- [新功能] 新增 `get_tushare_moneyflow_ths` Agent 工具，并在 L1 资金面候选专家中优先使用 TuShare THS 个股资金流，不做跨数据源 fallback。
+- [新功能] 新增 `get_tushare_moneyflow_ths` Agent 手动工具；当前因权限不足不在 L1/三席位主链路主动调用，不做跨数据源 fallback。
 - [文档] 新增 TuShare 候选专家工具补全记录，梳理资金、板块、消息、基本面和技术候选专家可复用的 TuShare 接口。
 - [修复] Agent Trace 选中具体账户时强制注入该账户持仓上下文，并在执行层为持仓快照和搜索工具补齐账户/代码名称约束，避免报告误用全账户汇总或代码名称错配。
 - [修复] `get_capital_flow` 在 StockAPI `codeFlow` fallback 上按接口文档使用 `pageSize=50`，并开放 `start_date/end_date/page_no/page_size` 参数，支持按指定日期窗口查询历史资金流。

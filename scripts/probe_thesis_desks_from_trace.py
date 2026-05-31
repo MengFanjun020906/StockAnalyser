@@ -33,7 +33,7 @@ from src.agent.candidate_experts_v2.experts.early_turn_desk import EarlyTurnDesk
 from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
 from src.agent.candidate_experts_v2.experts.quality_repair_desk import QualityRepairDeskExpert
 from src.agent.candidate_experts_v2.recall import build_recall_pool
-from src.agent.candidate_experts_v2.schemas import SeedItem
+from src.agent.candidate_experts_v2.schemas import SeedFactPacket, SeedItem
 
 
 DEFAULT_TRACE_DIR = (
@@ -108,12 +108,38 @@ def _seed_items_from_preview(preview: Sequence[Dict[str, Any]]) -> List[SeedItem
     return seeds
 
 
+def _load_seed_facts_from_trace(trace_dir: Path) -> Dict[str, SeedFactPacket]:
+    path = trace_dir / "seed_facts.json"
+    if not path.exists():
+        return {}
+    payload = _read_json(path)
+    packets = payload.get("packets") if isinstance(payload, dict) else payload
+    if not isinstance(packets, list):
+        return {}
+    by_code: Dict[str, SeedFactPacket] = {}
+    for item in packets:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        try:
+            by_code[code] = SeedFactPacket.model_validate(item)
+        except Exception:
+            continue
+    return by_code
+
+
 class ProbeLLM:
     """Fast deterministic LLM replacement that records prompt sizes."""
 
     def __init__(self, *, emit_candidate: bool = True) -> None:
         self.emit_candidate = emit_candidate
         self.calls: List[Dict[str, Any]] = []
+        self._current_desk = ""
+
+    def set_context(self, *, desk: str = "") -> None:
+        self._current_desk = desk
 
     def __call__(self, messages: List[Dict[str, Any]], tool_decls: List[Dict[str, Any]]) -> LLMTurn:
         user_text = str(messages[-1].get("content") or "") if messages else ""
@@ -122,7 +148,9 @@ class ProbeLLM:
         name = _extract_first_json_value(user_text, "name") or code
         self.calls.append(
             {
+                "desk": self._current_desk,
                 "code": code,
+                "seed_code": code,
                 "messages": len(messages),
                 "tool_decls": len(tool_decls),
                 "system_chars": len(system_text),
@@ -284,12 +312,16 @@ def _set_llm_context(llm: Any, *, desk: str) -> None:
 def _call_console_summary(call: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "desk": call.get("desk"),
-        "seed_code": call.get("seed_code"),
+        "seed_code": call.get("seed_code") or call.get("code"),
         "round": call.get("round"),
         "elapsed_ms": call.get("elapsed_ms"),
         "provider": call.get("provider"),
         "model": call.get("model"),
         "content_is_json": call.get("content_is_json"),
+        "messages": call.get("messages") or call.get("message_count"),
+        "tool_decls": call.get("tool_decls"),
+        "user_chars": call.get("user_chars"),
+        "system_chars": call.get("system_chars"),
         "tool_call_count": len(call.get("tool_calls") or []),
         "content_chars": len(str(call.get("content") or "")),
     }
@@ -671,10 +703,18 @@ def main() -> None:
         prebuilt_pool=pool,
     )
     rows = recall.rows
+    seed_facts = _load_seed_facts_from_trace(args.trace_dir)
+    attached_seed_facts = 0
+    for row in rows:
+        packet = seed_facts.get(row.code)
+        if packet is not None:
+            row.seed_fact = packet
+            attached_seed_facts += 1
     print(
         f"trace={args.trace_dir}\n"
         f"seed_preview={len(preview)} seed_items={len(seeds)} "
-        f"recall_rows={len(rows)} recall_sources={json.dumps(recall.sources, ensure_ascii=False)}"
+        f"recall_rows={len(rows)} attached_seed_facts={attached_seed_facts} "
+        f"recall_sources={json.dumps(recall.sources, ensure_ascii=False)}"
     )
     print("first_rows=" + json.dumps([{"code": r.code, "name": r.name, "sources": r.recall_sources} for r in rows[:5]], ensure_ascii=False))
 

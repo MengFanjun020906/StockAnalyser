@@ -93,6 +93,7 @@ class FeatureRow(BaseModel):
     market: str = "cn"
     flags: List[FeatureFlag] = Field(default_factory=list)
     fact_sheet: Optional["FactSheet"] = None
+    seed_fact: Optional["SeedFactPacket"] = None
     recall_sources: List[str] = Field(default_factory=list)
     coarse_kept: bool = True
     coarse_drop_reason: str = ""
@@ -145,7 +146,7 @@ class FactSheet(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     code: str
-    # 资金(确定性,来自 get_capital_flow / moneyflow_ths,缺失填 unknown)
+    # 资金(确定性,来自 get_capital_flow / moneyflow_dc,缺失填 unknown)
     capital_direction: Literal["inflow", "outflow", "neutral", "unknown"] = "unknown"
     capital_violent_outflow: bool = False  # 红线候选:放量主力夺路出逃
     # 趋势/位置(本地日线算)
@@ -169,6 +170,47 @@ class FactSheet(BaseModel):
     leader_already_up: Optional[bool] = None  # 板块龙头是否已涨(补涨判断用)
     freshness: str = "unknown"
     warnings: List[str] = Field(default_factory=list)
+
+
+class SeedFactToolResult(BaseModel):
+    """One pre-desk tool result inside a SeedFactPacket."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: Literal["ok", "partial", "failed", "timeout", "missing"] = "missing"
+    data: Any = Field(default_factory=dict)
+    errors: List[str] = Field(default_factory=list)
+    elapsed_ms: int = 0
+
+
+class SeedFactDataQuality(BaseModel):
+    """Aggregate quality metadata for one seed's pre-fetched facts."""
+
+    model_config = ConfigDict(extra="allow")
+
+    status: Literal["ok", "partial", "failed"] = "failed"
+    tool_count: int = 0
+    ok_tools: int = 0
+    partial_tools: List[str] = Field(default_factory=list)
+    failed_tools: List[str] = Field(default_factory=list)
+    missing_tools: List[str] = Field(default_factory=list)
+    elapsed_ms: int = 0
+
+
+class SeedFactPacket(BaseModel):
+    """Shared fixed facts JSON built once before all thesis desks."""
+
+    model_config = ConfigDict(extra="allow")
+
+    code: str
+    name: str = ""
+    market: str = "cn"
+    recall_sources: List[str] = Field(default_factory=list)
+    flags: List[Dict[str, Any]] = Field(default_factory=list)
+    fact_sheet: Dict[str, Any] = Field(default_factory=dict)
+    facts: Dict[str, SeedFactToolResult] = Field(default_factory=dict)
+    data_quality: SeedFactDataQuality = Field(default_factory=SeedFactDataQuality)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class EvidenceItem(BaseModel):

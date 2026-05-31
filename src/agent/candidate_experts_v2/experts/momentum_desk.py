@@ -21,7 +21,6 @@ MOMENTUM_DESK_TOOLS: tuple[str, ...] = (
     "analyze_price_structure",
     "get_volume_analysis",
     "get_capital_flow",
-    "get_tushare_moneyflow_ths",
     "get_tushare_moneyflow_dc",
     "get_tushare_limit_list_d",
     "get_tushare_limit_step",

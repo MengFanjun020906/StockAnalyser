@@ -1376,19 +1376,43 @@ class TraceArtifactWriterSeedPoolTestCase(unittest.TestCase):
                         "candidate_source": "llm_expert_committee",
                     },
                 })
+                writer.append_event({
+                    "type": "selection_seed_facts",
+                    "payload": {
+                        "total": 1,
+                        "ok": 0,
+                        "partial": 1,
+                        "failed": 0,
+                        "elapsed_ms": 42,
+                        "packets_ref": "seed_facts.json",
+                        "tool_status_counts": {"analyze_trend": {"ok": 1}},
+                        "packets_preview": [{"code": "600001", "status": "partial"}],
+                        "packets": [
+                            {
+                                "code": "600001",
+                                "facts": {"analyze_trend": {"status": "ok", "data": {}}},
+                                "data_quality": {"status": "partial", "ok_tools": 1},
+                            }
+                        ],
+                    },
+                })
 
                 with open(os.path.join(writer.path, "seed_pool.json"), encoding="utf-8") as fh:
                     seed_pool = json.load(fh)
                 with open(os.path.join(writer.path, "seed_gate.json"), encoding="utf-8") as fh:
                     seed_gate = json.load(fh)
+                with open(os.path.join(writer.path, "seed_facts.json"), encoding="utf-8") as fh:
+                    seed_facts = json.load(fh)
                 with open(os.path.join(writer.path, "events.ndjson"), encoding="utf-8") as fh:
                     event_types = [json.loads(line)["type"] for line in fh if line.strip()]
 
-        self.assertEqual(event_types, ["selection_seed_pool_built", "selection_seed_gate_done"])
+        self.assertEqual(event_types, ["selection_seed_pool_built", "selection_seed_gate_done", "selection_seed_facts"])
         self.assertEqual(seed_pool["seed_pool_summary"]["seed_count"], 2)
         self.assertEqual(seed_pool["seed_pool_diagnostics"][0]["source"], "local_price_volume")
         self.assertEqual(seed_gate["seed_gate"]["kept_count"], 1)
         self.assertEqual(seed_gate["candidate_source"], "llm_expert_committee")
+        self.assertEqual(seed_facts["packets"][0]["facts"]["analyze_trend"]["status"], "ok")
+        self.assertNotIn("data", seed_facts["packets"][0]["facts"]["analyze_trend"])
 
 
 if __name__ == "__main__":

@@ -107,6 +107,14 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(cleaned[start : end + 1])
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                return None
         return None
 
 

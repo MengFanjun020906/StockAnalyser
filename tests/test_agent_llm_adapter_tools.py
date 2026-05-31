@@ -81,6 +81,38 @@ def test_call_completion_enforces_hard_timeout_around_litellm_retries(monkeypatc
     assert "hard timeout" in str(response.content)
 
 
+def test_call_completion_reserves_timeout_for_fallback_model(monkeypatch):
+    """A slow primary model must not consume the entire timeout budget."""
+    from src.agent import llm_adapter as module
+    from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
+
+    monkeypatch.setattr(module, "get_effective_agent_models_to_try", lambda _config: ["unit/slow", "unit/fast"])
+
+    adapter = LLMToolAdapter()
+    calls = []
+
+    def fake_call(*_args, **kwargs):
+        model = _args[2]
+        calls.append((model, kwargs.get("timeout")))
+        if model == "unit/slow":
+            time.sleep(0.2)
+            raise AssertionError("slow primary should be hard-timed-out")
+        return LLMResponse(content="ok", provider="unit", model=model)
+
+    monkeypatch.setattr(adapter, "_call_litellm_model", fake_call)
+
+    response = adapter.call_completion(
+        [{"role": "user", "content": "ping"}],
+        timeout=0.2,
+    )
+
+    assert response.provider == "unit"
+    assert response.model == "unit/fast"
+    assert [item[0] for item in calls] == ["unit/slow", "unit/fast"]
+    assert calls[0][1] <= 0.11
+    assert calls[1][1] > 0
+
+
 def test_call_completion_passes_response_format_to_litellm(monkeypatch):
     """Candidate desks rely on provider-side JSON mode when available."""
     from src.agent import llm_adapter as module

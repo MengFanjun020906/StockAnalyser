@@ -469,6 +469,21 @@ def test_base_expert_fails_on_non_json_final(tmp_path, monkeypatch):
     assert "final_output_not_json" in pkt.errors
 
 
+def test_base_expert_extracts_json_object_from_wrapped_final(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+    wrapped = (
+        "以下是最终 JSON：\n"
+        '{"candidates":[{"code":"600000","name":"浦发银行","evidence":[{"tool":"get_tushare_moneyflow_ths","summary":"x"}]}],'
+        '"rejected":[],"data_quality":{"status":"partial"}}\n'
+        "请查收。"
+    )
+    llm = _ScriptedLLM([LLMTurn(text=wrapped)])
+    expert = _make_expert(llm=llm, tool_registry={})
+    pkt = expert.run([SeedItem(code="600000")], use_cache=False)
+    assert pkt.status == "partial"
+    assert pkt.candidates[0].code == "600000"
+
+
 def test_base_expert_tool_call_cap(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
     call_count = {"n": 0}

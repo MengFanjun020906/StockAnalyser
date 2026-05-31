@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from src.agent.candidate_experts_v2.cache import cache_key, save_packet
 from src.agent.candidate_experts_v2.experts.base import BaseExpert, LLMCallable
+from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
 from src.agent.candidate_experts_v2.schemas import (
     ExpertDataQualityV2,
     ExpertPacketV2,
@@ -466,6 +467,11 @@ class BaseDeskExpert(BaseExpert):
         for row in rows[:30]:
             fs = row.fact_sheet
             fs_dict = _fact_sheet_to_dict(fs) if fs else {}
+            seed_fact_packets = compact_seed_fact_packets_for_model(
+                [row.seed_fact],
+                limit=1,
+            ) if getattr(row, "seed_fact", None) is not None else []
+            seed_fact_dict = seed_fact_packets[0] if seed_fact_packets else {}
             candidates_payload.append(
                 {
                     "code": row.code,
@@ -482,6 +488,7 @@ class BaseDeskExpert(BaseExpert):
                         for f in row.flags
                     ],
                     "fact_sheet": fs_dict,
+                    "seed_fact": seed_fact_dict,
                 }
             )
 
@@ -489,9 +496,10 @@ class BaseDeskExpert(BaseExpert):
             f"市场: {market}\n"
             f"市场状态(regime): {regime}\n"
             f"席位: {self.expert_name}\n"
-            f"候选池（最多 30 只，每只附带 FactSheet + FeatureFlags）:\n"
+            f"候选池（最多 30 只，每只附带 FactSheet + SeedFactPacket + FeatureFlags）:\n"
             f"{json.dumps(candidates_payload, ensure_ascii=False)}\n\n"
-            "请按 system prompt 的要求调用工具、给出证据，并以 JSON 输出最终候选。"
+            "请优先读取 seed_fact.facts 里已经预取的工具结果；只有缺失、失败、冲突或本席位关键二次确认时才补充调用工具。"
+            "按 system prompt 的要求给出证据，并以 JSON 输出最终候选。"
         )
 
 
@@ -554,12 +562,17 @@ def _seed_from_row(row: FeatureRow) -> SeedItem:
 
 
 def _row_packet_hash(row: FeatureRow, *, regime: str) -> str:
+    compact_seed_fact = compact_seed_fact_packets_for_model(
+        [row.seed_fact],
+        limit=1,
+    ) if getattr(row, "seed_fact", None) is not None else []
     payload = {
         "code": row.code,
         "market": row.market,
         "recall_sources": row.recall_sources,
         "flags": [flag.model_dump(mode="json") for flag in row.flags],
         "fact_sheet": row.fact_sheet.model_dump(mode="json") if row.fact_sheet else None,
+        "seed_fact": compact_seed_fact[0] if compact_seed_fact else None,
         "regime": regime,
     }
     digest = hashlib.sha1(

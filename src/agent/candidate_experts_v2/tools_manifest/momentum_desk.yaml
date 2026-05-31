@@ -64,26 +64,6 @@ tools:
       - 非 A 股个股（ETF/指数/港美股）不支持，返回空。
       - Tushare/数据源额度耗尽时返回空。
 
-  - tool: get_tushare_moneyflow_ths
-    priority: 10
-    when_to_use: >-
-      验证主力资金净流入持续性（THS 口径），判断资金是否真实承接。
-      连板/动量候选必须核查资金有无持续性。
-    typical_args:
-      stock_code: "{code}"
-    returns_summary: >-
-      返回近 5/10 日主力净流入额和方向。
-    key_fields:
-      - net_inflow
-      - net_5d_inflow
-      - direction
-    combo_hints:
-      - 资金连续净流入 + 涨势不散 = 承接真实。
-      - 单日大幅净流入后次日资金撤离 = 可能诱多。
-    cost: medium
-    failure_modes:
-      - Tushare 额度耗尽时返回空。
-
   - tool: get_tushare_moneyflow_dc
     priority: 12
     when_to_use: >-

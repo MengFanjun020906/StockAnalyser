@@ -43,6 +43,7 @@ from src.agent.candidate_experts_v2.experts.base import (
 from src.agent.candidate_experts_v2.runtime import run_experts_parallel
 from src.agent.candidate_experts_v2.schemas import (
     AggregatedCandidate,
+    ExpertPacketV2,
     FeatureRow,
     SeedItem,
 )
@@ -62,6 +63,7 @@ _STANCE_RANK: Dict[str, int] = {
 
 CommitteeOverallTimeoutSeconds = 90.0
 SEED_SOURCE_CAPS: Dict[str, int] = {
+    "user_watchlist": 20,
     "daily_screener": 20,
     "limit_up_pool": 10,
     "hot_rank": 8,
@@ -81,6 +83,7 @@ SEED_SOURCE_CAPS: Dict[str, int] = {
     "fallback": 4,
 }
 SEED_SOURCE_ORDER = [
+    "user_watchlist",
     "daily_screener",
     "fundamental_snapshot",
     "low_base_structure",
@@ -997,6 +1000,54 @@ def _build_seed_pool_result(
             return
         bucket.append(item)
 
+    user_seed_count = 0
+    for seed in _to_seed_items(seed_symbols, market):
+        before = len(seeds_by_source.get("user_watchlist", []))
+        _collect(seed)
+        after = len(seeds_by_source.get("user_watchlist", []))
+        if after > before:
+            user_seed_count += 1
+    if seed_symbols:
+        diagnostics.append(
+            _source_diagnostic(
+                "user_watchlist",
+                "ok" if user_seed_count else "empty",
+                count=user_seed_count,
+                detail={"requested_count": len([symbol for symbol in seed_symbols if str(symbol or "").strip()])},
+            )
+        )
+        source_quality["user_watchlist"] = _source_quality(
+            "ok" if user_seed_count else "empty",
+            freshness="request",
+        )
+    if user_seed_count >= max(1, int(total_limit or 1)):
+        result_pool = _assemble_seed_pool(
+            seeds_by_source,
+            total_limit=total_limit,
+            limit_per_source=limit_per_source,
+        )
+        hard_exclusion = {
+            "excluded_count": int(sum(exclusion_counts.values())),
+            "post_source_excluded_count": sum(exclusion_counts.values()),
+            "post_source_reasons": exclusion_counts,
+            "local_universe": local_hard_exclusion,
+        }
+        logger.info(
+            "seed pool built from user_watchlist only: total=%d hard_exclusion=%s elapsed_ms=%d preview=%s",
+            len(result_pool),
+            hard_exclusion,
+            int((time.time() - started) * 1000),
+            _seed_log_preview(result_pool),
+        )
+        return SeedPoolBuildResult(
+            seeds=result_pool,
+            diagnostics=diagnostics,
+            hard_exclusion=hard_exclusion,
+            source_quality=source_quality,
+            total_limit=total_limit,
+            market_regime=market_regime,
+        )
+
     # Use the most recent trading day for limit-up/hot-rank so weekend/holiday
     # runs still fetch real data from the last session.
     try:
@@ -1030,7 +1081,6 @@ def _build_seed_pool_result(
 
     # --- Source 3a: capital-flow anomaly rankings ---
     for tool_name, api_label in (
-        ("get_tushare_moneyflow_ths", "moneyflow_ths"),
         ("get_tushare_moneyflow_dc", "moneyflow_dc"),
     ):
         try:
@@ -2657,6 +2707,9 @@ def run_committee_discovery(
     prebuilt_seeds: Optional[Sequence[SeedItem]] = None,
     seed_pool_result: Optional[SeedPoolBuildResult] = None,
     enable_seed_gate: bool = True,
+    seed_fact_tools: Optional[Sequence[str]] = None,
+    seed_fact_max_workers: int = 12,
+    seed_fact_tool_timeout_seconds: float = 12.0,
 ) -> Dict[str, Any]:
     """Run the LLM expert committee and return a discover-compatible payload.
 
@@ -2747,6 +2800,9 @@ def run_committee_discovery(
             overall_timeout_s=budget_remaining,
             seed_pool_result=build_result,
             prebuilt_seeds=seeds if build_result is None else None,
+            seed_fact_tools=seed_fact_tools,
+            seed_fact_max_workers=seed_fact_max_workers,
+            seed_fact_tool_timeout_seconds=seed_fact_tool_timeout_seconds,
         )
         # Merge thesis result into payload while preserving seed-pool diagnostics.
         # Empty desk output is a hard candidate-discovery failure, not permission
@@ -2873,6 +2929,9 @@ def run_thesis_desk_committee(
     allocation_json: Optional[str] = None,
     backfill_rules_json: Optional[str] = None,
     backfill_max: int = 3,
+    seed_fact_tools: Optional[Sequence[str]] = None,
+    seed_fact_max_workers: int = 12,
+    seed_fact_tool_timeout_seconds: float = 12.0,
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
 
@@ -2890,6 +2949,11 @@ def run_thesis_desk_committee(
     from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
     from src.agent.candidate_experts_v2.experts.quality_repair_desk import QualityRepairDeskExpert
     from src.agent.candidate_experts_v2.recall import build_recall_pool
+    from src.agent.candidate_experts_v2.seed_facts import (
+        build_seed_fact_packets_parallel,
+        compact_seed_fact_packets_for_model,
+        summarize_seed_fact_packets,
+    )
 
     started = time.time()
     market_value = (market or "cn").strip().lower() or "cn"
@@ -2938,7 +3002,38 @@ def run_thesis_desk_committee(
         payload["thesis_desk_committee_elapsed_ms"] = int((time.time() - started) * 1000)
         return payload
 
-    # ── Step 2: run desks in parallel ────────────────────────────────────
+    # ── Step 2: build shared seed facts before desks ─────────────────────
+    seed_fact_packets = build_seed_fact_packets_parallel(
+        rows,
+        tool_registry=tool_registry,
+        tools=seed_fact_tools,
+        max_workers=seed_fact_max_workers,
+        tool_timeout_seconds=seed_fact_tool_timeout_seconds,
+    )
+    packet_by_code = {packet.code: packet for packet in seed_fact_packets}
+    for row in rows:
+        row.seed_fact = packet_by_code.get(row.code)
+    seed_fact_summary = summarize_seed_fact_packets(seed_fact_packets)
+    payload["seed_fact_summary"] = seed_fact_summary
+    payload["seed_fact_packets"] = compact_seed_fact_packets_for_model(
+        seed_fact_packets,
+        limit=len(seed_fact_packets),
+    )
+    payload["discovery_steps"].append(
+        {
+            "source": "seed_facts",
+            "status": "ok" if seed_fact_summary.get("ok") else "partial",
+            "dimension": "pre_desk_facts",
+            "total": seed_fact_summary.get("total"),
+            "ok": seed_fact_summary.get("ok"),
+            "partial": seed_fact_summary.get("partial"),
+            "failed": seed_fact_summary.get("failed"),
+            "elapsed_ms": seed_fact_summary.get("elapsed_ms"),
+            "packets_ref": "seed_facts.json",
+        }
+    )
+
+    # ── Step 3: run desks in parallel ────────────────────────────────────
     try:
         llm_callable = _coerce_llm_callable(llm_adapter)
     except Exception as exc:
@@ -2954,27 +3049,51 @@ def run_thesis_desk_committee(
     if today:
         prompt_variables["today"] = today
 
-    early_turn_desk = EarlyTurnDeskExpert(
-        tool_registry=tool_registry,
-        tool_decls=tdecls,
-        llm=llm_callable,
-        prompt_variables=prompt_variables,
-        fallback_supplement_n=desk_fallback_supplement_n,
-    )
-    momentum_desk = MomentumDeskExpert(
-        tool_registry=tool_registry,
-        tool_decls=tdecls,
-        llm=llm_callable,
-        prompt_variables=prompt_variables,
-        fallback_supplement_n=desk_fallback_supplement_n,
-    )
-    quality_repair_desk = QualityRepairDeskExpert(
-        tool_registry=tool_registry,
-        tool_decls=tdecls,
-        llm=llm_callable,
-        prompt_variables=prompt_variables,
-        fallback_supplement_n=desk_fallback_supplement_n,
-    )
+    try:
+        early_turn_desk = EarlyTurnDeskExpert(
+            tool_registry=tool_registry,
+            tool_decls=tdecls,
+            llm=llm_callable,
+            prompt_variables=prompt_variables,
+            fallback_supplement_n=desk_fallback_supplement_n,
+        )
+        momentum_desk = MomentumDeskExpert(
+            tool_registry=tool_registry,
+            tool_decls=tdecls,
+            llm=llm_callable,
+            prompt_variables=prompt_variables,
+            fallback_supplement_n=desk_fallback_supplement_n,
+        )
+        quality_repair_desk = QualityRepairDeskExpert(
+            tool_registry=tool_registry,
+            tool_decls=tdecls,
+            llm=llm_callable,
+            prompt_variables=prompt_variables,
+            fallback_supplement_n=desk_fallback_supplement_n,
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.warning("thesis_desk_committee: desk init failed: %s\n%s", exc, tb)
+        payload["status"] = "failed"
+        payload["error"] = f"desk init failed: {exc}"
+        payload["traceback"] = tb
+        payload["thesis_desk_diagnostics"] = [
+            {
+                "desk": "all",
+                "status": "failed",
+                "errors": [str(exc)],
+            }
+        ]
+        payload["thesis_desk_committee_elapsed_ms"] = int((time.time() - started) * 1000)
+        payload["discovery_steps"].append(
+            {
+                "source": "thesis_desk_committee",
+                "status": "failed",
+                "dimension": "desk_init",
+                "error": str(exc),
+            }
+        )
+        return payload
 
     budget = max(10.0, overall_timeout_s - (time.time() - started))
     desk_deadline_s = time.time() + max(1.0, budget - 1.0)

@@ -374,6 +374,7 @@ class LLMToolAdapter:
         hit_rate_limit = False
         for idx, model in enumerate(models_to_try):
             remaining_timeout = timeout
+            model_timeout = timeout
             if timeout is not None and timeout > 0:
                 remaining_timeout = max(0.0, float(timeout) - (time.time() - started_at))
                 if remaining_timeout <= 0:
@@ -381,6 +382,8 @@ class LLMToolAdapter:
                         f"LLM completion timed out before trying fallback model {model}"
                     )
                     break
+                remaining_models = max(1, len(models_to_try) - idx)
+                model_timeout = remaining_timeout / remaining_models
             try:
                 return self._call_litellm_model_with_hard_timeout(
                     messages,
@@ -388,7 +391,7 @@ class LLMToolAdapter:
                     model,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=remaining_timeout,
+                    timeout=model_timeout,
                     response_format=response_format,
                 )
             except Exception as e:

@@ -39,7 +39,7 @@ _DESK_DIM_TOOL_MAP: Dict[str, Dict[str, Set[str]]] = {
     "momentum_desk": {
         "trend":     {"analyze_trend"},
         "volume":    {"get_volume_analysis"},
-        "capital":   {"get_tushare_moneyflow_ths", "get_tushare_moneyflow_dc", "get_capital_flow"},
+        "capital":   {"get_tushare_moneyflow_dc", "get_capital_flow"},
         "structure": {"get_tushare_limit_step", "get_tushare_dragon_tiger_list",
                       "get_tushare_dragon_tiger_inst", "get_tushare_limit_list_d"},
     },

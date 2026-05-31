@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.evidence import build_evidence_cards_for_stock
 from src.agent.evidence.adapter import cards_to_json
+from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
 from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
 from src.agent.multi_expert import AgentState, ExpertOrchestrator
 from src.agent.runner import try_parse_json
@@ -28,7 +29,9 @@ from src.agent.stock_selection_prompts import (
     build_candidate_screening_prompt,
     build_deep_dive_prompt,
     build_judge_decision_prompt,
+    build_meta_orchestrator_prompt,
     build_portfolio_allocation_prompt,
+    build_pricing_agent_prompt,
 )
 from src.agent.tools.registry import ToolRegistry
 from src.config import Config
@@ -41,6 +44,9 @@ SELECTION_INTENT = "watchlist_scan"
 DEFAULT_CANDIDATE_LIMIT = 8
 DISCOVERY_RECALL_LIMIT = 20
 DEFAULT_DEEP_DIVE_LIMIT = 8
+PROMPT_STOCK_LIMIT = 5
+PROMPT_SCENARIO_LIMIT = 3
+PROMPT_CONSTRAINT_LIMIT = 4
 MIN_RICH_REPORT_DEEP_DIVE_TARGETS = 3
 FAILED_TOOL_STATUSES = {"failed", "error", "tool_failed", "timeout"}
 CONDITIONAL_ENTRY_SCORE_MIN_DEFAULT = 88.0
@@ -441,6 +447,30 @@ def run_stock_selection_pipeline(
         ctx.set_stage("single_stock_deep_dive", deep_dive_stage)
         _emit(progress_callback, "selection_deep_dive_done", payload=ctx.stages["single_stock_deep_dive"].to_dict(include_full=False))
 
+        meta_payload = _call_stage_json(
+            ctx=ctx,
+            llm_adapter=llm_adapter,
+            stage_name="meta_orchestrator",
+            prompt=build_meta_orchestrator_prompt(_build_meta_orchestrator_input(ctx)),
+            fallback=_fallback_meta_orchestrator(ctx),
+            timeout_seconds=timeout_seconds,
+        )
+        _enforce_stage_stock_identity(ctx, meta_payload, "meta_orchestrator")
+        ctx.set_stage("meta_orchestrator", meta_payload)
+        _emit(progress_callback, "selection_meta_orchestrator_done", payload=ctx.stages["meta_orchestrator"].to_dict(include_full=False))
+
+        pricing_payload = _call_stage_json(
+            ctx=ctx,
+            llm_adapter=llm_adapter,
+            stage_name="pricing_agent",
+            prompt=build_pricing_agent_prompt(_build_pricing_agent_input(ctx)),
+            fallback=_fallback_pricing_agent(ctx),
+            timeout_seconds=timeout_seconds,
+        )
+        _enforce_stage_stock_identity(ctx, pricing_payload, "pricing_agent")
+        ctx.set_stage("pricing_agent", pricing_payload)
+        _emit(progress_callback, "selection_pricing_agent_done", payload=ctx.stages["pricing_agent"].to_dict(include_full=False))
+
         allocation_payload = _call_stage_json(
             ctx=ctx,
             llm_adapter=llm_adapter,
@@ -450,6 +480,10 @@ def run_stock_selection_pipeline(
                 "account_summary": ctx.account_summary,
                 "investor_profile": ctx.investor_profile,
                 "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
                 "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
                 "balanced_candidate_evidence_ref": "candidate_evidence.md",
                 "market_regime": _summarize_market_regime(ctx.market_regime),
@@ -477,6 +511,10 @@ def run_stock_selection_pipeline(
                 "balanced_candidate_evidence_ref": "candidate_evidence.md",
                 "screening_summary": ctx.stage_summary("candidate_screening"),
                 "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
                 "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
                 "market_regime": _summarize_market_regime(ctx.market_regime),
                 "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
@@ -497,6 +535,10 @@ def run_stock_selection_pipeline(
                 "account_summary": ctx.account_summary,
                 "investor_profile": ctx.investor_profile,
                 "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
+                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
                 "opposing_review_summary": ctx.stage_summary("adversarial_review"),
                 "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
                 "balanced_candidate_evidence_ref": "candidate_evidence.md",
@@ -548,6 +590,8 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     allocation = report.get("portfolio_allocation", {}).get("summary", {})
     positions = report.get("portfolio_allocation", {}).get("full", {}).get("positions_plan", [])
     adversarial = report.get("adversarial_review", {}).get("summary", {})
+    meta_summary = report.get("meta_orchestrator", {}).get("summary", {})
+    pricing_summary = report.get("pricing_agent", {}).get("summary", {})
     discovery = report.get("candidate_discovery", {})
     discovery_summary = discovery.get("summary") if isinstance(discovery.get("summary"), dict) else {}
     discovery_full = discovery.get("full") if isinstance(discovery.get("full"), dict) else {}
@@ -602,6 +646,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         item for item in recommendations
         if not item.get("has_deep_dive") and _execution_mode(item) not in {"immediate_open", "conditional_open"} and _is_observable_item(item)
     ]
+    displayed_recommendations = recommended_items[:5]
 
     lines = [
         "# 选股分析报告：下周可关注候选",
@@ -618,17 +663,22 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         f"| 最大约束 | {_markdown_cell(allocation.get('main_constraint') or '-')} |",
         f"| 候选池规模 | {_markdown_cell(discovery_summary.get('source_count') or discovery.get('candidate_count') or candidate_quality.get('candidate_count') or len(candidates))} 只 |",
         "",
-        "## 二、推荐排序与入场决策" if execution_recommendations else "## 二、深挖结果与等待/排除决策",
-        "",
     ]
 
-    if recommended_items:
+    lines.extend(_render_meta_agent_chain_section(report, recommendations=displayed_recommendations))
+
+    lines.extend([
+        "## 三、推荐排序与入场决策" if execution_recommendations else "## 三、深挖结果与等待/排除决策",
+        "",
+    ])
+
+    if displayed_recommendations:
         if not execution_recommendations:
             lines.extend([
                 "本轮深挖对象已完成取证，但当前没有形成可执行开仓计划。以下内容用于展示观察、等待或排除结论，不代表立即买入排序。",
                 "",
             ])
-        for idx, item in enumerate(recommended_items[:4], start=1):
+        for idx, item in enumerate(displayed_recommendations, start=1):
             lines.extend(_render_recommendation_block(idx, item))
     else:
         lines.extend([
@@ -658,7 +708,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 三、Execute 证据摘要",
+        "## 四、Execute 证据摘要",
         "",
         "| 证据项 | 状态 | 关键结果 | 对选股结论的影响 |",
         "| --- | --- | --- | --- |",
@@ -675,7 +725,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 四、关键风险与等待确认",
+        "## 五、关键风险与等待确认",
         "",
     ])
     risk_lines = _final_risk_lines(recommendations, adversarial, all_missing)
@@ -686,7 +736,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 五、组合配置表",
+        "## 六、组合配置表",
         "",
         "| 排名 | 股票 | 动作 | 首仓比例 | 入场条件 | 止损条件 | 复查触发 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
@@ -709,13 +759,15 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 六、辅助审查摘要",
+        "## 七、辅助审查摘要",
         "",
         "反方审查和 Judge 裁决只作为主方案的校验层，完整原始输出保留在 Trace artifact 中。",
         "",
         "| 审查项 | 摘要 |",
         "| --- | --- |",
         f"| 辅助审查 | {_markdown_cell(review_note)} |",
+        f"| Meta 场景约束 | {_markdown_cell(_brief_markdown_text(_meta_report_note(meta_summary), 180))} |",
+        f"| 点位计算条件单 | {_markdown_cell(_brief_markdown_text(_pricing_report_note(pricing_summary), 180))} |",
         f"| 反方提醒 | {_markdown_cell(_brief_markdown_text(adversarial.get('opposing_summary') or '-', 180))} |",
         f"| Judge 调整 | {_markdown_cell(_brief_markdown_text(judge.get('decision_summary') or '-', 180))} |",
     ])
@@ -823,6 +875,297 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         lines.extend(["", "## 附录三、风控条件"])
         lines.extend([f"- {item}" for item in risk_controls])
     return "\n".join(lines).strip()
+
+
+def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations: List[Dict[str, Any]]) -> List[str]:
+    """Render the three-desk -> Meta -> point-calculation handoff without extra tool calls."""
+
+    meta_full = report.get("meta_orchestrator", {}).get("full", {})
+    pricing_full = report.get("pricing_agent", {}).get("full", {})
+    packages = meta_full.get("packages") if isinstance(meta_full, dict) and isinstance(meta_full.get("packages"), list) else []
+    matrix = (
+        pricing_full.get("if_then_order_matrix")
+        if isinstance(pricing_full, dict) and isinstance(pricing_full.get("if_then_order_matrix"), list)
+        else []
+    )
+    desk_by_code = _desk_opinions_by_code(report)
+    package_by_code = {
+        _normalize_stock_identity_code((item.get("stock") or {}).get("code")): item
+        for item in packages
+        if isinstance(item, dict) and isinstance(item.get("stock"), dict)
+    }
+    pricing_by_code = {
+        _normalize_stock_identity_code(item.get("code")): item
+        for item in matrix
+        if isinstance(item, dict) and _normalize_stock_identity_code(item.get("code"))
+    }
+    recommendation_by_code = {
+        _normalize_stock_identity_code(item.get("code")): item
+        for item in recommendations
+        if isinstance(item, dict) and _normalize_stock_identity_code(item.get("code"))
+    }
+    sorted_pricing_codes = [
+        _normalize_stock_identity_code(item.get("code"))
+        for item in sorted(matrix, key=_point_calc_item_rank, reverse=True)
+        if isinstance(item, dict)
+    ]
+    codes: List[str] = []
+    for source in (list(recommendation_by_code), sorted_pricing_codes, list(package_by_code), list(desk_by_code)):
+        for code in source:
+            if code and code not in codes:
+                codes.append(code)
+            if len(codes) >= 5:
+                break
+        if len(codes) >= 5:
+            break
+
+    lines = [
+        "## 二、Meta-Agent 选股链路",
+        "",
+        "本节只复用三席位、Meta-Agent、点位计算层已落盘结果，不重新抓取数据。字段缺失会直接标为缺失，不用隐含假设补齐。",
+        "",
+        "### 字段说明",
+        "",
+        "| 字段 | 在报告中的作用 |",
+        "| --- | --- |",
+        "| 三席位意见 | 展示低位启动、动量、质量修复三个打法对同一股票的支持、观察、反对或拒绝。 |",
+        "| `meta_analysis.factual_consensus` | Meta-Agent 从三席位和深挖结果里抽出的事实共识，只陈述事实。 |",
+        "| `meta_analysis.strategic_divergence` | 三席位之间的主观分歧，说明为什么不能把单一席位意见直接当买入结论。 |",
+        "| `asset_regime` | Meta-Agent 给股票打的机会类型标签，用来决定后续点位计算层要算哪类剧本。 |",
+        "| `hard_constraints_for_pricing_agent` | 传给点位计算层的硬约束包，包括失效位、均值回归锚点、禁追高和风险边界。 |",
+        "| `required_pricing_scenarios` | Meta-Agent 强制点位计算层必算的顺势、衰竭、回归等场景。 |",
+        "| `if_then_order_matrix` | 点位计算层按硬约束生成的 If-Then 条件单矩阵，Judge 必须按它降级或采纳。 |",
+        "",
+    ]
+
+    if not codes:
+        lines.extend([
+            "### 链路状态",
+            "",
+            "- 缺失：本轮没有形成 Meta-Agent 包或点位计算条件单，报告不能给出入场区间、止盈止损。",
+            "",
+        ])
+        return lines
+
+    for idx, code in enumerate(codes, start=1):
+        package = package_by_code.get(code) or {}
+        stock = package.get("stock") if isinstance(package.get("stock"), dict) else {}
+        pricing = pricing_by_code.get(code) or {}
+        rec = recommendation_by_code.get(code) or {}
+        name = stock.get("name") or pricing.get("name") or rec.get("name") or ""
+        lines.extend([
+            f"### {idx}. {_markdown_cell(f'{code} {name}'.strip())}",
+            "",
+            "#### 三席位意见",
+            "",
+            "| 席位 | 输出意见 | 处理结果 | 核心理由 |",
+            "| --- | --- | --- | --- |",
+        ])
+        desk_rows = desk_by_code.get(code) or []
+        if desk_rows:
+            for row in desk_rows:
+                lines.append(
+                    "| {desk} | {stance} | {status} | {reason} |".format(
+                        desk=_markdown_cell(row.get("desk") or "-"),
+                        stance=_markdown_cell(row.get("stance") or "-"),
+                        status=_markdown_cell(row.get("status") or "-"),
+                        reason=_markdown_cell(_brief_markdown_text(row.get("reason") or "-", 180)),
+                    )
+                )
+        else:
+            lines.append("| - | 缺失 | 缺失 | 本轮 candidate_discovery 未落盘 thesis_desk_packets。 |")
+
+        meta = package.get("meta_analysis") if isinstance(package.get("meta_analysis"), dict) else {}
+        market = package.get("market_context") if isinstance(package.get("market_context"), dict) else {}
+        lines.extend([
+            "",
+            "#### Meta-Agent 约束包",
+            "",
+            "| 项目 | 内容 |",
+            "| --- | --- |",
+            f"| 资产定性 | {_markdown_cell(meta.get('asset_regime') or pricing.get('asset_regime') or '缺失：asset_regime 未返回')} |",
+            f"| 事实共识 | {_markdown_cell(_join_limited(meta.get('factual_consensus'), 3, '缺失：factual_consensus 未返回'))} |",
+            f"| 策略分歧 | {_markdown_cell(meta.get('strategic_divergence') or '缺失：strategic_divergence 未返回')} |",
+            f"| 市场环境 | {_markdown_cell(_market_context_text(market))} |",
+        ])
+        constraints = package.get("hard_constraints_for_pricing_agent") if isinstance(package.get("hard_constraints_for_pricing_agent"), dict) else {}
+        lines.extend(_render_meta_constraints_rows(constraints))
+
+        scenarios = package.get("required_pricing_scenarios") if isinstance(package.get("required_pricing_scenarios"), list) else []
+        if scenarios:
+            lines.extend([
+                "",
+                "Meta 必算场景：",
+            ])
+            for scenario in scenarios[:5]:
+                if not isinstance(scenario, dict):
+                    continue
+                lines.append(
+                    f"- {_markdown_cell(scenario.get('scenario_name') or 'Unnamed')}: "
+                    f"{_markdown_cell(scenario.get('condition') or '缺失 condition')}；"
+                    f"{_markdown_cell(scenario.get('required_output') or '缺失 required_output')}"
+                )
+        else:
+            lines.extend(["", "- 缺失：Meta-Agent 未返回 required_pricing_scenarios。"])
+
+        lines.extend([
+            "",
+            "#### 点位计算 If-Then 条件单",
+            "",
+            "| 场景 | 条件 | 动作 | 入场区间 | 止盈目标 | 止损/失效 | 备注 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        pricing_scenarios = pricing.get("scenarios") if isinstance(pricing.get("scenarios"), list) else []
+        if pricing_scenarios:
+            for scenario in pricing_scenarios[:5]:
+                if not isinstance(scenario, dict):
+                    continue
+                lines.append(
+                    "| {name} | {condition} | {action} | {entry} | {target} | {stop} | {comment} |".format(
+                        name=_markdown_cell(scenario.get("scenario_name") or "-"),
+                        condition=_markdown_cell(scenario.get("condition") or "-"),
+                        action=_markdown_cell(scenario.get("action") or "-"),
+                        entry=_markdown_cell(_pricing_entry_text(scenario, rec)),
+                        target=_markdown_cell(_pricing_take_profit_text(scenario, rec)),
+                        stop=_markdown_cell(_pricing_stop_text(scenario, rec)),
+                        comment=_markdown_cell(_brief_markdown_text(scenario.get("risk_reward_comment") or "-", 160)),
+                    )
+                )
+        else:
+            lines.append("| - | 缺失 | - | 缺失：点位计算层未返回 scenarios | 缺失 | 缺失 | 不生成条件单。 |")
+        warnings = _as_text_list(pricing.get("pricing_warnings"))
+        if warnings:
+            lines.extend(["", "点位计算警告："])
+            lines.extend([f"- {_markdown_cell(_brief_markdown_text(item, 180))}" for item in warnings[:4]])
+        lines.append("")
+    return lines
+
+
+def _desk_opinions_by_code(report: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    discovery_full = report.get("candidate_discovery", {}).get("full", {})
+    packets = (
+        discovery_full.get("thesis_desk_packets")
+        if isinstance(discovery_full, dict) and isinstance(discovery_full.get("thesis_desk_packets"), list)
+        else []
+    )
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for packet in packets:
+        if not isinstance(packet, dict):
+            continue
+        desk = str(packet.get("expert") or "-")
+        for bucket, status_label in (("candidates", "入选"), ("rejected", "反对/拒绝")):
+            rows = packet.get(bucket) if isinstance(packet.get(bucket), list) else []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+                if not code:
+                    continue
+                by_code.setdefault(code, []).append({
+                    "desk": desk,
+                    "stance": item.get("stance") or "-",
+                    "status": status_label,
+                    "reason": item.get("reason") or _first_text(item.get("risks")) or "-",
+                })
+    return by_code
+
+
+def _join_limited(value: Any, limit: int, missing_text: str) -> str:
+    items = _as_text_list(value)
+    return "；".join(items[:limit]) if items else missing_text
+
+
+def _market_context_text(market: Dict[str, Any]) -> str:
+    if not isinstance(market, dict) or not market:
+        return "缺失：market_context 未返回"
+    parts = [
+        f"regime={market.get('market_regime')}" if market.get("market_regime") else "",
+        f"volatility={market.get('volatility_bucket')}" if market.get("volatility_bucket") else "",
+        f"risk={market.get('risk_level')}" if market.get("risk_level") else "",
+        str(market.get("regime_weight_adjustment") or ""),
+    ]
+    text = "；".join(part for part in parts if part)
+    warnings = _as_text_list(market.get("market_context_warnings"))
+    if warnings:
+        text = f"{text}；{'；'.join(warnings[:2])}" if text else "；".join(warnings[:2])
+    return text or "缺失：market_context 未返回可读字段"
+
+
+def _render_meta_constraints_rows(constraints: Dict[str, Any]) -> List[str]:
+    if not isinstance(constraints, dict) or not constraints:
+        return ["| 硬约束 | 缺失：hard_constraints_for_pricing_agent 未返回 |"]
+    rows: List[str] = []
+    invalidation = constraints.get("invalidation_level") if isinstance(constraints.get("invalidation_level"), dict) else {}
+    anchor = constraints.get("mean_reversion_anchor") if isinstance(constraints.get("mean_reversion_anchor"), dict) else {}
+    premium = constraints.get("max_chase_premium") if isinstance(constraints.get("max_chase_premium"), dict) else constraints.get("max_chase_premium")
+    rows.append(f"| 失效位 | {_markdown_cell(_constraint_text(invalidation, '缺失：invalidation_level 未返回'))} |")
+    rows.append(f"| 均值回归锚点 | {_markdown_cell(_constraint_text(anchor, '缺失：mean_reversion_anchor 未返回'))} |")
+    rows.append(f"| 禁追高 | {_markdown_cell(_premium_constraint_text(premium))} |")
+    risk_constraints = constraints.get("risk_constraints") if isinstance(constraints.get("risk_constraints"), list) else []
+    rows.append(f"| 风险边界 | {_markdown_cell(_join_limited(risk_constraints, 4, '缺失：risk_constraints 未返回'))} |")
+    return rows
+
+
+def _constraint_text(value: Dict[str, Any], missing_text: str) -> str:
+    if not isinstance(value, dict) or not value:
+        return missing_text
+    bits = []
+    if value.get("price") not in (None, ""):
+        bits.append(f"price={value.get('price')}")
+    if value.get("value") not in (None, ""):
+        bits.append(f"value={value.get('value')}")
+    if value.get("reason"):
+        bits.append(str(value.get("reason")))
+    if value.get("source"):
+        bits.append(f"source={value.get('source')}")
+    return "；".join(bits) if bits else missing_text
+
+
+def _premium_constraint_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return _constraint_text(value, "缺失：max_chase_premium 未返回")
+    if value not in (None, ""):
+        return str(value)
+    return "缺失：max_chase_premium 未返回"
+
+
+def _pricing_entry_text(scenario: Dict[str, Any], rec: Dict[str, Any]) -> str:
+    for key in ("entry_zone", "entry_condition"):
+        if _has_text_value(scenario.get(key)):
+            return str(scenario.get(key))
+    action = str(scenario.get("action") or "").strip().lower()
+    if action in {"monitor", "plain_wait", "wait"}:
+        return "不入场，仅监控触发条件"
+    for key in ("entry_condition", "ideal_entry_zone", "pullback_trigger", "breakout_trigger"):
+        if _has_text_value(rec.get(key)):
+            return str(rec.get(key))
+    return "缺失：未给出可执行入场区间"
+
+
+def _pricing_take_profit_text(scenario: Dict[str, Any], rec: Dict[str, Any]) -> str:
+    for key in ("take_profit", "take_profit_condition", "target", "target_zone"):
+        if _has_text_value(scenario.get(key)):
+            return str(scenario.get(key))
+    action = str(scenario.get("action") or "").strip().lower()
+    if action in {"monitor", "plain_wait"}:
+        return "不适用：该场景不生成开仓单"
+    if _has_text_value(rec.get("take_profit_condition")):
+        return str(rec.get("take_profit_condition"))
+    targets = [str(rec.get(key)) for key in ("target_1", "target_2", "take_profit_condition") if _has_text_value(rec.get(key))]
+    return " / ".join(targets) if targets else "缺失：点位计算/深挖未给出止盈目标"
+
+
+def _pricing_stop_text(scenario: Dict[str, Any], rec: Dict[str, Any]) -> str:
+    values = []
+    for key in ("stop_loss", "failure_condition"):
+        if _has_text_value(scenario.get(key)):
+            values.append(str(scenario.get(key)))
+    if not values:
+        for key in ("stop_loss_condition", "stop_loss", "failure_condition"):
+            if _has_text_value(rec.get(key)):
+                values.append(str(rec.get(key)))
+    text = "；".join(dict.fromkeys(values))
+    return _brief_markdown_text(text, 260) if text else "缺失：未给出止损/失效条件"
 
 
 APPENDIX_SEPARATOR = "<!-- APPENDIX_SEPARATOR -->"
@@ -1018,6 +1361,10 @@ def _ensure_failure_judge_stage(ctx: SelectionRunContext, error: str) -> None:
             },
             "full_ref": "judge_decision.json",
         })
+    if "meta_orchestrator" not in ctx.stages:
+        ctx.set_stage("meta_orchestrator", _fallback_meta_orchestrator(ctx))
+    if "pricing_agent" not in ctx.stages:
+        ctx.set_stage("pricing_agent", _fallback_pricing_agent(ctx))
     if "portfolio_allocation" not in ctx.stages:
         ctx.set_stage("portfolio_allocation", _fallback_portfolio_allocation(ctx))
     if "adversarial_review" not in ctx.stages:
@@ -1033,27 +1380,48 @@ def _call_stage_json(
     fallback: Dict[str, Any],
     timeout_seconds: Optional[float],
 ) -> Dict[str, Any]:
-    response = llm_adapter.call_text(
-        [
-            {
-                "role": "system",
-                "content": "你是账户感知股票选股流水线中的阶段 Agent。只输出 JSON，不输出 Markdown。",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        timeout=timeout_seconds,
-    )
-    _accumulate_usage(ctx, response)
-    parsed = try_parse_json(response.content or "")
+    raw_text = ""
+    parsed: Dict[str, Any] = {}
+    stage_error: Optional[str] = None
+    try:
+        response = llm_adapter.call_text(
+            [
+                {
+                    "role": "system",
+                    "content": "你是账户感知股票选股流水线中的阶段 Agent。只输出 JSON，不输出 Markdown。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            timeout=timeout_seconds,
+        )
+        _accumulate_usage(ctx, response)
+        raw_text = response.content or ""
+        parsed = try_parse_json(raw_text) or {}
+    except StopIteration as exc:
+        stage_error = f"llm_stage_call_failed: {exc}"
+        parsed = {}
     if not parsed:
         parsed = dict(fallback)
         parsed.setdefault("full", {})
         parsed["full"].setdefault("tool_failures", [])
         parsed["full"]["tool_failures"].append({
             "stage": stage_name,
-            "error": "llm_json_parse_failed",
-            "raw": _truncate(response.content or "", 1000),
+            "error": stage_error or "llm_json_parse_failed",
+            "raw": _truncate(raw_text, 1000),
         })
+    else:
+        parsed_stage = str(parsed.get("stage") or "")
+        expected_stage = stage_name.split(":", 1)[0]
+        if parsed_stage and parsed_stage != stage_name and parsed_stage != expected_stage:
+            original = parsed
+            parsed = dict(fallback)
+            parsed.setdefault("full", {})
+            parsed["full"].setdefault("tool_failures", [])
+            parsed["full"]["tool_failures"].append({
+                "stage": stage_name,
+                "error": f"llm_stage_mismatch:{parsed_stage}",
+                "raw": _truncate(json.dumps(original, ensure_ascii=False, default=str), 1000),
+            })
     return _normalize_stage_payload(parsed, fallback=fallback)
 
 
@@ -1511,12 +1879,18 @@ def _run_candidate_discovery_tool(
                     pass
             from src.agent.candidate_experts_v2.committee import _build_seed_pool_result
             today_str = datetime.now().strftime("%Y%m%d")
+            try:
+                seed_pool_total_limit = int(
+                    getattr(Config.get_instance(), "agent_seed_pool_total_limit", 20) or 20
+                )
+            except Exception:
+                seed_pool_total_limit = 20
             seed_pool_result = _build_seed_pool_result(
                 market=ctx.market,
                 seed_symbols=target_symbols,
                 tool_registry=tool_registry,  # original ToolRegistry with .execute()
                 today=today_str,
-                total_limit=20,
+                total_limit=max(1, min(40, seed_pool_total_limit)),
             )
             _emit(
                 ctx.progress_callback,
@@ -1541,9 +1915,26 @@ def _run_candidate_discovery_tool(
                 tool_decls=tool_decls,
                 seed_pool_result=seed_pool_result,
                 overall_timeout_s=committee_timeout_s,
+                seed_fact_tools=getattr(Config.get_instance(), "agent_seed_fact_tools", None),
+                seed_fact_max_workers=int(
+                    getattr(Config.get_instance(), "agent_seed_fact_max_workers", 12) or 12
+                ),
+                seed_fact_tool_timeout_seconds=float(
+                    getattr(Config.get_instance(), "agent_seed_fact_tool_timeout_seconds", 12.0) or 12.0
+                ),
             )
             if not isinstance(payload, dict):
                 raise RuntimeError(f"committee discovery returned {type(payload).__name__}")
+            seed_fact_summary = payload.get("seed_fact_summary")
+            if isinstance(seed_fact_summary, dict):
+                _emit(
+                    ctx.progress_callback,
+                    "selection_seed_facts",
+                    payload={
+                        **seed_fact_summary,
+                        "packets": payload.get("seed_fact_packets") if isinstance(payload.get("seed_fact_packets"), list) else [],
+                    },
+                )
             _emit(
                 ctx.progress_callback,
                 "selection_seed_gate_done",
@@ -2300,6 +2691,8 @@ def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT
         "seed_pool_hard_exclusion": seed_result.get("seed_pool_hard_exclusion"),
         "seed_source_quality": seed_result.get("seed_source_quality"),
         "seed_market_regime": seed_result.get("seed_market_regime"),
+        "seed_fact_summary": seed_result.get("seed_fact_summary"),
+        "seed_fact_packets": _compact_seed_fact_packets(seed_result.get("seed_fact_packets")),
         "candidates": compact_candidates,
         "expert_packets": compact_expert_packets,
         "quality_summary": seed_result.get("quality_summary"),
@@ -2309,6 +2702,11 @@ def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT
         "theme_observations": _compact_theme_observations(seed_result),
         "errors": _as_text_list(seed_result.get("errors"))[:6],
     }
+
+
+def _compact_seed_fact_packets(value: Any, *, limit: int = DEFAULT_CANDIDATE_LIMIT) -> List[Dict[str, Any]]:
+    packets = value if isinstance(value, list) else []
+    return compact_seed_fact_packets_for_model(packets, limit=limit)
 
 
 def _compact_seed_pool_build_result(build_result: Any) -> Dict[str, Any]:
@@ -2988,8 +3386,672 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
     }
 
 
+def _build_meta_orchestrator_input(ctx: SelectionRunContext) -> Dict[str, Any]:
+    candidate_records = _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
+    code_order = _prompt_code_order(ctx)
+    deep_results = _order_rows_by_codes(
+        _deep_dive_results_for_meta(ctx),
+        code_order,
+        lambda item: item.get("code") if isinstance(item, dict) else None,
+    )[:PROMPT_STOCK_LIMIT]
+    selected_codes = {_normalize_stock_identity_code(item.get("code")) for item in deep_results if isinstance(item, dict)}
+    return {
+        "user_message": ctx.user_message,
+        "market": ctx.market,
+        "market_context": _summarize_market_regime(ctx.market_regime),
+        "candidate_discovery_summary": ctx.stage_summary("candidate_discovery"),
+        "candidate_screening_summary": ctx.stage_summary("candidate_screening"),
+        "desk_reports": _desk_reports_for_meta(candidate_records, deep_results),
+        "deep_dive_results": deep_results,
+        "fact_sheets": {
+            code: _truncate_nested_for_prompt(record.get("fact_sheet"))
+            for code, record in candidate_records.items()
+            if _normalize_stock_identity_code(code) in selected_codes and isinstance(record, dict) and isinstance(record.get("fact_sheet"), dict)
+        },
+        "seed_facts": {
+            code: _truncate_nested_for_prompt(record.get("seed_fact"))
+            for code, record in candidate_records.items()
+            if _normalize_stock_identity_code(code) in selected_codes and isinstance(record, dict) and isinstance(record.get("seed_fact"), dict)
+        },
+        "input_policy": {
+            "raw_tool_json": "not_passed",
+            "meta_agent_role": "asset_regime_and_constraint_packaging_only",
+            "point_calculation_role": "if_then_condition_order_math_only",
+            "stock_limit": PROMPT_STOCK_LIMIT,
+        },
+    }
+
+
+def _build_pricing_agent_input(ctx: SelectionRunContext) -> Dict[str, Any]:
+    return {
+        "user_message": ctx.user_message,
+        "market": ctx.market,
+        "market_context": _summarize_market_regime(ctx.market_regime),
+        "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+        "scenario_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+        "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+        "realtime_or_recent_evidence": _pricing_recent_evidence(ctx),
+        "account_summary": ctx.account_summary,
+        "investor_profile": ctx.investor_profile,
+    }
+
+
+def _short_list(value: Any, limit: int) -> List[Any]:
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if item not in (None, "")][:limit]
+    if value in (None, ""):
+        return []
+    return [value]
+
+
+def _first_number(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _compact_dimension_summary(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(item, dict):
+            continue
+        compact[str(key)] = {
+            "verdict": item.get("verdict"),
+            "summary": _truncate(str(item.get("summary") or ""), 180),
+        }
+    return compact
+
+
+def _compact_desk_evidence(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    for desk, rows in value.items():
+        items = []
+        for row in _short_list(rows, 4):
+            if isinstance(row, dict):
+                items.append({
+                    "tool": row.get("tool"),
+                    "summary": _truncate(str(row.get("summary") or row.get("reason") or ""), 180),
+                })
+            else:
+                items.append(_truncate(str(row), 180))
+        compact[str(desk)] = items
+    return compact
+
+
+def _asset_regime_from_setup(setup_type: str, item: Dict[str, Any], market: Dict[str, Any]) -> str:
+    regime = str(market.get("regime") or "").lower()
+    risk = str(market.get("risk_level") or "").lower()
+    if regime in {"risk_off", "panic", "trending_down"} or risk in {"high", "extreme"}:
+        return "Avoid_By_Market_Regime"
+    setup = str(setup_type or "").lower()
+    risks = " ".join(str(x) for x in _short_list(item.get("main_risks"), 8))
+    if setup in {"trend_continuation", "capital_momentum"}:
+        if any(token in risks for token in ("追高", "过热", "衰竭", "高位")):
+            return "Right_Side_Momentum_High_Exhaustion_Risk"
+        return "Right_Side_Momentum"
+    if setup == "early_turn":
+        return "Early_Turn_Low_Base_Confirmation"
+    if setup == "quality_repair":
+        return "Quality_Repair_Price_Not_Fully_Reflected"
+    if setup == "theme_follow":
+        return "Theme_Follow_Breadth_Dependent"
+    return "Unknown"
+
+
+def _meta_factual_consensus(item: Dict[str, Any], record: Dict[str, Any]) -> List[str]:
+    facts: List[str] = []
+    for key in ("ideal_entry_zone", "no_chase_line", "stop_loss", "failure_condition"):
+        value = item.get(key)
+        if value:
+            facts.append(f"{key}: {value}")
+    for evidence in _short_list(item.get("main_supporting_evidence"), 3):
+        facts.append(str(evidence))
+    if record.get("confidence") is not None:
+        facts.append(f"席位工具覆盖率 confidence={record.get('confidence')}")
+    return facts[:6] or ["深挖阶段已有结构化摘要,但事实共识不足。"]
+
+
+def _meta_divergence_text(record: Dict[str, Any], item: Dict[str, Any]) -> str:
+    desks = _short_list(record.get("desks"), 5)
+    primary = record.get("primary_desk") or record.get("setup_type") or "unknown"
+    risks = _short_list(item.get("main_risks") or record.get("risks"), 3)
+    if risks:
+        return f"主导席位为 {primary}, 但存在反方风险: {'; '.join(str(r) for r in risks)}"
+    if desks:
+        return f"主导席位为 {primary}, 参与席位 {', '.join(str(d) for d in desks)} 暂无显著冲突。"
+    return "席位分歧信息不足,按保守条件型约束处理。"
+
+
+def _opposing_desks(record: Dict[str, Any]) -> List[str]:
+    primary = str(record.get("primary_desk") or "")
+    return [str(desk) for desk in _short_list(record.get("desks"), 5) if str(desk) != primary]
+
+
+def _meta_regime_adjustment(market: Dict[str, Any]) -> str:
+    regime = str(market.get("regime") or "unknown")
+    if regime == "trending_up":
+        return "大盘偏强,可保留动量延续剧本,但仍需回踩确认和追高约束。"
+    if regime in {"range_bound", "high_volatility"}:
+        return "震荡或高波动环境,高位突破需按诱多风险处理,提高回撤确认要求。"
+    if regime in {"risk_off", "panic", "trending_down"}:
+        return "风险偏好下降,主动做多和追高信号降级,优先观察/防守。"
+    return "市场环境不明,所有场景按条件触发处理。"
+
+
+def _meta_risk_constraints(record: Dict[str, Any], item: Dict[str, Any], market: Dict[str, Any]) -> List[Dict[str, Any]]:
+    constraints: List[Dict[str, Any]] = []
+    for risk in _short_list(item.get("main_risks") or record.get("risks"), 5):
+        constraints.append({"constraint": str(risk), "source": "desk_or_deep_dive_risk"})
+    if item.get("no_chase_line"):
+        constraints.append({"constraint": f"超过追高线不得追高: {item.get('no_chase_line')}", "source": "deep_dive"})
+    regime = str(market.get("regime") or "")
+    if regime in {"risk_off", "panic", "trending_down"}:
+        constraints.append({"constraint": f"市场状态 {regime} 下不得主动追高或无条件开仓", "source": "detect_market_regime"})
+    return constraints[:8]
+
+
+def _default_required_pricing_scenarios() -> List[Dict[str, str]]:
+    return [
+        {
+            "scenario_name": "Breakout_Continuation",
+            "condition": "价格维持在结构失效位之上,且缩量回踩或放量续强",
+            "required_output": "计算右侧顺势入场区间、止损和最小盈亏比",
+        },
+        {
+            "scenario_name": "Fakeout_Exhaustion",
+            "condition": "价格放量跌破结构失效位",
+            "required_output": "计算退出条件、回避条件和风险提示;A股默认不生成做空执行单",
+        },
+        {
+            "scenario_name": "Mean_Reversion_Pullback",
+            "condition": "价格回落至均值回归锚点附近且未破前低",
+            "required_output": "计算低吸区间、防守止损位和确认条件",
+        },
+    ]
+
+
+def _main_meta_constraints(packages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    constraints: List[Dict[str, Any]] = []
+    for package in packages:
+        stock = package.get("stock") if isinstance(package.get("stock"), dict) else {}
+        hard = package.get("hard_constraints_for_pricing_agent") if isinstance(package.get("hard_constraints_for_pricing_agent"), dict) else {}
+        for key in ("invalidation_level", "mean_reversion_anchor", "max_chase_premium"):
+            value = hard.get(key)
+            if isinstance(value, dict):
+                constraints.append({
+                    "code": stock.get("code"),
+                    "constraint_type": key,
+                    "reason": value.get("reason") or value.get("value"),
+                })
+    return constraints[:12]
+
+
+def _meta_packages(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    full = ctx.stage_full("meta_orchestrator")
+    packages = full.get("packages") if isinstance(full, dict) else []
+    return [item for item in packages or [] if isinstance(item, dict)]
+
+
+def _prompt_code_order(ctx: SelectionRunContext) -> List[str]:
+    """Stable top-code order for prompt budgets: executable plans first, then upstream rank."""
+    order: List[str] = []
+
+    def add(raw_code: Any) -> None:
+        code = _normalize_stock_identity_code(raw_code)
+        if code and code not in order:
+            order.append(code)
+
+    for item in sorted(_pricing_matrix(ctx), key=_point_calc_item_rank, reverse=True):
+        add(item.get("code") if isinstance(item, dict) else None)
+    for package in _meta_packages(ctx):
+        stock = package.get("stock") if isinstance(package.get("stock"), dict) else {}
+        add(stock.get("code"))
+    for item in _deep_dive_results_for_meta(ctx):
+        add(item.get("code") if isinstance(item, dict) else None)
+    screening = ctx.stage_summary("candidate_screening")
+    for code in _short_list(screening.get("deep_dive_targets") if isinstance(screening, dict) else None, PROMPT_STOCK_LIMIT):
+        add(code)
+    for code in _candidate_records_by_code(ctx.stage_full("candidate_discovery")):
+        add(code)
+    return order[:PROMPT_STOCK_LIMIT]
+
+
+def _order_rows_by_codes(
+    rows: Sequence[Dict[str, Any]],
+    code_order: Sequence[str],
+    code_getter: Callable[[Dict[str, Any]], Any],
+) -> List[Dict[str, Any]]:
+    if not code_order:
+        return [item for item in rows if isinstance(item, dict)]
+    rank = {code: idx for idx, code in enumerate(code_order)}
+
+    def key(item: Dict[str, Any]) -> Tuple[int, int]:
+        code = _normalize_stock_identity_code(code_getter(item))
+        return (rank.get(code, len(rank) + 1), 0)
+
+    return sorted([item for item in rows if isinstance(item, dict)], key=key)
+
+
+def _truncate_nested_for_prompt(value: Any, *, max_depth: int = 4, max_items: int = 8, max_chars: int = 360) -> Any:
+    if max_depth <= 0:
+        return _truncate(str(value), max_chars)
+    if isinstance(value, dict):
+        compact: Dict[str, Any] = {}
+        for idx, (key, item) in enumerate(value.items()):
+            if idx >= max_items:
+                compact["_truncated_keys"] = max(0, len(value) - max_items)
+                break
+            compact[str(key)] = _truncate_nested_for_prompt(item, max_depth=max_depth - 1, max_items=max_items, max_chars=max_chars)
+        return compact
+    if isinstance(value, list):
+        compact_list = [
+            _truncate_nested_for_prompt(item, max_depth=max_depth - 1, max_items=max_items, max_chars=max_chars)
+            for item in value[:max_items]
+        ]
+        if len(value) > max_items:
+            compact_list.append({"_truncated_items": len(value) - max_items})
+        return compact_list
+    if isinstance(value, str):
+        return _truncate(value, max_chars)
+    return value
+
+
+def _compact_meta_packages_for_prompt(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    code_order = _prompt_code_order(ctx)
+    packages = _order_rows_by_codes(
+        _meta_packages(ctx),
+        code_order,
+        lambda item: (item.get("stock") or {}).get("code") if isinstance(item.get("stock"), dict) else None,
+    )[:PROMPT_STOCK_LIMIT]
+    compact: List[Dict[str, Any]] = []
+    for package in packages:
+        stock = package.get("stock") if isinstance(package.get("stock"), dict) else {}
+        meta = package.get("meta_analysis") if isinstance(package.get("meta_analysis"), dict) else {}
+        market = package.get("market_context") if isinstance(package.get("market_context"), dict) else {}
+        constraints = package.get("hard_constraints_for_pricing_agent") if isinstance(package.get("hard_constraints_for_pricing_agent"), dict) else {}
+        scenarios = package.get("required_pricing_scenarios") if isinstance(package.get("required_pricing_scenarios"), list) else []
+        compact.append({
+            "stock": {
+                "code": stock.get("code"),
+                "name": stock.get("name"),
+                "market": stock.get("market"),
+            },
+            "meta_analysis": {
+                "asset_regime": meta.get("asset_regime"),
+                "dominant_thesis": meta.get("dominant_thesis"),
+                "opposing_theses": _short_list(meta.get("opposing_theses"), PROMPT_CONSTRAINT_LIMIT),
+                "factual_consensus": [_truncate(str(item), 180) for item in _short_list(meta.get("factual_consensus"), PROMPT_CONSTRAINT_LIMIT)],
+                "strategic_divergence": _truncate(str(meta.get("strategic_divergence") or ""), 240),
+            },
+            "market_context": _truncate_nested_for_prompt(market, max_depth=2, max_items=6, max_chars=180),
+            "hard_constraints_for_pricing_agent": _truncate_nested_for_prompt(
+                constraints,
+                max_depth=3,
+                max_items=6,
+                max_chars=220,
+            ),
+            "required_pricing_scenarios": [
+                {
+                    "scenario_name": scenario.get("scenario_name"),
+                    "condition": _truncate(str(scenario.get("condition") or ""), 180),
+                    "required_output": _truncate(str(scenario.get("required_output") or ""), 180),
+                }
+                for scenario in scenarios[:PROMPT_SCENARIO_LIMIT]
+                if isinstance(scenario, dict)
+            ],
+        })
+    return compact
+
+
+def _pricing_recent_evidence(ctx: SelectionRunContext) -> Dict[str, Any]:
+    deep_results = _deep_dive_results_for_meta(ctx)
+    code_order = set(_prompt_code_order(ctx))
+    return {
+        item.get("code"): {
+            "quote_basis": item.get("quote_basis"),
+            "ideal_entry_zone": item.get("ideal_entry_zone"),
+            "stop_loss": item.get("stop_loss"),
+            "no_chase_line": item.get("no_chase_line"),
+        }
+        for item in deep_results
+        if item.get("code") and _normalize_stock_identity_code(item.get("code")) in code_order
+    }
+
+
+def _pricing_action_for_scenario(name: str, asset_regime: str, market_regime: Dict[str, Any]) -> Tuple[str, str]:
+    regime = str((market_regime or {}).get("regime") or "").lower()
+    if "Avoid" in asset_regime or regime in {"risk_off", "panic", "trending_down"}:
+        return "monitor", "plain_wait"
+    if name == "Breakout_Continuation":
+        return "wait", "conditional_open"
+    if name == "Mean_Reversion_Pullback":
+        return "wait", "conditional_open"
+    return "monitor", "plain_wait"
+
+
+def _pricing_entry_zone(name: str, constraints: Dict[str, Any]) -> str:
+    if name == "Mean_Reversion_Pullback":
+        return _constraint_reason(constraints.get("mean_reversion_anchor")) or "回踩均值锚点附近确认"
+    if name == "Breakout_Continuation":
+        return "结构失效位上方回踩确认或放量续强"
+    return "跌破结构位时不入场,只执行退出/回避"
+
+
+def _constraint_reason(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("reason") or value.get("value") or "").strip()
+    return str(value or "").strip()
+
+
+def _constraints_used(constraints: Dict[str, Any]) -> List[str]:
+    used = []
+    for key in ("invalidation_level", "mean_reversion_anchor", "max_chase_premium"):
+        reason = _constraint_reason(constraints.get(key))
+        if reason:
+            used.append(f"{key}: {reason}")
+    return used
+
+
+def _main_pricing_constraints(matrix: Sequence[Dict[str, Any]]) -> List[str]:
+    constraints: List[str] = []
+    for item in matrix:
+        for scenario in item.get("scenarios") or []:
+            if isinstance(scenario, dict) and scenario.get("constraints_used"):
+                constraints.extend(str(x) for x in scenario.get("constraints_used")[:2])
+    return list(dict.fromkeys(constraints))[:8]
+
+
+def _pricing_matrix(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    full = ctx.stage_full("pricing_agent")
+    matrix = full.get("if_then_order_matrix") if isinstance(full, dict) else []
+    return [item for item in matrix or [] if isinstance(item, dict)]
+
+
+def _point_calc_item_rank(item: Dict[str, Any]) -> int:
+    if not isinstance(item, dict):
+        return -999
+    score = 0
+    status = str(item.get("data_status") or "").lower()
+    if status == "ok":
+        score += 20
+    elif status == "partial":
+        score -= 5
+    elif status in {"insufficient_data", "failed", "tool_failed"}:
+        score -= 40
+    scenarios = item.get("scenarios") if isinstance(item.get("scenarios"), list) else []
+    selected = _selected_pricing_scenario(item) or {}
+    executable_modes = {"immediate_open", "conditional_open", "strong_watch"}
+    if selected.get("execution_mode") in executable_modes:
+        score += 60
+    if any(isinstance(s, dict) and s.get("execution_mode") in executable_modes for s in scenarios):
+        score += 30
+    if _has_text_value(selected.get("entry_zone")) and _has_text_value(selected.get("stop_loss")):
+        score += 20
+    if _has_text_value(selected.get("risk_reward_comment")):
+        score += 10
+    if _as_text_list(item.get("pricing_warnings")):
+        score -= min(20, len(_as_text_list(item.get("pricing_warnings"))) * 5)
+    return score
+
+
+def _compact_pricing_matrix_for_prompt(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    for item in sorted(_pricing_matrix(ctx), key=_point_calc_item_rank, reverse=True)[:PROMPT_STOCK_LIMIT]:
+        compact.append({
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "asset_regime": item.get("asset_regime"),
+            "data_status": item.get("data_status"),
+            "selected_scenario": item.get("selected_scenario"),
+            "scenarios": [
+                {
+                    "scenario_name": scenario.get("scenario_name"),
+                    "action": scenario.get("action"),
+                    "execution_mode": scenario.get("execution_mode"),
+                    "condition": _truncate(str(scenario.get("condition") or ""), 180),
+                    "entry_zone": _truncate(str(scenario.get("entry_zone") or ""), 140),
+                    "stop_loss": _truncate(str(scenario.get("stop_loss") or ""), 140),
+                    "failure_condition": _truncate(str(scenario.get("failure_condition") or ""), 160),
+                    "risk_reward_comment": _truncate(str(scenario.get("risk_reward_comment") or ""), 180),
+                    "constraints_used": _short_list(scenario.get("constraints_used"), PROMPT_CONSTRAINT_LIMIT),
+                }
+                for scenario in (item.get("scenarios") or [])[:PROMPT_SCENARIO_LIMIT]
+                if isinstance(scenario, dict)
+            ],
+            "pricing_warnings": _short_list(item.get("pricing_warnings"), 3),
+        })
+    return compact
+
+
+def _pricing_item_for_code(matrix: Sequence[Dict[str, Any]], code: Any) -> Optional[Dict[str, Any]]:
+    code_text = str(code or "").strip()
+    for item in matrix:
+        if str(item.get("code") or "").strip() == code_text:
+            return item
+    return None
+
+
+def _selected_pricing_scenario(item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    selected = str(item.get("selected_scenario") or "")
+    scenarios = item.get("scenarios") if isinstance(item.get("scenarios"), list) else []
+    for scenario in scenarios:
+        if isinstance(scenario, dict) and str(scenario.get("scenario_name") or "") == selected:
+            return scenario
+    for scenario in scenarios:
+        if isinstance(scenario, dict) and scenario.get("execution_mode") in {"conditional_open", "immediate_open"}:
+            return scenario
+    return scenarios[0] if scenarios and isinstance(scenarios[0], dict) else None
+
+
+def _deep_dive_results_for_meta(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    deep = ctx.stage_full("single_stock_deep_dive")
+    results = deep.get("results") if isinstance(deep, dict) else []
+    compact: List[Dict[str, Any]] = []
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+        full = item.get("full") if isinstance(item.get("full"), dict) else {}
+        stock = full.get("stock") if isinstance(full.get("stock"), dict) else {}
+        entry_quality = full.get("entry_quality") if isinstance(full.get("entry_quality"), dict) else {}
+        code = str(summary.get("code") or stock.get("code") or "").strip()
+        if not code:
+            continue
+        compact.append({
+            "code": code,
+            "name": summary.get("name") or stock.get("name") or code,
+            "market": stock.get("market") or ctx.market,
+            "action_bias": summary.get("action_bias") or full.get("action_bias"),
+            "action_strength": summary.get("action_strength") or full.get("action_strength"),
+            "quote_basis": summary.get("quote_basis") or full.get("quote_basis"),
+            "ideal_entry_zone": summary.get("ideal_entry_zone") or entry_quality.get("ideal_entry_zone"),
+            "no_chase_line": summary.get("no_chase_line") or entry_quality.get("no_chase_line"),
+            "stop_loss": summary.get("stop_loss") or entry_quality.get("stop_loss"),
+            "failure_condition": summary.get("failure_condition") or entry_quality.get("failure_condition"),
+            "target_1": summary.get("target_1") or entry_quality.get("target_1"),
+            "target_2": summary.get("target_2") or entry_quality.get("target_2"),
+            "main_supporting_evidence": _short_list(summary.get("main_supporting_evidence"), 5),
+            "main_risks": _short_list(summary.get("main_risks") or full.get("risk_flags"), 5),
+            "main_missing_evidence": _short_list(summary.get("main_missing_evidence") or full.get("missing_evidence"), 5),
+            "dimension_summary": _compact_dimension_summary(full.get("dimension_summary")),
+        })
+    return compact
+
+
+def _desk_reports_for_meta(
+    candidate_records: Dict[str, Dict[str, Any]],
+    deep_results: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    reports: Dict[str, Any] = {}
+    for item in deep_results:
+        code = str(item.get("code") or "").strip()
+        record = candidate_records.get(code) if code else None
+        if not isinstance(record, dict):
+            continue
+        reports[code] = {
+            "primary_desk": record.get("primary_desk"),
+            "desks": _short_list(record.get("desks"), 5),
+            "stance": record.get("stance"),
+            "stance_by_desk": record.get("stance_by_desk") if isinstance(record.get("stance_by_desk"), dict) else {},
+            "setup_type": record.get("setup_type"),
+            "setup_subtype": record.get("setup_subtype"),
+            "reason": record.get("reason"),
+            "confidence": record.get("confidence"),
+            "multi_desk_conviction": record.get("multi_desk_conviction"),
+            "conflict_flags": _short_list(record.get("conflict_flags"), 8),
+            "risks": _short_list(record.get("risks"), 8),
+            "llm_expert_evidence": _compact_desk_evidence(record.get("llm_expert_evidence")),
+        }
+    return reports
+
+
+def _fallback_meta_orchestrator(ctx: SelectionRunContext) -> Dict[str, Any]:
+    deep_results = _deep_dive_results_for_meta(ctx)
+    candidate_records = _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
+    market = _summarize_market_regime(ctx.market_regime)
+    packages = []
+    for item in deep_results:
+        code = str(item.get("code") or "").strip()
+        record = candidate_records.get(code, {}) if code else {}
+        setup_type = str(record.get("setup_type") or "").strip()
+        asset_regime = _asset_regime_from_setup(setup_type, item, market)
+        invalidation_text = item.get("stop_loss") or item.get("failure_condition") or "跌破关键结构位则论点失效"
+        mean_anchor_text = item.get("ideal_entry_zone") or item.get("no_chase_line") or "等待回踩确认"
+        no_chase_text = item.get("no_chase_line") or "高于追高线且无回踩确认时禁止追高"
+        package = {
+            "stock": {"code": code, "name": item.get("name") or code, "market": item.get("market") or ctx.market},
+            "meta_analysis": {
+                "factual_consensus": _meta_factual_consensus(item, record),
+                "strategic_divergence": _meta_divergence_text(record, item),
+                "asset_regime": asset_regime,
+                "dominant_thesis": record.get("primary_desk") or record.get("setup_type") or "unknown",
+                "opposing_theses": _opposing_desks(record),
+            },
+            "market_context": {
+                "market_regime": market.get("regime") or "unknown",
+                "volatility_bucket": market.get("volatility_bucket") or "unknown",
+                "risk_level": market.get("risk_level") or "unknown",
+                "regime_weight_adjustment": _meta_regime_adjustment(market),
+                "market_context_warnings": [] if market.get("status") == "ok" else ["市场环境数据不完整，Meta 结论降级为条件型。"],
+            },
+            "hard_constraints_for_pricing_agent": {
+                "invalidation_level": {
+                    "price": _first_number(invalidation_text),
+                    "source": "single_stock_deep_dive",
+                    "reason": str(invalidation_text),
+                },
+                "mean_reversion_anchor": {
+                    "price": _first_number(mean_anchor_text),
+                    "source": "single_stock_deep_dive",
+                    "reason": str(mean_anchor_text),
+                },
+                "max_chase_premium": {
+                    "value": "2.0%",
+                    "source": "meta_fallback",
+                    "reason": str(no_chase_text),
+                },
+                "risk_constraints": _meta_risk_constraints(record, item, market),
+            },
+            "required_pricing_scenarios": _default_required_pricing_scenarios(),
+            "handoff_notes": {
+                "for_pricing_agent": "不要重新判断股票好坏，只按 hard_constraints 与实时 ATR/盘口计算条件单。",
+                "for_judge": "若点位计算层无法给出满足盈亏比的条件单，即使 Meta 定性偏正面也必须降级。",
+            },
+        }
+        packages.append(package)
+    return {
+        "stage": "meta_orchestrator",
+        "status": "partial" if packages else "insufficient_data",
+        "summary": {
+            "package_count": len(packages),
+            "asset_regimes": [
+                {"code": pkg["stock"]["code"], "asset_regime": pkg["meta_analysis"]["asset_regime"]}
+                for pkg in packages
+            ],
+            "market_context_note": _meta_regime_adjustment(market),
+            "main_constraints": _main_meta_constraints(packages),
+        },
+        "full": {
+            "packages": packages,
+            "tool_failures": [],
+            "missing_evidence": [] if packages else ["single_stock_deep_dive"],
+        },
+        "full_ref": "meta_orchestrator.json",
+    }
+
+
+def _fallback_pricing_agent(ctx: SelectionRunContext) -> Dict[str, Any]:
+    packages = _meta_packages(ctx)
+    matrix = []
+    for package in packages:
+        stock = package.get("stock") if isinstance(package.get("stock"), dict) else {}
+        constraints = package.get("hard_constraints_for_pricing_agent") if isinstance(package.get("hard_constraints_for_pricing_agent"), dict) else {}
+        asset_regime = ((package.get("meta_analysis") or {}).get("asset_regime") if isinstance(package.get("meta_analysis"), dict) else "") or "Unknown"
+        scenarios = []
+        for scenario in package.get("required_pricing_scenarios") or _default_required_pricing_scenarios():
+            if not isinstance(scenario, dict):
+                continue
+            name = str(scenario.get("scenario_name") or "Scenario")
+            action, execution_mode = _pricing_action_for_scenario(name, asset_regime, ctx.market_regime)
+            scenarios.append({
+                "scenario_name": name,
+                "condition": scenario.get("condition") or "等待条件触发",
+                "action": action,
+                "execution_mode": execution_mode,
+                "entry_zone": _pricing_entry_zone(name, constraints),
+                "stop_loss": _constraint_reason(constraints.get("invalidation_level")) or "跌破结构失效位",
+                "failure_condition": _constraint_reason(constraints.get("invalidation_level")) or "右侧/低吸论点被证伪",
+                "risk_reward_comment": "fallback 只生成条件型矩阵，需结合实时价/ATR 复核。",
+                "constraints_used": _constraints_used(constraints),
+            })
+        matrix.append({
+            "code": stock.get("code"),
+            "name": stock.get("name"),
+            "asset_regime": asset_regime,
+            "data_status": "partial",
+            "scenarios": scenarios,
+            "selected_scenario": "Breakout_Continuation" if "Avoid" not in asset_regime else "Mean_Reversion_Pullback",
+            "pricing_warnings": ["点位计算 fallback 未使用实时盘口/ATR，只保留条件型计划。"],
+        })
+    tradable_count = sum(
+        1
+        for item in matrix
+        for scenario in item.get("scenarios", [])
+        if scenario.get("execution_mode") in {"conditional_open", "immediate_open"}
+    )
+    return {
+        "stage": "pricing_agent",
+        "status": "partial" if matrix else "insufficient_data",
+        "summary": {
+            "priced_count": len(matrix),
+            "tradable_count": tradable_count,
+            "main_pricing_constraints": _main_pricing_constraints(matrix),
+            "pricing_note": "点位计算 fallback 已生成 If-Then 条件矩阵；真实点位需结合实时价/ATR/盘口复核。",
+        },
+        "full": {
+            "if_then_order_matrix": matrix,
+            "constraints_echo": _main_meta_constraints(packages),
+            "missing_evidence": ["realtime_orderbook", "atr"] if matrix else ["meta_orchestrator"],
+        },
+        "full_ref": "pricing_agent.json",
+    }
+
+
 def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
     deep = ctx.stage_full("single_stock_deep_dive")
+    pricing_matrix = _pricing_matrix(ctx)
     results = deep.get("results") if isinstance(deep, dict) else []
     plans = []
     max_single = ctx.investor_profile.get("max_single_position_pct") or 20
@@ -3003,22 +4065,26 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
             initial_pct = 0
         else:
             initial_pct = 0
+        pricing_item = _pricing_item_for_code(pricing_matrix, summary.get("code"))
+        selected_scenario = _selected_pricing_scenario(pricing_item)
         plans.append({
             "rank": idx,
             "code": summary.get("code"),
             "name": summary.get("name"),
             "action": action,
             "action_strength": summary.get("action_strength") or "weak",
+            "execution_mode": (selected_scenario or {}).get("execution_mode") or ("conditional_open" if action == "open" else "plain_wait"),
             "initial_position_pct": initial_pct,
             "initial_amount": (available_cash * initial_pct / 100) if isinstance(available_cash, (int, float)) else None,
-            "entry_condition": summary.get("ideal_entry_zone") or "等待确认",
+            "entry_condition": (selected_scenario or {}).get("condition") or summary.get("ideal_entry_zone") or "等待确认",
             "add_condition": "突破后回踩不破再评估",
-            "stop_loss_condition": summary.get("stop_loss") or "跌破关键支撑",
+            "stop_loss_condition": (selected_scenario or {}).get("stop_loss") or summary.get("stop_loss") or "跌破关键支撑",
             "take_profit_condition": "到达第一压力位分批止盈",
             "review_trigger": "下一交易日开盘或关键价格触发",
             "auto_downgrade_rules": ["如果价格高于 no_chase_line，降级为 wait"],
-            "reason": "来自单股深度分析的条件型计划。",
+            "reason": "来自单股深度分析和 Meta/点位计算条件矩阵的条件型计划。",
             "risk_flags": summary.get("main_risks") or [],
+            "pricing_scenario": (selected_scenario or {}).get("scenario_name"),
         })
     total_pct = sum((item.get("initial_position_pct") or 0) for item in plans)
     action = "open" if total_pct > 0 else "wait"
@@ -3046,7 +4112,7 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
                 "default_stop_loss_pct": ctx.investor_profile.get("default_stop_loss_pct"),
             },
             "positions_plan": plans,
-            "execution_matrix": [],
+            "execution_matrix": pricing_matrix,
             "cash_plan": {"reserved_cash_pct": max(0, 100 - total_pct), "reason": "保留现金等待确认和回撤机会。"},
             "risk_controls": ["价格高于追高线不买", "工具证据缺失时降低动作强度"],
             "missing_evidence": [],
@@ -3379,6 +4445,8 @@ def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
         "balanced_candidate_evidence": ctx.stages.get("balanced_candidate_evidence", SelectionStage()).to_dict(include_full=True),
         "candidate_screening": ctx.stages.get("candidate_screening", SelectionStage()).to_dict(include_full=True),
         "single_stock_deep_dive": ctx.stages.get("single_stock_deep_dive", SelectionStage()).to_dict(include_full=True),
+        "meta_orchestrator": ctx.stages.get("meta_orchestrator", SelectionStage()).to_dict(include_full=True),
+        "pricing_agent": ctx.stages.get("pricing_agent", SelectionStage()).to_dict(include_full=True),
         "portfolio_allocation": ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
         "adversarial_review": ctx.stages.get("adversarial_review", SelectionStage()).to_dict(include_full=True),
         "judge_decision": ctx.stages.get("judge_decision", SelectionStage()).to_dict(include_full=True),
@@ -3634,7 +4702,7 @@ def _selection_deep_dive_limit() -> int:
         value = int(raw)
     except (TypeError, ValueError):
         value = DEFAULT_DEEP_DIVE_LIMIT
-    return max(1, min(20, value))
+    return max(1, min(5, value))
 
 
 def _deep_dive_setup_router_enabled() -> bool:
@@ -3852,7 +4920,15 @@ def _all_missing_evidence(ctx: SelectionRunContext) -> List[str]:
 
 def _report_missing_evidence(report: Dict[str, Any]) -> List[str]:
     missing: List[str] = []
-    for stage_name in ("candidate_discovery", "candidate_screening", "single_stock_deep_dive", "portfolio_allocation", "adversarial_review"):
+    for stage_name in (
+        "candidate_discovery",
+        "candidate_screening",
+        "single_stock_deep_dive",
+        "meta_orchestrator",
+        "pricing_agent",
+        "portfolio_allocation",
+        "adversarial_review",
+    ):
         stage = report.get(stage_name)
         full = stage.get("full") if isinstance(stage, dict) and isinstance(stage.get("full"), dict) else {}
         stage_missing = full.get("missing_evidence")
@@ -3914,12 +4990,36 @@ def _auxiliary_review_note(judge: Dict[str, Any]) -> str:
     verdict = str(judge.get("primary_plan_verdict") or "").strip()
     action = str(judge.get("final_action") or "").strip()
     if verdict and action:
-        return f"{verdict}，最终动作 {action}；详见第六节辅助审查摘要。"
+        return f"{verdict}，最终动作 {action}；详见辅助审查摘要。"
     if verdict:
-        return f"{verdict}；详见第六节辅助审查摘要。"
+        return f"{verdict}；详见辅助审查摘要。"
     if action:
-        return f"最终动作 {action}；详见第六节辅助审查摘要。"
+        return f"最终动作 {action}；详见辅助审查摘要。"
     return "-"
+
+
+def _meta_report_note(summary: Dict[str, Any]) -> str:
+    if not isinstance(summary, dict) or not summary:
+        return "-"
+    regimes = summary.get("asset_regimes") if isinstance(summary.get("asset_regimes"), list) else []
+    labels = []
+    for item in regimes[:3]:
+        if isinstance(item, dict):
+            labels.append(f"{item.get('code')}: {item.get('asset_regime')}")
+    constraint_count = len(summary.get("main_constraints") or []) if isinstance(summary.get("main_constraints"), list) else 0
+    note = summary.get("market_context_note") or ""
+    prefix = "；".join(labels) if labels else f"约束包 {summary.get('package_count', 0)} 个"
+    return f"{prefix}；硬约束 {constraint_count} 条；{note}".strip("；")
+
+
+def _pricing_report_note(summary: Dict[str, Any]) -> str:
+    if not isinstance(summary, dict) or not summary:
+        return "-"
+    return (
+        f"已定价 {summary.get('priced_count', 0)} 只；"
+        f"可条件执行场景 {summary.get('tradable_count', 0)} 个；"
+        f"{summary.get('pricing_note') or ''}"
+    ).strip("；")
 
 
 def _recommendation_items(
@@ -4348,6 +5448,9 @@ def _render_conditional_entry_table(item: Dict[str, Any]) -> List[str]:
         f"| 动作强度 | {_markdown_cell(item.get('action_strength') or '-')} |",
         f"| 行情口径 | {_markdown_cell(_quote_basis_label(item.get('quote_basis')))} |",
         f"| 明日触发条件 | {_markdown_cell(_conditional_entry_trigger(item))} |",
+        f"| 入场区间 | {_markdown_cell(item.get('entry_condition') or item.get('ideal_entry_zone') or item.get('pullback_trigger') or '缺失：未给出可执行入场区间')} |",
+        f"| 止盈目标 | {_markdown_cell(_take_profit_condition_text(item))} |",
+        f"| 止损位 | {_markdown_cell(item.get('stop_loss_condition') or item.get('stop_loss') or '缺失：未给出止损位')} |",
         f"| 可试探仓位 | {_markdown_cell(_conditional_position_text(item))} |",
         f"| 禁止追高 | {_markdown_cell(item.get('no_chase_line') or _default_no_chase_condition())} |",
         f"| 失效条件 | {_markdown_cell(_failure_condition_text(item))} |",
@@ -4390,6 +5493,17 @@ def _conditional_position_text(item: Dict[str, Any]) -> str:
     if pct_num > 0:
         return _format_pct(pct)
     return "5%-10% 试探仓，需受账户现金与单票上限约束；账户缺失时不写确定仓位。"
+
+
+def _take_profit_condition_text(item: Dict[str, Any]) -> str:
+    if _has_text_value(item.get("take_profit_condition")):
+        return str(item.get("take_profit_condition"))
+    values = [
+        item.get("target_1"),
+        item.get("target_2"),
+    ]
+    targets = [str(value).strip() for value in values if _has_text_value(value)]
+    return " / ".join(targets) if targets else "缺失：未给出止盈目标"
 
 
 def _failure_condition_text(item: Dict[str, Any]) -> str:

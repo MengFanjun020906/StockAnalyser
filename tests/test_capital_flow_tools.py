@@ -60,7 +60,7 @@ def test_stockapi_market_microstructure_tools_are_registered():
     assert "get_stockapi_hot_money_activity" in registry
 
 
-def test_tushare_moneyflow_ths_is_first_capital_expert_source():
+def test_tushare_moneyflow_dc_is_first_capital_expert_source():
     orchestrator = CandidateExpertOrchestrator(timeout_s=1.0)
     packet = orchestrator._capital_packet(limit=8, tools={
         "tushare_moneyflow_ths": lambda limit: {"status": "empty", "items": [], "errors": []},
@@ -76,9 +76,9 @@ def test_tushare_moneyflow_ths_is_first_capital_expert_source():
         "stockapi_hot_money_activity": lambda limit: {"status": "empty", "items": [], "errors": []},
     })
 
-    assert packet.diagnostics[0]["source"] == "tushare_moneyflow_ths"
-    assert packet.diagnostics[1]["source"] == "tushare_moneyflow_dc"
-    assert packet.diagnostics[2]["source"] == "tushare_dragon_tiger_list"
+    assert packet.diagnostics[0]["source"] == "tushare_moneyflow_dc"
+    assert packet.diagnostics[1]["source"] == "tushare_dragon_tiger_list"
+    assert packet.diagnostics[2]["source"] == "tushare_dragon_tiger_inst"
 
 
 def test_sector_theme_expert_prefers_tushare_board_moneyflow_and_members():

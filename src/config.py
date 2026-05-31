@@ -651,6 +651,7 @@ class Config:
     tushare_token: Optional[str] = None
     tushare_http_url: str = "http://118.89.66.41:8010/"
     stockapi_token: Optional[str] = None
+    stockapi_url: str = "https://www.stockapi.com.cn/v1/base/codeFlow"
     tickflow_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
@@ -757,6 +758,7 @@ class Config:
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
     agent_candidate_expert_timeout_seconds: float = 60.0  # Max seconds for one L1 candidate expert discovery packet
+    agent_seed_pool_total_limit: int = 20  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
     agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
     agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
     agent_veto_gate_enabled: bool = True  # Enable shared bearish red-line veto gate (thesis_desk_committee); default only hard_risk_flags trigger
@@ -773,6 +775,18 @@ class Config:
     agent_sector_rankings_timeout_seconds: float = 10.0  # Max seconds for sector ranking data-source probing
     agent_regime_component_timeout_seconds: float = 25.0  # Max seconds for one market-regime auxiliary component
     agent_tushare_tool_timeout_seconds: float = 20.0  # Max seconds for one Tushare Agent tool request
+    agent_seed_fact_max_workers: int = 12  # Max concurrent (seed, tool) workers before thesis desks
+    agent_seed_fact_tool_timeout_seconds: float = 12.0  # Max seconds for one SeedFactPacket tool call
+    agent_seed_fact_tools: List[str] = field(
+        default_factory=lambda: [
+            "analyze_price_structure",
+            "analyze_trend",
+            "calculate_ma",
+            "get_volume_analysis",
+            "get_capital_flow",
+            "get_stock_info",
+        ]
+    )
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
     agent_deep_research_budget: int = 30000  # Max token budget for deep research
     agent_deep_research_timeout: int = 180  # Max seconds for /research command before returning timeout
@@ -1391,6 +1405,7 @@ class Config:
             tushare_token=os.getenv('TUSHARE_TOKEN'),
             tushare_http_url=(os.getenv('TUSHARE_HTTP_URL') or "http://118.89.66.41:8010/").strip(),
             stockapi_token=os.getenv('STOCKAPI_TOKEN'),
+            stockapi_url=(os.getenv('STOCKAPI_URL') or "https://www.stockapi.com.cn/v1/base/codeFlow").strip(),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
@@ -1496,12 +1511,19 @@ class Config:
                 field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
+            agent_seed_pool_total_limit=parse_env_int(
+                os.getenv('AGENT_SEED_POOL_TOTAL_LIMIT'),
+                20,
+                field_name='AGENT_SEED_POOL_TOTAL_LIMIT',
+                minimum=1,
+                maximum=40,
+            ),
             agent_selection_deep_dive_limit=parse_env_int(
                 os.getenv('AGENT_SELECTION_DEEP_DIVE_LIMIT'),
                 4,
                 field_name='AGENT_SELECTION_DEEP_DIVE_LIMIT',
                 minimum=1,
-                maximum=20,
+                maximum=5,
             ),
             agent_deep_dive_setup_router_enabled=parse_env_bool(
                 os.getenv('AGENT_DEEP_DIVE_SETUP_ROUTER_ENABLED'),
@@ -1572,6 +1594,26 @@ class Config:
                 field_name='AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
+            agent_seed_fact_max_workers=parse_env_int(
+                os.getenv('AGENT_SEED_FACT_MAX_WORKERS'),
+                12,
+                field_name='AGENT_SEED_FACT_MAX_WORKERS',
+                minimum=1,
+            ),
+            agent_seed_fact_tool_timeout_seconds=parse_env_float(
+                os.getenv('AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS'),
+                12.0,
+                field_name='AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS',
+                minimum=1.0,
+            ),
+            agent_seed_fact_tools=[
+                name.strip()
+                for name in os.getenv(
+                    'AGENT_SEED_FACT_TOOLS',
+                    'analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_info',
+                ).split(',')
+                if name.strip()
+            ],
             agent_risk_override=os.getenv('AGENT_RISK_OVERRIDE', 'true').lower() == 'true',
             agent_deep_research_budget=parse_env_int(
                 os.getenv('AGENT_DEEP_RESEARCH_BUDGET'),

@@ -117,7 +117,10 @@ def _akshare_fund_flow_market(stock_code: str) -> str:
 
 
 def _stockapi_code_flow_url() -> str:
-    return "https://www.stockapi.com.cn/v1/base/codeFlow"
+    return (
+        os.getenv("STOCKAPI_URL", "").strip()
+        or "https://www.stockapi.com.cn/v1/base/codeFlow"
+    )
 
 
 def _stockapi_default_completed_date() -> str:

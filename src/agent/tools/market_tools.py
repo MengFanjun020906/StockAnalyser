@@ -2348,7 +2348,6 @@ def _handle_discover_watchlist_candidates(
                 "tushare_moneyflow_ind_dc": lambda limit: _data_tool_result("get_tushare_moneyflow_ind_dc", limit=limit),
                 "tushare_moneyflow_cnt_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_cnt_ths", limit=limit),
                 "tushare_ths_member": lambda ts_code, limit: _data_tool_result("get_tushare_ths_member", ts_code=ts_code, limit=limit),
-                "tushare_moneyflow_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_ths", limit=limit),
                 "tushare_moneyflow_dc": lambda limit: _data_tool_result("get_tushare_moneyflow_dc", limit=limit),
                 "tushare_dragon_tiger_list": lambda limit: _data_tool_result("get_tushare_dragon_tiger_list", limit=limit),
                 "tushare_dragon_tiger_inst": lambda limit: _data_tool_result("get_tushare_dragon_tiger_inst", limit=limit),

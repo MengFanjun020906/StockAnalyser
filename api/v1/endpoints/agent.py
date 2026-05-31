@@ -19,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
+from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
 from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
 from src.schemas.agent_signal import TradeAction, TradePlan
 from src.services.agent_model_service import list_agent_model_deployments
@@ -974,6 +975,20 @@ def _write_trace_json(path: Path, payload: Any) -> None:
     )
 
 
+def _write_trace_json_compact(path: Path, payload: Any) -> None:
+    sanitized = _sanitize_json_payload(payload)
+    path.write_text(
+        json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+            allow_nan=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _append_trace_event(path: Path, event: Dict[str, Any]) -> None:
     sanitized = _sanitize_json_payload(event)
     with path.open("a", encoding="utf-8") as fh:
@@ -1781,6 +1796,24 @@ class TraceArtifactWriter:
                     "seed_gate": payload.get("seed_gate"),
                     "candidate_count": payload.get("candidate_count"),
                     "candidate_source": payload.get("candidate_source"),
+                },
+            )
+        elif event_type == "selection_seed_facts":
+            packets = payload.get("packets") if isinstance(payload.get("packets"), list) else []
+            _write_trace_json_compact(
+                self.path / "seed_facts.json",
+                {
+                    "event_type": event_type,
+                    "phase": payload.get("phase") or "pre_desk_facts",
+                    "total": payload.get("total"),
+                    "ok": payload.get("ok"),
+                    "partial": payload.get("partial"),
+                    "failed": payload.get("failed"),
+                    "elapsed_ms": payload.get("elapsed_ms"),
+                    "packets_ref": payload.get("packets_ref") or "seed_facts.json",
+                    "tool_status_counts": payload.get("tool_status_counts"),
+                    "packets_preview": payload.get("packets_preview"),
+                    "packets": compact_seed_fact_packets_for_model(packets, limit=len(packets)),
                 },
             )
 

@@ -449,7 +449,6 @@ class CandidateExpertOrchestrator:
         status_values: List[str] = []
 
         for source_name, tool_name in (
-            ("tushare_moneyflow_ths", "tushare_moneyflow_ths"),
             ("tushare_moneyflow_dc", "tushare_moneyflow_dc"),
             ("tushare_dragon_tiger_list", "tushare_dragon_tiger_list"),
             ("tushare_dragon_tiger_inst", "tushare_dragon_tiger_inst"),

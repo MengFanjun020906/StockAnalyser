@@ -23,8 +23,229 @@ from src.agent.candidate_experts_v2.committee import (
     _build_seed_pool,
     _build_seed_pool_result,
     run_committee_discovery,
+    run_thesis_desk_committee,
 )
 from src.agent.candidate_experts_v2.experts.base import LLMTurn
+from src.agent.candidate_experts_v2.experts.desk_base import BaseDeskExpert
+from src.agent.candidate_experts_v2.schemas import (
+    FactSheet,
+    FeatureFlag,
+    FeatureRow,
+    SeedFactDataQuality,
+    SeedFactPacket,
+    SeedFactToolResult,
+)
+from src.agent.candidate_experts_v2.seed_facts import (
+    build_seed_fact_packets_parallel,
+    compact_seed_fact_packets_for_model,
+)
+
+
+def test_seed_fact_packets_run_seed_tool_tasks_once_and_record_failures():
+    calls = []
+
+    def _ok_tool(stock_code):
+        calls.append(("ok_tool", stock_code))
+        return {"status": "ok", "value": stock_code}
+
+    def _bad_tool(stock_code):
+        calls.append(("bad_tool", stock_code))
+        raise RuntimeError(f"boom {stock_code}")
+
+    rows = [
+        FeatureRow(code="600001", name="测试一", flags=[FeatureFlag(detector="x", summary="x")]),
+        FeatureRow(code="600002", name="测试二", flags=[FeatureFlag(detector="y", summary="y")]),
+    ]
+
+    packets = build_seed_fact_packets_parallel(
+        rows,
+        tool_registry={"ok_tool": _ok_tool, "bad_tool": _bad_tool},
+        tools=["ok_tool", "bad_tool", "missing_tool"],
+        max_workers=4,
+        tool_timeout_seconds=3.0,
+    )
+
+    assert len(packets) == 2
+    assert sorted(calls) == [
+        ("bad_tool", "600001"),
+        ("bad_tool", "600002"),
+        ("ok_tool", "600001"),
+        ("ok_tool", "600002"),
+    ]
+    by_code = {packet.code: packet for packet in packets}
+    assert by_code["600001"].facts["ok_tool"].status == "ok"
+    assert by_code["600001"].facts["bad_tool"].status == "failed"
+    assert by_code["600001"].facts["missing_tool"].status == "missing"
+    assert by_code["600001"].data_quality.status == "partial"
+    assert by_code["600001"].data_quality.ok_tools == 1
+    assert by_code["600001"].data_quality.failed_tools == ["bad_tool"]
+    assert by_code["600001"].data_quality.missing_tools == ["missing_tool"]
+
+
+def test_desk_prompt_includes_seed_fact_packet_before_tool_calls():
+    row = FeatureRow(
+        code="600001",
+        name="测试一",
+        flags=[FeatureFlag(detector="low_base:range_low", kind="position", summary="低位")],
+        fact_sheet=FactSheet(code="600001", range_pct_120=0.2),
+    )
+    row.seed_fact = build_seed_fact_packets_parallel(
+        [row],
+        tool_registry={"analyze_trend": lambda stock_code: {"status": "ok", "trend": "neutral", "raw_blob": "x" * 10000}},
+        tools=["analyze_trend"],
+        max_workers=1,
+        tool_timeout_seconds=3.0,
+    )[0]
+    desk = BaseDeskExpert(
+        allowed_tools=["analyze_trend"],
+        tool_registry={"analyze_trend": lambda stock_code: {"status": "ok"}},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+        system_prompt="system",
+    )
+    desk._desk_rows = [row]
+    desk._desk_regime = "unknown"
+
+    message = desk._build_user_message([], market="cn")
+
+    assert "SeedFactPacket" in message
+    payload_start = message.index("[")
+    payload_end = message.index("\n\n请优先读取", payload_start)
+    payload = json.loads(message[payload_start:payload_end])
+    assert payload[0]["seed_fact"]["facts"]["analyze_trend"]["status"] == "ok"
+    assert "data" not in payload[0]["seed_fact"]["facts"]["analyze_trend"]
+    assert "raw_blob" not in message
+
+
+def test_seed_fact_compaction_preserves_decision_facts_not_raw_payload():
+    packet = SeedFactPacket(
+        code="600001",
+        name="事实保真",
+        market="cn",
+        fact_sheet={
+            "range_pct_120": 0.21,
+            "bias_ma20": -2.3,
+            "volume_ratio": 1.8,
+            "rsi14": 42.0,
+            "freshness": "local_phase_a",
+        },
+        facts={
+            "analyze_price_structure": SeedFactToolResult(
+                status="ok",
+                data={
+                    "status": "ok",
+                    "latest_bar": {"time": "2026-05-29", "close": 10.2, "high": 10.5, "low": 9.8, "volume": 123456},
+                    "chan": {
+                        "status": "ok",
+                        "pen_count": 4,
+                        "center_count": 1,
+                        "structure_summary": {"latest_pen_direction": "up", "latest_center": {"ZG": 10.5, "ZD": 9.7}},
+                        "latest_pens": [{"direction": "up", "amplitude_pct": 6.2, "power": {"macd_area": 1.1}}],
+                        "latest_centers": [{"ZG": 10.5, "ZD": 9.7, "width_pct": 8.2}],
+                    },
+                    "smc": {
+                        "status": "ok",
+                        "swing_count": 8,
+                        "structure_summary": {"bias": "up", "latest_labels": ["HL", "HH"]},
+                        "bos": {"status": "bullish", "break_price": 10.2},
+                        "choch": {"status": "none"},
+                        "latest_swings": [{"type": "low", "price": 9.7}, {"type": "high", "price": 10.5}],
+                    },
+                    "raw": {"merged_bars": [{"close": 1}] * 1000},
+                },
+            ),
+            "analyze_trend": SeedFactToolResult(
+                status="ok",
+                data={
+                    "trend_status": "弱势多头",
+                    "ma_alignment": "MA5>MA10",
+                    "trend_strength": 55,
+                    "current_price": 10.2,
+                    "bias_ma5": 1.2,
+                    "bias_ma10": 1.8,
+                    "bias_ma20": -2.3,
+                    "support_levels": [9.8, 9.5],
+                    "resistance_levels": [10.5, 11.0],
+                    "macd_status": "金叉初期",
+                    "rsi_6": 51.2,
+                    "rsi_status": "neutral",
+                    "signal_reasons": ["站上MA10"],
+                    "risk_factors": ["跌破9.8则失败"],
+                },
+            ),
+            "get_capital_flow": SeedFactToolResult(
+                status="ok",
+                data={
+                    "status": "ok",
+                    "main_net_inflow": 12000000,
+                    "inflow_5d": 33000000,
+                    "inflow_10d": -5000000,
+                    "source_chain": [{"provider": "long noisy transport detail"}],
+                    "sector_rankings": {
+                        "top_inflow_sectors": [{"name": "电力", "main_net_inflow": 100}],
+                    },
+                },
+            ),
+            "get_stock_info": SeedFactToolResult(
+                status="ok",
+                data={
+                    "status": "ok",
+                    "code": "600001",
+                    "name": "事实保真",
+                    "belong_boards": [{"name": "电力", "code": "BK0428"}],
+                    "fundamental_context": {
+                        "status": "ok",
+                        "coverage": {"valuation": "ok"},
+                        "valuation": {"status": "ok", "data": {"pe_ratio": 12.3, "pb_ratio": 1.1}},
+                        "growth": {"status": "ok", "data": {"revenue_yoy": 18.2}},
+                    },
+                },
+            ),
+        },
+        data_quality=SeedFactDataQuality(status="ok", tool_count=4, ok_tools=4),
+    )
+
+    compact = compact_seed_fact_packets_for_model([packet], limit=1)[0]
+    facts = compact["facts"]
+
+    assert compact["fact_sheet"]["range_pct_120"] == 0.21
+    assert facts["analyze_price_structure"]["summary"]["chan"]["structure_summary"]["latest_pen_direction"] == "up"
+    assert facts["analyze_price_structure"]["summary"]["smc"]["bos"]["status"] == "bullish"
+    assert "raw" not in facts["analyze_price_structure"]["summary"]
+    assert facts["analyze_trend"]["summary"]["support_levels"] == [9.8, 9.5]
+    assert facts["analyze_trend"]["summary"]["macd_status"] == "金叉初期"
+    assert facts["get_capital_flow"]["summary"]["inflow_10d"] == -5000000
+    assert "source_chain" not in facts["get_capital_flow"]["summary"]
+    assert facts["get_stock_info"]["summary"]["fundamental_context"]["valuation"]["data"]["pe_ratio"] == 12.3
+    assert facts["get_stock_info"]["summary"]["belong_boards"][0]["name"] == "电力"
+
+
+def test_thesis_desk_init_failure_preserves_seed_fact_payload():
+    seed_result = committee_module.SeedPoolBuildResult(
+        seeds=[committee_module.SeedItem(code="600001", name="测试一", source="user_watchlist")],
+        total_limit=1,
+    )
+    result = run_thesis_desk_committee(
+        market="cn",
+        seed_symbols=[],
+        tool_registry={
+            "analyze_price_structure": lambda stock_code: {"status": "ok"},
+            "analyze_trend": lambda stock_code: {"status": "ok"},
+        },
+        llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+        seed_pool_result=seed_result,
+        seed_fact_tools=["analyze_trend"],
+        seed_fact_max_workers=1,
+        seed_fact_tool_timeout_seconds=3.0,
+    )
+
+    assert result["status"] == "failed"
+    assert result["seed_fact_summary"]["total"] == 1
+    assert result["seed_fact_packets"][0]["facts"]["analyze_trend"]["status"] == "ok"
+    assert "data" not in result["seed_fact_packets"][0]["facts"]["analyze_trend"]
+    assert "summary" in result["seed_fact_packets"][0]["facts"]["analyze_trend"]
+    assert result["discovery_steps"][0]["source"] == "seed_facts"
+    assert result["discovery_steps"][-1]["dimension"] == "desk_init"
 
 
 def _deterministic_stub(*, market: str, seed_symbols, limit: int):
@@ -394,11 +615,15 @@ def test_build_seed_pool_result_includes_capital_dragon_and_valuation_sources():
             seed_symbols=[],
             tool_registry={
                 "get_tushare_moneyflow_ths": lambda **kwargs: {
+                    "status": "failed",
+                    "items": [],
+                    "errors": ["disabled_for_permission_gap"],
+                },
+                "get_tushare_moneyflow_dc": lambda **kwargs: {
                     "status": "ok",
                     "trade_date": "20260522",
                     "items": [{"code": "600101", "name": "资金一", "net_inflow": 80_000_000, "net_5d_inflow": 120_000_000, "pct_change": 3.2}],
                 },
-                "get_tushare_moneyflow_dc": lambda **kwargs: {"status": "empty", "items": []},
                 "get_tushare_hsgt_top10": lambda **kwargs: {
                     "status": "ok",
                     "trade_date": "20260522",
@@ -437,7 +662,7 @@ def test_build_seed_pool_result_includes_capital_dragon_and_valuation_sources():
     assert by_code["600104"].source == "northbound_stock_connect"
     assert by_code["600105"].source == "margin_financing"
     assert by_code["600106"].source == "block_trade"
-    assert any(item["source"] == "capital_flow_anomaly:moneyflow_ths" for item in result.diagnostics)
+    assert any(item["source"] == "capital_flow_anomaly:moneyflow_dc" for item in result.diagnostics)
     assert any(item["source"] == "northbound_stock_connect" for item in result.diagnostics)
 
 

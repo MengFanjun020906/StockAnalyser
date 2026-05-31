@@ -39,6 +39,17 @@ primary_plan_verdict = accept | accept_with_changes | reject | wait_for_more_dat
 judge_winner = primary | opposing | mixed | insufficient_data"""
 
 
+META_POINT_CALC_FIELD_GUIDE = """\
+Meta/点位计算字段语义（必须按约束输入处理）：
+- meta_orchestrator_summary.asset_regimes：Meta-Agent 对每只股票的资产定性标签，只说明机会类型，不等于买入指令。
+- meta_orchestrator_summary.main_constraints：Meta-Agent 传下来的硬约束摘要，必须优先于普通深挖观点。
+- meta_constraint_packages：Meta-Agent 约束包的压缩版，只保留最多 5 只股票和每只最多 3 个必算场景，供后续阶段控长使用。
+- if_then_order_matrix[].scenarios：点位计算层基于 Meta hard_constraints 计算出的 If-Then 条件单场景。
+- if_then_order_matrix[].selected_scenario：当前更可执行的场景；若其 action 不是 open/conditional_open，不得强行升级。
+- scenario.entry_zone / stop_loss / failure_condition / risk_reward_comment：最终报告和组合计划中的入场、止损、失效、盈亏比应优先引用这些字段。
+- 若点位计算层标记 data_status=partial 或缺 ATR/盘口/实时价，必须在输出中暴露缺口，不得伪造成精确点位。"""
+
+
 STRATEGY_THRESHOLDS = {
     "hot_sector": {
         "turnover_rate_min": 3,
@@ -474,6 +485,148 @@ def build_deep_dive_prompt(payload: Dict[str, Any]) -> str:
     return _build_deep_dive_prompt_routed(payload)
 
 
+def build_meta_orchestrator_prompt(payload: Dict[str, Any]) -> str:
+    return f"""\
+你是账户感知股票选股系统中的“Meta-Agent / Orchestrator”。
+{ROLE_BOUNDARY}
+你只负责把三席位报告、单股深挖摘要和大盘环境整理成【资产定性 + 硬约束 + 必算场景包】，供下游点位计算层计算 If-Then 条件单。
+
+任务：
+1. 提取三席位报告里的事实共识与策略分歧。
+2. 结合 MarketRegime 判断每只深挖股票属于什么资产机会类型。
+3. 把反对派风险转成 hard_constraints_for_pricing_agent。
+4. 强制下游至少计算 Breakout_Continuation、Fakeout_Exhaustion、Mean_Reversion_Pullback 三个场景。
+
+输入：
+{_dump(payload)}
+
+硬规则：
+1. 禁止输出具体入场点位、止盈点位或“建议买入/卖出”结论。
+2. 允许引用上游已经给出的价格锚点，但只能作为约束来源，不得改写成最终交易点位。
+3. 反对席位的风险不能只写成提醒，必须落入 risk_constraints、invalidation_level、mean_reversion_anchor 或 max_chase_premium。
+4. 如果 market_regime 为 risk_off / panic / trending_down，asset_regime 必须偏防守，且 required_pricing_scenarios 不得鼓励主动追高。
+5. A 股默认不生成做空执行语义；Fakeout_Exhaustion 只能要求点位计算层计算退出/回避/风险提示，除非未来显式支持融券或对冲。
+6. 每只深挖股票都要输出一个 package；没有深挖股票时 status=insufficient_data。
+
+{JSON_RULES}
+
+输出 schema：
+{{
+  "stage": "meta_orchestrator",
+  "status": "ok | partial | insufficient_data | invalid_input",
+  "summary": {{
+    "package_count": 0,
+    "asset_regimes": [{{"code": "股票代码", "asset_regime": "Right_Side_Momentum_High_Exhaustion_Risk | Early_Turn_Low_Base_Confirmation | Quality_Repair_Price_Not_Fully_Reflected | Theme_Follow_Breadth_Dependent | Avoid_By_Market_Regime | Unknown"}}],
+    "market_context_note": "",
+    "main_constraints": []
+  }},
+  "full": {{
+    "packages": [
+      {{
+        "stock": {{"code": "股票代码", "name": "股票名称", "market": "cn"}},
+        "meta_analysis": {{
+          "factual_consensus": [],
+          "strategic_divergence": "",
+          "asset_regime": "",
+          "dominant_thesis": "",
+          "opposing_theses": []
+        }},
+        "market_context": {{
+          "market_regime": "",
+          "volatility_bucket": "",
+          "risk_level": "",
+          "regime_weight_adjustment": "",
+          "market_context_warnings": []
+        }},
+        "hard_constraints_for_pricing_agent": {{
+          "invalidation_level": {{"price": null, "source": "", "reason": ""}},
+          "mean_reversion_anchor": {{"price": null, "source": "", "reason": ""}},
+          "max_chase_premium": {{"value": "2.0%", "source": "", "reason": ""}},
+          "risk_constraints": []
+        }},
+        "required_pricing_scenarios": [
+          {{"scenario_name": "Breakout_Continuation", "condition": "", "required_output": ""}},
+          {{"scenario_name": "Fakeout_Exhaustion", "condition": "", "required_output": ""}},
+          {{"scenario_name": "Mean_Reversion_Pullback", "condition": "", "required_output": ""}}
+        ],
+        "handoff_notes": {{
+          "for_pricing_agent": "不要重新判断股票好坏，只按 hard_constraints 与实时 ATR/盘口计算条件单。",
+          "for_judge": "若点位计算层无法给出满足盈亏比的条件单，即使 Meta 定性偏正面也必须降级。"
+        }}
+      }}
+    ],
+    "tool_failures": [],
+    "missing_evidence": []
+  }},
+  "full_ref": null
+}}"""
+
+
+def build_pricing_agent_prompt(payload: Dict[str, Any]) -> str:
+    return f"""\
+你是账户感知股票选股系统中的“点位计算 Agent / 条件单计算层”（内部 stage key 为 pricing_agent）。
+{ROLE_BOUNDARY}
+你只负责根据 Meta-Agent 给出的 hard_constraints 和实时/最近行情数据，计算 If-Then 条件单矩阵。你不重新判断股票好坏，也不覆盖 Meta-Agent 的硬约束。
+
+任务：
+1. 逐只读取 meta_orchestrator.full.packages。
+2. 对每只股票分别计算 Breakout_Continuation、Fakeout_Exhaustion、Mean_Reversion_Pullback 三套条件场景。
+3. 输出条件单矩阵：触发条件、执行动作、止损/失效条件、风险收益说明。
+
+输入：
+{_dump(payload)}
+
+硬规则：
+1. 不得删除、弱化或重写 hard_constraints_for_pricing_agent。
+2. 如果缺少实时价/ATR/盘口，只能输出 conditional/monitor 计划，并把 data_status 写为 partial。
+3. A 股场景下 Fakeout_Exhaustion 不生成真实做空执行单；只生成退出、回避或风险提示。
+4. 如果 market_regime 为 risk_off / panic / trending_down，Breakout_Continuation 最高只能是 watch/conditional，不得生成 immediate_open。
+5. 每个 scenario 必须包含 condition、action、entry_zone、stop_loss、failure_condition、risk_reward_comment。
+
+{JSON_RULES}
+{COMMON_ENUMS}
+
+输出 schema：
+{{
+  "stage": "pricing_agent",
+  "status": "ok | partial | insufficient_data | invalid_input",
+  "summary": {{
+    "priced_count": 0,
+    "tradable_count": 0,
+    "main_pricing_constraints": [],
+    "pricing_note": ""
+  }},
+  "full": {{
+    "if_then_order_matrix": [
+      {{
+        "code": "股票代码",
+        "name": "股票名称",
+        "asset_regime": "",
+        "data_status": "ok | partial | insufficient_data",
+        "scenarios": [
+          {{
+            "scenario_name": "Breakout_Continuation",
+            "condition": "",
+            "action": "open | wait | reject | monitor",
+            "execution_mode": "immediate_open | conditional_open | strong_watch | plain_wait | reject",
+            "entry_zone": "",
+            "stop_loss": "",
+            "failure_condition": "",
+            "risk_reward_comment": "",
+            "constraints_used": []
+          }}
+        ],
+        "selected_scenario": "",
+        "pricing_warnings": []
+      }}
+    ],
+    "constraints_echo": [],
+    "missing_evidence": []
+  }},
+  "full_ref": null
+}}"""
+
+
 def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
     return f"""\
 你是账户感知股票分析系统中的“组合配置 Agent”。
@@ -502,6 +655,10 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 13. 如果所有标的都是 plain_wait/reject，summary.core_reason 必须明确写“本轮没有可直接入手标的”，recommended_position_count 必须为 0；如果存在 conditional_open 或 strong_watch，summary.core_reason 必须写“本轮没有无条件买入标的，但存在可按次日条件触发的强候选”。
 14. 未进入 single_stock_deep_dive 的候选只能作为观察池，不得写入可执行开仓计划。
 15. balanced_candidate_evidence 是候选池统一证据包；生成组合计划时必须优先参考其中已取证信息，不要要求重新拉取同一批候选数据。
+16. 如果输入包含 meta_orchestrator_summary、meta_constraint_packages 和 if_then_order_matrix，必须优先遵守 Meta-Agent 的硬约束和点位计算层的 If-Then 条件单；不得把 Meta 只用于定性的 asset_regime 误写成无条件买入建议。
+17. positions_plan.entry_condition / stop_loss_condition 应优先来自 if_then_order_matrix 中选中的场景；如果点位计算层只给 monitor/plain_wait，不得强行升级为 open。
+
+{META_POINT_CALC_FIELD_GUIDE}
 
 {JSON_RULES}
 {COMMON_ENUMS}
@@ -562,7 +719,9 @@ def build_adversarial_review_prompt(payload: Dict[str, Any]) -> str:
 输入：
 {_dump(payload)}
 
-反方必须检查候选池是否过度依赖单一热点板块、是否把板块强误当成个股可买、追高风险、证据缺口、亏损股/高估值包装、仓位风险、休市或行情时效、回滚条件。若输入包含 balanced_candidate_evidence，优先基于该统一证据包审查，不要要求重复取证。
+反方必须检查候选池是否过度依赖单一热点板块、是否把板块强误当成个股可买、追高风险、证据缺口、亏损股/高估值包装、仓位风险、休市或行情时效、回滚条件。若输入包含 balanced_candidate_evidence，优先基于该统一证据包审查，不要要求重复取证。若输入包含 Meta/点位计算结果，必须检查 hard_constraints 是否被组合配置遵守、If-Then 条件单是否缺失失败场景。
+
+{META_POINT_CALC_FIELD_GUIDE}
 
 {JSON_RULES}
 
@@ -599,6 +758,9 @@ def build_judge_decision_prompt(payload: Dict[str, Any]) -> str:
 7. 如果裁决为 reject，必须说明终止本轮还是回到候选发现阶段。
 8. 如果输入包含 balanced_candidate_evidence，裁决应把它作为候选池证据真源；不要因为没有重新调用工具而否定已落盘证据。
 9. 区分“无条件买入失败”和“条件入场成立”：账户/行情/资金证据不足时不能裁定 open，但如果主方案已有 wait + conditional_open、明确触发和失效条件，允许保留为条件型看盘计划。
+10. 如果输入包含 if_then_order_matrix，裁决必须核对组合配置是否遵守该矩阵；若点位计算层没有给出满足盈亏比的 conditional_open，即使 Meta 定性偏正面也必须降级为 wait/monitor。
+
+{META_POINT_CALC_FIELD_GUIDE}
 
 {JSON_RULES}
 {COMMON_ENUMS}

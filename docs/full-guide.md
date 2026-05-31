@@ -297,6 +297,9 @@ daily_stock_analysis/
 | `get_tushare_today_news` | Agent 工具：调用 Tushare `news` 获取当日新闻快讯，时间窗口固定为今天 `00:00:00` 到当前时刻；支持 `sina`、`wallstreetcn`、`10jqka`、`eastmoney`、`yuncaijing`、`fenghuang`、`jinrongjie`、`cls`、`yicai` 来源；需 Tushare 单独开通 news 权限 | - | 工具 |
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
+| `AGENT_SEED_FACT_MAX_WORKERS` | 三席位选股前 `SeedFactPacket` 取数层的 `(seed,tool)` 并发 worker 上限 | `12` | 可选 |
+| `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | `SeedFactPacket` 单个工具调用预算；失败会写入 trace，不会伪造成成功 facts | `12.0` | 可选 |
+| `AGENT_SEED_FACT_TOOLS` | 三席位共享的预取工具列表，逗号分隔；默认覆盖趋势、结构、均线、量能、资金与基础信息 | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_info` | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
@@ -309,8 +312,9 @@ daily_stock_analysis/
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `3.0` | 可选 |
 | `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 Tushare `moneyflow` 个股历史资金流，失败时回退 StockAPI `codeFlow` | `15.0` | 可选 |
 | `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 在 Tushare `moneyflow` 不可用时回退调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
+| `STOCKAPI_URL` | StockAPI 历史资金流 `codeFlow` 接口地址；默认使用官方 `https://www.stockapi.com.cn/v1/base/codeFlow`，可在私有代理或测试环境覆盖 | 官方 codeFlow URL | 可选 |
 | `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace | `30.0` | 可选 |
-| `AGENT_SELECTION_DEEP_DIVE_LIMIT` | `watchlist_scan` 最多对多少只 L1 候选做逐股深度分析；默认深挖 4 只，在覆盖面和整轮耗时之间取平衡，调大可减少“候选观察”但会增加工具调用 | `4` | 可选 |
+| `AGENT_SELECTION_DEEP_DIVE_LIMIT` | `watchlist_scan` 最多对多少只 L1 候选做逐股深度分析；有效范围 1-5，默认深挖 4 只，在覆盖面和整轮耗时之间取平衡，调大可减少“候选观察”但会增加工具调用 | `4` | 可选 |
 | `AGENT_CANDIDATE_BLACKLIST_CODES` | L1 候选池硬排除黑名单，逗号分隔；命中后不会进入候选池 | - | 可选 |
 | `AGENT_CANDIDATE_MIN_AVG_AMOUNT` | 候选源提供均成交额/成交额字段时的最低流动性阈值；`0` 表示不启用 | `0` | 可选 |
 | `AGENT_CANDIDATE_MIN_LISTING_DAYS` | 候选源提供上市天数字段时的最低上市天数；`0` 表示不启用 | `0` | 可选 |

@@ -12,6 +12,7 @@ from src.agent.candidate_experts_v2.schemas import (
     ExpertCandidateV2,
     ExpertPacketV2,
     RiskNote,
+    SeedFactPacket,
     SeedItem,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "ExpertCandidateV2",
     "ExpertPacketV2",
     "RiskNote",
+    "SeedFactPacket",
     "SeedItem",
 ]
