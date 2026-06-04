@@ -1,0 +1,302 @@
+{
+  "MLCC": {
+    "aliases": ["MLCC", "被动元件", "片式多层陶瓷电容", "陶瓷电容", "高端电容"],
+    "related_boards": ["电子元件", "被动元件", "MLCC", "AI服务器材料"],
+    "mapped_stocks": [
+      {"code": "300408", "name": "三环集团", "role": "ceramic_component"},
+      {"code": "000636", "name": "风华高科", "role": "passive_component"},
+      {"code": "002859", "name": "洁美科技", "role": "passive_component_material"},
+      {"code": "603678", "name": "火炬电子", "role": "capacitor_component"},
+      {"code": "300726", "name": "宏达电子", "role": "tantalum_capacitor"},
+      {"code": "300285", "name": "国瓷材料", "role": "ceramic_material"}
+    ]
+  },
+  "AI服务器": {
+    "aliases": ["AI服务器", "AI 服务器", "算力服务器", "服务器BOM", "AI算力硬件", "GB200服务器", "GB300服务器"],
+    "related_boards": ["AI服务器", "算力", "服务器", "液冷服务器", "高速PCB"],
+    "mapped_stocks": [
+      {"code": "601138", "name": "工业富联", "role": "ai_server_oem"},
+      {"code": "000977", "name": "浪潮信息", "role": "server_system"},
+      {"code": "603019", "name": "中科曙光", "role": "server_hpc"},
+      {"code": "000938", "name": "紫光股份", "role": "server_network"},
+      {"code": "002463", "name": "沪电股份", "role": "high_speed_pcb"},
+      {"code": "300476", "name": "胜宏科技", "role": "high_speed_pcb"}
+    ]
+  },
+  "GPU算力芯片": {
+    "aliases": ["GPU", "算力芯片", "AI芯片", "GPGPU", "国产GPU", "推理芯片", "训练芯片"],
+    "related_boards": ["AI芯片", "GPU", "半导体", "国产算力"],
+    "mapped_stocks": [
+      {"code": "688256", "name": "寒武纪", "role": "ai_accelerator"},
+      {"code": "688041", "name": "海光信息", "role": "dc_processor"},
+      {"code": "300474", "name": "景嘉微", "role": "gpu_chip"},
+      {"code": "688047", "name": "龙芯中科", "role": "processor"},
+      {"code": "688521", "name": "芯原股份", "role": "chip_ip"}
+    ]
+  },
+  "先进封装": {
+    "aliases": ["先进封装", "Chiplet", "CoWoS", "2.5D封装", "HBM封装", "晶圆级封装"],
+    "related_boards": ["先进封装", "Chiplet", "半导体封测", "HBM"],
+    "mapped_stocks": [
+      {"code": "600584", "name": "长电科技", "role": "osat"},
+      {"code": "002156", "name": "通富微电", "role": "osat"},
+      {"code": "002185", "name": "华天科技", "role": "osat"},
+      {"code": "688362", "name": "甬矽电子", "role": "advanced_packaging"},
+      {"code": "000021", "name": "深科技", "role": "memory_packaging"}
+    ]
+  },
+  "存储器": {
+    "aliases": ["存储器", "存储领域", "存储产业链", "内存", "HBM", "DRAM", "NAND", "存储芯片", "美光科技", "SK海力士"],
+    "related_boards": ["存储芯片", "半导体", "HBM", "存储模组", "存储材料"],
+    "mapped_stocks": [
+      {"code": "603986", "name": "兆易创新", "role": "memory_chip"},
+      {"code": "688525", "name": "佰维存储", "role": "memory_module"},
+      {"code": "300475", "name": "香农芯创", "role": "memory_distribution"},
+      {"code": "002409", "name": "雅克科技", "role": "semiconductor_material"},
+      {"code": "301308", "name": "江波龙", "role": "memory_module"},
+      {"code": "001309", "name": "德明利", "role": "memory_controller_module"},
+      {"code": "688766", "name": "普冉股份", "role": "nor_flash"},
+      {"code": "300223", "name": "北京君正", "role": "memory_chip"}
+    ]
+  },
+  "PCB": {
+    "aliases": ["PCB", "AI PCB", "高速PCB", "高速覆铜板", "覆铜板", "铜箔", "电子级玻纤"],
+    "related_boards": ["PCB", "高速PCB", "覆铜板", "电子材料"],
+    "mapped_stocks": [
+      {"code": "002463", "name": "沪电股份", "role": "high_speed_pcb"},
+      {"code": "300476", "name": "胜宏科技", "role": "high_speed_pcb"},
+      {"code": "002916", "name": "深南电路", "role": "pcb_substrate"},
+      {"code": "600183", "name": "生益科技", "role": "ccl_material"},
+      {"code": "603228", "name": "景旺电子", "role": "pcb"},
+      {"code": "300814", "name": "中富电路", "role": "pcb"},
+      {"code": "002815", "name": "崇达技术", "role": "pcb"}
+    ]
+  },
+  "CPO光通信": {
+    "aliases": ["CPO", "光模块", "光通信", "硅光", "800G", "1.6T", "光芯片", "光器件", "高速光模块"],
+    "related_boards": ["CPO", "光模块", "光通信", "光器件", "算力网络"],
+    "mapped_stocks": [
+      {"code": "300308", "name": "中际旭创", "role": "optical_module"},
+      {"code": "300502", "name": "新易盛", "role": "optical_module"},
+      {"code": "300394", "name": "天孚通信", "role": "optical_component"},
+      {"code": "002281", "name": "光迅科技", "role": "optical_chip_module"},
+      {"code": "603083", "name": "剑桥科技", "role": "optical_module"}
+    ]
+  },
+  "光连接": {
+    "aliases": ["光连接", "光互连", "光连接器", "光电连接", "光电互连", "光引擎", "光电共封装", "光I/O", "Optical I/O", "silicon photonics interconnect"],
+    "related_boards": ["光连接", "光互连", "硅光", "CPO", "高速连接器"],
+    "mapped_stocks": [
+      {"code": "300394", "name": "天孚通信", "role": "optical_component"},
+      {"code": "300308", "name": "中际旭创", "role": "optical_module"},
+      {"code": "300502", "name": "新易盛", "role": "optical_module"},
+      {"code": "301205", "name": "联特科技", "role": "optical_module"},
+      {"code": "688205", "name": "德科立", "role": "optical_module"},
+      {"code": "002281", "name": "光迅科技", "role": "optical_chip_module"},
+      {"code": "300570", "name": "太辰光", "role": "fiber_connector"},
+      {"code": "300548", "name": "博创科技", "role": "silicon_photonics_module"},
+      {"code": "688498", "name": "源杰科技", "role": "laser_chip"}
+    ]
+  },
+  "人形机器人": {
+    "aliases": ["人形机器人", "机器人", "具身智能", "物理AI", "物理 AI", "执行器", "减速器", "灵巧手"],
+    "related_boards": ["机器人", "人形机器人", "减速器", "执行器", "传感器"],
+    "mapped_stocks": [
+      {"code": "002050", "name": "三花智控", "role": "thermal_actuator"},
+      {"code": "601689", "name": "拓普集团", "role": "actuator_chassis"},
+      {"code": "603728", "name": "鸣志电器", "role": "motor_control"},
+      {"code": "688017", "name": "绿的谐波", "role": "harmonic_reducer"},
+      {"code": "002747", "name": "埃斯顿", "role": "industrial_robot"},
+      {"code": "002472", "name": "双环传动", "role": "precision_gear"},
+      {"code": "603662", "name": "柯力传感", "role": "force_sensor"},
+      {"code": "003021", "name": "兆威机电", "role": "micro_drive"}
+    ]
+  },
+  "AI PC": {
+    "aliases": ["AI PC", "AIPC", "AI电脑", "AI笔记本", "RTX Spark", "AI终端"],
+    "related_boards": ["AI PC", "消费电子", "PC", "端侧AI"],
+    "mapped_stocks": [
+      {"code": "603890", "name": "春秋电子", "role": "pc_structural_part"},
+      {"code": "301387", "name": "光大同创", "role": "pc_accessory"},
+      {"code": "300496", "name": "中科创达", "role": "edge_ai_os"},
+      {"code": "603296", "name": "华勤技术", "role": "terminal_odm"},
+      {"code": "603341", "name": "龙旗科技", "role": "terminal_odm"},
+      {"code": "600745", "name": "闻泰科技", "role": "terminal_odm"}
+    ]
+  },
+  "AI眼镜": {
+    "aliases": ["AI眼镜", "智能眼镜", "AR眼镜", "XR", "空间计算", "智能穿戴"],
+    "related_boards": ["AI眼镜", "消费电子", "AR", "XR"],
+    "mapped_stocks": [
+      {"code": "002241", "name": "歌尔股份", "role": "xr_oem"},
+      {"code": "002273", "name": "水晶光电", "role": "optical_component"},
+      {"code": "300088", "name": "长信科技", "role": "display_module"},
+      {"code": "002475", "name": "立讯精密", "role": "consumer_electronics_oem"},
+      {"code": "300433", "name": "蓝思科技", "role": "cover_glass"},
+      {"code": "603501", "name": "韦尔股份", "role": "image_sensor"},
+      {"code": "002456", "name": "欧菲光", "role": "optical_module"}
+    ]
+  },
+  "AI玩具": {
+    "aliases": ["AI玩具", "智能玩具", "AI陪伴", "儿童陪伴机器人", "教育玩具"],
+    "related_boards": ["AI玩具", "传媒娱乐", "教育", "端侧AI"],
+    "mapped_stocks": [
+      {"code": "002292", "name": "奥飞娱乐", "role": "toy_ip"},
+      {"code": "002862", "name": "实丰文化", "role": "smart_toy"},
+      {"code": "002575", "name": "群兴玩具", "role": "toy"},
+      {"code": "300043", "name": "星辉娱乐", "role": "toy_game"},
+      {"code": "300459", "name": "汤姆猫", "role": "ai_companion_ip"},
+      {"code": "002599", "name": "盛通股份", "role": "education_toy"}
+    ]
+  },
+  "太空算力": {
+    "aliases": ["太空算力", "卫星算力", "星载算力", "太空算力中心", "星载AI"],
+    "related_boards": ["商业航天", "卫星互联网", "算力", "卫星物联网"],
+    "mapped_stocks": [
+      {"code": "601698", "name": "中国卫通", "role": "satellite_operator"},
+      {"code": "688066", "name": "航天宏图", "role": "satellite_application"},
+      {"code": "688387", "name": "信科移动", "role": "satellite_communication"},
+      {"code": "300762", "name": "上海瀚讯", "role": "satellite_communication"},
+      {"code": "688418", "name": "震有科技", "role": "satellite_iot_network"}
+    ]
+  },
+  "商业航天": {
+    "aliases": ["商业航天", "卫星互联网", "低轨卫星", "火箭", "千帆星座", "卫星物联网", "可回收火箭"],
+    "related_boards": ["商业航天", "卫星导航", "卫星互联网", "军工"],
+    "mapped_stocks": [
+      {"code": "601698", "name": "中国卫通", "role": "satellite_operator"},
+      {"code": "688066", "name": "航天宏图", "role": "satellite_application"},
+      {"code": "300455", "name": "航天智装", "role": "space_equipment"},
+      {"code": "600118", "name": "中国卫星", "role": "satellite_manufacturing"},
+      {"code": "600879", "name": "航天电子", "role": "space_electronics"},
+      {"code": "300045", "name": "华力创通", "role": "satellite_navigation"},
+      {"code": "002465", "name": "海格通信", "role": "satellite_communication"}
+    ]
+  },
+  "低空经济": {
+    "aliases": ["低空经济", "飞行汽车", "eVTOL", "无人机", "通航", "空域改革"],
+    "related_boards": ["低空经济", "飞行汽车", "无人机", "通用航空"],
+    "mapped_stocks": [
+      {"code": "002085", "name": "万丰奥威", "role": "evtol_airframe"},
+      {"code": "001696", "name": "宗申动力", "role": "aviation_power"},
+      {"code": "000099", "name": "中信海直", "role": "general_aviation"},
+      {"code": "002625", "name": "光启技术", "role": "aircraft_material"},
+      {"code": "300975", "name": "商络电子", "role": "evtol_supply_chain"},
+      {"code": "000801", "name": "四川九洲", "role": "air_traffic_control"}
+    ]
+  },
+  "绿色电力": {
+    "aliases": ["绿色电力", "绿电", "电力现货", "虚拟电厂", "算电协同", "绿色算力", "绿色算力平台"],
+    "related_boards": ["绿色电力", "电力", "虚拟电厂", "算电协同"],
+    "mapped_stocks": [
+      {"code": "600900", "name": "长江电力", "role": "hydropower"},
+      {"code": "600027", "name": "华电国际", "role": "power_operator"},
+      {"code": "000539", "name": "粤电力A", "role": "power_operator"},
+      {"code": "600886", "name": "国投电力", "role": "power_operator"},
+      {"code": "600011", "name": "华能国际", "role": "power_operator"},
+      {"code": "688248", "name": "南网科技", "role": "grid_digitalization"},
+      {"code": "600131", "name": "国网信通", "role": "grid_it"}
+    ]
+  },
+  "数据中心": {
+    "aliases": ["数据中心", "IDC", "智算中心", "算力中心", "液冷", "绿色数据中心"],
+    "related_boards": ["数据中心", "IDC", "液冷服务器", "算力"],
+    "mapped_stocks": [
+      {"code": "300738", "name": "奥飞数据", "role": "idc_operator"},
+      {"code": "300442", "name": "润泽科技", "role": "idc_operator"},
+      {"code": "002929", "name": "润建股份", "role": "computing_ops"},
+      {"code": "002335", "name": "科华数据", "role": "idc_power"},
+      {"code": "002518", "name": "科士达", "role": "power_cooling"},
+      {"code": "300499", "name": "高澜股份", "role": "liquid_cooling"}
+    ]
+  },
+  "钠离子电池": {
+    "aliases": ["钠离子电池", "钠电池", "钠电", "钠离子", "钠电量产"],
+    "related_boards": ["钠离子电池", "新能源电池", "储能"],
+    "mapped_stocks": [
+      {"code": "300750", "name": "宁德时代", "role": "battery_leader"},
+      {"code": "300207", "name": "欣旺达", "role": "battery"},
+      {"code": "002245", "name": "蔚蓝锂芯", "role": "battery"},
+      {"code": "300073", "name": "当升科技", "role": "cathode_material"},
+      {"code": "688005", "name": "容百科技", "role": "cathode_material"},
+      {"code": "002709", "name": "天赐材料", "role": "electrolyte"}
+    ]
+  },
+  "创新药": {
+    "aliases": ["创新药", "医保目录", "商保创新药", "谈判药品", "ADC", "双抗", "临床获批"],
+    "related_boards": ["创新药", "医药", "生物制药"],
+    "mapped_stocks": [
+      {"code": "688235", "name": "百济神州", "role": "innovative_drug"},
+      {"code": "600276", "name": "恒瑞医药", "role": "innovative_drug"},
+      {"code": "688266", "name": "泽璟制药", "role": "innovative_drug"},
+      {"code": "688180", "name": "君实生物", "role": "innovative_drug"},
+      {"code": "300558", "name": "贝达药业", "role": "innovative_drug"},
+      {"code": "688506", "name": "百利天恒", "role": "adc_drug"}
+    ]
+  },
+  "脑机接口": {
+    "aliases": ["脑机接口", "脑机", "BCI", "神经接口", "脑科学"],
+    "related_boards": ["脑机接口", "医疗器械", "人工智能"],
+    "mapped_stocks": [
+      {"code": "301293", "name": "三博脑科", "role": "neurosurgery"},
+      {"code": "002173", "name": "创新医疗", "role": "brain_computer_concept"},
+      {"code": "600775", "name": "南京熊猫", "role": "bci_equipment_concept"},
+      {"code": "300003", "name": "乐普医疗", "role": "medical_device"}
+    ]
+  },
+  "量子科技": {
+    "aliases": ["量子科技", "量子通信", "量子计算", "量子安全", "量子密钥"],
+    "related_boards": ["量子科技", "量子通信", "信息安全"],
+    "mapped_stocks": [
+      {"code": "688027", "name": "国盾量子", "role": "quantum_security"},
+      {"code": "300520", "name": "科大国创", "role": "quantum_it_concept"},
+      {"code": "000555", "name": "神州信息", "role": "fintech_security"},
+      {"code": "003029", "name": "吉大正元", "role": "cryptography"},
+      {"code": "600120", "name": "浙江东方", "role": "quantum_investment"}
+    ]
+  },
+  "核聚变": {
+    "aliases": ["核聚变", "可控核聚变", "聚变能", "核聚变能", "人造太阳"],
+    "related_boards": ["核聚变", "核电", "高端装备", "新材料"],
+    "mapped_stocks": [
+      {"code": "688776", "name": "国光电气", "role": "fusion_device"},
+      {"code": "000969", "name": "安泰科技", "role": "magnetic_material"},
+      {"code": "002318", "name": "久立特材", "role": "special_alloy"},
+      {"code": "603011", "name": "合锻智能", "role": "forming_equipment"},
+      {"code": "600468", "name": "百利电气", "role": "electrical_equipment"}
+    ]
+  },
+  "航运": {
+    "aliases": ["航运", "集运", "集装箱海运", "运价", "旺季附加费", "霍尔木兹海峡"],
+    "related_boards": ["航运", "港口航运", "油运", "集运"],
+    "mapped_stocks": [
+      {"code": "601919", "name": "中远海控", "role": "container_shipping"},
+      {"code": "601872", "name": "招商轮船", "role": "shipping"},
+      {"code": "600026", "name": "中远海能", "role": "oil_shipping"},
+      {"code": "601022", "name": "宁波远洋", "role": "regional_shipping"},
+      {"code": "600428", "name": "中远海特", "role": "special_shipping"}
+    ]
+  },
+  "房地产": {
+    "aliases": ["房地产", "楼市", "地产", "房贷", "限购", "公积金贷款", "房地产贷款"],
+    "related_boards": ["房地产", "地产开发", "物业", "建筑"],
+    "mapped_stocks": [
+      {"code": "600048", "name": "保利发展", "role": "real_estate_developer"},
+      {"code": "000002", "name": "万科A", "role": "real_estate_developer"},
+      {"code": "001979", "name": "招商蛇口", "role": "real_estate_developer"},
+      {"code": "002244", "name": "滨江集团", "role": "real_estate_developer"},
+      {"code": "600325", "name": "华发股份", "role": "regional_developer"}
+    ]
+  },
+  "前沿新材料": {
+    "aliases": ["前沿新材料", "新材料", "先进材料", "碳纤维", "复合材料", "高分子材料"],
+    "related_boards": ["新材料", "碳纤维", "复合材料", "化工材料"],
+    "mapped_stocks": [
+      {"code": "600143", "name": "金发科技", "role": "polymer_material"},
+      {"code": "300699", "name": "光威复材", "role": "carbon_fiber"},
+      {"code": "688295", "name": "中复神鹰", "role": "carbon_fiber"},
+      {"code": "002130", "name": "沃尔核材", "role": "functional_material"},
+      {"code": "300285", "name": "国瓷材料", "role": "ceramic_material"}
+    ]
+  }
+}

@@ -33,7 +33,7 @@ except ModuleNotFoundError:
     json_repair_stub.repair_json.side_effect = lambda content, **_kwargs: content
     sys.modules["json_repair"] = json_repair_stub
 
-from src.agent.executor import AgentExecutor, AgentResult
+from src.agent.executor import AgentExecutor, AgentResult, _build_context_tool_argument_guard
 from src.agent.llm_adapter import LLMResponse, ToolCall
 from src.agent.runner import parse_dashboard_json, run_agent_loop, serialize_tool_result
 from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter
@@ -218,6 +218,46 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertEqual(len(result.tool_calls_log), 1)
         self.assertEqual(result.tool_calls_log[0]["tool"], "echo")
         self.assertTrue(result.tool_calls_log[0]["success"])
+
+    def test_context_tool_argument_guard_scopes_portfolio_snapshot_to_selected_account(self):
+        context = AgentUserContext(
+            accounts=[{"account_id": 3, "account_name": "5w账户", "total_equity": 50000}],
+            positions=[],
+            report=ReportContext(intent="position_review", analysis_mode="planning_execute"),
+        )
+
+        guard = _build_context_tool_argument_guard({"agent_user_context": context})
+
+        self.assertIsNotNone(guard)
+        self.assertEqual(
+            guard("get_portfolio_snapshot", {"include_positions": True}),
+            {"include_positions": True, "account_id": 3},
+        )
+
+    def test_context_tool_argument_guard_corrects_search_stock_name_from_positions(self):
+        context = AgentUserContext(
+            accounts=[{"account_id": 3, "account_name": "5w账户", "total_equity": 50000}],
+            positions=[
+                PositionContext(
+                    symbol="601399",
+                    quantity=100,
+                    account_id=3,
+                    stock_name="国机重装",
+                )
+            ],
+            report=ReportContext(intent="position_review", analysis_mode="planning_execute"),
+        )
+
+        guard = _build_context_tool_argument_guard({"agent_user_context": context})
+
+        self.assertIsNotNone(guard)
+        self.assertEqual(
+            guard(
+                "search_comprehensive_intel",
+                {"stock_code": "601399", "stock_name": "国投电力"},
+            )["stock_name"],
+            "国机重装",
+        )
 
     def test_candidate_discovery_keeps_structured_result_json(self):
         registry = ToolRegistry()

@@ -1,0 +1,251 @@
+dimension: momentum_desk
+description: >-
+  动量席位可调用的工具集，覆盖两类打法：
+  1. trend_continuation — 趋势健康的强势延续，有回踩位。
+  2. capital_momentum — 资金/连板承接真实非诱多。
+
+tools:
+  - tool: analyze_trend
+    priority: 5
+    when_to_use: >-
+      核实趋势结构是否健康：多头排列、均线上扬、有明确回踩位。
+      动量席的首要条件是「趋势没有破坏」。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 trend_status、支撑/压力位、近期高低点走向。
+    key_fields:
+      - trend_status
+      - support_levels
+      - resistance_levels
+    combo_hints:
+      - trend_status = bullish + 支撑位明确 = trend_continuation 信号。
+    cost: cheap
+    failure_modes:
+      - 历史数据不足时结论弱化。
+
+  - tool: get_volume_analysis
+    priority: 8
+    when_to_use: >-
+      判断量价健康度：趋势延续需要量价配合、无透支迹象；
+      连板需判断封板强度和是否开板。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回量比、成交量趋势、量价配合评估、近期高点量能。
+    key_fields:
+      - volume_ratio
+      - volume_trend
+      - volume_price_fit
+    combo_hints:
+      - 趋势强但量缩 = 注意分歧；量增价涨 = 趋势确认。
+    cost: cheap
+    failure_modes:
+      - 停牌期间数据缺失。
+
+  - tool: get_capital_flow
+    priority: 9
+    when_to_use: >-
+      核查 A 股个股主力资金流向（最新日净流入、近 5/10 日累计），
+      判断动量/连板是否有真实主力资金承接而非诱多。仅支持 A 股个股。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回最新日主力净流入、近 5 日与 10 日累计净流入及方向。
+    key_fields:
+      - net_inflow
+      - net_5d_inflow
+      - net_10d_inflow
+    combo_hints:
+      - 主力近 5/10 日持续净流入 + 趋势不散 = 资金承接真实。
+      - 当日大幅净流入但 5/10 日累计转负 = 资金撤离，警惕诱多。
+    cost: medium
+    failure_modes:
+      - 非 A 股个股（ETF/指数/港美股）不支持，返回空。
+      - Tushare/数据源额度耗尽时返回空。
+
+  - tool: get_tushare_moneyflow_dc
+    priority: 12
+    when_to_use: >-
+      补充 DC 口径资金数据，与 THS 交叉验证资金方向一致性。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回 DC 口径主力净流入额和方向。
+    key_fields:
+      - net_inflow
+      - direction
+    combo_hints:
+      - THS 与 DC 资金方向一致 = 资金信号可信度更高。
+    cost: medium
+    failure_modes:
+      - 与 THS 数据来源不同，可能存在口径差异。
+
+  - tool: get_tushare_limit_list_d
+    priority: 14
+    when_to_use: >-
+      验证连板候选的涨停信息：是否封板、封单金额、开板次数、连板天数。
+      capital_momentum 必须核查封板强度。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回涨停日期、封单额、开板次数、涨停原因。
+    key_fields:
+      - fd_amount
+      - open_times
+      - limit_times
+      - reason
+    combo_hints:
+      - 封单大 + 开板次数少 = 封板强度高，承接真实。
+      - 封单小 + 多次开板 = 弱板，慎重。
+    cost: medium
+    failure_modes:
+      - 当日未涨停时无数据。
+
+  - tool: get_tushare_limit_step
+    priority: 16
+    when_to_use: >-
+      查看连板高度和梯队结构：候选在哪一层，高度是否可控（首板/低位板优先）。
+      排除高位板 ≥5 的追高风险。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回连板梯队信息、当前连板高度、梯队排名。
+    key_fields:
+      - limit_times
+      - tier_rank
+    combo_hints:
+      - 首板或 2-3 连板 = 低位板，性价比高。
+      - ≥5 连板 = 高位板，动量席 stance 最多 watch。
+    cost: medium
+    failure_modes:
+      - 非连板日无数据。
+
+  - tool: get_tushare_dragon_tiger_list
+    priority: 18
+    when_to_use: >-
+      验证龙虎榜机构/游资席位结构：机构净买 = 承接真实；游资主导大幅溢价 = 高风险。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回龙虎榜买卖席位、机构/游资净买额、上榜原因。
+    key_fields:
+      - inst_net
+      - seat_type
+      - reason
+    combo_hints:
+      - 机构买入席位多 + 净买额大 = 承接真实信号。
+      - 游资全包 + 大幅溢价 = 博弈风险高。
+    cost: medium
+    failure_modes:
+      - 未上榜日无数据。
+
+  - tool: get_tushare_dragon_tiger_inst
+    priority: 20
+    when_to_use: >-
+      补充机构专项龙虎榜数据，精确核查机构净买额和席位分布。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回机构合计净买额、各席位明细。
+    key_fields:
+      - inst_net_total
+      - seats
+    combo_hints:
+      - 与 dragon_tiger_list 联动：机构席位数多且集中净买 = 强共识。
+    cost: medium
+    failure_modes:
+      - 非机构上榜日无数据。
+
+  - tool: get_tushare_hot_rank
+    priority: 22
+    when_to_use: >-
+      查看市场热度排名变化：热度上升快 = 资金关注增加；热度已见顶 = 可能临近分歧。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回热度排名及近期变化趋势。
+    key_fields:
+      - rank
+      - rank_change
+    combo_hints:
+      - 热度持续上升 + 资金净流入 = 双重信号。
+      - 热度见顶回落 + 量价背离 = 预警。
+    cost: cheap
+    failure_modes:
+      - 部分平台热度数据延迟。
+
+  - tool: get_sector_rankings
+    priority: 25
+    when_to_use: >-
+      确认板块强度和所在梯队。趋势延续候选需要板块支撑；
+      若个股主因是板块补涨，需核查龙头是否已涨、二线是否跟上。
+    typical_args:
+      market: "{market}"
+    returns_summary: >-
+      返回各板块涨跌幅排名和强度分级。
+    key_fields:
+      - sector_name
+      - sector_rank
+      - sector_change_pct
+    combo_hints:
+      - 板块强 + 个股趋势健康 = 顺势信号。
+      - 板块见顶但个股仍拉涨 = 补涨博弈，风险上升。
+    cost: cheap
+    failure_modes:
+      - 板块分类可能不精确。
+
+  - tool: analyze_price_structure
+    priority: 28
+    when_to_use: >-
+      确认趋势延续候选的回踩位是否舒适，是否存在明确的入场支撑。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回区间位置、支撑压力位。
+    key_fields:
+      - support_levels
+      - resistance_levels
+      - position_zone
+    combo_hints:
+      - 回踩到支撑位附近 + 量缩 = 舒适入场点。
+    cost: cheap
+    failure_modes:
+      - 无明显支撑时返回 unknown。
+
+  - tool: get_realtime_quote
+    priority: 30
+    when_to_use: >-
+      快速核查追高风险：今日涨幅、换手率、是否已追高。
+      动量席必须做追高检查。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回最新可用价、涨跌幅、换手率、量比。
+    key_fields:
+      - price
+      - change_pct
+      - turnover_rate
+      - volume_ratio
+    combo_hints:
+      - 今日涨幅 > 7% + 换手率 > 12% = 追高风险，至多 watch。
+    cost: cheap
+    failure_modes:
+      - 休市返回最近可用价。
+
+  - tool: get_stock_info
+    priority: 35
+    when_to_use: >-
+      获取行业/板块归属。辅助判断板块背景。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回行业、概念、流通股本。
+    key_fields:
+      - industry
+      - sector
+    combo_hints:
+      - 板块轮动背景下，行业信息帮助判断补涨空间。
+    cost: cheap
+    failure_modes:
+      - 少数标的信息缺失。

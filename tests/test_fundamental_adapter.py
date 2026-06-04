@@ -21,6 +21,7 @@ from data_provider.fundamental_adapter import (
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
     _stockapi_code_flow_completed_date,
+    _stockapi_default_completed_date,
 )
 
 
@@ -38,22 +39,43 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(_akshare_fund_flow_market("688001"), "sh")
         self.assertEqual(_akshare_fund_flow_market("BJ920748"), "bj")
 
-    def test_capital_flow_does_not_fallback_to_eastmoney_when_stockapi_fails(self) -> None:
+    def test_stockapi_default_completed_date_uses_1600_cutoff_for_hot_sectors(self) -> None:
+        class _MorningDateTime(datetime):
+            @classmethod
+            def now(cls):
+                return cls(2026, 6, 2, 15, 59, 0)
+
+        class _AfternoonDateTime(datetime):
+            @classmethod
+            def now(cls):
+                return cls(2026, 6, 2, 16, 0, 0)
+
+        with patch("data_provider.fundamental_adapter.datetime", _MorningDateTime):
+            self.assertEqual(_stockapi_default_completed_date(), "2026-06-01")
+        with patch("data_provider.fundamental_adapter.datetime", _AfternoonDateTime):
+            self.assertEqual(_stockapi_default_completed_date(), "2026-06-02")
+
+    def test_capital_flow_fails_when_tushare_and_stockapi_both_fail(self) -> None:
         adapter = AkshareFundamentalAdapter()
 
-        with patch.object(adapter, "_get_stockapi_capital_flow", return_value=({}, None, ["stockapi_codeFlow:failed"])), \
+        with patch.object(adapter, "_get_tushare_capital_flow", return_value=({}, None, ["tushare_moneyflow:failed"])), \
+                patch.object(adapter, "_get_stockapi_capital_flow", return_value=({}, None, ["stockapi_codeFlow:failed"])), \
                 patch.object(adapter, "_call_df_candidates") as mock_akshare:
             result = adapter.get_capital_flow("300456")
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["stock_flow"], {})
-        self.assertEqual(result["errors"], ["stockapi_codeFlow:failed"])
+        self.assertEqual(result["errors"], ["tushare_moneyflow:failed", "stockapi_codeFlow:failed"])
         mock_akshare.assert_not_called()
 
     def test_capital_flow_not_supported_for_non_a_share_without_eastmoney(self) -> None:
         adapter = AkshareFundamentalAdapter()
 
         with patch.object(
+            adapter,
+            "_get_tushare_capital_flow",
+            return_value=({}, None, ["tushare_moneyflow:not_supported:HK.00700"]),
+        ), patch.object(
             adapter,
             "_get_stockapi_capital_flow",
             return_value=({}, None, ["stockapi_codeFlow:not_supported:HK.00700"]),
@@ -62,10 +84,37 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         self.assertEqual(result["status"], "not_supported")
         self.assertEqual(result["stock_flow"], {})
-        self.assertEqual(result["errors"], ["stockapi_codeFlow:not_supported:HK.00700"])
+        self.assertEqual(
+            result["errors"],
+            ["tushare_moneyflow:not_supported:HK.00700", "stockapi_codeFlow:not_supported:HK.00700"],
+        )
         mock_akshare.assert_not_called()
 
-    def test_capital_flow_prefers_stockapi_code_flow(self) -> None:
+    def test_capital_flow_prefers_tushare_moneyflow(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        tushare_df = pd.DataFrame([
+            {"trade_date": "20260506", "net_mf_amount": 100.0},
+            {"trade_date": "20260507", "net_mf_amount": -20.0},
+            {"trade_date": "20260508", "net_mf_amount": 30.0},
+        ])
+
+        with patch("data_provider.fundamental_adapter.query_tushare_api", return_value=tushare_df), \
+                patch.object(adapter, "_get_stockapi_capital_flow") as stockapi_mock, \
+                patch.object(adapter, "_call_df_candidates") as mock_akshare:
+            result = adapter.get_capital_flow("600004")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 300000.0)
+        self.assertEqual(result["stock_flow"]["inflow_5d"], 1100000.0)
+        self.assertEqual(result["stock_flow"]["inflow_10d"], 1100000.0)
+        self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
+        self.assertEqual(result["stock_flow"]["source_update"], "tushare_moneyflow_after_market_close")
+        self.assertIn("capital_stock:tushare_moneyflow", result["source_chain"])
+        self.assertEqual(result["errors"], [])
+        stockapi_mock.assert_not_called()
+        mock_akshare.assert_not_called()
+
+    def test_capital_flow_falls_back_to_stockapi_when_tushare_fails(self) -> None:
         adapter = AkshareFundamentalAdapter()
         stockapi_payload = {
             "code": 20000,
@@ -84,7 +133,8 @@ class TestFundamentalAdapter(unittest.TestCase):
             def json(self):
                 return stockapi_payload
 
-        with patch.object(adapter, "_call_df_candidates") as mock_akshare, \
+        with patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=RuntimeError("sdk timeout")), \
+                patch.object(adapter, "_call_df_candidates") as mock_akshare, \
                 patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
             result = adapter.get_capital_flow("600004")
 
@@ -94,11 +144,57 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["stock_flow"]["inflow_10d"], 110.0)
         self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
         self.assertIn("capital_stock:stockapi_codeFlow", result["source_chain"])
-        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["errors"], ["tushare_moneyflow:RuntimeError:sdk timeout"])
         mock_akshare.assert_not_called()
         params = mock_get.call_args.kwargs["params"]
         self.assertEqual(params["code"], "600004")
-        self.assertEqual(params["pageSize"], "20")
+        self.assertEqual(params["pageSize"], "50")
+
+    def test_capital_flow_stockapi_honors_explicit_window_and_page(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "code": 20000,
+                    "msg": "success",
+                    "data": [{"date": "2026-05-15", "mainAmount": "100.0", "code": "600004"}],
+                }
+
+        with patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=RuntimeError("sdk timeout")), \
+                patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            result = adapter.get_capital_flow(
+                "600004",
+                start_date="2026-05-15",
+                end_date="20260515",
+                page_no=2,
+                page_size=80,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["code"], "600004")
+        self.assertEqual(params["startDate"], "2026-05-15")
+        self.assertEqual(params["endDate"], "2026-05-15")
+        self.assertEqual(params["pageNo"], "2")
+        self.assertEqual(params["pageSize"], "80")
+
+    def test_capital_flow_stockapi_rejects_invalid_explicit_window(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        with patch("data_provider.fundamental_adapter.requests.get") as mock_get:
+            result = adapter.get_capital_flow(
+                "600004",
+                start_date="2026-05-16",
+                end_date="2026-05-15",
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["errors"], ["tushare_moneyflow:invalid_date:start_date_after_end_date", "stockapi_codeFlow:invalid_date:start_date_after_end_date"])
+        mock_get.assert_not_called()
 
     def test_stockapi_code_flow_completed_date_uses_previous_day_before_1530(self) -> None:
         self.assertEqual(
@@ -111,6 +207,14 @@ class TestFundamentalAdapter(unittest.TestCase):
         )
         self.assertEqual(
             _stockapi_code_flow_completed_date(datetime(2026, 5, 15, 16, 0)).isoformat(),
+            "2026-05-15",
+        )
+        self.assertEqual(
+            _stockapi_code_flow_completed_date(datetime(2026, 5, 17, 20, 0)).isoformat(),
+            "2026-05-15",
+        )
+        self.assertEqual(
+            _stockapi_code_flow_completed_date(datetime(2026, 5, 18, 15, 29)).isoformat(),
             "2026-05-15",
         )
 
@@ -130,6 +234,7 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         with patch.dict(os.environ, {"STOCKAPI_TOKEN": "test-token"}, clear=False), \
                 patch("data_provider.fundamental_adapter.datetime") as mock_datetime, \
+                patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=RuntimeError("sdk timeout")), \
                 patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
             mock_datetime.now.return_value = datetime(2026, 5, 15, 15, 29)
             result = adapter.get_capital_flow("301028")
@@ -156,6 +261,7 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         with patch.dict(os.environ, {"STOCKAPI_TOKEN": "test-token"}, clear=False), \
                 patch("data_provider.fundamental_adapter.datetime") as mock_datetime, \
+                patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=RuntimeError("sdk timeout")), \
                 patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
             mock_datetime.now.return_value = datetime(2026, 5, 15, 15, 30)
             result = adapter.get_capital_flow("301028")
@@ -189,6 +295,7 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         with patch.dict(os.environ, {"STOCKAPI_TOKEN": "test-token"}, clear=False), \
                 patch("data_provider.fundamental_adapter.datetime") as mock_datetime, \
+                patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=RuntimeError("sdk timeout")), \
                 patch("data_provider.fundamental_adapter.requests.get", side_effect=responses) as mock_get:
             mock_datetime.now.return_value = datetime(2026, 5, 15, 16, 0)
             result = adapter.get_capital_flow("603418")
@@ -215,12 +322,16 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         with patch.dict(os.environ, {"STOCKAPI_TOKEN": ""}, clear=False), \
                 patch("data_provider.fundamental_adapter.datetime") as mock_datetime, \
+                patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=RuntimeError("sdk timeout")), \
                 patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
             mock_datetime.now.return_value = datetime(2026, 5, 10, 16, 0)
             result = adapter.get_capital_flow("600004")
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["errors"], ["stockapi_codeFlow:empty_data"])
+        self.assertEqual(
+            result["errors"],
+            ["tushare_moneyflow:RuntimeError:sdk timeout", "stockapi_codeFlow:empty_data"],
+        )
         self.assertEqual(mock_get.call_count, 3)
         windows = [
             (call.kwargs["params"]["startDate"], call.kwargs["params"]["endDate"])
@@ -229,9 +340,9 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(
             windows,
             [
-                ("2026-05-02", "2026-05-06"),
-                ("2026-04-27", "2026-05-01"),
-                ("2026-04-22", "2026-04-26"),
+                ("2026-04-30", "2026-05-04"),
+                ("2026-04-25", "2026-04-29"),
+                ("2026-04-20", "2026-04-24"),
             ],
         )
 
@@ -338,6 +449,76 @@ class TestFundamentalAdapter(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertIn("missing_bk_code", result["errors"][0])
+
+    def test_stockapi_hot_sector_leaders_normalizes_rows(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "code": 20000,
+                    "msg": "success",
+                    "data": [
+                        {
+                            "code": "600001",
+                            "name": "测试龙头",
+                            "bkCode": "BK1234",
+                            "bkName": "机器人",
+                            "mainAmount": "1230000",
+                            "qiangdu": "91.2",
+                        }
+                    ],
+                }
+
+        with patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            result = adapter.get_stockapi_hot_sector_leaders(date="2026-05-15", limit=5)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["items"][0]["code"], "600001")
+        self.assertEqual(result["items"][0]["bk_code"], "BK1234")
+        self.assertEqual(result["items"][0]["main_net_inflow"], 1230000.0)
+        self.assertIn("/v1/hotBkJlrLongTou", mock_get.call_args.args[0])
+
+    def test_stockapi_change_all_history_normalizes_rows(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "code": 20000,
+                    "msg": "success",
+                    "data": [
+                        {
+                            "time": "145051",
+                            "code": "603398",
+                            "name": "测试异动",
+                            "type": 8201,
+                            "info": "4.67%",
+                            "typeName": "火箭发射",
+                            "dateId": "2026-05-15",
+                        }
+                    ],
+                }
+
+        with patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            result = adapter.get_stockapi_change_all_history(
+                start_date="2026-05-15",
+                end_date="2026-05-15",
+                event_type="8201",
+                limit=5,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["items"][0]["code"], "603398")
+        self.assertEqual(result["items"][0]["event_name"], "火箭发射")
+        self.assertIn("/v1/change/allHistory", mock_get.call_args.args[0])
+        self.assertEqual(mock_get.call_args.kwargs["params"]["type"], "8201")
 
     def test_stockapi_popularity_rank_normalizes_rows(self) -> None:
         adapter = AkshareFundamentalAdapter()
@@ -570,6 +751,33 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["summary"]["northbound_net_inflow"], 1200.0)
         self.assertEqual(len(result["history"]), 2)
         self.assertTrue(result["source_chain"])
+        self.assertTrue(result["data_quality"]["core_numeric_available"])
+
+    def test_northbound_capital_flow_marks_rows_without_numeric_fields(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        summary_df = pd.DataFrame({"日期": ["2026-05-07"], "说明": ["北向资金暂无数据"]})
+        hist_df = pd.DataFrame({"日期": ["2026-05-06", "2026-05-07"], "状态": ["休市", "暂无"]})
+        seen = []
+
+        def _fake_call_df_candidates(candidates):
+            seen.append(candidates)
+            if len(seen) == 1:
+                return summary_df, "stock_hsgt_fund_flow_summary_em", []
+            if len(seen) == 2:
+                return hist_df, "stock_hsgt_hist_em", []
+            return None, None, []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_northbound_capital_flow(limit=2)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertFalse(result["data_quality"]["core_numeric_available"])
+        self.assertEqual(result["data_quality"]["history_rows"], 2)
+        self.assertEqual(result["data_quality"]["history_rows_with_numeric"], 0)
+        self.assertIn(
+            "northbound_source_returned_rows_but_no_numeric_flow_fields",
+            result["warnings"],
+        )
 
     def test_margin_trading_summary_returns_exchange_data(self) -> None:
         adapter = AkshareFundamentalAdapter()

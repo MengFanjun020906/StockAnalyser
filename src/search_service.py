@@ -294,6 +294,7 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int,
         days: int = 7,
         topic: Optional[str] = None,
+        include_domains: Optional[List[str]] = None,
     ) -> SearchResponse:
         """执行 Tavily 搜索"""
         try:
@@ -321,6 +322,8 @@ class TavilySearchProvider(BaseSearchProvider):
             }
             if topic is not None:
                 search_kwargs["topic"] = topic
+            if include_domains:
+                search_kwargs["include_domains"] = include_domains
 
             response = client.search(
                 **search_kwargs,
@@ -368,9 +371,10 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int = 5,
         days: int = 7,
         topic: Optional[str] = None,
+        include_domains: Optional[List[str]] = None,
     ) -> SearchResponse:
-        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
-        if topic is None:
+        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic 或 domain 限定。"""
+        if topic is None and not include_domains:
             return super().search(query, max_results=max_results, days=days)
 
         api_key = self._get_next_key()
@@ -385,7 +389,10 @@ class TavilySearchProvider(BaseSearchProvider):
 
         start_time = time.time()
         try:
-            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
+            response = self._do_search(
+                query, api_key, max_results,
+                days=days, topic=topic, include_domains=include_domains,
+            )
             response.search_time = time.time() - start_time
 
             if response.success:
@@ -3164,6 +3171,21 @@ class SearchService:
                     'tavily_topic': None,
                     'strict_freshness': False,
                 },
+                {
+                    'name': 'financial_sites',
+                    'query': f"{stock_name} {stock_code}",
+                    'desc': '财经网站',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                    'include_domains': [
+                        'xueqiu.com',
+                        '10jqka.com.cn',
+                        'eastmoney.com',
+                        'cls.cn',
+                        'finance.sina.com.cn',
+                        'stcn.com',
+                    ],
+                },
             ]
         
         search_days = self._effective_news_window_days()
@@ -3201,16 +3223,24 @@ class SearchService:
             
             logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+            include_domains = dim.get('include_domains') or []
+            effective_query = dim['query']
+
+            if isinstance(provider, TavilySearchProvider):
                 response = provider.search(
-                    dim['query'],
+                    effective_query,
                     max_results=provider_max_results,
                     days=search_days,
-                    topic=dim['tavily_topic'],
+                    topic=dim.get('tavily_topic'),
+                    include_domains=include_domains or None,
                 )
             else:
+                # Non-Tavily: prepend site: filter so every result comes from trusted domains
+                if include_domains:
+                    site_prefix = " OR ".join(f"site:{d}" for d in include_domains)
+                    effective_query = f"({site_prefix}) {effective_query}"
                 response = provider.search(
-                    dim['query'],
+                    effective_query,
                     max_results=provider_max_results,
                     days=search_days,
                 )
@@ -3258,10 +3288,12 @@ class SearchService:
         lines = [f"【{stock_name} 情报搜索结果】"]
         
         # 维度展示顺序
-        display_order = ['latest_news', 'announcements', 'market_analysis', 'risk_check', 'earnings', 'industry']
+        display_order = ['latest_news', 'financial_sites', 'announcements', 'market_analysis', 'risk_check', 'earnings', 'industry']
 
         dim_labels = {
             'latest_news': '📰 最新消息',
+            'financial_sites': '💹 财经网站',
+            'capital_signals': '💰 资金信号',
             'announcements': '📋 公司公告',
             'market_analysis': '📈 机构分析',
             'risk_check': '⚠️ 风险排查',

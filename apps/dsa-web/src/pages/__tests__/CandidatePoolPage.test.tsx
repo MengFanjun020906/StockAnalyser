@@ -33,6 +33,8 @@ describe('CandidatePoolPage', () => {
     expect(screen.getByText('贵州茅台')).toBeInTheDocument();
     expect(screen.getByText('600519')).toBeInTheDocument();
     expect(screen.getByText('AlphaSift YAML 多因子策略入池')).toBeInTheDocument();
+    expect(screen.getByText('候选入池榜')).toBeInTheDocument();
+    expect(screen.getByText('重点观察')).toBeInTheDocument();
     expect(screen.getByText('硬策略主干')).toBeInTheDocument();
     expect(screen.getByText('可用')).toBeInTheDocument();
     expect(screen.getAllByText('新进入').length).toBeGreaterThanOrEqual(1);

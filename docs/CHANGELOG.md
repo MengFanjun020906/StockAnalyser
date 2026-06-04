@@ -9,8 +9,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [新功能] 四席位 seed pool 新增 `news_theme_daily` 盘前日报主题来源，接入东方财富财经早餐 `stock_info_cjzc_em`，按 `trade_date` 匹配当天 6 点日报，并通过本地概念字典、可选 `jieba` 分词和规则引擎映射主题成分股；日报直接点名公司仅做诊断与避雷，不直接生成 seed。
+- [文档] 重写根 README 为专业化项目首页，突出账户感知 AI 投资研究、四席位选股、Meta 约束、点位计算、组合配置、Judge 和 Trace 复盘；新增 `docs/stock-selection-pipeline.md` 专题文档说明选股链路输入输出、机会首选/执行首选双轴语义和 Trace artifact。
+- [文档] 在 README 与 `docs/stock-selection-pipeline.md` 的 L1 seed pool 说明中显式列出 `AlphaSift` 与 `Sequoia` 本地主干候选源，避免把两者泛化成“本地价量与形态”。
+- [新功能] 四席位委员会新增 `theme_catalyst_desk` 主题催化席，专门判断日报/当日主题是否与个股业务归属匹配、是否已有板块或资金验证，并输出 `theme_catalyst` setup；聚合默认名额表同步给主题席保留 2 个常规名额、事件驱动 regime 保留 4 个名额。
+- [修复] `news_theme_daily` 不再只读取东方财富财经早餐列表摘要；工具会根据文章链接抓取东财原文 `ContentBody`，按 `每日精选/热点题材/公司新闻` 分区抽取主题并在 Trace 暴露 `article_fetch_status/article_sections/evidence_section`，避免摘要漏掉 MLCC 等正文主题。
+- [改进] `news_theme_daily` 主题评分新增高影响产业催化词加权，命中 `英伟达/NVIDIA/黄仁勋/CUDA/Blackwell` 等词的非公司新闻主题会提高 `theme_score` 并在 Trace 暴露 `high_impact_terms`；公司新闻否认/澄清仍只做诊断不产 seed。
+- [改进] 扩充 `news_theme_daily` 本地概念映射字典，覆盖 AI服务器、GPU算力芯片、先进封装、PCB、CPO光通信、AI玩具、低空经济、数据中心、钠离子电池、创新药、航运、房地产等常见财经早餐主题，便于原文主题召回后的成分股映射查询。
+- [改进] 四席位 seed pool 移除 `event_impact`、`news_momentum`、`fundamental_snapshot` 三个低精度主召回来源，并将 `news_theme_daily` source cap 从 6 提高到 8，给高质量盘前消息池多 2 个候选名额。
+- [改进] `news_theme_daily` 本地概念映射补充存储领域、光模块和光连接主题，覆盖 `存储领域/存储产业链/光器件/高速光模块/光互连/光引擎/光I/O` 等别名及对应宽口径成分股。
+- [改进] `news_theme_daily` 日期路由改为每日 06:00 前自动使用上一自然日财经早餐、06:00 后使用当日财经早餐，并在 Trace 暴露 `requested_target_date`、`target_date`、`target_date_rule`。
+- [修复] Agent 主分析工具批次改为正常宽度真正并行执行，并为 `get_stock_info`、`get_market_capital_flow`、`search_comprehensive_intel` 增加工具内硬超时/快搜边界，避免 Step 1 大批量工具排队后被统一 30s 标记为 `Tool execution timed out`。
+- [改进] Agent Trace 工具诊断细化 `score_stock_news_sentiment`、`get_tushare_announcements`、`get_northbound_capital_flow` 的空结果与部分数据语义：公告/新闻暴露查询窗口和状态，北向资金暴露 `data_quality` 与无核心数值字段 warning，避免把 `empty`、`partial-null` 和 `error` 混读。
+- [修复] `get_sector_rankings` 改为快路径板块工具，优先东方财富行业板块实时行情 `stock_board_industry_name_em` 背后的 boardlist 数据接口，StockAPI `/v1/hotBkJlrDr` 仅作可用时兜底；权限/额度/网络失败时直接返回结构化 `failed/timeout`，不再进入 Tushare/AkShare/Efinance 慢速轮询导致外层 30 秒超时。
+- [改进] Agent Trace 页历史记录由横向 pill 列表改为竖向列表，历史问题摘要支持多行显示，避免横向滚动时内容显示不完整。
+- [修复] 选股最终报告核心结论表改为“机会首选/执行首选”双轴展示：机会首选不因账户过于谨慎而被抹掉，执行首选才受账户、市场和风控约束；未深挖候选仅进入观察池，Meta-Agent 链路标题改为“链路对齐（非推荐排序）”，避免表头与后续章节像两套独立排序。
+- [新功能] Agent 新增 `get_stock_business_context` 轻量业务归属工具，只返回名称、行业、板块、业务线索摘要、来源与日期；四席位 `SeedFactPacket` 默认改用该工具补齐第一层业务上下文，`get_stock_info` 保留给深层基本面。
+- [改进] 四席位 `SeedFactPacket` 新增宽口径 `business_context`，从所属板块、FactSheet 和召回特征中合并宽行业、原始板块名与主题线索，避免高位事件票只因价量过热而丢失业务催化证据。
+- [改进] Web 全局字体切换为优先使用 `Noto Sans SC` / 思源黑体，并移除 Agent Trace 页面的衬线字体覆盖，提升中文页面清晰度。
+- [改进] 四席位 seed pool 移除当前权限不可用的 `northbound_stock_connect/hsgt_top10` 主来源，`hot_rank` 改用 StockAPI `renQi` 人气榜，并用 StockAPI `hotBkJlrDr/hotBkJlrLongTou` 补充 `sector_theme` 板块来源。
+- [修复] 四席位 seed pool 最终合并改为除 `user_watchlist` 外按可用 source 总数平均分配名额，并将不足来源的空余名额再分配；Trace 同步拆出 `sector_theme` 在线补充 bucket 的诊断，避免成功返回的来源被前三类挤出或被汇总入口遮蔽。
+- [修复] 四席位 LLM 首轮输入改用压缩版 `SeedFactPacket`，保留结构、支撑压力、趋势、均线、量能、资金、板块和基本面等决策事实，同时让 LLM fallback 共享超时预算，避免单个慢模型吃完整个 60s 后导致席位连续失败熔断；Trace probe 会回挂落盘的 `seed_facts.json`，用于真实复跑排障。
+- [新功能] Agent 新增 Tushare `get_tushare_today_news` 当日新闻快讯工具，固定查询今天 `00:00:00` 到当前时刻的 `news` 数据，并复用 `TUSHARE_TOKEN`/`TUSHARE_HTTP_URL` 环境配置。
+- [新功能] 选股流水线接入 `meta_orchestrator` 与 `pricing_agent` 两个真实阶段：四席位深挖后生成资产定性、硬约束与必算场景包，再由点位计算层输出 If-Then 条件单矩阵并传递给组合配置、反方审查、Judge 和最终报告。
+- [改进] 选股 `final.md` 改为面向 Meta-Agent 链路展示：新增“四席位 → Meta 约束包 → 点位计算 If-Then 条件单”专章，显式解释 Meta 字段语义、硬约束、必算场景、入场区间、止盈止损和缺失证据；深挖/报告标的数量收敛为 1-5 只。
+- [文档] 明确 Meta-Agent 后续运行顺序：Meta → 点位计算 → 组合规划 → 反方审查 → Judge 为 5 次串行 LLM stage 调用，`final.md` 只读取已落盘 JSON 做确定性渲染。
+- [改进] 选股 Meta-Agent 后续阶段新增 prompt 控长保护：下游只接收最多 5 只股票、每只最多 3 个必算场景的压缩约束包和条件单矩阵，并按可执行性稳定排序，避免完整 Meta/深挖结果撑爆模型上下文。
+- [改进] 暂停四席位主链路主动使用 `moneyflow_ths`：种子池资金异常源和动量席工具白名单不再调用 THS 个股资金流；单票资金验证继续走 `get_capital_flow`，由 Tushare `moneyflow` 失败后回退 StockAPI `codeFlow`。
+- [改进] StockAPI 历史资金流 fallback 支持 `STOCKAPI_URL` 覆盖 codeFlow 地址，默认仍为 `https://www.stockapi.com.cn/v1/base/codeFlow`。
+- [改进] L1 四席位种子池新增 `AGENT_SEED_POOL_TOTAL_LIMIT` 上限配置，默认 20 保持原行为；单票真实 smoke 或排障时可临时设为 1-3，避免候选事实包补数拖慢 Meta/点位计算闭环验证。
+- [修复] 四席位种子池恢复 `user_watchlist` 最高优先级，显式传入的 `target_symbols` 会先进入 seed pool；当 `AGENT_SEED_POOL_TOTAL_LIMIT` 已被用户 seed 填满时不再继续拉在线候选源，保证单票排障稳定命中指定股票。
+- [修复] 四席位最终 JSON 解析兼容真实模型输出的短前后缀文本，自动提取首尾大括号中的 JSON object；纯自然语言仍按 `final_output_not_json` 失败处理。
+- [文档] 补充选股链路 Meta-Agent / Orchestrator 架构：明确四席位报告如何被整理成资产定性、市场环境过滤、硬约束与必算场景包，并定义点位计算层只做 If-Then 条件单计算的职责边界。
+- [改进] 四席位选股链路新增 `SeedFactPacket` 前置并行取数层，按 `(seed,tool)` 构建共享 facts JSON，并把压缩后的模型输入版 `seed_facts.json` 写入 Trace 便于定位取数慢、缺失或失败，避免原始工具数据撑爆后续模型上下文。
+- [改进] `detect_market_regime` 准确性优先：上调市场环境辅助组件默认预算，`AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` 从 `8.0` 调至 `25.0`、`AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` 从 `3.0` 调至 `10.0`、`AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` 从 `5.0` 调至 `20.0`；指数历史快路径和北向/两融/市场资金/板块排行均使用完整组件预算，降低短超时导致辅助输入缺失的概率。
+- [文档] 补充选股链路重构方案的深入探究层设计：将选股候选深挖从通用 `planning_prompts.py`/个股分析 prompt 中拆出，明确最多 3 只、最少 1 只的深挖目标选择、默认 3 次单股 prompt 调用、输入 payload、输出 schema 与报告消费规则。
+- [修复] 放宽 `get_stock_info` 默认超时预算：基本面阶段总预算从 1.5s 调整为 8s，单源 fetch 从 0.8s 调整为 3s，所属板块补充从 1s 调整为 3s，降低 AkShare/efinance 慢响应导致的 `partial` 与板块缺失。
+- [修复] 四席位最终输出收紧为 JSON contract + Few-shot JSON 示例，并在席位 LLM 调用中启用 `response_format={"type":"json_object"}`，减少工具调用后回灌阶段输出自然语言导致的 `final_output_not_json`。
+- [文档] 补充 `docs/选股链路重构-实施方案.md` 的端到端链路总览，明确种子池多来源、三打法席位输出、聚合层和后续 screening/deep dive/judge 的传递关系。
+- [修复] 四席位单 seed LLM 默认超时从 20s 调整为 60s，并将外层 per-seed guard 上限提高到 180s、整体 committee 预算按「首轮 LLM + 工具 + 后续 LLM」同步放宽；实测工具本身多为 1-8s，主要耗时来自工具结果回灌后的 LLM 二/三轮。
+- [修复] 四席位候选发现的 LLM 调用增加 adapter 级硬超时并关闭限时调用内的 LiteLLM 重试拖延；LLM provider 超时/错误会作为逐 seed `failed` 暴露并触发连续失败熔断，不再被外层 seed guard 提前吞成无原因 `timeout`。
+- [chore] 新增 `scripts/probe_thesis_desks_from_trace.py`，可从保存的 Agent Trace 复用 seed preview 直接驱动四席位，隔离验证 seed/recall/desk loop、工具 schema 和真实 LLM 首轮调用耗时。
+- [修复] 四席位候选发现取消 seed pool 失败兜底：seed pool 只作为输入与诊断，四席位未产出 L1 候选时 `candidate_discovery.status=failed`、`candidates=[]`，选股流水线直接终止并在 Trace/报告错误中暴露席位与逐 seed 失败原因，不再继续 screening/deep dive。
+- [修复] seed pool 入池后不再对外展示跨来源统一分数：`priority_score` 降级为 `source_diagnostics`，Agent Trace 与候选池页只展示来源证据/初筛分，避免把 AlphaSift、新闻主题等不同来源的 90 分直接比较。
+- [修复] 四席位逐 seed 执行增加 seed 级 wall-clock 保护与连续 timeout 熔断：单只 seed 超时会保存为 `per_seed_packets[]`，席位返回 `partial` 而不是等整席位 400s 后被外层合成空 timeout；Trace 页面同步展示每个席位下逐 seed 的状态、耗时、工具数和错误。
+- [修复] 四席位候选发现改为逐 seed 调用 LLM 并逐票保存 `per_seed_packets`，同时显式把 `AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS` 传给每次 LLM 工具调用，避免 LiteLLM 默认 `6000s` 导致席位线程晚到、Trace 先报 timeout，并透传 `thesis_desk_packets` 供前端查看四席位报告。
+- [改进] 选股候选发现当前调试阶段收敛到 `thesis_desk_committee` 四席位链路：后端默认模式改为四席位，前端 Trace 只暴露四席位选项；若 API/旧配置显式传 `deterministic` 或 `llm_expert_committee`，流水线会在候选发现前直接退出并写入 `candidate_discovery.status=skipped`，避免误跑旧链路干扰四席位排障。
+- [修复] 选股打法席位委员会：修复 LLM 适配器 `_convert_messages` 只识别扁平 `tool_calls` 结构、遇到候选专家委员会的嵌套 OpenAI 结构（`{"function": {"name", "arguments"}}`）时抛 `KeyError('name')` 的问题，曾导致三个打法席位（低位启动/动量/质量修复）在多轮工具调用后全部 failed/timeout、候选池静默回退到 60 只召回结果。
+- [改进] 打法席位聚合诊断（`thesis_desk_diagnostics`）补充每个席位的真实 `errors`/`warnings`，降级时不再只记 `status` 而丢失失败原因，避免靠盲目重跑定位问题。
+- [改进] 统一后端入口日志落盘：`server.py` 和 `webui.py` 改为复用项目日志配置并关闭 uvicorn 默认日志配置，避免 uvicorn / FastAPI 日志只停留在终端，方便后续排查时直接查看 `logs/*.log`。
+- [修复] 选股链路重连候选池与最终报告：候选证据包改为对席位已收敛的「候选入池榜」逐只建证据（与候选池、筛选、深挖共用同一份名单），`balanced_candidate_evidence.summary.selection_mode` 标注走 `canonical_desk_shortlist` 还是 `balanced_buckets_fallback`；席位未打标签（降级回退原始召回）时才退回四类来源分桶选取，避免报告深挖标的与候选入池榜对不上。
+- [修复] 深挖目标 provenance 透明化：当 `candidate_screening` 放行不足、深挖按候选池顺序兜底补足时，对应标的标注 `deep_dive_provenance=pool_fallback`（报告写明「进入深挖：筛选未通过，按候选池顺序兜底」），避免读者误判为已通过筛选。
+- [改进] Agent Trace 候选入池榜新增席位可见性：候选卡片展示 `primary_desk`/`setup_type`/`stance`/多席共振/冲突标签，并新增席位委员会状态横幅读取 `candidate_discovery.thesis_desk_committee` 的 `status`/`degraded`/`dimensions_covered`/`error`，降级或报错时高亮告警。
+- [修复] 席位聚合崩溃可见化与加固：`committee.py` 聚合/召回/LLM coerce 各 except 捕获并落 `traceback` 诊断字段（不再只存 `str(exc)`），`aggregator.py` 对所有 set/dict-key（stance/code/tool/setup_type）加 `str()` 强转防 `unhashable type: 'dict'` 静默吞噬导致席位收敛失败回退至原始召回池。
+- [改进] `committee.py` 席位→候选 dict 序列化输出真实 `stance`（取代硬编码 `support`），`_fallback_candidate_discovery` 透传顶层 `degraded`/`dimensions_covered`，并在 desk 子诊断报降级时置顶层 `candidate_discovery.degraded`。
 
+- [修复] 修复 `llm_expert_committee` 委托 P4 席位链路时 `build_recall_pool(prebuilt_pool=...)` 参数不匹配导致 thesis desk 在召回阶段直接失败的问题；当 thesis desk 空输出时不再保留 L1 seed fallback 候选，只在 Trace 候选发现产物中保留 thesis/recall 诊断字段。
+- [新功能] 选股链路重构 P4：新增三打法席位（低位启动/动量/质量修复）及聚合层。`BaseDeskExpert`（`experts/desk_base.py`）接受 `List[FeatureRow]` + `regime`，席位内部按 OR 兜底做 eligibility 过滤（low_base/bullish_trend/fundamental flag）防空跑；`EarlyTurnDeskExpert`/`MomentumDeskExpert`/`QualityRepairDeskExpert` 各自覆盖白名单工具与 eligibility 规则。
+- [新功能] 选股链路重构 P4 聚合层：新增 `aggregator.py`，`aggregate_desk_picks()` 按工具覆盖率确定性计算 `AggregatedCandidate.confidence`（不读 LLM 输出的 score/confidence），打标 4 类冲突 flag；`allocate_slots()` 按 `MarketRegime` 分配各席位名额，空额按定向回填表补充，防守市（risk_off/panic/trending_down）严格禁止回填动量席。
+- [新功能] 选股链路重构 P4 入口：`committee.py` 新增 `run_thesis_desk_committee()`，调用链：`build_recall_pool → [3 desks parallel] → aggregate_desk_picks → allocate_slots → payload`，`candidate_source="thesis_desk_committee"`，与 `run_committee_discovery` payload 形状兼容。
+- [新功能] 新增 9 项 P4 配置项：`DESK_SLOT_ALLOCATION_JSON`/`DESK_BACKFILL_RULES_JSON`/`DESK_PICK_TOP_N`/`SELECTION_TOTAL_SLOTS`/`DESK_BACKFILL_MAX`/`LOW_BASE_RANGE_PCT_MAX`/`DESK_MAX_LLM_ROUNDS`/`DESK_MAX_TOOL_CALLS`/`THESIS_COMMITTEE_TIMEOUT_S`，均配有占位默认值，不配置可正常运行。
+- [新功能] 新增三个席位的工具白名单 YAML（`tools_manifest/early_turn_desk.yaml`/`momentum_desk.yaml`/`quality_repair_desk.yaml`）及对应 system prompt（`prompts/early_turn_desk.py`/`momentum_desk.py`/`quality_repair_desk.py`/`_desk_base.py`）。
+- [改进] API `AgentTraceRunRequest.candidate_discovery_mode` 新增 `thesis_desk_committee` 枚举值；前端 `AgentTracePage` 下拉选项同步新增"打法席位委员会 (P4)"。
+- [chore] 选股链路重构 P5：删除旧 `CapitalFlowExpert`/`EarlyTurnExpert` 专家实现（`experts/capital_flow.py`、`experts/early_turn.py`、`prompts/capital.py`、`prompts/early_turn.py`、`tools_manifest/capital.yaml`、`tools_manifest/early_turn.yaml`）；`run_committee_discovery`（llm_expert_committee 模式）改为透传委托至 `run_thesis_desk_committee`，保留 payload 形状向后兼容；删除失效的 `_run_seed_gate`/`_committee_candidate_score`/`_sort_committee_candidates`/`_merge_*_evidence`/`_packet_summary`/`_packet_dimension` 内部函数；`_registry_lookup` 从 `capital_flow.py` 迁移至 `experts/base.py`，所有席位专家统一从 `base` 导入。
+- [测试] P5 同步更新 `tests/test_tools_manifest.py`（改用 `early_turn_desk` manifest 验证 YAML/validate/renderer/prompt 注入）和 `tests/test_candidate_experts_v2.py`（移除已删除的 CapitalFlowExpert/EarlyTurnExpert 专项用例，保留 BaseExpert/cache/runtime 通用覆盖）。
+
+
+- [新功能] 选股链路重构 P3：新增召回层 `src/agent/candidate_experts_v2/recall.py`，策略→特征 — 每只票产出 `FeatureRow`（`FeatureFlag` 列表 + FactSheet Phase A），按探测器命中数粗筛截断，**不排序、不打全局优先分**；同步在 `schemas.py` 新增 `FeatureFlag`/`FeatureRow`/`RecallResult` 数据结构。
+- [新功能] 新增 `AGENT_RECALL_COARSE_CAP`（默认 `120`，召回粗筛安全阀，并列全保）、`AGENT_DESK_FALLBACK_SUPPLEMENT_N`（默认 `10`，席位子集为空时的补充上限）。
+- [测试] 新增 `tests/test_recall_layer.py`（30 个单测），覆盖 FeatureFlag/FeatureRow schema、源→detector 映射、多源合并、并列边界全保 coarse cap、FactSheet 挂载、召回层不产出全局 priority_score 的 P3 核心不变量。
+- [新功能] 选股链路重构 P2：新增确定性 `FactSheet` 事实底表（`src/agent/candidate_experts_v2/fact_sheet.py`），每票算一次，Phase A 从本地日线推导位置分位/趋势/量比/RSI/乖离/流动性，Phase B 由调用方透传资金方向与板块上下文（缺失保持 `unknown`，不阻塞）；新增看空红线否决门 `veto_gate.apply_veto`（`src/agent/candidate_experts_v2/veto_gate.py`），非对称共识只否决不加分，默认仅 `hard_risk_flags` 非空触发。
+- [新功能] 新增 `AGENT_VETO_GATE_ENABLED`（默认 `true`，回滚开关）、`AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD`、`AGENT_VETO_BREAKDOWN_ACCEL_THRESHOLD`（均留空=禁用，永不触发）：软红线 `capital_violent_outflow`/`breakdown_accelerating` 阈值留空时保持 `False`，避免误杀资金未进的干净低位票。
+- [测试] 新增 `tests/test_fact_sheet.py` 与 `tests/test_veto_gate.py`，覆盖 FactSheet 位置/趋势/量比/RSI/流动性字段确定性可复现、红线阈值留空不触发（防误杀回归）、`intraday_bucket` 跳过午休的缓存分桶；veto 门 hard_risk 必否决、软红线 bool 否决、低位票保留、gate 关闭全放行。
+- [新功能] 选股链路重构 P1：单股深入探究按 `setup_type` 路由 5 套打法手册（低位启动/强势延续/资金连板/质量修复/题材补涨），`setup_subtype=theme_follow` 优先于 `setup_type`，未识别落保守通用模板；每套手册解耦 `failure_condition`（论点证伪，可非价格）与 `stop_loss`（价格风控线），并按 `market` 注入 A股/港股/美股专属口径与"已有证据只补缺口"复用提示。深挖输出 schema 保持不变，下游 allocation/adversarial/judge 零改动。
+- [新功能] 新增 `AGENT_DEEP_DIVE_SETUP_ROUTER_ENABLED`（默认 `true`）作为 P1 回滚开关：关闭时深挖回退到旧版单一 prompt（逐字不变）。上游未产出 `setup_type` 时由调用方按召回 source/策略标签做过渡期推断，并透传 `fact_sheet`/`conflict_flags`/上游证据。
+- [测试] 新增 `tests/test_deep_dive_setup_router.py`，覆盖 `deep_dive_router` 子类型优先级与未知兜底、各 setup 注入对应 playbook、flag-off 回退 legacy、输出 schema 不变、`failure_condition`≠`stop_loss`、`_infer_setup_type` 过渡期推断与 `_deep_dive_setup_fields` 可选上下文透传。
+- [修复] `scripts/update_sequoia_candidates.py` 默认支持断点续跑：逐股票落库后重启会跳过已达到最新本地日期的股票，并在连续网络失败时提前停止且跳过裁剪，避免 5000 只股票全量刷新断网后从 0 重跑。
+- [修复] Agent Trace 与候选池页面将“候选决策榜/评分”改为“候选入池榜/入池优先级”，默认区分 L1 召回优先级与 `candidate_screening` 初筛分，并压缩本地价量种子池高分段，避免大量 `100` 被误读为买入评分。
+- [修复] `detect_market_regime` 的 `000300` 指数历史改为无全局 Tushare 锁的 HTTP 快路径，并在指数快路径失败时只查本地缓存、不再落入股票数据源轮询，避免并发选股时市场状态被误判为历史 K 线超时。
+- [修复] Agent 选股单股深挖目标改为优先使用 `candidate_screening` 的 deep_dive / monitor 结果，并排除已标记 `reject` 的候选，避免弱势或不匹配标的仅因候选池排序靠前进入正文“等待确认”。
+- [修复] Tushare 私有网关代理绕过逻辑从固定旧 IP 扩展为所有数字 IP 地址，避免切换 `TUSHARE_HTTP_URL` 后请求仍被本机代理链路拖慢或超时。
+- [新功能] `llm_expert_committee` 种子池新增北向/互联互通、融资融券和大宗交易三类独立资金 seed source：补齐 Tushare `moneyflow_hsgt`、`moneyflow_mkt_dc`、`hsgt_top10`、`margin_detail`、`block_trade` Agent 工具，并将 `northbound_stock_connect`、`margin_financing`、`block_trade` 纳入 source cap、诊断和资金面专家工具手册。
+- [改进] `llm_expert_committee` 共享种子池重做为确定性本地扫描为主、在线来源补充的闭环：新增 `local_price_volume` 全市场价量异常源、板块/消息/事件补充源、结构化 `trigger_signals`、来源质量诊断、硬排除摘要和 source cap 汇总，并在专家前接入无工具 LLM 门卫做噪音过滤；门卫或单一信息源失败时保留确定性种子池继续并行专家分析。
+- [改进] `llm_expert_committee` 共享种子池新增结构化运行日志：逐来源输出状态/数量/错误，最终输出 source cap 后的种子预览、硬排除摘要、LLM 门卫输入输出和专家合并 top codes，便于定位信息源缺失、门卫误杀和空候选问题。
+- [改进] Agent Trace 为 `llm_expert_committee` 新增 `selection_seed_pool_built` 与 `selection_seed_gate_done` 进度事件，并即时落盘 `seed_pool.json` / `seed_gate.json`；最终 `candidate_discovery.json` 同步保留 seed pool 和 LLM 门卫字段，确保排查时能先看到种子池再看到后续工具调用。
+- [改进] `llm_expert_committee` 种子池按《种子池设计》补齐本地全市场硬排除和多维异常探测：`local_price_volume` 基于本地 `stock_daily` 先过滤新股/停牌或无交易/低流动性/连续一字板，再按 OR 逻辑输出价量、突破、均线、缩量蓄势、缺口和低位转强信号；同时接入资金异动、龙虎榜、日度估值流动性补充源，并让 LLM 门卫仅在 seed 超阈值时启用。
+- [新功能] `llm_expert_committee` 新增低位启动专家 `early_turn_expert`，接入 `get_realtime_quote`、`analyze_trend`、`calculate_ma`、`get_volume_analysis`、`analyze_price_structure`、`get_capital_flow`、`get_stock_info` 白名单；committee 共享种子池同步补充 `fundamental_snapshot` 与 `low_base_structure` 低位来源，避免低位专家成为仅在强势样本上运行的空壳接入。
+- [修复] Agent Trace 在 `watchlist_scan` 无唯一目标股票时不再错误复用持仓股和最后一条实时行情生成单股票 `risk_gate`；同时按股票代码精确匹配 `get_realtime_quote` 结果，并让单股深挖用真实 `quote_trade_date/price_label/freshness_note` 覆盖 LLM 错误行情口径，避免 Trace 报告出现串票或把休市行情写成盘中数据。
+- [新功能] 候选发现支持 LLM 专家委员会模式：新增 `src/agent/candidate_experts_v2/committee.py` facade（`run_committee_discovery`），`AgentTraceRunRequest.candidate_discovery_mode` 单次请求级生效，request 优先级 > `.env` `AGENT_CANDIDATE_DISCOVERY_MODE` > 默认 `deterministic`；当前三席位调试链路禁用失败回退，committee 失败会 emit `selection_candidate_discovery_mode` 事件携带 `fallback=False` 并终止选股流水线。
+- [新功能] 前端 `AgentTracePage` 在配置面板新增"候选发现模式"下拉，选项 `deterministic`（默认）/`llm_expert_committee`（实验），选择会持久化到 `localStorage.dsa.candidateDiscoveryMode` 并按当次随 `traceStream` payload 提交。
+- [测试] 新增 `tests/test_candidate_committee.py`，覆盖 committee facade 的 schema 兼容、资金面证据 attach 与 deterministic 异常 coerce 路径；`tests/test_agent_stock_selection.py` 补充 `SelectionRunContext.candidate_discovery_mode` 默认值、`_resolve_candidate_discovery_mode` fallback 与 `_run_candidate_discovery_tool` LLM 分流/降级用例；`tests/test_agent_models_api.py` 补充 `AgentTraceRunRequest.candidate_discovery_mode` 合法/非法/默认值 Pydantic 校验。
+- [新功能] 新增 macOS 一键部署：`scripts/install-mac.sh`（自动检测 Intel / Apple Silicon，装 Xcode CLT + Homebrew + `python@3.11` + `node@22` + `uv` + 项目依赖，剔除 graphiti / neo4j 并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB），并提供 `scripts/start-backend.command` / `scripts/start-web.command` 双击启动器（内部 `eval brew shellenv` 兼容 Finder 启动）。
+- [文档] 新增 `docs/deploy-to-new-mac.md`，覆盖从空白 Mac -> Homebrew -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
+
+- [新功能] 资金面候选专家新增 per-dimension 工具手册 (`src/agent/candidate_experts_v2/tools_manifest/capital.yaml`)，覆盖 11 个白名单工具的 priority / when_to_use / typical_args / returns_summary / key_fields / combo_hints / cost / failure_modes 9 字段业务语义；YAML 在 `CapitalFlowExpert.__init__` 阶段加载并按 priority 渲染进 SYSTEM prompt，并对 whitelist / ToolRegistry / typical_args 参数名做三层一致性校验，typical_args 支持 `{today}` / `{seed_codes}` 运行时占位符替换；`get_tushare_moneyflow_ths` 保留为手动工具但不在主链路主动调用。
+- [测试] 新增 `tests/test_tools_manifest.py`，覆盖 manifest 加载、白名单与 registry 交叉校验、参数名子集校验、占位符替换、Markdown 渲染顺序和最终 SYSTEM prompt 注入路径，共 16 个用例。
+
+- [新功能] 新增新机器部署脚本：`scripts/install-windows.ps1`（Windows 宿主启用 WSL2 并安装 Ubuntu）、`scripts/bootstrap-wsl.sh`（WSL 内一键装 Python 3.11 / Node 22 / uv / 依赖，自动剔除 graphiti、neo4j 行并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB）、`scripts/start-backend.sh` 与 `scripts/start-web.sh`（前台启动器）。
+- [文档] 新增 `docs/deploy-to-new-windows.md`，覆盖从空白 Windows -> WSL2 -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
+- [新功能] 新增 `src/agent/candidate_experts_v2` 多专家选股委员会骨架（LLM 驱动 + 工具白名单 enforcement + 跨 session 文件缓存），首发资金面专家 `capital_flow_expert`；默认开关 `AGENT_CANDIDATE_DISCOVERY_MODE=deterministic` 不影响现网，需显式切换 `llm_expert_committee` 才会启用。
+- [文档] 新增 Agent 选股阶段当前实现说明，梳理 `watchlist_scan` 阶段流水线、底层工具取证、Trace artifact 和 `NaN` 非标准 JSON 排障路径。
 - [改进] Agent Trace 最终报告新增 Markdown 导出按钮，便于保存和复盘本轮分析结果。
+- [改进] Agent Trace 与候选池页面统一为候选决策榜展示，默认突出建议动作、评分、核心依据和可展开证据，原始专家分组降级为折叠调试区。
+- [改进] 选股最终报告将高分 wait 拆分为条件入场、强观察和等待确认，并把标题分数标注为候选分，补充次日触发、禁止追高和失效条件。
+- [文档] 新增 Agent 选股 wait 过度保守校准方案，规划将强等待候选拆分为条件入场、强观察和普通等待，并优化候选分与报告渲染语义。
+- [新功能] Agent TuShare 工具补齐板块主题、消息事件、基本面和技术侧直连接口，并将 THS 板块资金流、结构化事件和 `daily_basic` 快照接入候选专家。
+- [新功能] 资金面候选专家补齐 TuShare 东财资金流、龙虎榜、涨停榜、连板天梯和热榜工具，并接入 L1 候选发现链路，所有新增 TuShare 工具均不做跨数据源 fallback。
+- [新功能] 新增 `get_tushare_moneyflow_ths` Agent 手动工具；当前因权限不足不在 L1/三席位主链路主动调用，不做跨数据源 fallback。
+- [文档] 新增 TuShare 候选专家工具补全记录，梳理资金、板块、消息、基本面和技术候选专家可复用的 TuShare 接口。
+- [修复] Agent Trace 选中具体账户时强制注入该账户持仓上下文，并在执行层为持仓快照和搜索工具补齐账户/代码名称约束，避免报告误用全账户汇总或代码名称错配。
+- [修复] `get_capital_flow` 在 StockAPI `codeFlow` fallback 上按接口文档使用 `pageSize=50`，并开放 `start_date/end_date/page_no/page_size` 参数，支持按指定日期窗口查询历史资金流。
+- [修复] `get_capital_flow` 明确以 Tushare `moneyflow` 为资金面主数据源，失败时回退 StockAPI `codeFlow`，避免私有网关正常时仍落到滞后历史窗口。
+- [新功能] `watchlist_scan` 新增均衡候选证据包，按策略、消息、资金、基本面各最多 2 只候选统一取证并落盘 `candidate_evidence.json` / `candidate_evidence.md`；候选级取证并行执行，重复候选按维度顺序跳过并继续补位，后续深挖优先复用已获取证据。
+- [修复] Tushare 官方接口和私有网关请求默认绕过本机代理，避免资金流 fallback 被 `127.0.0.1` 代理超时拖垮。
+- [修复] 统一 Tushare 查询入口改为优先使用官方 SDK 并显式设置 `pro._DataApi__http_url`，兼容私有网关调用方式，HTTP 轻量客户端仅作为兜底；SDK 超时隔离使用线程而非进程级信号，避免影响后端服务稳定性。
+- [修复] `get_capital_flow` 的 Tushare `moneyflow` 兜底不再先请求慢速交易日历，并为私有网关预留更长单次预算，避免 5 秒超时导致真实资金流数据被判失败。
+- [改进] 默认将 `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` 提升到 15 秒，并将 `watchlist_scan` 的 `AGENT_SELECTION_DEEP_DIVE_LIMIT` 下调到 2，减少资金流误超时并缩短整轮选股耗时。
+- [修复] `get_chip_distribution` 继续以 Tushare `cyq_chips` 为主链路，并修复 Tushare 子请求预算向下取整导致 `1.5s` 被截断为 `1s` 的超时误判；同时上调默认筹码预算以适配私有网关最近交易日查询耗时。
+- [修复] Tushare 私有网关查询改为进程内串行调用，并在 `get_capital_flow` 的 `moneyflow` 空表结果上自动重试一次，同时记录查询参数，避免并发 Trace 下偶发空表被误判为资金流缺失。
+- [修复] Tushare 默认 HTTP 入口统一切换为 `http://118.89.66.41:8010/`，并保留 `TUSHARE_HTTP_URL` 作为部署覆盖项。
+- [改进] 候选发现底层补齐更丰富的技术指标输出：AlphaSift/Sequoia 技术候选现在可携带 MA、MACD、RSI 与布林带位置等信息；同时修复 provider 侧 `_short_metric` 缺失导致技术专家链路报错的问题。
 - [文档] 新增 Agent 候选池多专家架构方案，明确当前串行候选召回与真正多专家候选生成的区别，并规划 AlphaSift、Sequoia、sector、消息和资金工具的复用路径。
 - [文档] 新增 Agent 候选池策略缺口与建设路线，梳理 AlphaSift、Sequoia、资金、基本面、消息和回评闭环的待办事项。
 - [文档] 新增消息事件 Graphiti 知识图谱方案，规划新闻入库、事件归一、成熟度追踪、验证事实、图谱候选生成和前端事件链路展示。

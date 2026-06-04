@@ -342,7 +342,7 @@ class SkillManager:
         logger.debug(f"Registered skill: {skill.name} ({skill.display_name})")
 
     def load_builtin_skills(self) -> int:
-        """Load all built-in skills from the compatibility `strategies/` directory.
+        """Load all built-in skills.
 
         Returns:
             Number of skills loaded.

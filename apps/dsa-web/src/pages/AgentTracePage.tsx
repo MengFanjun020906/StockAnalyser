@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BrainCircuit,
@@ -17,7 +17,8 @@ import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams } from 'react-router-dom';
 import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
 import { portfolioApi } from '../api/portfolio';
-import { ApiErrorAlert, Button, JsonViewer } from '../components/common';
+import { CandidateDecisionTable, type CandidateDecisionRow, type CandidateDecisionTone } from '../components/candidates/CandidateDecisionTable';
+import { ApiErrorAlert, Button, Collapsible, JsonViewer } from '../components/common';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import type { PortfolioAccountItem } from '../types/portfolio';
 import { cn } from '../utils/cn';
@@ -49,6 +50,10 @@ const REPORT_INTENT_OPTIONS = [
   { value: 'risk_review', label: '账户风控' },
   { value: 'event_impact', label: '事件影响' },
 ];
+const CANDIDATE_DISCOVERY_OPTIONS = [
+  { value: 'thesis_desk_committee', label: '打法席位委员会 (P4)', desc: '当前调试阶段只允许四席位链路：召回层 → 低位启动/动量/质量修复/主题催化 → Regime 分配名额' },
+] as const;
+const CANDIDATE_DISCOVERY_STORAGE_KEY = 'dsa.candidateDiscoveryMode';
 const TRACE_HISTORY_KEY = 'dsa.agentTrace.history.v1';
 const TRACE_HISTORY_LIMIT = 10;
 const TRACE_SESSION_PREFIX = 'trace-';
@@ -117,6 +122,22 @@ const toStringList = (value: unknown): string[] => {
   if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
   if (typeof value === 'string') return value ? [value] : [];
   return [String(value)];
+};
+
+const APPENDIX_SEPARATOR = '<!-- APPENDIX_SEPARATOR -->';
+const APPENDIX_HEADING_RE = /\n##\s+附录[一二三四五六七八九十]+[、，]|$/;
+
+const splitReportContent = (content: string): { main: string; appendix: string } => {
+  if (!content) return { main: '', appendix: '' };
+  if (content.includes(APPENDIX_SEPARATOR)) {
+    const [main, ...rest] = content.split(APPENDIX_SEPARATOR);
+    return { main: main.trimEnd(), appendix: rest.join(APPENDIX_SEPARATOR).trim() };
+  }
+  const match = APPENDIX_HEADING_RE.exec(content);
+  if (match && match.index > 0 && match.index < content.length) {
+    return { main: content.slice(0, match.index).trimEnd(), appendix: content.slice(match.index).trim() };
+  }
+  return { main: content, appendix: '' };
 };
 
 const sanitizeMarkdownFileNamePart = (value: string): string => value
@@ -413,12 +434,21 @@ type DisplayCandidate = {
   tags: string[];
   reason: string;
   score?: number;
+  scoreKind?: string;
+  scoreLabel?: string;
+  scoreNote?: string;
   latestDate: string;
   metrics: Record<string, unknown>;
   reasonDimensions: CandidateReasonDimension[];
   lifecycleStatus: string;
   consensusBonus?: number;
   mixedEvidence: boolean;
+  setupType?: string;
+  primaryDesk?: string;
+  stance?: string;
+  desks: string[];
+  multiDeskConviction: boolean;
+  conflictFlags: string[];
 };
 
 type CandidateDimensionGroup = {
@@ -447,6 +477,57 @@ type CandidateExpertPacketDisplay = {
   required: boolean;
   directStockCandidate: boolean;
   goal: string;
+};
+
+type SeedPoolPreviewItem = {
+  code: string;
+  name: string;
+  source: string;
+  hint: string;
+  sourceDiagnostics?: Record<string, unknown>;
+  freshness: string;
+  triggerSignals: string[];
+};
+
+type SeedPoolDisplay = {
+  seedCount: number;
+  totalLimit?: number;
+  sourceCounts: Record<string, number>;
+  dimensionCounts: Record<string, number>;
+  preview: SeedPoolPreviewItem[];
+};
+
+type ThesisDeskPacketDisplay = {
+  expert: string;
+  label: string;
+  status: string;
+  seedCount: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  elapsedMs?: number;
+  candidates: Array<{
+    code: string;
+    name: string;
+    stance: string;
+    setupType: string;
+    reason: string;
+    confidence?: number;
+  }>;
+  rejected: Array<{ code: string; name: string; reason: string }>;
+  diagnostics: string[];
+  errors: string[];
+  toolCallCount: number;
+  perSeedPackets: Array<{
+    code: string;
+    name: string;
+    status: string;
+    elapsedMs?: number;
+    candidateCount: number;
+    rejectedCount: number;
+    toolCallCount: number;
+    errors: string[];
+    diagnostics: string[];
+  }>;
 };
 
 type CandidateThemeDisplay = {
@@ -481,6 +562,14 @@ type CandidateHardExclusionDisplay = {
   reasonCounts: Record<string, number>;
   examples: Array<{ code: string; name: string; reason: string; source?: string }>;
   policy: Record<string, unknown>;
+};
+
+type CandidateActionSuggestion = {
+  key: string;
+  label: string;
+  tone?: CandidateDecisionTone;
+  strength?: string;
+  reason?: string;
 };
 
 type EventImpactWatch = {
@@ -540,6 +629,35 @@ const SOURCE_LABEL_PREFIXES: Array<[string, string]> = [
   ['user_seed', '用户输入'],
 ];
 
+const DESK_LABELS: Record<string, string> = {
+  early_turn_desk: '低位启动席',
+  momentum_desk: '动量席',
+  quality_repair_desk: '质量修复席',
+  theme_catalyst_desk: '主题催化席',
+};
+
+const SETUP_TYPE_LABELS: Record<string, string> = {
+  trend_continuation: '趋势延续',
+  early_turn: '低位启动',
+  theme_follow: '题材跟随',
+  theme_catalyst: '主题催化',
+  quality_repair: '质量修复',
+  capital_momentum: '资金动量',
+  unknown: '未分类',
+};
+
+const STANCE_LABELS: Record<string, string> = {
+  support: '支持',
+  watch: '观察',
+  neutral: '中性',
+  oppose: '反对',
+  invalid: '无效',
+};
+
+const deskLabel = (key: string): string => DESK_LABELS[key] || key;
+const setupTypeLabel = (key: string): string => SETUP_TYPE_LABELS[key] || key;
+const stanceLabel = (key: string): string => STANCE_LABELS[key] || key;
+
 const CANDIDATE_EXPERT_LABELS: Record<string, string> = {
   strategy_factor_expert: 'AlphaSift 策略多因子专家',
   technical_candidate_expert: 'Sequoia 技术形态专家',
@@ -548,6 +666,10 @@ const CANDIDATE_EXPERT_LABELS: Record<string, string> = {
   news_event_expert: '消息事件专家',
   sentiment_theme_expert: '情绪/宏观专家',
   fundamental_expert: '基本面发现专家',
+  early_turn_desk: '低位启动席',
+  momentum_desk: '动量席',
+  quality_repair_desk: '质量修复席',
+  theme_catalyst_desk: '主题催化席',
 };
 
 const CANDIDATE_EXPERT_META: Record<string, { goal: string; required: boolean; directStockCandidate: boolean }> = {
@@ -558,6 +680,10 @@ const CANDIDATE_EXPERT_META: Record<string, { goal: string; required: boolean; d
   sector_theme_expert: { goal: '强势板块扩散到个股', required: false, directStockCandidate: true },
   news_event_expert: { goal: '公司级硬事件', required: false, directStockCandidate: true },
   sentiment_theme_expert: { goal: '主题观察和验证线索', required: false, directStockCandidate: false },
+  early_turn_desk: { goal: '低位区间、资金回补、拐点启动', required: true, directStockCandidate: true },
+  momentum_desk: { goal: '趋势延续、放量突破、强势动量', required: true, directStockCandidate: true },
+  quality_repair_desk: { goal: '基本面质量、低估修复、困境反转', required: true, directStockCandidate: true },
+  theme_catalyst_desk: { goal: '日报主题、业务匹配、板块资金验证', required: true, directStockCandidate: true },
 };
 
 const DIMENSION_GROUP_LABELS: Record<string, string> = {
@@ -662,16 +788,51 @@ const fundamentalMetricBadges = (candidate: DisplayCandidate): string[] => {
     .filter(Boolean);
 };
 
+const technicalMetricBadges = (candidate: DisplayCandidate): string[] => {
+  const metrics = candidate.metrics || {};
+  const macdRaw = String(metrics.macd_status || '').trim();
+  const macd = macdRaw
+    ? ({ bullish: 'MACD 多头', bearish: 'MACD 空头', neutral: 'MACD 中性' } as Record<string, string>)[macdRaw] || `MACD ${macdRaw}`
+    : '';
+  const rsiValue = formatMetricWithSuffix(metrics.rsi_value, '');
+  const rsiRaw = String(metrics.rsi_status || '').trim();
+  const rsi = rsiValue
+    ? `RSI ${rsiValue}${rsiRaw === 'overbought' ? ' / 超买' : rsiRaw === 'oversold' ? ' / 超卖' : ''}`
+    : '';
+  const bollRaw = String(metrics.boll_position || '').trim();
+  const boll = bollRaw
+    ? ({
+      above_upper: '布林上轨外',
+      upper_half: '布林中上轨',
+      lower_half: '布林中下轨',
+      below_lower: '布林下轨外',
+    } as Record<string, string>)[bollRaw] || `布林 ${bollRaw}`
+    : '';
+  return [
+    ['MA5', metrics.ma5, ''],
+    ['MA20', metrics.ma20, ''],
+    ['MA60', metrics.ma60, ''],
+    ['量比', metrics.volume_ratio, ''],
+    ['RPS', metrics.rps, ''],
+  ]
+    .map(([label, value, suffix]) => {
+      const formatted = formatMetricWithSuffix(value, String(suffix));
+      return formatted ? `${label} ${formatted}` : '';
+    })
+    .concat([macd, rsi, boll].filter(Boolean))
+    .filter(Boolean);
+};
+
 const dimensionTone = (dimension: string): string => {
-  if (dimension === 'strategy') return 'border-blue-100 bg-blue-50 text-blue-700';
-  if (dimension === 'technical') return 'border-emerald-100 bg-emerald-50 text-emerald-700';
-  if (dimension === 'capital') return 'border-amber-100 bg-amber-50 text-amber-700';
-  if (dimension === 'sentiment') return 'border-purple-100 bg-purple-50 text-purple-700';
-  if (dimension === 'message') return 'border-sky-100 bg-sky-50 text-sky-700';
-  if (dimension === 'fundamental') return 'border-stone-200 bg-stone-50 text-stone-700';
-  if (dimension === 'market_regime') return 'border-red-100 bg-red-50 text-red-700';
-  if (dimension === 'portfolio_risk') return 'border-slate-200 bg-slate-50 text-slate-700';
-  return 'border-[#e8e8e3] bg-[#f5f5f0] text-[#666]';
+  if (dimension === 'strategy') return 'border-cyan/25 bg-cyan/10 text-cyan';
+  if (dimension === 'technical') return 'border-success/25 bg-success/10 text-success';
+  if (dimension === 'capital') return 'border-warning/25 bg-warning/10 text-warning';
+  if (dimension === 'sentiment') return 'border-purple/25 bg-purple/10 text-purple';
+  if (dimension === 'message') return 'border-cyan/25 bg-cyan/10 text-cyan';
+  if (dimension === 'fundamental') return 'border-border/60 bg-surface-2 text-secondary-text';
+  if (dimension === 'market_regime') return 'border-danger/25 bg-danger/10 text-danger';
+  if (dimension === 'portfolio_risk') return 'border-border/60 bg-surface-2 text-secondary-text';
+  return 'border-border/60 bg-surface-2 text-muted-text';
 };
 
 const displayEventMaturity = (maturity: string): string => {
@@ -692,6 +853,67 @@ const displayLifecycleStatus = (status: string): string => {
     removed: '已移出',
   };
   return mapping[status] || status || '未知';
+};
+
+const displayCandidateAction = (action: string): { label: string; tone: CandidateDecisionTone } => {
+  const mapping: Record<string, { label: string; tone: CandidateDecisionTone }> = {
+    open: { label: '可小仓试探', tone: 'success' },
+    add: { label: '可加仓', tone: 'success' },
+    hold: { label: '继续持有', tone: 'info' },
+    wait: { label: '等待确认', tone: 'warning' },
+    monitor: { label: '观察跟踪', tone: 'info' },
+    reject: { label: '暂不纳入', tone: 'danger' },
+    reduce: { label: '减仓', tone: 'warning' },
+    take_profit: { label: '止盈观察', tone: 'warning' },
+    stop_loss: { label: '止损', tone: 'danger' },
+    insufficient_data: { label: '证据不足', tone: 'warning' },
+    deep_dive: { label: '进入深挖', tone: 'success' },
+  };
+  return mapping[action] || { label: action || '观察跟踪', tone: 'default' };
+};
+
+const actionStrengthLabel = (strength: string): string => {
+  const mapping: Record<string, string> = {
+    strong: '强',
+    medium: '中',
+    weak: '弱',
+    none: '无',
+  };
+  return mapping[strength] || strength;
+};
+
+const inferCandidateActionFromScore = (candidate: DisplayCandidate): CandidateActionSuggestion => {
+  const isFallback = candidate.source === 'fallback_seed_pool' || candidate.recallSources.includes('fallback_seed_pool');
+  if (isFallback) {
+    return {
+      key: 'monitor',
+      label: '观察跟踪',
+      tone: 'info',
+      reason: '固定种子池只用于维持取证链路，不作为真实推荐。',
+    };
+  }
+  if (candidate.mixedEvidence) {
+    return {
+      key: 'wait',
+      label: '等待确认',
+      tone: 'warning',
+      reason: '候选存在反证，需等待后续技术、资金或消息证据确认。',
+    };
+  }
+  if (candidate.multiDeskConviction || candidate.recallSources.length > 1) {
+    return {
+      key: 'monitor',
+      label: '重点观察',
+      tone: 'info',
+      reason: '候选具备多来源或多席位证据，但尚未完成最终 Judge 裁决。',
+    };
+  }
+  return {
+    key: 'monitor',
+    label: '观察跟踪',
+    tone: 'info',
+    reason: '候选池阶段只代表值得继续取证，不代表直接买入。',
+  };
 };
 
 const displayExclusionReason = (reason: string): string => {
@@ -840,7 +1062,8 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
   const code = String(item.code || item.stock_code || item.symbol || '').trim();
   if (!code) return null;
   const metrics = asRecord(item.metrics) || {};
-  const score = typeof item.signal_score === 'number' ? item.signal_score : Number(item.signal_score);
+  const scoreValue = item.signal_score ?? item.score;
+  const score = typeof scoreValue === 'number' ? scoreValue : Number(scoreValue);
   const source = String(item.source || item.candidate_source || '');
   const recallSources = toStringList(item.recall_sources);
   const isFallbackSeed = source === 'fallback_seed_pool' || recallSources.includes('fallback_seed_pool');
@@ -858,12 +1081,21 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
     tags: isFallbackSeed ? [] : toStringList(item.strategy_tags).filter((tag) => !STRATEGY_ONLY_TAGS.has(tag)).map(displayStrategyName),
     reason: displayReasonText(String(item.reason || item.candidate_reason || item.entry_reason || '')),
     score: Number.isFinite(score) ? score : undefined,
+    scoreKind: item.score_kind ? String(item.score_kind) : undefined,
+    scoreLabel: item.score_label ? String(item.score_label) : undefined,
+    scoreNote: item.score_note ? String(item.score_note) : undefined,
     latestDate: String(item.latest_date || item.date || ''),
     metrics,
     reasonDimensions: isFallbackSeed ? fallbackReasonDimensions : normalizeReasonDimensions(item),
     lifecycleStatus: String(item.lifecycle_status || 'new'),
     consensusBonus: typeof item.consensus_bonus === 'number' ? item.consensus_bonus : undefined,
     mixedEvidence: Boolean(item.mixed_evidence),
+    setupType: item.setup_type ? String(item.setup_type) : undefined,
+    primaryDesk: item.primary_desk ? String(item.primary_desk) : undefined,
+    stance: item.stance ? String(item.stance) : undefined,
+    desks: toStringList(item.desks),
+    multiDeskConviction: Boolean(item.multi_desk_conviction),
+    conflictFlags: toStringList(item.conflict_flags),
   };
 };
 
@@ -883,7 +1115,12 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     current.strategies = Array.from(new Set([...current.strategies, ...candidate.strategies]));
     current.tags = Array.from(new Set([...current.tags, ...candidate.tags]));
     current.reason = current.reason || candidate.reason;
-    current.score = Math.max(current.score ?? 0, candidate.score ?? 0) || current.score || candidate.score;
+    if (candidate.score != null && (current.score == null || candidate.score > current.score)) {
+      current.score = candidate.score;
+      current.scoreKind = candidate.scoreKind || current.scoreKind;
+      current.scoreLabel = candidate.scoreLabel || current.scoreLabel;
+      current.scoreNote = candidate.scoreNote || current.scoreNote;
+    }
     current.latestDate = current.latestDate || candidate.latestDate;
     current.metrics = { ...candidate.metrics, ...current.metrics };
     current.lifecycleStatus = current.lifecycleStatus || candidate.lifecycleStatus;
@@ -897,6 +1134,151 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     });
   });
   return Array.from(byCode.values());
+};
+
+type DeskCommitteeStatus = {
+  mode: string;
+  status: string;
+  degraded: boolean;
+  error: string;
+  dimensionsCovered: string[];
+  deskDiagnostics: Array<{ desk: string; status: string; picks: number }>;
+};
+
+const findCandidateDiscoveryPayload = (
+  stockSelection: Record<string, unknown> | null,
+): { discovery: Record<string, unknown>; full: Record<string, unknown> } => {
+  const stockSel = stockSelection || {};
+  const finalReport = asRecord(stockSel.final_report_json) || {};
+  const stages = asRecord(asRecord(stockSel.selection_context)?.stages) || {};
+  const discovery = asRecord(finalReport.candidate_discovery) || asRecord(stages.candidate_discovery) || {};
+  const full = asRecord(discovery.full) || {};
+  return { discovery, full };
+};
+
+const extractSeedPoolDisplay = (
+  result: AgentTraceRunResponse,
+  stockSelection: Record<string, unknown> | null,
+): SeedPoolDisplay | null => {
+  const { discovery, full } = findCandidateDiscoveryPayload(stockSelection);
+  const eventSummary = result.events
+    .map((event) => asRecord(asRecord(event)?.payload)?.seed_pool_summary)
+    .map(asRecord)
+    .find(Boolean);
+  const summary = (
+    asRecord(discovery.seed_pool_summary)
+    || asRecord(full.seed_pool_summary)
+    || eventSummary
+  );
+  if (!summary) return null;
+  const preview = toRecordList(summary.preview).map((item) => ({
+    code: String(item.code || ''),
+    name: String(item.name || ''),
+    source: String(item.source || ''),
+    hint: String(item.hint || ''),
+    sourceDiagnostics: asRecord(item.source_diagnostics) || undefined,
+    freshness: String(item.freshness || ''),
+    triggerSignals: toRecordList(item.trigger_signals)
+      .map((signal) => String(signal.summary || signal.kind || signal.dimension || ''))
+      .filter(Boolean),
+  })).filter((item) => item.code);
+  return {
+    seedCount: Number(summary.seed_count || preview.length || 0),
+    totalLimit: typeof summary.total_limit === 'number' ? summary.total_limit : undefined,
+    sourceCounts: Object.fromEntries(Object.entries(asRecord(summary.seed_sources) || {}).map(([key, value]) => [key, Number(value || 0)])),
+    dimensionCounts: Object.fromEntries(Object.entries(asRecord(summary.signal_dimensions) || {}).map(([key, value]) => [key, Number(value || 0)])),
+    preview,
+  };
+};
+
+const extractThesisDeskPackets = (
+  stockSelection: Record<string, unknown> | null,
+): ThesisDeskPacketDisplay[] => {
+  const { discovery, full } = findCandidateDiscoveryPayload(stockSelection);
+  const packets = toRecordList(discovery.thesis_desk_packets).length
+    ? toRecordList(discovery.thesis_desk_packets)
+    : toRecordList(full.thesis_desk_packets);
+  return packets.map((packet) => {
+    const expert = String(packet.expert || '');
+    const seedSummary = asRecord(packet.seed_summary) || {};
+    const perSeedPackets = toRecordList(packet.per_seed_packets).map((seedPacket) => {
+      const seedCandidates = toRecordList(seedPacket.candidates);
+      const seedRejected = toRecordList(seedPacket.rejected);
+      const seedDiagnostics = toRecordList(seedPacket.diagnostics);
+      const diagnosticCode = seedDiagnostics
+        .map((item) => String(item.code || item.expected_code || ''))
+        .find(Boolean) || '';
+      const firstCandidate = asRecord(seedCandidates[0]) || {};
+      const firstRejected = asRecord(seedRejected[0]) || {};
+      return {
+        code: String(firstCandidate.code || firstRejected.code || diagnosticCode || ''),
+        name: String(firstCandidate.name || firstRejected.name || ''),
+        status: String(seedPacket.status || 'unknown'),
+        elapsedMs: typeof seedPacket.elapsed_ms === 'number' ? seedPacket.elapsed_ms : undefined,
+        candidateCount: seedCandidates.length,
+        rejectedCount: seedRejected.length,
+        toolCallCount: toRecordList(seedPacket.tool_calls).length,
+        errors: toStringList(seedPacket.errors),
+        diagnostics: seedDiagnostics
+          .map((item) => [item.source, item.status, item.reason, item.error].filter(Boolean).join(' · '))
+          .filter(Boolean),
+      };
+    });
+    return {
+      expert,
+      label: displayCandidateExpertName(expert || String(packet.dimension || '')),
+      status: String(packet.status || 'unknown'),
+      seedCount: Number(seedSummary.seed_count || 0),
+      acceptedCount: Number(seedSummary.accepted_count ?? packet.candidate_count ?? toRecordList(packet.candidates).length),
+      rejectedCount: Number(seedSummary.rejected_count ?? packet.rejected_count ?? toRecordList(packet.rejected).length),
+      elapsedMs: typeof packet.elapsed_ms === 'number' ? packet.elapsed_ms : undefined,
+      candidates: toRecordList(packet.candidates).map((candidate) => ({
+        code: String(candidate.code || ''),
+        name: String(candidate.name || ''),
+        stance: String(candidate.stance || ''),
+        setupType: String(candidate.setup_type || ''),
+        reason: String(candidate.reason || ''),
+        confidence: typeof candidate.confidence === 'number' ? candidate.confidence : undefined,
+      })).filter((candidate) => candidate.code),
+      rejected: toRecordList(packet.rejected).map((item) => ({
+        code: String(item.code || ''),
+        name: String(item.name || ''),
+        reason: String(item.reason || item.summary || ''),
+      })).filter((item) => item.code || item.reason),
+      diagnostics: toRecordList(packet.diagnostics)
+        .map((item) => [item.source, item.status, item.note, item.error].filter(Boolean).join(' · '))
+        .filter(Boolean),
+      errors: toStringList(packet.errors),
+      toolCallCount: toRecordList(packet.tool_calls).length,
+      perSeedPackets,
+    };
+  }).filter((packet) => packet.expert);
+};
+
+const extractDeskCommitteeStatus = (
+  stockSelection: Record<string, unknown> | null,
+): DeskCommitteeStatus | null => {
+  const { discovery, full } = findCandidateDiscoveryPayload(stockSelection);
+  let mode = 'thesis_desk_committee';
+  let desk = asRecord(discovery.thesis_desk_committee) || asRecord(full.thesis_desk_committee);
+  if (!desk) {
+    mode = 'llm_expert_committee';
+    desk = asRecord(discovery.llm_expert_committee) || asRecord(full.llm_expert_committee);
+  }
+  if (!desk) return null;
+  const diags = toRecordList(desk.thesis_desk_diagnostics).length
+    ? toRecordList(desk.thesis_desk_diagnostics)
+    : toRecordList(desk.diagnostics);
+  return {
+    mode,
+    status: String(desk.status || ''),
+    degraded: Boolean(desk.degraded) || Boolean(discovery.degraded),
+    error: String(desk.error || ''),
+    dimensionsCovered: toStringList(desk.dimensions_covered),
+    deskDiagnostics: diags
+      .map((d) => ({ desk: String(d.desk || ''), status: String(d.status || ''), picks: Number(d.picks || 0) }))
+      .filter((d) => d.desk),
+  };
 };
 
 const extractDiscoveryCandidates = (
@@ -956,6 +1338,85 @@ const extractCandidateExpertPackets = (result: AgentTraceRunResponse): Candidate
       seen.add(packet.expert);
       return true;
     });
+};
+
+const extractExpertGroupedCandidates = (result: AgentTraceRunResponse): CandidateDimensionGroup[] => {
+  const byDimension = new Map<string, CandidateDimensionGroup>();
+  const packetByExpert = new Map<string, CandidateExpertPacketDisplay>();
+  extractCandidateExpertPackets(result).forEach((packet) => {
+    packetByExpert.set(packet.expert, packet);
+  });
+
+  const packetCandidatesByDimension = new Map<string, Array<{ candidate: DisplayCandidate; details: string[] }>>();
+  result.tool_calls
+    .filter((call) => call.tool === 'discover_watchlist_candidates')
+    .flatMap((call) => toRecordList(asRecord(call.result_json)?.expert_packets))
+    .forEach((packet) => {
+      const expert = String(packet.expert || '');
+      const dimension = String(packet.dimension || '') || 'other';
+      const normalizedCandidates = toRecordList(packet.candidates)
+        .map(normalizeCandidate)
+        .filter((item): item is DisplayCandidate => Boolean(item));
+      if (!expert || !normalizedCandidates.length) return;
+
+      const key = dimension || 'other';
+      const existing = packetCandidatesByDimension.get(key) || [];
+      normalizedCandidates.forEach((candidate) => {
+        const current = existing.find((item) => item.candidate.code === candidate.code);
+        const details = candidate.reasonDimensions
+          .filter((entry) => entry.dimension === key)
+          .map((entry) => displayReasonText(entry.detail || candidate.reason || '-'))
+          .filter(Boolean);
+        const fallbackDetails = details.length ? details : [candidate.reason || candidate.source || '-'];
+        if (current) {
+          fallbackDetails.forEach((detail) => {
+            if (detail && !current.details.includes(detail)) current.details.push(detail);
+          });
+        } else {
+          existing.push({ candidate, details: fallbackDetails });
+        }
+      });
+      packetCandidatesByDimension.set(key, existing);
+    });
+
+  const assignedCodes = new Set<string>();
+  DIMENSION_GROUP_ORDER.forEach((dimension) => {
+    const items = packetCandidatesByDimension.get(dimension) || [];
+    const uniqueItems = items.filter((item) => {
+      if (assignedCodes.has(item.candidate.code)) return false;
+      assignedCodes.add(item.candidate.code);
+      return true;
+    });
+    if (!uniqueItems.length) return;
+    const packetMeta = Array.from(packetByExpert.values()).find((packet) => packet.dimension === dimension);
+    byDimension.set(dimension, {
+      dimension,
+      label: packetMeta?.dimensionLabel || DIMENSION_GROUP_LABELS[dimension] || dimension,
+      candidates: uniqueItems,
+    });
+  });
+
+  packetCandidatesByDimension.forEach((items, dimension) => {
+    if (byDimension.has(dimension)) return;
+    const uniqueItems = items.filter((item) => {
+      if (assignedCodes.has(item.candidate.code)) return false;
+      assignedCodes.add(item.candidate.code);
+      return true;
+    });
+    if (!uniqueItems.length) return;
+    const packetMeta = Array.from(packetByExpert.values()).find((packet) => packet.dimension === dimension);
+    byDimension.set(dimension, {
+      dimension,
+      label: packetMeta?.dimensionLabel || DIMENSION_GROUP_LABELS[dimension] || dimension,
+      candidates: uniqueItems,
+    });
+  });
+
+  return Array.from(byDimension.values()).sort((a, b) => {
+    const ai = DIMENSION_GROUP_ORDER.indexOf(a.dimension);
+    const bi = DIMENSION_GROUP_ORDER.indexOf(b.dimension);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
 };
 
 const extractCandidateExpertThemes = (result: AgentTraceRunResponse): CandidateThemeDisplay[] => {
@@ -1031,6 +1492,188 @@ const extractCandidateHardExclusion = (result: AgentTraceRunResponse): Candidate
     })),
     policy: asRecord(hardExclusion.policy) || {},
   };
+};
+
+const findScreeningFull = (stockSelection: Record<string, unknown> | null): Record<string, unknown> => {
+  const selCtx = asRecord(stockSelection?.selection_context) || {};
+  const stages = asRecord(selCtx.stages) || {};
+  const finalReport = asRecord(stockSelection?.final_report_json) || {};
+  return asRecord(asRecord(finalReport.candidate_screening)?.full) || asRecord(asRecord(stages.candidate_screening)?.full) || {};
+};
+
+const findScreeningSummary = (stockSelection: Record<string, unknown> | null): Record<string, unknown> => {
+  const selCtx = asRecord(stockSelection?.selection_context) || {};
+  const stages = asRecord(selCtx.stages) || {};
+  const finalReport = asRecord(stockSelection?.final_report_json) || {};
+  return asRecord(asRecord(finalReport.candidate_screening)?.summary) || asRecord(asRecord(stages.candidate_screening)?.summary) || {};
+};
+
+const findDeepDiveFull = (stockSelection: Record<string, unknown> | null): Record<string, unknown> => {
+  const selCtx = asRecord(stockSelection?.selection_context) || {};
+  const stages = asRecord(selCtx.stages) || {};
+  const finalReport = asRecord(stockSelection?.final_report_json) || {};
+  return asRecord(asRecord(finalReport.single_stock_deep_dive)?.full) || asRecord(asRecord(stages.single_stock_deep_dive)?.full) || {};
+};
+
+const extractDeepDiveSummariesByCode = (stockSelection: Record<string, unknown> | null): Map<string, Record<string, unknown>> => {
+  const byCode = new Map<string, Record<string, unknown>>();
+  const full = findDeepDiveFull(stockSelection);
+  const results = toRecordList(full.results);
+  results.forEach((item) => {
+    const summary = asRecord(item.summary) || {};
+    const stock = asRecord(asRecord(item.full)?.stock) || {};
+    const code = String(summary.code || stock.code || '').trim();
+    if (!code) return;
+    byCode.set(code, summary);
+  });
+  return byCode;
+};
+
+const extractScreeningByCode = (stockSelection: Record<string, unknown> | null): Map<string, Record<string, unknown>> => {
+  const byCode = new Map<string, Record<string, unknown>>();
+  toRecordList(findScreeningFull(stockSelection).shortlist).forEach((item) => {
+    const code = String(item.code || '').trim();
+    if (code) byCode.set(code, item);
+  });
+  return byCode;
+};
+
+const suggestTraceCandidateAction = (
+  candidate: DisplayCandidate,
+  stockSelection: Record<string, unknown> | null,
+): CandidateActionSuggestion => {
+  const screeningSummary = findScreeningSummary(stockSelection);
+  const deepTargets = new Set(toStringList(screeningSummary.deep_dive_targets));
+  const monitorTargets = new Set(toStringList(screeningSummary.monitor_targets));
+  const rejectedTargets = new Set(toStringList(screeningSummary.rejected_targets));
+  const screeningByCode = extractScreeningByCode(stockSelection);
+  const deepByCode = extractDeepDiveSummariesByCode(stockSelection);
+  const deepSummary = deepByCode.get(candidate.code);
+  const screening = screeningByCode.get(candidate.code);
+  const deepAction = String(deepSummary?.action_bias || '').trim();
+  if (deepAction) {
+    const display = displayCandidateAction(deepAction);
+    const strength = String(deepSummary?.action_strength || '');
+    return {
+      key: deepAction,
+      label: display.label,
+      tone: display.tone,
+      strength: actionStrengthLabel(strength),
+      reason: String(deepSummary?.key_reason || toStringList(deepSummary?.main_supporting_evidence)[0] || '动作来自单股深度取证结果。'),
+    };
+  }
+  if (rejectedTargets.has(candidate.code) || String(screening?.screening_result || '') === 'reject') {
+    return { key: 'reject', label: '暂不纳入', tone: 'danger', reason: String(screening?.primary_reason || '初筛阶段已淘汰。') };
+  }
+  if (deepTargets.has(candidate.code) || String(screening?.screening_result || '') === 'deep_dive') {
+    return { key: 'deep_dive', label: '进入深挖', tone: 'success', reason: String(screening?.primary_reason || '初筛认为值得进入单股深度取证。') };
+  }
+  if (monitorTargets.has(candidate.code) || String(screening?.screening_result || '') === 'monitor') {
+    return { key: 'monitor', label: '观察跟踪', tone: 'info', reason: String(screening?.primary_reason || '初筛建议继续观察。') };
+  }
+  return inferCandidateActionFromScore(candidate);
+};
+
+const candidateEvidenceTone = (dimension: string): CandidateDecisionTone => {
+  if (dimension === 'strategy' || dimension === 'technical' || dimension === 'fundamental') return 'info';
+  if (dimension === 'capital' || dimension === 'sentiment' || dimension === 'message') return 'warning';
+  if (dimension === 'fallback') return 'warning';
+  return 'default';
+};
+
+const candidateMetricHighlights = (candidate: DisplayCandidate): string[] => (
+  [...fundamentalMetricBadges(candidate), ...technicalMetricBadges(candidate)].slice(0, 10)
+);
+
+const candidateDecisionRank = (actionKey: string): number => {
+  if (['buy', 'open', 'add', 'conditional_buy', 'deep_dive'].includes(actionKey)) return 0;
+  if (['monitor', 'wait'].includes(actionKey)) return 1;
+  if (['hold', 'reduce'].includes(actionKey)) return 2;
+  if (['reject', 'avoid'].includes(actionKey)) return 4;
+  return 3;
+};
+
+const finiteNumber = (value: unknown): number | undefined => {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const toTraceCandidateDecisionRows = (
+  candidates: DisplayCandidate[],
+  stockSelection: Record<string, unknown> | null,
+): CandidateDecisionRow[] => {
+  const screeningByCode = extractScreeningByCode(stockSelection);
+  const deepByCode = extractDeepDiveSummariesByCode(stockSelection);
+  return candidates
+    .map((candidate) => {
+      const action = suggestTraceCandidateAction(candidate, stockSelection);
+      const screening = screeningByCode.get(candidate.code);
+      const hasDeepSummary = deepByCode.has(candidate.code);
+      const screeningScore = finiteNumber(screening?.score);
+      const decisionScore = screeningScore;
+      const sources = [candidate.source, ...candidate.recallSources].filter((source, index, arr) => source && arr.indexOf(source) === index);
+      const screeningReason = String(screening?.primary_reason || '').trim();
+      const reason = hasDeepSummary
+        ? (action.reason || screeningReason || candidate.reasonDimensions[0]?.detail || candidate.reason || '')
+        : (screeningReason || candidate.reasonDimensions[0]?.detail || candidate.reason || action.reason || '');
+      const scoreNote = screeningScore != null
+        ? 'candidate_screening 阶段的取证分；seed pool 召回分只保留为来源诊断。'
+        : undefined;
+      const evidence = [
+        ...(screening ? [{
+          label: `初筛：${displayCandidateAction(String(screening.screening_result || action.key)).label}`,
+          detail: displayReasonText(screeningReason || action.reason || ''),
+          tone: action.tone,
+        }] : []),
+        ...candidate.reasonDimensions.map((entry) => ({
+          label: entry.label || DIMENSION_GROUP_LABELS[entry.dimension] || entry.dimension,
+          detail: displayReasonText(entry.detail),
+          tone: candidateEvidenceTone(entry.dimension),
+        })),
+      ];
+      return {
+        id: candidate.code,
+        code: candidate.code,
+        name: candidate.name,
+        score: decisionScore,
+        scoreLabel: screeningScore != null ? '初筛分' : undefined,
+        scoreNote,
+        secondaryScores: [],
+        action,
+        primaryReason: displayReasonText(reason),
+        dimensionLabels: candidate.reasonDimensions.map((item) => item.label || DIMENSION_GROUP_LABELS[item.dimension] || item.dimension),
+        expertLabels: candidate.candidateExperts.map(displayCandidateExpertName),
+        sourceLabels: sources.map(displaySourceName),
+        lifecycleLabel: displayLifecycleStatus(candidate.lifecycleStatus),
+        dateLabel: candidate.latestDate,
+        badges: [
+          ...(candidate.primaryDesk ? [{ label: deskLabel(candidate.primaryDesk), tone: 'history' as CandidateDecisionTone }] : []),
+          ...(candidate.setupType ? [{ label: setupTypeLabel(candidate.setupType), tone: 'info' as CandidateDecisionTone }] : []),
+          ...(candidate.stance && candidate.stance !== 'support' ? [{ label: `席位:${stanceLabel(candidate.stance)}`, tone: 'default' as CandidateDecisionTone }] : []),
+          ...(candidate.multiDeskConviction ? [{ label: '多席共振', tone: 'history' as CandidateDecisionTone }] : []),
+          ...candidate.conflictFlags.map((flag) => ({ label: `冲突:${flag}`, tone: 'warning' as CandidateDecisionTone })),
+          ...(candidate.candidateExperts.length > 1 || candidate.recallSources.length > 1
+            ? [{ label: '多专家候选共振', tone: 'history' as CandidateDecisionTone }]
+            : []),
+          ...(candidate.consensusBonus != null && candidate.consensusBonus > 0 ? [{ label: `共振 +${formatMetricValue(candidate.consensusBonus)}`, tone: 'success' as CandidateDecisionTone }] : []),
+          ...(candidate.mixedEvidence ? [{ label: '存在反证', tone: 'warning' as CandidateDecisionTone }] : []),
+        ],
+        evidence,
+        metricHighlights: candidateMetricHighlights(candidate),
+        riskFlags: [
+          ...(candidate.mixedEvidence ? ['存在反证，需要后续取证确认'] : []),
+          ...candidate.reasonDimensions
+            .filter((entry) => entry.detail.includes('超买') || entry.detail.includes('追高') || entry.dimension === 'fallback')
+            .map((entry) => displayReasonText(entry.detail)),
+        ],
+        detailNote: '候选池阶段只说明入池价值，最终买卖动作以后续深挖、组合配置和风控为准。',
+      };
+    })
+    .sort((a, b) => {
+      const actionDiff = candidateDecisionRank(a.action.key) - candidateDecisionRank(b.action.key);
+      if (actionDiff !== 0) return actionDiff;
+      return String(a.code).localeCompare(String(b.code));
+    });
 };
 
 const extractEventImpactWatches = (result: AgentTraceRunResponse): EventImpactWatch[] => {
@@ -1127,44 +1770,6 @@ const getIntentResolution = (result: AgentTraceRunResponse): Record<string, unkn
   asRecord(asRecord(result.context_summary)?.intent_resolution)
 );
 
-const buildCandidateDimensionGroups = (candidates: DisplayCandidate[]): CandidateDimensionGroup[] => {
-  const byDimension = new Map<string, CandidateDimensionGroup>();
-  const ensure = (dimension: string, label?: string): CandidateDimensionGroup => {
-    const key = dimension || 'other';
-    const existing = byDimension.get(key);
-    if (existing) return existing;
-    const group = {
-      dimension: key,
-      label: label || DIMENSION_GROUP_LABELS[key] || key,
-      candidates: [],
-    };
-    byDimension.set(key, group);
-    return group;
-  };
-
-  candidates.forEach((candidate) => {
-    const entries = candidate.reasonDimensions.length
-      ? candidate.reasonDimensions
-      : [{ dimension: 'other', label: '其他', detail: candidate.reason || candidate.source || '-' }];
-    entries.forEach((entry) => {
-      const group = ensure(entry.dimension, DIMENSION_GROUP_LABELS[entry.dimension] || `${entry.label}候选`);
-      const current = group.candidates.find((item) => item.candidate.code === candidate.code);
-      const detail = displayReasonText(entry.detail || candidate.reason || '-');
-      if (current) {
-        if (detail && !current.details.includes(detail)) current.details.push(detail);
-      } else {
-        group.candidates.push({ candidate, details: detail ? [detail] : [] });
-      }
-    });
-  });
-
-  return Array.from(byDimension.values()).sort((a, b) => {
-    const ai = DIMENSION_GROUP_ORDER.indexOf(a.dimension);
-    const bi = DIMENSION_GROUP_ORDER.indexOf(b.dimension);
-    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-  });
-};
-
 const hasCandidateDimension = (groups: CandidateDimensionGroup[], dimensions: string[]): boolean => (
   groups.some((group) => dimensions.includes(group.dimension) && group.candidates.length > 0)
 );
@@ -1178,18 +1783,18 @@ type StepStatus = 'pending' | 'active' | 'done' | 'error';
 
 const StepIcon: React.FC<{ status: StepStatus }> = ({ status }) => {
   if (status === 'done') return <Check className="h-3.5 w-3.5 text-white" />;
-  if (status === 'active') return <Loader2 className="h-3.5 w-3.5 animate-spin text-white" />;
+  if (status === 'active') return <Loader2 className="h-3.5 w-3.5 animate-spin text-background" />;
   if (status === 'error') return <AlertTriangle className="h-3.5 w-3.5 text-white" />;
-  return <Circle className="h-2.5 w-2.5 text-[#999]" />;
+  return <Circle className="h-2.5 w-2.5 text-muted-text" />;
 };
 
 const StepNode: React.FC<{ status: StepStatus }> = ({ status }) => (
   <div className={cn(
     'relative z-10 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border-2',
-    status === 'done' && 'border-emerald-500 bg-emerald-500',
-    status === 'active' && 'border-[#1a1a1a] bg-[#1a1a1a]',
-    status === 'error' && 'border-red-500 bg-red-500',
-    status === 'pending' && 'border-[#e8e8e3] bg-white',
+    status === 'done' && 'border-success bg-success',
+    status === 'active' && 'border-foreground bg-foreground',
+    status === 'error' && 'border-danger bg-danger',
+    status === 'pending' && 'border-border bg-card',
   )}>
     <StepIcon status={status} />
   </div>
@@ -1204,38 +1809,35 @@ const TimelineStep: React.FC<{
   children?: React.ReactNode;
   defaultOpen?: boolean;
 }> = ({ label, title, status, narrative, isLast = false, children, defaultOpen = false }) => {
-  const [open, setOpen] = useState(defaultOpen);
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  const open = manualOpen ?? defaultOpen;
   const hasContent = Boolean(children);
-
-  useEffect(() => {
-    if (defaultOpen) setOpen(true);
-  }, [defaultOpen]);
 
   return (
     <div className="relative flex gap-4">
       {/* Vertical line */}
       <div className="flex flex-col items-center">
         <StepNode status={status} />
-        {!isLast && <div className="w-px flex-1 bg-[#e8e8e3]" />}
+        {!isLast && <div className="w-px flex-1 bg-border" />}
       </div>
 
       {/* Content */}
       <div className={cn('min-w-0 flex-1 pb-8', isLast && 'pb-0')}>
         <div className="flex items-baseline gap-2">
-          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#999]">{label}</span>
-          <h3 className="text-sm font-medium text-[#1a1a1a]">{title}</h3>
+          <span className="text-label font-semibold uppercase tracking-wider text-muted-text">{label}</span>
+          <h3 className="text-sm font-medium text-foreground">{title}</h3>
         </div>
 
         {narrative ? (
-          <p className="mt-1.5 text-[13px] leading-relaxed text-[#555]">{narrative}</p>
+          <p className="mt-1.5 text-sm leading-relaxed text-secondary-text">{narrative}</p>
         ) : null}
 
         {hasContent ? (
           <>
             <button
               type="button"
-              onClick={() => setOpen(!open)}
-              className="mt-2 flex items-center gap-1 text-xs text-[#999] transition-colors hover:text-[#555]"
+              onClick={() => setManualOpen(!open)}
+              className="mt-2 flex items-center gap-1 text-xs text-muted-text transition-colors hover:text-secondary-text"
             >
               <ChevronDown className={cn('h-3 w-3 transition-transform', !open && '-rotate-90')} />
               {open ? '收起详情' : '展开详情'}
@@ -1248,9 +1850,10 @@ const TimelineStep: React.FC<{
   );
 };
 
-const inputClass = 'h-9 w-full rounded-xl border border-[#e8e8e3] bg-white px-3 text-sm text-[#1a1a1a] outline-none transition-all placeholder:text-[#999] focus:border-[#ccc] focus:ring-2 focus:ring-[#f0f0ec]';
+const inputClass = 'h-9 w-full rounded-xl border border-border bg-card px-3 text-sm text-foreground outline-none transition-all placeholder:text-muted-text focus:border-ring focus:ring-2 focus:ring-ring/20';
 const selectClass = inputClass;
-const textareaClass = 'min-h-20 w-full resize-y rounded-xl border border-[#e8e8e3] bg-white px-3 py-2 text-sm text-[#1a1a1a] outline-none transition-all placeholder:text-[#999] focus:border-[#ccc] focus:ring-2 focus:ring-[#f0f0ec]';
+const textareaClass = 'min-h-20 w-full resize-y rounded-xl border border-border bg-card px-3 py-2 text-sm text-foreground outline-none transition-all placeholder:text-muted-text focus:border-ring focus:ring-2 focus:ring-ring/20';
+const markdownProseClass = 'max-w-none text-sm leading-relaxed text-foreground [&_h1]:text-lg [&_h1]:font-semibold [&_h1]:text-foreground [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-foreground [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-foreground [&_h4]:text-sm [&_h4]:font-medium [&_h4]:text-foreground [&_strong]:font-semibold [&_strong]:text-foreground [&_a]:text-cyan [&_a]:underline [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-1 [&_p]:my-2 [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-4 [&_blockquote]:text-secondary-text [&_code]:rounded [&_code]:bg-surface-2 [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_pre]:rounded-lg [&_pre]:bg-surface-2 [&_pre]:p-3 [&_table]:w-full [&_th]:border [&_th]:border-border [&_th]:bg-surface-2 [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:text-xs [&_th]:font-medium [&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-1.5 [&_td]:text-xs';
 
 /* ═══════════════════════════════════════════════
    Main Page Component
@@ -1264,6 +1867,7 @@ const AgentTracePage: React.FC = () => {
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
   const [reportIntent, setReportIntent] = useState('auto');
+  const [candidateDiscoveryMode, setCandidateDiscoveryMode] = useState<'thesis_desk_committee'>('thesis_desk_committee');
   const [riskPreference, setRiskPreference] = useState('balanced');
   const [tradingHorizon, setTradingHorizon] = useState('long_term');
   const [maxSinglePositionPct, setMaxSinglePositionPct] = useState('20');
@@ -1284,7 +1888,7 @@ const AgentTracePage: React.FC = () => {
   const activeRunSessionIdRef = useRef<string | null>(null);
   const runtimeConfigRef = useRef<Record<string, unknown> | null>(null);
 
-  const hydrateTraceSessionFromBackend = (sessionId: string, fallback?: TraceHistoryItem) => {
+  const hydrateTraceSessionFromBackend = useCallback((sessionId: string, fallback?: TraceHistoryItem) => {
     const placeholder = fallback?.result || createEmptyTraceResult();
     setResult({
       ...placeholder,
@@ -1324,7 +1928,7 @@ const AgentTracePage: React.FC = () => {
           setStatusMessage('未找到该 Trace 记录');
         }
       });
-  };
+  }, [runtimeConfig]);
 
   useEffect(() => {
     document.title = 'Agent Trace';
@@ -1348,7 +1952,7 @@ const AgentTracePage: React.FC = () => {
     setMessage(historyItem.message);
     setStockCode(historyItem.stockCode);
     setSelectedAccountId(historyItem.accountId ? String(historyItem.accountId) : '');
-  }, [routeSessionId]);
+  }, [routeSessionId, hydrateTraceSessionFromBackend]);
 
   useEffect(() => {
     let alive = true;
@@ -1388,6 +1992,8 @@ const AgentTracePage: React.FC = () => {
     const sessionId = createTraceSessionId();
     activeRunSessionIdRef.current = sessionId;
     const stockCodeToSend = shouldSendStockCode(message, stockCode) ? stockCode.trim() : undefined;
+    const selectedAccountNumber = selectedAccountId ? Number(selectedAccountId) : undefined;
+    const shouldInjectPortfolioContext = injectPortfolioContext || selectedAccountNumber != null;
     navigate(`/agent-trace/${encodeURIComponent(sessionId)}`, { replace: false });
     setRunning(true);
     setTraceStatus('running');
@@ -1399,9 +2005,9 @@ const AgentTracePage: React.FC = () => {
       const response = await agentApi.traceStream({
         session_id: sessionId,
         message,
-        account_id: selectedAccountId ? Number(selectedAccountId) : undefined,
+        account_id: selectedAccountNumber,
         stock_code: stockCodeToSend,
-        inject_portfolio_context: injectPortfolioContext,
+        inject_portfolio_context: shouldInjectPortfolioContext,
         analysis_mode: 'planning_execute',
         report_intent: reportIntent === 'auto' ? undefined : reportIntent,
         risk_preference: riskPreference,
@@ -1411,6 +2017,7 @@ const AgentTracePage: React.FC = () => {
         max_acceptable_drawdown_pct: parseOptionalPercent(maxAcceptableDrawdownPct),
         default_stop_loss_pct: parseOptionalPercent(defaultStopLossPct),
         investor_notes: investorNotes.trim() || undefined,
+        candidate_discovery_mode: candidateDiscoveryMode,
       });
       await consumeTraceStream(response);
     } catch (err) {
@@ -1606,16 +2213,16 @@ const AgentTracePage: React.FC = () => {
 
   /* ─── Render ─── */
   return (
-    <div className="min-h-screen bg-[#f5f5f0]" style={{ fontFamily: '"Noto Serif SC", "Source Han Serif SC", Georgia, "Times New Roman", serif' }}>
+    <div className="min-h-screen bg-surface-2">
       <div className="mx-auto max-w-[1100px] px-6 py-10">
         {/* Header */}
         <header className="mb-8">
-          <h1 className="text-lg font-semibold text-[#1a1a1a]">Agent Trace</h1>
-          <p className="mt-1 text-sm text-[#777]">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
+          <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
+          <p className="mt-1 text-sm text-muted-text">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
         </header>
 
         {/* Input area */}
-        <div className="mb-8 rounded-xl border border-[#e8e8e3] bg-white p-5 shadow-sm">
+        <div className="mb-8 rounded-xl border border-border bg-card p-5 shadow-sm">
           <div className="flex gap-3">
             <textarea
               value={message}
@@ -1631,7 +2238,7 @@ const AgentTracePage: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setShowConfig(!showConfig)}
-                className="text-[11px] text-[#999] hover:text-[#555]"
+                className="text-label text-muted-text hover:text-secondary-text"
               >
                 {showConfig ? '收起配置' : '展开配置'}
               </button>
@@ -1639,69 +2246,86 @@ const AgentTracePage: React.FC = () => {
           </div>
 
           {showConfig ? (
-            <div className="mt-4 border-t border-[#eeeee9] pt-4">
+            <div className="mt-4 border-t border-border pt-4">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">股票代码</span>
+                  <span className="mb-1 block text-label text-muted-text">股票代码</span>
                   <input value={stockCode} onChange={(e) => setStockCode(e.target.value)} className={inputClass} placeholder="可选，输入后才会随请求发送" />
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">账户</span>
+                  <span className="mb-1 block text-label text-muted-text">账户</span>
                   <select value={selectedAccountId} onChange={(e) => setSelectedAccountId(e.target.value)} className={selectClass}>
                     <option value="">全部</option>
                     {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
                   </select>
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">报告意图</span>
+                  <span className="mb-1 block text-label text-muted-text">报告意图</span>
                   <select value={reportIntent} onChange={(e) => setReportIntent(e.target.value)} className={selectClass}>
                     {REPORT_INTENT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </label>
+                <label className="block" title={CANDIDATE_DISCOVERY_OPTIONS.find((o) => o.value === candidateDiscoveryMode)?.desc || ''}>
+                  <span className="mb-1 block text-label text-muted-text">候选发现</span>
+                  <select
+                    aria-label="候选发现模式"
+                    value={candidateDiscoveryMode}
+                    onChange={(e) => {
+                      const next = e.target.value === 'thesis_desk_committee' ? 'thesis_desk_committee' : 'thesis_desk_committee';
+                      setCandidateDiscoveryMode(next);
+                      if (typeof window !== 'undefined') {
+                        window.localStorage.setItem(CANDIDATE_DISCOVERY_STORAGE_KEY, next);
+                      }
+                    }}
+                    className={selectClass}
+                  >
+                    {CANDIDATE_DISCOVERY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">风险偏好</span>
+                  <span className="mb-1 block text-label text-muted-text">风险偏好</span>
                   <select value={riskPreference} onChange={(e) => setRiskPreference(e.target.value)} className={selectClass}>
                     {RISK_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">持有周期</span>
+                  <span className="mb-1 block text-label text-muted-text">持有周期</span>
                   <select value={tradingHorizon} onChange={(e) => setTradingHorizon(e.target.value)} className={selectClass}>
                     {HORIZON_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">单票上限%</span>
+                  <span className="mb-1 block text-label text-muted-text">单票上限%</span>
                   <input value={maxSinglePositionPct} onChange={(e) => setMaxSinglePositionPct(e.target.value)} className={inputClass} placeholder="20" />
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">总权益上限%</span>
+                  <span className="mb-1 block text-label text-muted-text">总权益上限%</span>
                   <input value={maxTotalEquityExposurePct} onChange={(e) => setMaxTotalEquityExposurePct(e.target.value)} className={inputClass} placeholder="80" />
                 </label>
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">最大回撤%</span>
+                  <span className="mb-1 block text-label text-muted-text">最大回撤%</span>
                   <input value={maxAcceptableDrawdownPct} onChange={(e) => setMaxAcceptableDrawdownPct(e.target.value)} className={inputClass} placeholder="15" />
                 </label>
               </div>
               <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <label className="block">
-                  <span className="mb-1 block text-[11px] text-[#999]">默认止损%</span>
+                  <span className="mb-1 block text-label text-muted-text">默认止损%</span>
                   <input value={defaultStopLossPct} onChange={(e) => setDefaultStopLossPct(e.target.value)} className={inputClass} placeholder="8" />
                 </label>
                 <label className="col-span-2 block">
-                  <span className="mb-1 block text-[11px] text-[#999]">画像备注</span>
+                  <span className="mb-1 block text-label text-muted-text">画像备注</span>
                   <input value={investorNotes} onChange={(e) => setInvestorNotes(e.target.value)} className={inputClass} placeholder="偏长期持有" />
                 </label>
                 <label className="flex items-end gap-2 pb-1">
-                  <input type="checkbox" checked={injectPortfolioContext} onChange={(e) => setInjectPortfolioContext(e.target.checked)} className="h-4 w-4 rounded border-[#e8e8e3]" />
-                  <span className="text-xs text-[#777]">注入持仓</span>
+                  <input type="checkbox" checked={injectPortfolioContext} onChange={(e) => setInjectPortfolioContext(e.target.checked)} className="h-4 w-4 rounded border-border" />
+                  <span className="text-xs text-muted-text">注入持仓</span>
                 </label>
               </div>
             </div>
           ) : null}
 
           {stockCode.trim() && !shouldSendStockCode(message, stockCode) ? (
-            <p className="mt-2 text-xs text-amber-600">默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。</p>
+            <p className="mt-2 text-xs text-warning">默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。</p>
           ) : null}
         </div>
 
@@ -1711,18 +2335,20 @@ const AgentTracePage: React.FC = () => {
         {historyItems.length ? (
           <div className="mb-8">
             <div className="mb-2 flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-xs text-[#999]"><History className="h-3 w-3" /> 历史</span>
-              <button type="button" onClick={() => { saveTraceHistory([]); setHistoryItems([]); }} className="flex items-center gap-1 text-[11px] text-[#999] hover:text-red-500">
+              <span className="flex items-center gap-1.5 text-xs text-muted-text"><History className="h-3 w-3" /> 历史</span>
+              <button type="button" onClick={() => { saveTraceHistory([]); setHistoryItems([]); }} className="flex items-center gap-1 text-label text-muted-text hover:text-danger">
                 <Trash2 className="h-3 w-3" /> 清空
               </button>
             </div>
-            <div className="flex gap-2 overflow-x-auto pb-1">
+            <div className="flex max-h-64 flex-col gap-2 overflow-y-auto pr-1">
               {historyItems.map((item) => (
                 <button key={`${item.id}-${item.createdAt}`} type="button" onClick={() => handleSelectHistory(item)}
-                  className="flex shrink-0 items-center gap-2 rounded-full border border-[#e8e8e3] bg-white px-3 py-1.5 text-xs transition-all hover:border-[#ddd] hover:shadow-sm">
-                  <span className={cn('h-1.5 w-1.5 rounded-full', item.status === 'success' ? 'bg-emerald-500' : 'bg-red-500')} />
-                  <span className="font-mono text-[#333]">{item.stockCode || '选股'}</span>
-                  <span className="max-w-[140px] truncate text-[#999]">{item.message}</span>
+                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-left text-xs transition-all hover:border-border hover:shadow-sm">
+                  <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
+                    <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
+                  </span>
                 </button>
               ))}
             </div>
@@ -1731,18 +2357,18 @@ const AgentTracePage: React.FC = () => {
 
         {/* Status */}
         {traceStatus !== 'idle' ? (
-          <div className="mb-6 flex items-center gap-2 text-sm text-[#777]">
+          <div className="mb-6 flex items-center gap-2 text-sm text-muted-text">
             {traceStatus === 'running' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-            {traceStatus === 'done' ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : null}
-            {traceStatus === 'error' ? <AlertTriangle className="h-3.5 w-3.5 text-red-500" /> : null}
+            {traceStatus === 'done' ? <Check className="h-3.5 w-3.5 text-success" /> : null}
+            {traceStatus === 'error' ? <AlertTriangle className="h-3.5 w-3.5 text-danger" /> : null}
             <span>{statusMessage}</span>
-            {result?.session_id ? <span className="ml-auto font-mono text-[11px] text-[#bbb]">{result.session_id}</span> : null}
+            {result?.session_id ? <span className="ml-auto font-mono text-label text-muted-text">{result.session_id}</span> : null}
           </div>
         ) : null}
 
         {/* Timeline */}
         {result ? (
-          <div className="rounded-xl border border-[#e8e8e3] bg-white px-6 py-8 shadow-sm">
+          <div className="rounded-xl border border-border bg-card px-6 py-8 shadow-sm">
             <TimelineStep
               label="L1"
               title="数据与候选池"
@@ -1819,14 +2445,14 @@ const AgentTracePage: React.FC = () => {
 
             {/* Final Output */}
             {result.content ? (
-              <div className="mt-8 border-t border-[#eeeee9] pt-6">
+              <div className="mt-8 border-t border-border pt-6">
                 <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                  <h3 className="text-sm font-medium text-[#1a1a1a]">最终报告</h3>
+                  <h3 className="text-sm font-medium text-foreground">最终报告</h3>
                   <Button
                     type="button"
                     variant="secondary"
                     size="sm"
-                    className="border-[#e8e8e3] bg-white text-[#333] hover:bg-[#f5f5f0]"
+                    className="border-border bg-card text-foreground hover:bg-surface-2"
                     onClick={() => downloadMarkdownReport(result)}
                     title="导出 Markdown 文件"
                     aria-label="导出 MD"
@@ -1836,19 +2462,26 @@ const AgentTracePage: React.FC = () => {
                   </Button>
                 </div>
                 {result.error ? (
-                  <div className="mb-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">{result.error}</div>
+                  <div className="mb-3 rounded-lg bg-danger/10 p-3 text-sm text-danger">{result.error}</div>
                 ) : null}
-                <div className="max-h-[500px] overflow-auto rounded-lg border border-[#eeeee9] bg-white p-5">
-                  <div className="max-w-none text-sm leading-relaxed text-[#333] [&_h1]:text-lg [&_h1]:font-semibold [&_h1]:text-[#1a1a1a] [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-[#1a1a1a] [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-[#1a1a1a] [&_h4]:text-sm [&_h4]:font-medium [&_h4]:text-[#333] [&_strong]:font-semibold [&_strong]:text-[#1a1a1a] [&_a]:text-blue-600 [&_a]:underline [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-1 [&_p]:my-2 [&_blockquote]:border-l-2 [&_blockquote]:border-[#e8e8e3] [&_blockquote]:pl-4 [&_blockquote]:text-[#555] [&_code]:rounded [&_code]:bg-[#f0f0ec] [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-xs [&_pre]:rounded-lg [&_pre]:bg-[#f5f5f0] [&_pre]:p-3 [&_table]:w-full [&_th]:border [&_th]:border-[#e8e8e3] [&_th]:bg-[#f5f5f0] [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:text-xs [&_th]:font-medium [&_td]:border [&_td]:border-[#e8e8e3] [&_td]:px-3 [&_td]:py-1.5 [&_td]:text-xs">
-                    <Markdown remarkPlugins={[remarkGfm]}>{result.content}</Markdown>
+                <div className="max-h-[500px] overflow-auto rounded-lg border border-border bg-card p-5">
+                  <div className={markdownProseClass}>
+                    <Markdown remarkPlugins={[remarkGfm]}>{splitReportContent(result.content).main}</Markdown>
                   </div>
                 </div>
+                {splitReportContent(result.content).appendix ? (
+                  <Collapsible title="附录：候选池来源、逐股维度证据与风控条件" defaultOpen={false}>
+                    <div className={markdownProseClass}>
+                      <Markdown remarkPlugins={[remarkGfm]}>{splitReportContent(result.content).appendix}</Markdown>
+                    </div>
+                  </Collapsible>
+                ) : null}
               </div>
             ) : null}
           </div>
         ) : (
-          <div className="rounded-xl border border-dashed border-[#e8e8e3] bg-white px-6 py-16 text-center">
-            <p className="text-sm text-[#999]">输入问题并点击「运行」，观察 Agent 的完整推理链路。</p>
+          <div className="rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
+            <p className="text-sm text-muted-text">输入问题并点击「运行」，观察 Agent 的完整推理链路。</p>
           </div>
         )}
       </div>
@@ -1869,8 +2502,6 @@ const L1Detail: React.FC<{
   const selCtx = asRecord(stockSelection?.selection_context) || {};
   const stages = asRecord(selCtx.stages) || {};
   const finalReport = asRecord(stockSelection?.final_report_json) || {};
-  const discoverySummary = asRecord(asRecord(finalReport.candidate_discovery)?.summary) || asRecord(asRecord(stages.candidate_discovery)?.summary) || {};
-  const candidateCodes = toStringList(discoverySummary.candidate_codes);
   const screeningSummary = asRecord(asRecord(finalReport.candidate_screening)?.summary) || asRecord(asRecord(stages.candidate_screening)?.summary) || {};
   const deepTargets = toStringList(screeningSummary.deep_dive_targets);
   const candidates = extractDiscoveryCandidates(result, stockSelection);
@@ -1885,7 +2516,7 @@ const L1Detail: React.FC<{
   const classifierModel = typeof intentResolution?.classifier_model === 'string' ? intentResolution.classifier_model : '';
   const displayOrchestrationMode = runtimeOrchestrationMode || orchestrationMode;
   const latestSelectionStage = getLatestSelectionStage(result);
-  const dimensionGroups = buildCandidateDimensionGroups(candidates);
+  const dimensionGroups = extractExpertGroupedCandidates(result);
   const hasSentimentCandidates = hasCandidateDimension(dimensionGroups, ['sentiment', 'message']);
   const fallbackCandidates = candidates.filter((candidate) => (
     candidate.source === 'fallback_seed_pool' || candidate.recallSources.includes('fallback_seed_pool')
@@ -1902,6 +2533,10 @@ const L1Detail: React.FC<{
   const candidateCapacity = extractCandidateCapacity(result);
   const candidateQuality = extractCandidateQuality(result);
   const candidateHardExclusion = extractCandidateHardExclusion(result);
+  const candidateDecisionRows = toTraceCandidateDecisionRows(candidates, stockSelection);
+  const deskStatus = extractDeskCommitteeStatus(stockSelection);
+  const seedPool = extractSeedPoolDisplay(result, stockSelection);
+  const thesisDeskPackets = extractThesisDeskPackets(stockSelection);
   const fundamentalPacket = candidateExpertPackets.find((packet) => packet.expert === 'fundamental_expert');
   const fundamentalCandidates = candidates.filter((candidate) => (
     candidate.candidateExperts.includes('fundamental_expert')
@@ -1914,36 +2549,36 @@ const L1Detail: React.FC<{
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border border-[#eeeee9] bg-[#fbfbf8] p-4">
+      <div className="rounded-lg border border-border bg-surface-2 p-4">
         <div className="flex flex-wrap items-center gap-2">
-          <BrainCircuit className="h-4 w-4 text-[#777]" />
-          <span className="text-sm font-semibold text-[#1a1a1a]">多专家选股状态</span>
+          <BrainCircuit className="h-4 w-4 text-muted-text" />
+          <span className="text-sm font-semibold text-foreground">多专家选股状态</span>
           <span className={cn(
-            'rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
-            displayOrchestrationMode === 'expert_graph' ? 'bg-[#1a1a1a] text-white' : 'bg-[#f0f0ec] text-[#777]',
+            'rounded-full px-2 py-0.5 text-xxs font-semibold uppercase tracking-wide',
+            displayOrchestrationMode === 'expert_graph' ? 'bg-foreground text-background' : 'bg-surface-2 text-muted-text',
           )}>
             {displayOrchestrationMode}
           </span>
           {stockSelection && runtimeOrchestrationMode && runtimeOrchestrationMode !== orchestrationMode ? (
-            <span className="text-[11px] text-amber-700">本次选股结果仍为 {orchestrationMode}，后端配置为 {runtimeOrchestrationMode}</span>
+            <span className="text-label text-warning">本次选股结果仍为 {orchestrationMode}，后端配置为 {runtimeOrchestrationMode}</span>
           ) : null}
         </div>
         {candidateExpertPackets.length ? (
           <div className="mt-3 space-y-3">
-            <div className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
+            <div className="rounded-lg border border-border bg-card p-3 shadow-sm shadow-black/5">
               <div className="mb-3 flex flex-wrap items-baseline gap-2">
-                <span className="text-xs font-semibold text-[#1a1a1a]">1. L1 候选发现专家</span>
-                <span className="text-[11px] text-[#777]">这些专家只负责 discover 候选池，不负责后续验证、买入裁决或组合风控。</span>
+                <span className="text-xs font-semibold text-foreground">1. L1 候选发现专家</span>
+                <span className="text-label text-muted-text">这些专家只负责 discover 候选池，不负责后续验证、买入裁决或组合风控。</span>
                 {candidateCapacity ? (
-                  <div className="ml-auto flex flex-wrap gap-1.5 text-[10px] text-[#777]">
+                  <div className="ml-auto flex flex-wrap gap-1.5 text-xxs text-muted-text">
                     {candidateCapacity.maxCandidatesToDeepDive != null ? (
-                      <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">深挖上限 {candidateCapacity.maxCandidatesToDeepDive}</span>
+                      <span className="rounded-full bg-surface-2 px-2 py-0.5">深挖上限 {candidateCapacity.maxCandidatesToDeepDive}</span>
                     ) : null}
                     {candidateCapacity.minPerExpert != null ? (
-                      <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">专家保底 {candidateCapacity.minPerExpert}</span>
+                      <span className="rounded-full bg-surface-2 px-2 py-0.5">专家保底 {candidateCapacity.minPerExpert}</span>
                     ) : null}
                     {candidateCapacity.maxPerExpert != null ? (
-                      <span className="rounded-full bg-[#f5f5f0] px-2 py-0.5">单专家最多 {candidateCapacity.maxPerExpert}</span>
+                      <span className="rounded-full bg-surface-2 px-2 py-0.5">单专家最多 {candidateCapacity.maxPerExpert}</span>
                     ) : null}
                   </div>
                 ) : null}
@@ -1953,17 +2588,17 @@ const L1Detail: React.FC<{
                   <div key={packet.expert} className={cn('rounded-lg border p-3', dimensionTone(packet.dimension))}>
                     <div className="mb-2 flex items-center gap-2">
                       <span className="text-xs font-semibold">{packet.label}</span>
-                      <span className="ml-auto rounded-full bg-white/75 px-2 py-0.5 text-[10px] font-medium">{packet.status}</span>
+                      <span className="ml-auto rounded-full bg-card/75 px-2 py-0.5 text-xxs font-medium">{packet.status}</span>
                     </div>
-                    <p className="text-[11px] leading-relaxed opacity-85">{packet.goal || '候选发现'}</p>
-                    <div className="mt-2 flex flex-wrap gap-1.5 text-[10px]">
-                      <span className="rounded-md bg-white/75 px-2 py-0.5">候选 {packet.count}</span>
-                      {packet.themeCount ? <span className="rounded-md bg-white/75 px-2 py-0.5">主题 {packet.themeCount}</span> : null}
-                      <span className="rounded-md bg-white/75 px-2 py-0.5">{packet.required ? '必须出候选' : '可选'}</span>
-                      <span className="rounded-md bg-white/75 px-2 py-0.5">{packet.directStockCandidate ? '可直接推个股' : '默认只观察主题'}</span>
+                    <p className="text-label leading-relaxed opacity-85">{packet.goal || '候选发现'}</p>
+                    <div className="mt-2 flex flex-wrap gap-1.5 text-xxs">
+                      <span className="rounded-md bg-card/75 px-2 py-0.5">候选 {packet.count}</span>
+                      {packet.themeCount ? <span className="rounded-md bg-card/75 px-2 py-0.5">主题 {packet.themeCount}</span> : null}
+                      <span className="rounded-md bg-card/75 px-2 py-0.5">{packet.required ? '必须出候选' : '可选'}</span>
+                      <span className="rounded-md bg-card/75 px-2 py-0.5">{packet.directStockCandidate ? '可直接推个股' : '默认只观察主题'}</span>
                     </div>
                     {packet.warnings.length || packet.errors.length ? (
-                      <p className="mt-2 line-clamp-2 text-[10px] leading-relaxed opacity-80">
+                      <p className="mt-2 line-clamp-2 text-xxs leading-relaxed opacity-80">
                         {[...packet.errors, ...packet.warnings].slice(0, 2).join('；')}
                       </p>
                     ) : null}
@@ -1972,15 +2607,15 @@ const L1Detail: React.FC<{
               </div>
             </div>
             {candidates.length ? (
-              <div className="rounded-lg border border-white bg-white p-3 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
+              <div className="rounded-lg border border-border bg-card p-3 shadow-sm shadow-black/5">
                 <div className="mb-3 flex flex-wrap items-baseline gap-2">
-                  <span className="text-xs font-semibold text-[#1a1a1a]">2. 合并后的候选池</span>
-                  <span className="text-[11px] text-[#777]">{candidates.length} 只；候选进入后续阶段才会做技术/资金/消息/基本面验证和 Judge 裁决。</span>
+                  <span className="text-xs font-semibold text-foreground">2. 合并后的候选池</span>
+                  <span className="text-label text-muted-text">{candidates.length} 只；候选进入后续阶段才会做技术/资金/消息/基本面验证和 Judge 裁决。</span>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {candidates.slice(0, 12).map((candidate) => (
-                    <span key={`expert-summary-candidate-${candidate.code}`} className="rounded-full border border-[#e8e8e3] bg-[#fbfbf8] px-2.5 py-1 text-[11px] text-[#555]">
-                      <span className="font-mono font-semibold text-[#1a1a1a]">{candidate.code}</span>
+                    <span key={`expert-summary-candidate-${candidate.code}`} className="rounded-full border border-border bg-surface-2 px-2.5 py-1 text-label text-secondary-text">
+                      <span className="font-mono font-semibold text-foreground">{candidate.code}</span>
                       {candidate.name ? ` ${candidate.name}` : ''}
                     </span>
                   ))}
@@ -1988,26 +2623,26 @@ const L1Detail: React.FC<{
               </div>
             ) : null}
             {fundamentalPacket ? (
-              <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-stone-800">
+              <div className="rounded-lg border border-border/60 bg-surface-2 p-3 text-foreground">
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <span className="text-xs font-semibold">P2 基本面发现闭环</span>
-                  <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-medium">{fundamentalPacket.status}</span>
-                  <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px]">候选 {fundamentalCandidates.length}</span>
-                  {fundamentalPacket.asOf ? <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px]">报告期 {fundamentalPacket.asOf}</span> : null}
+                  <span className="rounded-full bg-card/80 px-2 py-0.5 text-xxs font-medium">{fundamentalPacket.status}</span>
+                  <span className="rounded-full bg-card/80 px-2 py-0.5 text-xxs">候选 {fundamentalCandidates.length}</span>
+                  {fundamentalPacket.asOf ? <span className="rounded-full bg-card/80 px-2 py-0.5 text-xxs">报告期 {fundamentalPacket.asOf}</span> : null}
                   {fundamentalSnapshotDiag.row_count != null ? (
-                    <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px]">快照 {String(fundamentalSnapshotDiag.row_count)} 行</span>
+                    <span className="rounded-full bg-card/80 px-2 py-0.5 text-xxs">快照 {String(fundamentalSnapshotDiag.row_count)} 行</span>
                   ) : null}
                 </div>
-                <p className="text-[11px] leading-relaxed">
+                <p className="text-label leading-relaxed">
                   基本面专家读取本地预计算表，不在本轮 Trace 里实时全市场拉财报；如果这里为 0 只，优先检查快照表是否为空或筛选阈值是否未命中。
                 </p>
-                <div className="mt-2 grid gap-2 text-[10px] md:grid-cols-2">
-                  <div className="rounded-md bg-white/70 px-2 py-1.5">
-                    <span className="text-stone-500">数据源：</span>
+                <div className="mt-2 grid gap-2 text-xxs md:grid-cols-2">
+                  <div className="rounded-md bg-card/70 px-2 py-1.5">
+                    <span className="text-secondary-text">数据源：</span>
                     <span className="break-all">{[fundamentalSource.table, fundamentalSource.db_path].filter(Boolean).join(' · ') || '-'}</span>
                   </div>
-                  <div className="rounded-md bg-white/70 px-2 py-1.5">
-                    <span className="text-stone-500">诊断：</span>
+                  <div className="rounded-md bg-card/70 px-2 py-1.5">
+                    <span className="text-secondary-text">诊断：</span>
                     <span>{[...fundamentalPacket.errors, ...fundamentalPacket.warnings].slice(0, 2).join('；') || '基本面专家已参与本轮候选发现。'}</span>
                   </div>
                 </div>
@@ -2015,7 +2650,7 @@ const L1Detail: React.FC<{
             ) : null}
           </div>
         ) : isWatchlistScan ? (
-          <p className="mt-2 text-xs text-[#777]">
+          <p className="mt-2 text-xs text-muted-text">
             {displayOrchestrationMode === 'expert_graph' && isWaitingForCandidateExperts
               ? `多专家候选发现正在运行，当前尚未返回 discover 专家包。${latestSelectionStage ? `最新阶段：${latestSelectionStage.label}；` : ''}`
               : displayOrchestrationMode === 'expert_graph'
@@ -2023,7 +2658,7 @@ const L1Detail: React.FC<{
                 : '当前为 legacy 选股链路，尚未输出 L1 候选发现专家包。设置 AGENT_ORCHESTRATION_MODE=expert_graph 并重启后端后会显示。'}
           </p>
         ) : (
-          <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">
+          <div className="mt-2 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-xs leading-relaxed text-warning">
             <p>本次请求未进入选股链路，当前识别意图为 {reportIntent || '未知'}，所以不会生成 expert_state。</p>
             {classifierConfigured ? (
               <p className="mt-1">
@@ -2038,67 +2673,192 @@ const L1Detail: React.FC<{
         )}
       </div>
 
-      {candidateQuality ? (
-        <div className="rounded-lg border border-[#eeeee9] bg-white p-4">
+      {(seedPool || thesisDeskPackets.length) ? (
+        <div className="rounded-lg border border-border bg-card p-4">
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <p className="text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池质量与门禁</p>
+            <p className="text-label font-medium uppercase tracking-wider text-muted-text">P4 四席位可观察性</p>
+            {seedPool ? (
+              <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">
+                Seed {seedPool.seedCount}{seedPool.totalLimit != null ? ` / ${seedPool.totalLimit}` : ''}
+              </span>
+            ) : null}
+            {thesisDeskPackets.length ? (
+              <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">席位 {thesisDeskPackets.length}</span>
+            ) : null}
+          </div>
+
+          {seedPool ? (
+            <div className="space-y-3">
+              <div className="grid gap-2 md:grid-cols-3">
+                <div className="rounded-md bg-surface-2 p-3">
+                  <p className="text-xxs uppercase tracking-wider text-muted-text">种子数量</p>
+                  <p className="mt-1 text-xl font-semibold text-foreground">{seedPool.seedCount}</p>
+                </div>
+                <div className="rounded-md bg-surface-2 p-3">
+                  <p className="text-xxs uppercase tracking-wider text-muted-text">来源分布</p>
+                  <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-secondary-text">
+                    {Object.entries(seedPool.sourceCounts).map(([key, count]) => `${displaySourceName(key)} ${count}`).join('；') || '-'}
+                  </p>
+                </div>
+                <div className="rounded-md bg-surface-2 p-3">
+                  <p className="text-xxs uppercase tracking-wider text-muted-text">信号维度</p>
+                  <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-secondary-text">
+                    {Object.entries(seedPool.dimensionCounts).map(([key, count]) => `${displayQualityKey(key)} ${count}`).join('；') || '-'}
+                  </p>
+                </div>
+              </div>
+              {seedPool.preview.length ? (
+                <div>
+                  <p className="mb-2 text-xxs uppercase tracking-wider text-muted-text">Seed Preview ({seedPool.preview.length})</p>
+                  <div className="grid max-h-[360px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-4">
+                    {seedPool.preview.slice(0, 20).map((seed) => (
+                      <div key={`seed-${seed.code}-${seed.source}`} className="min-h-[92px] rounded-md border border-border/70 bg-surface-2 px-3 py-2">
+                        <div className="flex items-baseline gap-2">
+                          <span className="font-mono text-xs font-semibold text-foreground">{seed.code}</span>
+                          {seed.name ? <span className="truncate text-xs text-foreground">{seed.name}</span> : null}
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          <span className="rounded bg-card px-1.5 py-0.5 text-xxs text-secondary-text">{displaySourceName(seed.source)}</span>
+                          {seed.sourceDiagnostics ? <span className="rounded bg-card px-1.5 py-0.5 text-xxs text-secondary-text">来源诊断</span> : null}
+                        </div>
+                        <p className="mt-1 line-clamp-2 text-xxs leading-relaxed text-muted-text">
+                          {seed.triggerSignals.slice(0, 2).join('；') || seed.hint || seed.freshness || '-'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {thesisDeskPackets.length ? (
+            <div className={cn('grid gap-3', seedPool ? 'mt-4' : '', 'lg:grid-cols-3')}>
+              {thesisDeskPackets.map((packet) => (
+                <div key={`thesis-desk-${packet.expert}`} className="rounded-lg border border-border/70 bg-surface-2 p-3">
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="text-xs font-semibold text-foreground">{packet.label}</span>
+                    <span className="ml-auto rounded-full bg-card px-2 py-0.5 text-xxs text-secondary-text">{packet.status}</span>
+                  </div>
+                  <div className="mb-2 flex flex-wrap gap-1.5 text-xxs text-muted-text">
+                    <span className="rounded-md bg-card px-2 py-0.5">看 {packet.seedCount}</span>
+                    <span className="rounded-md bg-card px-2 py-0.5">输出 {packet.acceptedCount}</span>
+                    <span className="rounded-md bg-card px-2 py-0.5">剔除 {packet.rejectedCount}</span>
+                    <span className="rounded-md bg-card px-2 py-0.5">工具 {packet.toolCallCount}</span>
+                    {packet.elapsedMs != null ? <span className="rounded-md bg-card px-2 py-0.5">{packet.elapsedMs}ms</span> : null}
+                  </div>
+                  {packet.candidates.length ? (
+                    <div className="space-y-2">
+                      {packet.candidates.slice(0, 5).map((candidate) => (
+                        <div key={`${packet.expert}-${candidate.code}`} className="rounded-md bg-card/85 px-2.5 py-2">
+                          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                            <span className="font-mono text-xs font-semibold text-foreground">{candidate.code}</span>
+                            {candidate.name ? <span className="text-xs text-foreground">{candidate.name}</span> : null}
+                            {candidate.stance ? <span className="rounded bg-surface-2 px-1.5 py-0.5 text-xxs text-secondary-text">{stanceLabel(candidate.stance)}</span> : null}
+                            {candidate.setupType ? <span className="rounded bg-surface-2 px-1.5 py-0.5 text-xxs text-secondary-text">{setupTypeLabel(candidate.setupType)}</span> : null}
+                          </div>
+                          {candidate.reason ? <p className="mt-1 line-clamp-2 text-xxs leading-relaxed text-secondary-text">{displayReasonText(candidate.reason)}</p> : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="rounded-md bg-card/80 px-2.5 py-2 text-xxs text-muted-text">本席位未输出候选。</p>
+                  )}
+                  {packet.errors.length || packet.diagnostics.length ? (
+                    <p className="mt-2 line-clamp-2 text-xxs leading-relaxed text-muted-text">
+                      {[...packet.errors, ...packet.diagnostics].slice(0, 2).join('；')}
+                    </p>
+                  ) : null}
+                  {packet.perSeedPackets.length ? (
+                    <div className="mt-3 max-h-44 space-y-1.5 overflow-y-auto pr-1">
+                      {packet.perSeedPackets.slice(0, 20).map((seed, idx) => (
+                        <div key={`${packet.expert}-seed-${seed.code || idx}`} className="rounded-md bg-card/70 px-2 py-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5 text-xxs">
+                            <span className="font-mono font-semibold text-foreground">{seed.code || `seed-${idx + 1}`}</span>
+                            {seed.name ? <span className="text-secondary-text">{seed.name}</span> : null}
+                            <span className="rounded bg-surface-2 px-1.5 py-0.5 text-muted-text">{seed.status}</span>
+                            <span className="rounded bg-surface-2 px-1.5 py-0.5 text-muted-text">出 {seed.candidateCount}</span>
+                            <span className="rounded bg-surface-2 px-1.5 py-0.5 text-muted-text">剔 {seed.rejectedCount}</span>
+                            <span className="rounded bg-surface-2 px-1.5 py-0.5 text-muted-text">工具 {seed.toolCallCount}</span>
+                            {seed.elapsedMs != null ? <span className="rounded bg-surface-2 px-1.5 py-0.5 text-muted-text">{seed.elapsedMs}ms</span> : null}
+                          </div>
+                          {seed.errors.length || seed.diagnostics.length ? (
+                            <p className="mt-1 line-clamp-1 text-xxs leading-relaxed text-muted-text">
+                              {[...seed.errors, ...seed.diagnostics].slice(0, 1).join('；')}
+                            </p>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {candidateQuality ? (
+        <div className="rounded-lg border border-border bg-card p-4">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <p className="text-label font-medium uppercase tracking-wider text-muted-text">候选池质量与门禁</p>
             {candidateQuality.hardStrategyTrunkMissing ? (
-              <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700">硬策略主干缺失</span>
+              <span className="rounded-full bg-danger/10 px-2 py-0.5 text-xxs font-medium text-danger">硬策略主干缺失</span>
             ) : (
-              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">硬策略主干可用</span>
+              <span className="rounded-full bg-success/10 px-2 py-0.5 text-xxs font-medium text-success">硬策略主干可用</span>
             )}
             {candidateQuality.hardExclusionCount ? (
-              <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">硬排除 {candidateQuality.hardExclusionCount}</span>
+              <span className="rounded-full bg-warning/10 px-2 py-0.5 text-xxs font-medium text-warning">硬排除 {candidateQuality.hardExclusionCount}</span>
             ) : null}
           </div>
           <div className="grid gap-2 md:grid-cols-4">
-            <div className="rounded-lg bg-[#f8f8f3] p-3">
-              <p className="text-[10px] uppercase tracking-wider text-[#999]">候选数量</p>
-              <p className="mt-1 text-lg font-semibold text-[#1a1a1a]">{candidateQuality.candidateCount}</p>
+            <div className="rounded-lg bg-surface-2 p-3">
+              <p className="text-xxs uppercase tracking-wider text-muted-text">候选数量</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">{candidateQuality.candidateCount}</p>
             </div>
-            <div className="rounded-lg bg-[#f8f8f3] p-3">
-              <p className="text-[10px] uppercase tracking-wider text-[#999]">多源共振</p>
-              <p className="mt-1 text-lg font-semibold text-[#1a1a1a]">{candidateQuality.multiSourceCount}</p>
+            <div className="rounded-lg bg-surface-2 p-3">
+              <p className="text-xxs uppercase tracking-wider text-muted-text">多源共振</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">{candidateQuality.multiSourceCount}</p>
             </div>
-            <div className="rounded-lg bg-[#f8f8f3] p-3">
-              <p className="text-[10px] uppercase tracking-wider text-[#999]">兜底观察</p>
-              <p className="mt-1 text-lg font-semibold text-[#1a1a1a]">{candidateQuality.fallbackCount}</p>
+            <div className="rounded-lg bg-surface-2 p-3">
+              <p className="text-xxs uppercase tracking-wider text-muted-text">兜底观察</p>
+              <p className="mt-1 text-lg font-semibold text-foreground">{candidateQuality.fallbackCount}</p>
             </div>
-            <div className="rounded-lg bg-[#f8f8f3] p-3">
-              <p className="text-[10px] uppercase tracking-wider text-[#999]">生命周期</p>
-              <p className="mt-1 text-xs leading-relaxed text-[#555]">
+            <div className="rounded-lg bg-surface-2 p-3">
+              <p className="text-xxs uppercase tracking-wider text-muted-text">生命周期</p>
+              <p className="mt-1 text-xs leading-relaxed text-secondary-text">
                 {Object.entries(candidateQuality.lifecycleCounts).map(([key, count]) => `${displayLifecycleStatus(key)} ${count}`).join('；') || '-'}
               </p>
             </div>
           </div>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <div>
-              <p className="mb-1.5 text-[10px] uppercase tracking-wider text-[#999]">维度分布</p>
+              <p className="mb-1.5 text-xxs uppercase tracking-wider text-muted-text">维度分布</p>
               <div className="flex flex-wrap gap-1.5">
                 {Object.entries(candidateQuality.dimensionCounts).map(([key, count]) => (
-                  <span key={key} className="rounded-full bg-[#f0f0ec] px-2 py-0.5 text-[10px] text-[#666]">{displayQualityKey(key)} {count}</span>
+                  <span key={key} className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">{displayQualityKey(key)} {count}</span>
                 ))}
               </div>
             </div>
             <div>
-              <p className="mb-1.5 text-[10px] uppercase tracking-wider text-[#999]">来源分布</p>
+              <p className="mb-1.5 text-xxs uppercase tracking-wider text-muted-text">来源分布</p>
               <div className="flex flex-wrap gap-1.5">
                 {Object.entries(candidateQuality.sourceCounts).map(([key, count]) => (
-                  <span key={key} className="rounded-full bg-[#f0f0ec] px-2 py-0.5 text-[10px] text-[#666]">{displayQualityKey(key)} {count}</span>
+                  <span key={key} className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">{displayQualityKey(key)} {count}</span>
                 ))}
               </div>
             </div>
           </div>
           {candidateHardExclusion?.excludedCount ? (
-            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
-              <p className="text-[11px] font-semibold">硬排除明细</p>
-              <p className="mt-1 text-[10px] leading-relaxed">
+            <div className="mt-3 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-warning">
+              <p className="text-label font-semibold">硬排除明细</p>
+              <p className="mt-1 text-xxs leading-relaxed">
                 {Object.entries(candidateHardExclusion.reasonCounts).map(([key, count]) => `${displayExclusionReason(key)} ${count}`).join('；')}
               </p>
               {candidateHardExclusion.examples.length ? (
                 <div className="mt-2 flex flex-wrap gap-1.5">
                   {candidateHardExclusion.examples.slice(0, 6).map((item) => (
-                    <span key={`${item.code}-${item.reason}`} className="rounded-md bg-white/80 px-2 py-0.5 text-[10px]">
+                    <span key={`${item.code}-${item.reason}`} className="rounded-md bg-card/80 px-2 py-0.5 text-xxs">
                       {item.code}{item.name ? ` ${item.name}` : ''} · {displayExclusionReason(item.reason)}
                     </span>
                   ))}
@@ -2110,18 +2870,18 @@ const L1Detail: React.FC<{
       ) : null}
 
       {candidateThemes.length ? (
-        <div className="rounded-lg border border-[#eeeee9] bg-white p-4">
-          <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-[#999]">主题观察 ({candidateThemes.length})</p>
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="mb-2 text-label font-medium uppercase tracking-wider text-muted-text">主题观察 ({candidateThemes.length})</p>
           <div className="grid gap-2 md:grid-cols-2">
             {candidateThemes.slice(0, 6).map((theme) => (
-              <div key={`${theme.theme}-${theme.eventTitle}`} className="rounded-lg border border-purple-100 bg-purple-50 px-3 py-2 text-purple-700">
+              <div key={`${theme.theme}-${theme.eventTitle}`} className="rounded-lg border border-purple/25 bg-purple/10 px-3 py-2 text-purple">
                 <div className="mb-1 flex flex-wrap items-center gap-2">
                   <span className="text-xs font-semibold">{theme.theme}</span>
-                  <span className="rounded-full bg-white/75 px-2 py-0.5 text-[10px]">{displayEventMaturity(theme.status)}</span>
-                  {theme.confidence != null ? <span className="text-[10px] opacity-80">置信 {formatConfidence(theme.confidence)}</span> : null}
+                  <span className="rounded-full bg-card/75 px-2 py-0.5 text-xxs">{displayEventMaturity(theme.status)}</span>
+                  {theme.confidence != null ? <span className="text-xxs opacity-80">置信 {formatConfidence(theme.confidence)}</span> : null}
                 </div>
-                {theme.eventTitle ? <p className="text-[11px] leading-relaxed">{theme.eventTitle}</p> : null}
-                {theme.reason ? <p className="mt-1 line-clamp-2 text-[10px] leading-relaxed opacity-80">{theme.reason}</p> : null}
+                {theme.eventTitle ? <p className="text-label leading-relaxed">{theme.eventTitle}</p> : null}
+                {theme.reason ? <p className="mt-1 line-clamp-2 text-xxs leading-relaxed opacity-80">{theme.reason}</p> : null}
               </div>
             ))}
           </div>
@@ -2130,14 +2890,14 @@ const L1Detail: React.FC<{
 
       {discoverySteps.length ? (
         <div>
-          <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-[#999]">候选来源审计</p>
+          <p className="mb-2 text-label font-medium uppercase tracking-wider text-muted-text">候选来源审计</p>
           <div className="flex flex-wrap gap-1.5">
             {discoverySteps.map((step, i) => {
               const source = String(step.source || '-');
               const status = String(step.status || '-');
               const count = typeof step.count === 'number' ? step.count : undefined;
               return (
-                <span key={`${source}-${i}`} className="rounded-full border border-[#e8e8e3] bg-white px-2.5 py-1 text-[11px] text-[#666]">
+                <span key={`${source}-${i}`} className="rounded-full border border-border bg-card px-2.5 py-1 text-label text-secondary-text">
                   {displaySourceName(source)} · {status}{count != null ? ` · ${count}` : ''}
                 </span>
               );
@@ -2148,35 +2908,35 @@ const L1Detail: React.FC<{
 
       {eventWatches.length ? (
         <div>
-          <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-[#999]">消息/事件观察 ({eventWatches.length})</p>
+          <p className="mb-3 text-label font-medium uppercase tracking-wider text-muted-text">消息/事件观察 ({eventWatches.length})</p>
           <div className="grid gap-3 lg:grid-cols-2">
             {eventWatches.map((event) => {
               const confirmedCount = event.validationMatches.filter((match) => match.status === 'confirmed').length;
               return (
                 <div key={event.eventId || event.title} className={cn('rounded-lg border p-3', dimensionTone(event.maturity === 'confirmed' ? 'sentiment' : 'message'))}>
                   <div className="mb-2 flex flex-wrap items-center gap-2">
-                    <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-semibold">{displayEventMaturity(event.maturity)}</span>
-                    {event.eventType ? <span className="rounded-full bg-white/60 px-2 py-0.5 text-[10px]">{event.eventType}</span> : null}
-                    {event.validationWindowDays ? <span className="text-[10px] text-[#777]">{event.validationWindowDays} 日验证窗口</span> : null}
-                    {confirmedCount ? <span className="ml-auto rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-700">验证 {confirmedCount}</span> : null}
+                    <span className="rounded-full bg-card/80 px-2 py-0.5 text-xxs font-semibold">{displayEventMaturity(event.maturity)}</span>
+                    {event.eventType ? <span className="rounded-full bg-card/60 px-2 py-0.5 text-xxs">{event.eventType}</span> : null}
+                    {event.validationWindowDays ? <span className="text-xxs text-muted-text">{event.validationWindowDays} 日验证窗口</span> : null}
+                    {confirmedCount ? <span className="ml-auto rounded-full bg-success/10 px-2 py-0.5 text-xxs text-success">验证 {confirmedCount}</span> : null}
                   </div>
                   <div className="space-y-1.5">
-                    <p className="text-xs font-semibold leading-relaxed text-[#1a1a1a]">{event.title}</p>
-                    {event.snippet ? <p className="line-clamp-2 text-[11px] leading-relaxed text-[#555]">{event.snippet}</p> : null}
+                    <p className="text-xs font-semibold leading-relaxed text-foreground">{event.title}</p>
+                    {event.snippet ? <p className="line-clamp-2 text-label leading-relaxed text-secondary-text">{event.snippet}</p> : null}
                     {event.watchThemes.length ? (
                       <div className="flex flex-wrap gap-1">
                         {event.watchThemes.slice(0, 6).map((theme) => (
-                          <span key={theme} className="rounded-md bg-white/75 px-2 py-0.5 text-[10px] text-[#666]">{theme}</span>
+                          <span key={theme} className="rounded-md bg-card/75 px-2 py-0.5 text-xxs text-secondary-text">{theme}</span>
                         ))}
                       </div>
                     ) : null}
                     {event.impactVariables.length ? (
-                      <p className="text-[10px] leading-relaxed text-[#777]">影响变量：{event.impactVariables.slice(0, 5).join('、')}</p>
+                      <p className="text-xxs leading-relaxed text-muted-text">影响变量：{event.impactVariables.slice(0, 5).join('、')}</p>
                     ) : null}
                     {event.validationMatches.length ? (
-                      <div className="mt-2 space-y-1 rounded-md bg-white/70 p-2">
+                      <div className="mt-2 space-y-1 rounded-md bg-card/70 p-2">
                         {event.validationMatches.slice(0, 4).map((match) => (
-                          <div key={`${event.eventId}-${match.theme}`} className="text-[10px] leading-relaxed text-[#666]">
+                          <div key={`${event.eventId}-${match.theme}`} className="text-xxs leading-relaxed text-secondary-text">
                             <span className="font-semibold">{match.theme || '主题'}</span>
                             <span className="mx-1">·</span>
                             <span>{match.status === 'confirmed' ? `已验证 ${match.resultCount} 条` : '观察中，未形成个股候选'}</span>
@@ -2186,7 +2946,7 @@ const L1Detail: React.FC<{
                       </div>
                     ) : null}
                     {(event.source || event.publishedDate) ? (
-                      <p className="text-[10px] text-[#999]">{[event.source, event.publishedDate].filter(Boolean).join(' · ')}</p>
+                      <p className="text-xxs text-muted-text">{[event.source, event.publishedDate].filter(Boolean).join(' · ')}</p>
                     ) : null}
                   </div>
                 </div>
@@ -2196,33 +2956,64 @@ const L1Detail: React.FC<{
         </div>
       ) : null}
 
+      {deskStatus ? (
+        <div className={cn(
+          'rounded-lg border p-3 text-xs',
+          deskStatus.degraded || deskStatus.error ? 'border-amber-500/50 bg-amber-500/10' : 'border-emerald-500/40 bg-emerald-500/10',
+        )}>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-foreground">
+              {deskStatus.mode === 'thesis_desk_committee' ? '打法席位委员会' : 'LLM 专家委员会'}
+            </span>
+            <span className={cn(
+              'rounded-full px-2 py-0.5 text-xxs',
+              deskStatus.degraded || deskStatus.error ? 'bg-amber-500/20 text-amber-200' : 'bg-emerald-500/20 text-emerald-200',
+            )}>
+              {deskStatus.error ? '运行异常' : deskStatus.degraded ? '降级运行' : deskStatus.status ? `状态 ${deskStatus.status}` : '运行中'}
+            </span>
+            {deskStatus.deskDiagnostics.map((d) => (
+              <span key={d.desk} className="rounded-md bg-card/70 px-2 py-0.5 text-xxs text-secondary-text">
+                {deskLabel(d.desk)}: {d.status}{d.picks ? ` ${d.picks}只` : ''}
+              </span>
+            ))}
+          </div>
+          {deskStatus.error ? (
+            <p className="mt-1.5 text-xxs leading-relaxed text-amber-300">席位运行异常：{deskStatus.error}</p>
+          ) : deskStatus.degraded ? (
+            <p className="mt-1.5 text-xxs leading-relaxed text-amber-300">席位收敛降级，候选池回退到召回结果，请核对 trace candidate_discovery。</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {candidates.length ? (
+        <CandidateDecisionTable
+          title="候选入池榜"
+          description="优先展示初筛和深挖结论；seed pool 召回分只作为来源内诊断，不做跨来源评分比较。"
+          items={candidateDecisionRows}
+          scoreColumnLabel="评估口径"
+          emptyTitle="本轮没有候选"
+          emptyDescription="候选发现阶段没有返回可展示股票。"
+        />
+      ) : null}
+
       {dimensionGroups.length ? (
-        <div>
-          <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-[#999]">按专家维度分组的候选</p>
+        <Collapsible title="专家维度与原始候选分组" defaultOpen={false} icon={<BrainCircuit className="h-4 w-4" />}>
           <div className="grid gap-3 lg:grid-cols-2">
             {dimensionGroups.map((group) => (
               <div key={group.dimension} className={cn('rounded-lg border p-3', dimensionTone(group.dimension))}>
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <span className="text-xs font-semibold">{group.label}</span>
-                  <span className="rounded-full bg-white/70 px-2 py-0.5 text-[10px]">{group.candidates.length} 只</span>
+                  <span className="rounded-full bg-card/70 px-2 py-0.5 text-xxs">{group.candidates.length} 只</span>
                 </div>
                 <div className="space-y-2">
                   {group.candidates.slice(0, 6).map(({ candidate, details }) => (
-                    <div key={`${group.dimension}-${candidate.code}`} className="rounded-md bg-white/75 px-2.5 py-2">
+                    <div key={`${group.dimension}-${candidate.code}`} className="rounded-md bg-card/75 px-2.5 py-2">
                       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                        <span className="font-mono text-xs font-semibold text-[#1a1a1a]">{candidate.code}</span>
-                        {candidate.name ? <span className="text-xs font-medium text-[#333]">{candidate.name}</span> : null}
-                        {candidate.score != null ? <span className="text-[10px] text-[#777]">评分 {formatMetricValue(candidate.score)}</span> : null}
+                        <span className="font-mono text-xs font-semibold text-foreground">{candidate.code}</span>
+                        {candidate.name ? <span className="text-xs font-medium text-foreground">{candidate.name}</span> : null}
                       </div>
                       {details.length ? (
-                        <p className="mt-1 text-[11px] leading-relaxed text-[#555]">{details.slice(0, 2).join('；')}</p>
-                      ) : null}
-                      {group.dimension === 'fundamental' && fundamentalMetricBadges(candidate).length ? (
-                        <div className="mt-1.5 flex flex-wrap gap-1">
-                          {fundamentalMetricBadges(candidate).slice(0, 6).map((badge) => (
-                            <span key={badge} className="rounded-md bg-white px-1.5 py-0.5 text-[10px] text-stone-700">{badge}</span>
-                          ))}
-                        </div>
+                        <p className="mt-1 text-label leading-relaxed text-secondary-text">{details.slice(0, 2).join('；')}</p>
                       ) : null}
                     </div>
                   ))}
@@ -2233,35 +3024,34 @@ const L1Detail: React.FC<{
               <div className={cn('rounded-lg border p-3', dimensionTone('sentiment'))}>
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <span className="text-xs font-semibold">情绪/热点候选</span>
-                  <span className="rounded-full bg-white/70 px-2 py-0.5 text-[10px]">0 只</span>
+                  <span className="rounded-full bg-card/70 px-2 py-0.5 text-xxs">0 只</span>
                 </div>
-                <div className="rounded-md bg-white/75 px-2.5 py-2">
-                  <p className="text-[11px] leading-relaxed text-[#555]">
+                <div className="rounded-md bg-card/75 px-2.5 py-2">
+                  <p className="text-label leading-relaxed text-secondary-text">
                     本次候选召回没有命中消息/情绪来源；当前只会在强势板块、用户输入或后续情绪工具接入后生成这类候选。
                   </p>
                 </div>
               </div>
             ) : null}
           </div>
-        </div>
+        </Collapsible>
       ) : null}
 
       {fallbackCandidates.length ? (
         <div>
-          <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-amber-700">兜底观察池 ({fallbackCandidates.length})</p>
-          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
-            <p className="mb-2 text-[11px] leading-relaxed text-amber-800">
+          <p className="mb-3 text-label font-medium uppercase tracking-wider text-warning">兜底观察池 ({fallbackCandidates.length})</p>
+          <div className="rounded-lg border border-warning/25 bg-warning/10 p-3">
+            <p className="mb-2 text-label leading-relaxed text-warning">
               这些股票来自固定种子池，只用于真实候选召回失败时维持后续取证链路；它们不是策略、资金或消息面筛选结果，不能作为推荐依据。
             </p>
             <div className="grid gap-2 sm:grid-cols-2">
               {fallbackCandidates.slice(0, 8).map((candidate) => (
-                <div key={`fallback-${candidate.code}`} className="rounded-md bg-white/80 px-2.5 py-2">
+                <div key={`fallback-${candidate.code}`} className="rounded-md bg-card/80 px-2.5 py-2">
                   <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                    <span className="font-mono text-xs font-semibold text-[#1a1a1a]">{candidate.code}</span>
-                    {candidate.name ? <span className="text-xs font-medium text-[#333]">{candidate.name}</span> : null}
-                    {candidate.score != null ? <span className="text-[10px] text-[#777]">评分 {formatMetricValue(candidate.score)}</span> : null}
+                    <span className="font-mono text-xs font-semibold text-foreground">{candidate.code}</span>
+                    {candidate.name ? <span className="text-xs font-medium text-foreground">{candidate.name}</span> : null}
                   </div>
-                  <p className="mt-1 text-[11px] leading-relaxed text-[#666]">{candidate.reason || '固定兜底观察样本'}</p>
+                  <p className="mt-1 text-label leading-relaxed text-secondary-text">{candidate.reason || '固定兜底观察样本'}</p>
                 </div>
               ))}
             </div>
@@ -2269,89 +3059,12 @@ const L1Detail: React.FC<{
         </div>
       ) : null}
 
-      {candidates.length ? (
-        <div>
-          <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池列表 ({candidates.length})</p>
-          <div className="grid gap-3">
-            {candidates.map((c) => {
-              const sources = [c.source, ...c.recallSources].filter((source, index, arr) => source && arr.indexOf(source) === index);
-              const labels = [...c.strategies, ...c.tags].filter((label, index, arr) => label && arr.indexOf(label) === index);
-              return (
-                <div key={c.code} className="rounded-lg border border-[#eeeee9] bg-[#fbfbf8] p-4">
-                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                    <span className="font-mono text-sm font-semibold text-[#1a1a1a]">{c.code}</span>
-                    {c.name ? <span className="text-sm font-medium text-[#333]">{c.name}</span> : null}
-                    {c.score != null ? <span className="rounded-full bg-[#1a1a1a] px-2 py-0.5 text-[10px] font-medium text-white">评分 {formatMetricValue(c.score)}</span> : null}
-                    {c.consensusBonus != null && c.consensusBonus > 0 ? (
-                      <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">共振 +{formatMetricValue(c.consensusBonus)}</span>
-                    ) : null}
-                    {c.lifecycleStatus ? (
-                      <span className="rounded-full bg-[#f0f0ec] px-2 py-0.5 text-[10px] text-[#666]">{displayLifecycleStatus(c.lifecycleStatus)}</span>
-                    ) : null}
-                    {c.mixedEvidence ? (
-                      <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">存在反证</span>
-                    ) : null}
-                    {c.latestDate ? <span className="text-[11px] text-[#999]">{c.latestDate}</span> : null}
-                  </div>
-
-                  {sources.length ? (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {sources.map((source) => (
-                        <span key={source} className="rounded-md bg-white px-2 py-0.5 text-[11px] text-[#666]">{displaySourceName(source)}</span>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {c.candidateExperts.length ? (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {c.candidateExperts.map((expert) => (
-                        <span key={`${c.code}-${expert}`} className="rounded-md bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700">{displayCandidateExpertName(expert)}</span>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {labels.length ? (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {labels.map((label) => (
-                        <span key={label} className="rounded-md bg-[#f0f0ec] px-2 py-0.5 text-[11px] text-[#555]">{label}</span>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {c.reasonDimensions.length ? (
-                    <div className="mt-3 space-y-1.5">
-                      {c.reasonDimensions.map((item, i) => (
-                        <div key={`${c.code}-${item.dimension}-${i}`} className={cn('rounded-md border px-2.5 py-1.5 text-[12px] leading-relaxed', dimensionTone(item.dimension))}>
-                          <span className="mr-2 font-semibold">{item.label}</span>
-                          <span>{displayReasonText(item.detail)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : c.reason ? (
-                    <p className="mt-3 text-[12px] leading-relaxed text-[#666]">{c.reason}</p>
-                  ) : null}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      ) : candidateCodes.length ? (
-        <div>
-          <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-[#999]">候选池 ({candidateCodes.length})</p>
-          <div className="flex flex-wrap gap-1.5">
-            {candidateCodes.map((code) => (
-              <span key={code} className="rounded-md bg-[#f0f0ec] px-2 py-0.5 font-mono text-xs text-[#333]">{code}</span>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
       {deepTargets.length ? (
         <div>
-          <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-[#999]">深挖标的</p>
+          <p className="mb-1.5 text-label font-medium uppercase tracking-wider text-muted-text">深挖标的</p>
           <div className="flex flex-wrap gap-1.5">
             {deepTargets.map((code) => (
-              <span key={code} className="rounded-md bg-emerald-50 px-2 py-0.5 font-mono text-xs text-emerald-700">{code}</span>
+              <span key={code} className="rounded-md bg-success/10 px-2 py-0.5 font-mono text-xs text-success">{code}</span>
             ))}
           </div>
         </div>
@@ -2359,15 +3072,15 @@ const L1Detail: React.FC<{
       {/* Stage status */}
       {Object.keys(stages).length ? (
         <div>
-          <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-[#999]">流水线阶段</p>
+          <p className="mb-1.5 text-label font-medium uppercase tracking-wider text-muted-text">流水线阶段</p>
           <div className="flex flex-wrap gap-2">
             {Object.entries(stages).map(([key, val]) => {
               const s = asRecord(val) || {};
               const status = String(s.status || '-');
               return (
-                <span key={key} className="flex items-center gap-1.5 rounded-full border border-[#e8e8e3] px-2.5 py-1 text-[11px]">
-                  <span className={cn('h-1.5 w-1.5 rounded-full', status === 'ok' ? 'bg-emerald-500' : status === 'partial' ? 'bg-amber-500' : 'bg-[#ccc]')} />
-                  <span className="text-[#555]">{key.replace(/_/g, ' ')}</span>
+                <span key={key} className="flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-label">
+                  <span className={cn('h-1.5 w-1.5 rounded-full', status === 'ok' ? 'bg-success' : status === 'partial' ? 'bg-warning/100' : 'bg-muted-text')} />
+                  <span className="text-secondary-text">{key.replace(/_/g, ' ')}</span>
                 </span>
               );
             })}
@@ -2377,10 +3090,10 @@ const L1Detail: React.FC<{
       {/* Data tools used */}
       {result.tool_calls.filter((t) => t.tool.startsWith('get_') || t.tool.includes('quote')).length ? (
         <div>
-          <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-[#999]">数据工具</p>
+          <p className="mb-1.5 text-label font-medium uppercase tracking-wider text-muted-text">数据工具</p>
           <div className="flex flex-wrap gap-1.5">
             {result.tool_calls.filter((t) => t.tool.startsWith('get_') || t.tool.includes('quote')).map((t, i) => (
-              <span key={`${t.tool}-${i}`} className={cn('rounded-md px-2 py-0.5 text-[11px]', t.success ? 'bg-[#f0f0ec] text-[#555]' : 'bg-red-50 text-red-600')}>
+              <span key={`${t.tool}-${i}`} className={cn('rounded-md px-2 py-0.5 text-label', t.success ? 'bg-surface-2 text-secondary-text' : 'bg-danger/10 text-danger')}>
                 {t.tool}
               </span>
             ))}
@@ -2401,39 +3114,39 @@ const L2Detail: React.FC<{
   return (
     <div className="space-y-3">
       {/* Tool list */}
-      <div className="max-h-[300px] overflow-y-auto rounded-lg border border-[#eeeee9]">
+      <div className="max-h-[300px] overflow-y-auto rounded-lg border border-border">
         {toolCalls.length ? toolCalls.map((call, i) => (
           <button
             key={`${call.step}-${call.tool}-${i}`}
             type="button"
             onClick={() => onSelect(i)}
             className={cn(
-              'flex w-full items-center gap-3 border-b border-[#f2f2ed] px-3 py-2 text-left text-xs transition-colors last:border-0 hover:bg-[#f5f5f0]',
-              selectedIndex === i && 'bg-[#f5f5f0]',
+              'flex w-full items-center gap-3 border-b border-border px-3 py-2 text-left text-xs transition-colors last:border-0 hover:bg-surface-2',
+              selectedIndex === i && 'bg-surface-2',
             )}
           >
-            <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', call.success ? 'bg-emerald-500' : 'bg-red-500')} />
-            <span className="min-w-0 flex-1 truncate font-medium text-[#333]">{String(call.tool || '-')}</span>
-            <span className="shrink-0 font-mono text-[#999]">{formatDuration(call.duration)}</span>
+            <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', call.success ? 'bg-success' : 'bg-danger')} />
+            <span className="min-w-0 flex-1 truncate font-medium text-foreground">{String(call.tool || '-')}</span>
+            <span className="shrink-0 font-mono text-muted-text">{formatDuration(call.duration)}</span>
           </button>
         )) : (
-          <p className="p-3 text-xs text-[#999]">暂无工具调用</p>
+          <p className="p-3 text-xs text-muted-text">暂无工具调用</p>
         )}
       </div>
       {/* Selected tool detail */}
       {selectedTool ? (
-        <div className="rounded-lg border border-[#eeeee9] p-4">
+        <div className="rounded-lg border border-border p-4">
           <div className="mb-3 flex items-center gap-3 text-xs">
-            <Wrench className="h-3.5 w-3.5 text-[#999]" />
-            <span className="font-medium text-[#333]">{String(selectedTool.tool || '-')}</span>
-            <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', selectedTool.success ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700')}>
+            <Wrench className="h-3.5 w-3.5 text-muted-text" />
+            <span className="font-medium text-foreground">{String(selectedTool.tool || '-')}</span>
+            <span className={cn('rounded-full px-2 py-0.5 text-xxs font-medium', selectedTool.success ? 'bg-success/10 text-success' : 'bg-danger/10 text-danger')}>
               {selectedTool.success ? 'OK' : 'FAIL'}
             </span>
-            <span className="ml-auto font-mono text-[#999]">step {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
+            <span className="ml-auto font-mono text-muted-text">step {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
           </div>
           <JsonViewer data={(selectedTool.arguments || {}) as Record<string, unknown>} maxHeight="160px" />
           {preview ? (
-            <pre className="mt-3 max-h-[180px] overflow-auto rounded-lg bg-[#f5f5f0] p-3 font-mono text-[11px] leading-5 text-[#555] whitespace-pre-wrap">
+            <pre className="mt-3 max-h-[180px] overflow-auto rounded-lg bg-surface-2 p-3 font-mono text-label leading-5 text-secondary-text whitespace-pre-wrap">
               {preview}
             </pre>
           ) : null}
@@ -2454,14 +3167,14 @@ const L3Detail: React.FC<{ result: AgentTraceRunResponse; debate: Record<string,
           const dim = String(item.dimension || '-');
           const verdict = String(item.verdict || '-');
           return (
-            <div key={`${dim}-${i}`} className="flex items-center justify-between rounded-lg border border-[#eeeee9] px-3 py-2">
-              <span className="text-xs text-[#333]">{DIMENSION_LABELS[dim] || dim}</span>
+            <div key={`${dim}-${i}`} className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
+              <span className="text-xs text-foreground">{DIMENSION_LABELS[dim] || dim}</span>
               <span className={cn(
-                'rounded-full px-2 py-0.5 text-[10px] font-medium',
-                verdict === 'supports_primary' && 'bg-emerald-50 text-emerald-700',
-                verdict === 'supports_opposing' && 'bg-red-50 text-red-700',
-                verdict === 'mixed' && 'bg-amber-50 text-amber-700',
-                verdict === 'insufficient_data' && 'bg-[#f0f0ec] text-[#777]',
+                'rounded-full px-2 py-0.5 text-xxs font-medium',
+                verdict === 'supports_primary' && 'bg-success/10 text-success',
+                verdict === 'supports_opposing' && 'bg-danger/10 text-danger',
+                verdict === 'mixed' && 'bg-warning/10 text-warning',
+                verdict === 'insufficient_data' && 'bg-surface-2 text-muted-text',
               )}>
                 {verdict.replace(/_/g, ' ')}
               </span>
@@ -2478,16 +3191,16 @@ const L3Detail: React.FC<{ result: AgentTraceRunResponse; debate: Record<string,
       <div className="space-y-1">
         {result.tool_calls.slice(0, 8).map((t, i) => (
           <div key={`${t.tool}-${i}`} className="flex items-center gap-2 text-xs">
-            <span className={cn('h-1.5 w-1.5 rounded-full', t.success ? 'bg-emerald-500' : 'bg-red-500')} />
-            <span className="text-[#555]">{t.tool}</span>
-            <span className="text-[#999]">{t.success ? '证据可用' : '取证失败'}</span>
+            <span className={cn('h-1.5 w-1.5 rounded-full', t.success ? 'bg-success' : 'bg-danger')} />
+            <span className="text-secondary-text">{t.tool}</span>
+            <span className="text-muted-text">{t.success ? '证据可用' : '取证失败'}</span>
           </div>
         ))}
       </div>
     );
   }
 
-  return <p className="text-xs text-[#999]">等待证据进入信号层。</p>;
+  return <p className="text-xs text-muted-text">等待证据进入信号层。</p>;
 };
 
 const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Record<string, unknown> | null }> = ({ debate, planner }) => {
@@ -2500,9 +3213,9 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
     <div className="space-y-4">
       {/* Planner intent */}
       {planner ? (
-        <div className="rounded-lg bg-[#f5f5f0] p-3">
-          <p className="text-[11px] font-medium uppercase tracking-wider text-[#999]">Planner</p>
-          <p className="mt-1 text-xs text-[#333]">
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-label font-medium uppercase tracking-wider text-muted-text">Planner</p>
+          <p className="mt-1 text-xs text-foreground">
             意图: {String(planner.intent || '-')} · 目标: {String(planner.primary_symbol || '-')} · {planner.has_position ? '持仓命中' : '未命中持仓'}
           </p>
         </div>
@@ -2511,20 +3224,20 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
       {/* Debate thesis comparison */}
       {(primary.summary || opposing.summary) ? (
         <div className="grid gap-3 sm:grid-cols-2">
-          <div className="rounded-lg border border-[#eeeee9] p-4">
-            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[#999]">主观点</p>
-            <p className="text-xs leading-relaxed text-[#333]">{String(primary.summary || '-')}</p>
+          <div className="rounded-lg border border-border p-4">
+            <p className="mb-2 text-label font-semibold uppercase tracking-wider text-muted-text">主观点</p>
+            <p className="text-xs leading-relaxed text-foreground">{String(primary.summary || '-')}</p>
             {toStringList(primary.evidence).length ? (
-              <ul className="mt-2 space-y-0.5 text-[11px] text-[#777]">
+              <ul className="mt-2 space-y-0.5 text-label text-muted-text">
                 {toStringList(primary.evidence).slice(0, 4).map((e, i) => <li key={i}>· {e}</li>)}
               </ul>
             ) : null}
           </div>
-          <div className="rounded-lg border border-[#eeeee9] p-4">
-            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[#999]">反方</p>
-            <p className="text-xs leading-relaxed text-[#333]">{String(opposing.summary || '-')}</p>
+          <div className="rounded-lg border border-border p-4">
+            <p className="mb-2 text-label font-semibold uppercase tracking-wider text-muted-text">反方</p>
+            <p className="text-xs leading-relaxed text-foreground">{String(opposing.summary || '-')}</p>
             {toStringList(opposing.evidence).length ? (
-              <ul className="mt-2 space-y-0.5 text-[11px] text-[#777]">
+              <ul className="mt-2 space-y-0.5 text-label text-muted-text">
                 {toStringList(opposing.evidence).slice(0, 4).map((e, i) => <li key={i}>· {e}</li>)}
               </ul>
             ) : null}
@@ -2534,15 +3247,15 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
 
       {/* Judge */}
       {judge.final_action ? (
-        <div className="rounded-lg bg-[#1a1a1a] p-4 text-white">
+        <div className="rounded-lg bg-foreground p-4 text-background">
           <div className="flex items-center gap-2">
-            <BrainCircuit className="h-4 w-4 text-[#999]" />
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-[#999]">Judge 裁决</span>
-            <span className="ml-auto rounded-full bg-white/10 px-2.5 py-0.5 text-xs font-medium">{String(judge.final_action)}</span>
+            <BrainCircuit className="h-4 w-4 text-background/60" />
+            <span className="text-label font-semibold uppercase tracking-wider text-background/60">Judge 裁决</span>
+            <span className="ml-auto rounded-full bg-card/10 px-2.5 py-0.5 text-xs font-medium">{String(judge.final_action)}</span>
           </div>
-          <p className="mt-2 text-sm leading-relaxed text-white/85">{String(judge.decision_summary || judge.reason || '-')}</p>
+          <p className="mt-2 text-sm leading-relaxed text-background/85">{String(judge.decision_summary || judge.reason || '-')}</p>
           {reasonPoints.length ? (
-            <ul className="mt-3 space-y-1 text-xs text-[#999]">
+            <ul className="mt-3 space-y-1 text-xs text-background/60">
               {reasonPoints.map((p, i) => <li key={i}>· {p}</li>)}
             </ul>
           ) : null}
@@ -2553,7 +3266,7 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
 };
 
 const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ riskPayload }) => {
-  if (!riskPayload) return <p className="text-xs text-[#999]">尚未生成风控结果。</p>;
+  if (!riskPayload) return <p className="text-xs text-muted-text">尚未生成风控结果。</p>;
   const gate = asRecord(riskPayload.risk_gate) || {};
   const checks = toRecordList(gate.checks);
   const blockedReasons = toStringList(gate.blocked_reasons);
@@ -2566,18 +3279,18 @@ const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ r
             const passed = check.passed === true;
             return (
               <div key={`${String(check.rule_id)}-${i}`} className="flex items-start gap-2 text-xs">
-                <span className={cn('mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full', passed ? 'bg-emerald-500' : 'bg-red-500')} />
-                <span className="font-mono text-[#777]">{String(check.rule_id || '-')}</span>
-                <span className="flex-1 text-[#555]">{String(check.message || '-')}</span>
+                <span className={cn('mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full', passed ? 'bg-success' : 'bg-danger')} />
+                <span className="font-mono text-muted-text">{String(check.rule_id || '-')}</span>
+                <span className="flex-1 text-secondary-text">{String(check.message || '-')}</span>
               </div>
             );
           })}
         </div>
       ) : null}
       {blockedReasons.length ? (
-        <div className="rounded-lg bg-red-50 p-3">
-          <p className="text-[11px] font-medium text-red-700">阻断原因</p>
-          <ul className="mt-1 space-y-0.5 text-xs text-red-600">
+        <div className="rounded-lg bg-danger/10 p-3">
+          <p className="text-label font-medium text-danger">阻断原因</p>
+          <ul className="mt-1 space-y-0.5 text-xs text-danger">
             {blockedReasons.map((r, i) => <li key={i}>· {r}</li>)}
           </ul>
         </div>
@@ -2606,7 +3319,7 @@ function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<
       : orchestrationMode === 'expert_graph'
         ? 'L1 多专家候选发现已开启；'
         : '';
-    return `${expertText}第一阶段已生成 ${candidates.length} 只候选股票，来源包括${sourceLabels.length ? sourceLabels.join('、') : '多路召回'}；候选会按策略、技术、资金、消息/情绪等维度分组展示。`;
+    return `${expertText}第一阶段已生成 ${candidates.length} 只候选股票，来源包括${sourceLabels.length ? sourceLabels.join('、') : '多路召回'}；候选会汇总成决策榜，并按策略、技术、资金、消息/情绪和基本面拆解证据。`;
   }
   if (orchestrationMode === 'expert_graph' && reportIntent && reportIntent !== 'watchlist_scan') {
     return `后端多专家模式已开启，但本次识别为 ${reportIntent}，未进入选股候选池链路。`;

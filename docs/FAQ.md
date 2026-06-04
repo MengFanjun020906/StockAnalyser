@@ -298,7 +298,7 @@ OPENAI_MODEL=deepseek-v4-flash
 
 ---
 
-### Q14.1: Docker 中网络/DNS 解析失败（如 api.tushare.pro、searchapi.eastmoney.com 无法解析）？
+### Q14.1: Docker 中网络/DNS 解析失败（如 `TUSHARE_HTTP_URL`、searchapi.eastmoney.com 无法解析）？
 
 **现象**：日志显示 `Temporary failure in name resolution` 或 `NameResolutionError`，股票数据 API 和大模型 API 均无法访问。
 

@@ -285,7 +285,7 @@ daily_stock_analysis/
 | 变量名 | 说明 | 默认值 | 必填 |
 |--------|------|--------|:----:|
 | `TUSHARE_TOKEN` | Tushare Pro Token | - | 可选 |
-| `TUSHARE_HTTP_URL` | Tushare 兼容 HTTP 入口；使用私有网关时必须配置，否则 SDK/HTTP 调用会打到官方默认地址 | `http://api.tushare.pro` | 可选 |
+| `TUSHARE_HTTP_URL` | Tushare 兼容 HTTP 入口；默认使用项目私有网关，可按部署环境覆盖 | `http://118.89.66.41:8010/` | 可选 |
 | `TICKFLOW_API_KEY` | TickFlow API Key；配置后 A 股大盘复盘指数优先尝试 TickFlow，若套餐支持标的池查询则市场统计也会优先尝试 TickFlow | - | 可选 |
 | `LONGBRIDGE_APP_KEY` | [Longbridge OpenAPI](https://open.longbridge.com/) App Key；配置后美股/港股的量比、换手率、PE 等 YFinance 缺失字段会自动从长桥补充 | - | 可选 |
 | `LONGBRIDGE_APP_SECRET` | Longbridge App Secret | - | 可选 |
@@ -293,20 +293,28 @@ daily_stock_analysis/
 | `LONGBRIDGE_*`（可选） | 见官方 [环境变量](https://open.longbridge.com/zh-CN/docs/getting-started#环境变量)；另有 `LONGBRIDGE_STATIC_INFO_TTL_SECONDS` | - | 可选 |
 | `ENABLE_REALTIME_QUOTE` | 启用实时行情（关闭后使用历史收盘价分析） | `true` | 可选 |
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | 盘中实时技术面：启用时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘 | `true` | 可选 |
-| `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Agent 层单次 Tushare 工具请求超时；基础数据、筹码、两融、资金流和板块排行快路径共用 | `5.0` | 可选 |
-| `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析（该接口不稳定，云端部署建议关闭）。GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
+| `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Agent 层单次 Tushare 工具请求超时；基础数据、筹码、两融、资金流和板块排行快路径共用 | `20.0` | 可选 |
+| `get_tushare_today_news` | Agent 工具：调用 Tushare `news` 获取当日新闻快讯，时间窗口固定为今天 `00:00:00` 到当前时刻；支持 `sina`、`wallstreetcn`、`10jqka`、`eastmoney`、`yuncaijing`、`fenghuang`、`jinrongjie`、`cls`、`yicai` 来源；需 Tushare 单独开通 news 权限 | - | 工具 |
+| `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
+| `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
+| `AGENT_SEED_FACT_MAX_WORKERS` | 三席位选股前 `SeedFactPacket` 取数层的 `(seed,tool)` 并发 worker 上限 | `12` | 可选 |
+| `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | `SeedFactPacket` 单个工具调用预算；失败会写入 trace，不会伪造成成功 facts | `12.0` | 可选 |
+| `AGENT_SEED_FACT_TOOLS` | 三席位共享的预取工具列表，逗号分隔；默认覆盖趋势、结构、均线、量能、资金与轻量业务归属 | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context` | 可选 |
+| `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
+| `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
 | `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia 风格量化候选池 SQLite 路径；`watchlist_scan` 候选发现会读取 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` 并运行形态策略 | `Sequoia-X/data/sequoia_v2.db` | 可选 |
 | `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML 候选策略目录；`discover_watchlist_candidates` 的 `auto` 模式会优先读取启用的 YAML 策略做 L1 硬筛和因子召回 | `alphasift/alphasift/strategies` | 可选 |
 | `ALPHASIFT_CANDIDATE_DB_PATH` | AlphaSift 候选池 SQLite 路径；未配置时复用 `SEQUOIA_CANDIDATE_DB_PATH`，表结构同 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` | `SEQUOIA_CANDIDATE_DB_PATH` | 可选 |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
-| `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `1.5` | 可选 |
-| `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `0.8` | 可选 |
-| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 StockAPI `codeFlow` 个股历史资金流 | `3.0` | 可选 |
-| `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 默认调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
+| `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `8.0` | 可选 |
+| `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `3.0` | 可选 |
+| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 Tushare `moneyflow` 个股历史资金流，失败时回退 StockAPI `codeFlow` | `15.0` | 可选 |
+| `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 在 Tushare `moneyflow` 不可用时回退调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
+| `STOCKAPI_URL` | StockAPI 历史资金流 `codeFlow` 接口地址；默认使用官方 `https://www.stockapi.com.cn/v1/base/codeFlow`，可在私有代理或测试环境覆盖 | 官方 codeFlow URL | 可选 |
 | `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace | `30.0` | 可选 |
-| `AGENT_SELECTION_DEEP_DIVE_LIMIT` | `watchlist_scan` 最多对多少只 L1 候选做逐股深度分析；调大可减少“候选观察”，但会增加工具调用和耗时 | `6` | 可选 |
+| `AGENT_SELECTION_DEEP_DIVE_LIMIT` | `watchlist_scan` 最多对多少只 L1 候选做逐股深度分析；有效范围 1-5，默认深挖 4 只，在覆盖面和整轮耗时之间取平衡，调大可减少“候选观察”但会增加工具调用 | `4` | 可选 |
 | `AGENT_CANDIDATE_BLACKLIST_CODES` | L1 候选池硬排除黑名单，逗号分隔；命中后不会进入候选池 | - | 可选 |
 | `AGENT_CANDIDATE_MIN_AVG_AMOUNT` | 候选源提供均成交额/成交额字段时的最低流动性阈值；`0` 表示不启用 | `0` | 可选 |
 | `AGENT_CANDIDATE_MIN_LISTING_DAYS` | 候选源提供上市天数字段时的最低上市天数；`0` 表示不启用 | `0` | 可选 |
@@ -319,9 +327,9 @@ daily_stock_analysis/
 
 > 行为说明：
 > - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
-> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并裁剪旧数据。
+> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
 > - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
-> - `get_capital_flow` 默认优先使用 StockAPI 历史资金流 `codeFlow`，用最近可用交易日 `mainAmount` 生成 `main_net_inflow`、近 5 日和近 10 日累计主力净流入；当前不再默认调用东方财富个股资金流端点。未配置 `STOCKAPI_TOKEN` 时会按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
+> - `get_capital_flow` 默认优先使用 Tushare `moneyflow` 个股历史资金流，用最近可用交易日 `net_mf_amount` 生成 `main_net_inflow`、近 5 日和近 10 日累计主力净流入；当 Tushare 不可用时回退到 StockAPI 历史资金流 `codeFlow`。未配置 `STOCKAPI_TOKEN` 时，fallback 只能按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；
 > - ETF：返回可得项，缺失能力标记为 `not_supported`，整体不影响原流程；
 > - 美股/港股：返回 `not_supported` 兜底块；
@@ -339,11 +347,12 @@ daily_stock_analysis/
 >   - `get_stock_info.belong_boards` = 个股所属板块列表；
 >   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；
 >   - `get_stock_info.sector_rankings` 与 `fundamental_context.boards.data` 保持一致。
+> - 选股前置 `SeedFactPacket` 默认使用 `get_stock_business_context` 补齐 `industry/boards/business_summary`，不再为了第一层业务归属调用完整 `get_stock_info`；`get_stock_info` 仍保留给深层基本面、估值和财务上下文。
 >   - `AnalysisReport.details.belong_boards` = 结构化报告详情中的关联板块列表；
 >   - `AnalysisReport.details.sector_rankings` = 结构化报告详情中的板块涨跌榜（用于前端板块联动展示）。
 > - 板块涨跌榜使用数据源顺序：与全局 priority 一致。
 > - 超时控制为 `best-effort` 软超时：阶段会按预算快速降级继续执行，但不保证硬中断底层三方调用。
-> - `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=1.5` 表示新增基本面阶段的目标预算，不是严格硬 SLA。
+> - `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS=8.0` 表示新增基本面阶段的目标预算，不是严格硬 SLA。
 > - 若要硬 SLA，请在后续版本升级为子进程隔离执行并在超时后强制终止。
 
 ### 其他配置
@@ -981,6 +990,8 @@ python main.py --debug
 日志文件位置：
 - 常规日志：`logs/stock_analysis_YYYYMMDD.log`
 - 调试日志：`logs/stock_analysis_debug_YYYYMMDD.log`
+- API 服务入口（`python server.py` 或 `python main.py --serve-only`）会把 uvicorn / FastAPI 日志继续写入对应的 `logs/api_server_YYYYMMDD.log` 和调试日志文件。
+- WebUI 入口（`python webui.py`）会写入 `logs/web_server_YYYYMMDD.log` 和调试日志文件。
 
 调试日志默认保留项目自身 DEBUG 信息，但会将 LiteLLM 内部日志压低到 `WARNING`，避免流式生成时按 token 写入大量第三方调试日志；如需排查 LiteLLM 内部细节，可在 `.env` 中临时设置 `LITELLM_LOG_LEVEL=DEBUG`。
 
@@ -1242,7 +1253,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
 - 页面支持选择持仓账户、报告意图、风险偏好、持有周期、单票上限、总权益仓位上限、最大回撤、默认止损和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
 - 页面会把最近 10 次 Trace 完整结果保存在当前浏览器的 localStorage，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
-- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`；当 `watchlist_scan` 使用阶段化选股流水线时，还会写入 `stock_selection.json`、`selection_context.json`、`final_report.json` 以及各阶段 JSON 产物，便于复盘候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决。页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
+- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`；当 `watchlist_scan` 使用阶段化选股流水线时，还会写入 `stock_selection.json`、`selection_context.json`、`final_report.json` 以及各阶段 JSON 产物，便于复盘候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决。选股链路还会落盘 `candidate_evidence.json` 和 `candidate_evidence.md`，按策略、消息、资金、基本面四类各最多 2 只候选保存统一证据包，供后续规划和排障复用；候选级取证并行执行，若同一股票在多个维度重复出现，则以前序维度为准跳过重复项并继续向后补位。页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
 - planning prompt 包含独立的 `Execute Protocol`：要求执行器把工具结果落入 Evidence Ledger，记录失败降级、停止条件和最终输出审计门槛；`todo.md` 初始写入计划，执行结束后会补充工具成功/失败、参数、结果预览和 Execute 复核状态。
 - planning_execute 工具证据形成后会进入对抗式 Debate：主观点 Agent、强制反方 Agent 和 Judge Agent 共用同一份 Evidence Bundle；Judge 会按证据强弱、账户风险、数据可靠性和用户目标裁决，页面 `Debate Judge` 模块和 `debate.json` 可用于排查持仓模式与选股/入场模式的裁决链路。Judge 输出会拆成结论摘要、分维度证据、要点化理由、采纳/驳回论点和风控条件，并分别标注账户风险、技术面、资金面、消息面、基本面和数据质量；资金面或消息面缺失时必须显式写出缺口，不能被技术面结论覆盖。
 - 开发调试模式下，`Debate Judge` 还会展示同一 session 内的原始主报告输出、Primary/Opposing/Judge 原始 JSON 输出和最终合并输出；这些内容用于调试模型可见输出，不展示隐藏思维链。

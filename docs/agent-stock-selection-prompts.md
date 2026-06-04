@@ -31,7 +31,7 @@
   -> Prompt 1 候选池发现
   -> 工具取证：行情、板块、候选基础数据
   -> Prompt 2 候选初筛
-  -> 工具取证：重点候选技术、资金、消息、筹码、基本面
+  -> 工具取证：按策略、消息、资金、基本面各最多 2 只候选并行生成统一证据包 candidate_evidence.json / candidate_evidence.md；重复候选按维度顺序跳过并继续补位
   -> Prompt 3 单股深度分析
   -> Prompt 4 组合配置与执行计划
   -> Prompt 5A 反方审查
@@ -63,11 +63,11 @@
 
 | 阶段 | 新增输入 | 来自 |
 | --- | --- | --- |
-| Prompt 2 | `{{candidate_pool_summary}}`, `{{candidate_pool_full_ref}}` | Prompt 1 |
+| Prompt 2 | `{{candidate_pool_summary}}`, `{{candidate_pool_full_ref}}`, `{{balanced_candidate_evidence_summary}}`, `candidate_evidence.md` | Prompt 1 + 均衡候选取证 |
 | Prompt 3 | `{{screening_summary}}`, `{{deep_dive_targets}}`, `{{stock_code}}`, `{{stock_name}}` | Prompt 2 |
-| Prompt 4 | `{{deep_dive_results_summary}}`, `{{positions}}`, `{{available_cash}}` | Prompt 3 / 账户上下文 |
-| Prompt 5A | `{{allocation_plan_summary}}`, `{{candidate_discovery_summary}}`, `{{screening_summary}}`, `{{deep_dive_results_summary}}` | Prompt 1-4 |
-| Prompt 5B | `{{opposing_review_summary}}`, `{{allocation_plan_summary}}` | Prompt 5A / Prompt 4 |
+| Prompt 4 | `{{deep_dive_results_summary}}`, `{{balanced_candidate_evidence_summary}}`, `candidate_evidence.md`, `{{positions}}`, `{{available_cash}}` | Prompt 3 / 均衡候选取证 / 账户上下文 |
+| Prompt 5A | `{{allocation_plan_summary}}`, `{{candidate_discovery_summary}}`, `{{screening_summary}}`, `{{deep_dive_results_summary}}`, `{{balanced_candidate_evidence_summary}}` | Prompt 1-4 + 均衡候选取证 |
+| Prompt 5B | `{{opposing_review_summary}}`, `{{allocation_plan_summary}}`, `{{balanced_candidate_evidence_summary}}` | Prompt 5A / Prompt 4 / 均衡候选取证 |
 
 ## 上下文压缩策略
 
@@ -158,6 +158,8 @@ data/agent_traces/<run_id>/
   selection_context.json
   candidate_discovery.json
   candidate_screening.json
+  candidate_evidence.json
+  candidate_evidence.md
   deep_dive_results.json
   portfolio_allocation.json
   adversarial_review.json
@@ -513,6 +515,7 @@ judge_winner = primary | opposing | mixed | insufficient_data
 - `action_strength` 必填，枚举：strong | medium | weak | none。若 `action_bias=reject`，必须为 `none` 或 `weak`。
 - `entry_quality` 必填；如果无法给价格，必须给条件。
 - `stop_loss` 缺失时，`action_bias` 不得为 `open`。
+- 即使 `action_bias=wait`，也要尽量给出次日触发、禁止追高和失效条件；无法给止损或失效条件时，不得包装成可执行买点。
 - `summary` 和 `full` 必填。
 
 {
@@ -544,8 +547,12 @@ judge_winner = primary | opposing | mixed | insufficient_data
     "entry_quality": {
       "ideal_entry_zone": "价格区间或条件",
       "secondary_entry_zone": "价格区间或条件",
+      "auction_trigger": "竞价触发条件",
+      "breakout_trigger": "突破触发条件",
+      "pullback_trigger": "回踩触发条件",
       "no_chase_line": "价格或条件",
       "stop_loss": "价格或条件",
+      "failure_condition": "失效条件",
       "target_1": "价格或条件",
       "target_2": "价格或条件",
       "risk_reward_comment": "风险收益比说明"
@@ -599,7 +606,9 @@ judge_winner = primary | opposing | mixed | insufficient_data
 6. 每只股票必须给：动作、首仓比例或不买原因、入场条件、加仓条件、止损条件、复查触发。
 7. 组合必须说明现金保留比例和原因。
 8. 如果候选整体质量不足，应输出“本轮不建仓”，而不是硬凑组合。
-9. 账户摘要为空或可用现金缺失时，`portfolio_action` 不得为 `open`。
+9. 账户摘要为空或可用现金缺失时，`portfolio_action` 不得为 `open`；但如果候选具备强势延续条件、明确触发条件和失效条件，可以输出 `action=wait` + `execution_mode=conditional_open`，仓位写为“需按账户约束确认”或保守试探区间。
+10. `candidate_discovery` 里的候选分只代表入池召回强度，不得当成买入确定性分数。
+11. 如果所有标的都是 `plain_wait/reject`，`core_reason` 写“本轮没有可直接入手标的”；如果存在 `conditional_open` 或 `strong_watch`，必须说明“本轮没有无条件买入标的，但存在可按次日条件触发的强候选”。
 
 输出 JSON，不输出 Markdown。字段约束：
 - `stage` 必填，固定为 `portfolio_allocation`。
@@ -636,6 +645,7 @@ judge_winner = primary | opposing | mixed | insufficient_data
         "name": "股票名称",
         "action": "open | wait | reject | monitor",
         "action_strength": "strong | medium | weak | none",
+        "execution_mode": "immediate_open | conditional_open | strong_watch | plain_wait | reject",
         "initial_position_pct": 0,
         "initial_amount": 0,
         "entry_condition": "入场条件",

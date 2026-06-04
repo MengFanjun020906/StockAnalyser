@@ -11,8 +11,8 @@ Daily Stock Analysis - FastAPI 后端服务入口
 4. 托管前端静态文件（生产模式）
 
 启动方式：
-    uvicorn server:app --reload --host 0.0.0.0 --port 8000
-    
+    python server.py
+
     或使用 main.py:
     python main.py --serve-only      # 仅启动 API 服务
     python main.py --serve           # API 服务 + 执行分析
@@ -33,7 +33,6 @@ level = getattr(logging, level_name, logging.INFO)
 setup_logging(
     log_prefix="api_server",
     console_level=level,
-    extra_quiet_loggers=['uvicorn', 'fastapi'],
 )
 
 # 从 api.app 导入应用实例
@@ -51,4 +50,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
+        log_config=None,
     )

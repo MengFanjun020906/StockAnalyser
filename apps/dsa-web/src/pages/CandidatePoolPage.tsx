@@ -1,10 +1,11 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, BarChart3, Database, Layers3, ListFilter, RefreshCw, ShieldCheck, Sparkles, TrendingUp } from 'lucide-react';
+import { AlertTriangle, BarChart3, Database, Layers3, ListFilter, RefreshCw, ShieldCheck, Sparkles } from 'lucide-react';
 import { candidatePoolApi, type CandidatePoolDetail, type CandidatePoolItem, type CandidatePoolRun } from '../api/candidatePool';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
-import { ApiErrorAlert, Badge, EmptyState, StatusDot } from '../components/common';
+import { CandidateDecisionTable, type CandidateDecisionEvidence, type CandidateDecisionRow, type CandidateDecisionTone } from '../components/candidates/CandidateDecisionTable';
+import { ApiErrorAlert, Badge, Collapsible, EmptyState, StatusDot } from '../components/common';
 import { cn } from '../utils/cn';
 
 const dimensionLabels: Record<string, string> = {
@@ -32,6 +33,16 @@ const sourceLabels: Record<string, string> = {
   unknown: '未知',
 };
 
+const candidateExpertLabels: Record<string, string> = {
+  strategy_factor_expert: 'AlphaSift 策略多因子专家',
+  technical_candidate_expert: 'Sequoia 技术形态专家',
+  capital_flow_expert: '资金发现专家',
+  fundamental_expert: '基本面发现专家',
+  sector_theme_expert: '板块主题专家',
+  news_event_expert: '消息事件专家',
+  sentiment_theme_expert: '情绪/宏观专家',
+};
+
 const lifecycleLabels: Record<string, string> = {
   new: '新进入',
   active: '持续观察',
@@ -39,11 +50,6 @@ const lifecycleLabels: Record<string, string> = {
   decayed: '降权',
   removed: '移出',
 };
-
-function formatScore(value?: number | null): string {
-  if (value == null || Number.isNaN(Number(value))) return '--';
-  return Number(value).toFixed(0);
-}
 
 function labelFor(map: Record<string, string>, value?: string): string {
   const key = String(value || 'unknown');
@@ -59,6 +65,27 @@ function formatMetric(value: unknown, suffix = ''): string {
   const num = Number(value);
   if (!Number.isFinite(num)) return String(value);
   return `${num.toLocaleString(undefined, { maximumFractionDigits: 2 })}${suffix}`;
+}
+
+function displayCandidateExpertName(expert: string): string {
+  return candidateExpertLabels[expert] || expert.replace(/_/g, ' ');
+}
+
+function displaySourceName(source: string): string {
+  if (!source) return '未知';
+  const [family, ...rest] = source.split(':');
+  const familyLabel = labelFor(sourceLabels, family);
+  if (!rest.length) return familyLabel;
+  return `${familyLabel} · ${rest.join(':')}`;
+}
+
+function displayReasonText(reason: string): string {
+  return reason
+    .replaceAll('technical', '技术结构')
+    .replaceAll('fundamental', '基本面')
+    .replaceAll('capital', '资金')
+    .replaceAll('sentiment', '情绪')
+    .replaceAll('message', '消息');
 }
 
 function fundamentalMetricPairs(item: CandidatePoolItem): Array<[string, string]> {
@@ -87,6 +114,126 @@ function fundamentalStatusTone(status?: string): 'default' | 'good' | 'warn' | '
   if (status === 'empty' || status === 'unavailable' || status === 'missing_packet') return 'warn';
   if (status === 'failed' || status === 'timeout') return 'bad';
   return 'default';
+}
+
+function candidateActionFor(item: CandidatePoolItem): { key: string; label: string; tone: CandidateDecisionTone; strength?: string; reason: string } {
+  const source = String(item.source || '');
+  const recurrence = Number(item.recurrenceCount || 1);
+  const lifecycle = String(item.lifecycleStatus || 'new');
+  if (source === 'fallback' || source.startsWith('fallback:')) {
+    return {
+      key: 'monitor',
+      label: '观察跟踪',
+      tone: 'warning',
+      strength: '弱',
+      reason: '兜底池仅用于补足链路，不代表真实推荐。',
+    };
+  }
+  if (lifecycle === 'removed') {
+    return {
+      key: 'reject',
+      label: '暂不纳入',
+      tone: 'danger',
+      strength: '无',
+      reason: '该候选已从观察池移出。',
+    };
+  }
+  if (lifecycle === 'decayed') {
+    return {
+      key: 'monitor',
+      label: '观察跟踪',
+      tone: 'warning',
+      strength: '弱',
+      reason: '候选已降权，需等待新的证据。',
+    };
+  }
+  if ((item.recallSources || []).length > 1 || recurrence >= 3) {
+    return {
+      key: 'deep_dive',
+      label: '进入深挖',
+      tone: 'success',
+      strength: '强',
+      reason: '候选具备多源或多次出现证据，适合进入下一轮深度分析。',
+    };
+  }
+  if (item.reasonDimensions?.length || recurrence >= 2) {
+    return {
+      key: 'monitor',
+      label: '重点观察',
+      tone: 'info',
+      strength: '中',
+      reason: '当前来源证据适合继续跟踪。',
+    };
+  }
+  return {
+    key: 'wait',
+    label: '等待确认',
+    tone: 'warning',
+    strength: '弱',
+    reason: '证据强度尚不够，先保持观察。',
+  };
+}
+
+function candidateMetricHighlights(item: CandidatePoolItem): string[] {
+  const metrics = item.metrics || {};
+  const highlights = [
+    ['换手率', formatMetric(metrics.turnover_rate, '%')],
+    ['量比', formatMetric(metrics.volume_ratio)],
+    ['PE', formatMetric(metrics.peTtm ?? metrics.pe_ttm)],
+    ['PB', formatMetric(metrics.pb)],
+  ]
+    .filter(([, value]) => value !== '--')
+    .map(([label, value]) => `${label} ${value}`);
+  if (isFundamentalCandidate(item)) {
+    highlights.push(...fundamentalMetricPairs(item).map(([label, value]) => `${label} ${value}`));
+  }
+  return Array.from(new Set(highlights)).slice(0, 8);
+}
+
+function candidateItemToDecisionRow(item: CandidatePoolItem): CandidateDecisionRow {
+  const action = candidateActionFor(item);
+  const sourceLabelsList = [displaySourceName(item.source || '')]
+    .concat((item.recallSources || []).map(displaySourceName))
+    .filter((value, index, arr) => value && arr.indexOf(value) === index);
+  const reasonDimensions = item.reasonDimensions || [];
+  const evidenceTone = (dimension?: string): CandidateDecisionTone => {
+    if (dimension === 'fundamental') return 'success';
+    if (dimension === 'capital') return 'warning';
+    return 'info';
+  };
+  const evidence: CandidateDecisionEvidence[] = reasonDimensions.length ? reasonDimensions.map((entry) => ({
+    label: labelFor(dimensionLabels, entry.dimension),
+    detail: displayReasonText(String(entry.detail || item.reason || '')),
+    tone: evidenceTone(entry.dimension),
+  })) : (item.reason ? [{ label: '入池理由', detail: displayReasonText(item.reason), tone: 'info' }] : []);
+  return {
+    id: `${item.runId}-${item.code}`,
+    code: item.code,
+    name: item.name,
+    score: undefined,
+    scoreLabel: undefined,
+    scoreNote: undefined,
+    action,
+    primaryReason: displayReasonText(item.reason || '暂无入池理由'),
+    dimensionLabels: (item.candidateDimensions || ['unknown']).map((dimension) => labelFor(dimensionLabels, dimension)),
+    expertLabels: (item.candidateExperts || []).map(displayCandidateExpertName),
+    sourceLabels: sourceLabelsList,
+    lifecycleLabel: labelFor(lifecycleLabels, item.lifecycleStatus || 'new'),
+    occurrenceLabel: `出现 ${item.recurrenceCount || 1} 次`,
+    dateLabel: item.validUntil ? `有效至 ${item.validUntil}` : undefined,
+    badges: [
+      ...(item.recallSources && item.recallSources.length > 1 ? [{ label: '多源共振', tone: 'success' as CandidateDecisionTone }] : []),
+      ...(isFundamentalCandidate(item) ? [{ label: '基本面候选', tone: 'history' as CandidateDecisionTone }] : []),
+    ],
+    evidence,
+    metricHighlights: candidateMetricHighlights(item),
+    riskFlags: [
+      ...(item.source === 'fallback' || item.source?.startsWith('fallback:') ? ['兜底池，不代表真实推荐'] : []),
+      ...(item.lifecycleStatus === 'removed' ? ['已移出候选池'] : []),
+      ...(item.lifecycleStatus === 'decayed' ? ['已降权，需要新的证据确认'] : []),
+    ],
+    detailNote: '候选池页以日常跟踪为主，建议动作只表示下一步观察方向，不等同于最终买卖裁决。',
+  };
 }
 
 const MetricTile: React.FC<{ label: string; value: string | number; tone?: 'default' | 'good' | 'warn' | 'bad'; icon: React.ReactNode }> = ({
@@ -133,69 +280,6 @@ const CountStrip: React.FC<{ title: string; counts?: Record<string, number>; lab
         <p className="text-sm text-muted-text">暂无分布数据</p>
       )}
     </section>
-  );
-};
-
-const CandidateRow: React.FC<{ item: CandidatePoolItem }> = ({ item }) => {
-  const dimensions = item.candidateDimensions?.length ? item.candidateDimensions : ['unknown'];
-  const lifecycle = item.lifecycleStatus || 'new';
-  return (
-    <tr className="border-b border-border/50 align-top last:border-0">
-      <td className="w-[170px] px-4 py-4">
-        <div className="font-mono text-sm font-semibold text-foreground">{item.code}</div>
-        <div className="mt-1 max-w-[150px] truncate text-sm text-secondary-text">{item.name || item.code}</div>
-      </td>
-      <td className="w-[90px] px-4 py-4">
-        <span className="inline-flex h-9 min-w-12 items-center justify-center rounded-md border border-cyan/25 bg-cyan/10 px-2 font-mono text-sm font-semibold text-cyan">
-          {formatScore(item.signalScore)}
-        </span>
-      </td>
-      <td className="px-4 py-4">
-        <div className="flex flex-wrap gap-1.5">
-          {dimensions.map((dimension) => (
-            <Badge key={dimension} variant={dimension === 'unknown' ? 'warning' : 'info'}>
-              {labelFor(dimensionLabels, dimension)}
-            </Badge>
-          ))}
-        </div>
-        <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">{item.reason || '暂无入池理由'}</p>
-        {item.recallSources?.length ? (
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {item.recallSources.slice(0, 5).map((source) => (
-              <span key={source} className="rounded-md border border-border/50 bg-surface-2 px-2 py-0.5 text-[11px] text-muted-text">
-                {source}
-              </span>
-            ))}
-          </div>
-        ) : null}
-        {isFundamentalCandidate(item) ? (
-          <div className="mt-3 rounded-lg border border-stone-200 bg-stone-50/70 px-3 py-2">
-            <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold text-stone-700">
-              <BarChart3 className="h-3.5 w-3.5" />
-              P2 基本面指标
-              {item.validUntil ? <span className="font-normal text-stone-500">有效至 {item.validUntil}</span> : null}
-            </div>
-            {fundamentalMetricPairs(item).length ? (
-              <div className="flex flex-wrap gap-1.5">
-                {fundamentalMetricPairs(item).map(([label, value]) => (
-                  <span key={label} className="rounded-md bg-white/80 px-2 py-0.5 text-[11px] text-stone-700">
-                    {label} {value}
-                  </span>
-                ))}
-              </div>
-            ) : (
-              <p className="text-[11px] text-stone-600">候选来自基本面专家，但本条未带可展示指标。</p>
-            )}
-          </div>
-        ) : null}
-      </td>
-      <td className="w-[150px] px-4 py-4">
-        <Badge variant={lifecycle === 'new' ? 'success' : 'history'}>
-          {labelFor(lifecycleLabels, lifecycle)}
-        </Badge>
-        <div className="mt-2 text-xs text-muted-text">出现 {item.recurrenceCount || 1} 次</div>
-      </td>
-    </tr>
   );
 };
 
@@ -259,6 +343,9 @@ const CandidatePoolPage: React.FC = () => {
     if (activeDimension === 'all') return items;
     return items.filter((item) => (item.candidateDimensions || []).includes(activeDimension));
   }, [activeDimension, detail?.items]);
+  const decisionRows = useMemo(() => (
+    visibleItems.map(candidateItemToDecisionRow)
+  ), [visibleItems]);
 
   const summary = detail?.summary || {};
   const hardStrategyMissing = Boolean(summary.hardStrategyTrunkMissing);
@@ -278,7 +365,7 @@ const CandidatePoolPage: React.FC = () => {
           </div>
           <h1 className="mt-2 text-2xl font-semibold text-foreground">候选池</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">
-            这里展示候选发现阶段的独立结果：候选来自哪些专家/策略、为什么入池、是否使用兜底，以及硬排除和生命周期状态。
+            面向日常看盘的候选入池榜：先看后续动作、来源证据和核心依据，再展开查看专家来源、证据拆解和风险。
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
@@ -419,54 +506,34 @@ const CandidatePoolPage: React.FC = () => {
             <CountStrip title="生命周期" counts={summary.lifecycleCounts} labels={lifecycleLabels} />
           </section>
 
-          <section className="rounded-lg border border-border/60 bg-card/60">
-            <div className="flex flex-col gap-3 border-b border-border/60 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <h2 className="text-base font-semibold text-foreground">候选明细</h2>
-                <p className="mt-1 text-xs text-muted-text">入池理由按结构化摘要展示，原始证据仍保留在 Trace 中。</p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {dimensionOptions.map((dimension) => (
-                  <button
-                    type="button"
-                    key={dimension}
-                    className={cn(
-                      'rounded-full border px-3 py-1 text-xs transition',
-                      activeDimension === dimension
-                        ? 'border-cyan/45 bg-cyan/12 text-cyan'
-                        : 'border-border/60 bg-surface-2 text-secondary-text hover:text-foreground',
-                    )}
-                    onClick={() => setActiveDimension(dimension)}
-                  >
-                    {dimension === 'all' ? '全部' : labelFor(dimensionLabels, dimension)}
-                  </button>
-                ))}
-              </div>
+          <CandidateDecisionTable
+            title="候选入池榜"
+            description="按动作建议和证据质量展示；seed pool 召回分只作为来源内诊断，不做跨来源评分比较。"
+            items={decisionRows}
+            scoreColumnLabel="评估口径"
+            emptyTitle="当前筛选下没有候选"
+            emptyDescription="切换到全部维度可查看本轮完整候选池。"
+          />
+
+          <Collapsible title="筛选维度" defaultOpen={false} icon={<ListFilter className="h-4 w-4" />}>
+            <div className="flex flex-wrap gap-2">
+              {dimensionOptions.map((dimension) => (
+                <button
+                  type="button"
+                  key={dimension}
+                  className={cn(
+                    'rounded-full border px-3 py-1 text-xs transition',
+                    activeDimension === dimension
+                      ? 'border-cyan/45 bg-cyan/12 text-cyan'
+                      : 'border-border/60 bg-surface-2 text-secondary-text hover:text-foreground',
+                  )}
+                  onClick={() => setActiveDimension(dimension)}
+                >
+                  {dimension === 'all' ? '全部' : labelFor(dimensionLabels, dimension)}
+                </button>
+              ))}
             </div>
-            {visibleItems.length ? (
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-left">
-                  <thead className="border-b border-border/60 text-xs text-muted-text">
-                    <tr>
-                      <th className="px-4 py-3 font-medium">股票</th>
-                      <th className="px-4 py-3 font-medium">评分</th>
-                      <th className="px-4 py-3 font-medium">入池依据</th>
-                      <th className="px-4 py-3 font-medium">生命周期</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleItems.map((item) => (
-                      <CandidateRow key={`${item.runId}-${item.code}`} item={item} />
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <div className="p-6">
-                <EmptyState title="当前筛选下没有候选" description="切换到全部维度可查看本轮完整候选池。" icon={<TrendingUp className="h-8 w-8" />} />
-              </div>
-            )}
-          </section>
+          </Collapsible>
         </>
       )}
     </div>

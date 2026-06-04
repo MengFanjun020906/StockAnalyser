@@ -2438,7 +2438,15 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
-    def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
+    def get_capital_flow_context(
+        self,
+        stock_code: str,
+        budget_seconds: Optional[float] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page_no: int = 1,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""
         from src.config import get_config
 
@@ -2461,7 +2469,13 @@ class DataFetcherManager:
                 ["fundamental stage timeout"],
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+            lambda: self._fundamental_adapter.get_capital_flow(
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                page_no=page_no,
+                page_size=page_size,
+            ),
             timeout,
             "capital_flow",
         )

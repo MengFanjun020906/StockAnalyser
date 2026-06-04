@@ -9,12 +9,14 @@ Tools:
 """
 
 import logging
+import math
 import re
 import concurrent.futures
 import time
+import requests
 from datetime import datetime, timedelta
 from threading import Thread
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from src.agent.candidate_experts import CandidateExpertOrchestrator, apply_hard_exclusion
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
@@ -247,6 +249,153 @@ def _get_tushare_sector_rankings_fast(top_n: int, timeout: float) -> Optional[tu
     return None
 
 
+def _get_stockapi_sector_rankings_fast(top_n: int) -> tuple:
+    """Fast-path sector rankings via StockAPI hot sectors without AkShare fallback."""
+    try:
+        from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+    except Exception as exc:
+        return [], [], [], f"stockapi_hot_sectors_import_failed:{exc}"
+
+    result = AkshareFundamentalAdapter().get_stockapi_hot_sectors(
+        limit=max(top_n, 20),
+        allow_fallback=False,
+    )
+    sectors = result.get("sectors") or []
+    source_chain = result.get("source_chain") or []
+    errors = list(result.get("errors") or [])
+    if not sectors:
+        return [], [], source_chain, " | ".join(errors) or "StockAPI hot sectors empty"
+
+    top: List[Dict[str, Any]] = []
+    for sector in sectors[:top_n]:
+        name = str(sector.get("bk_name") or sector.get("name") or "").strip()
+        if not name:
+            continue
+        top.append({
+            "name": name,
+            "change_pct": sector.get("return_pct"),
+            "net_inflow": sector.get("net_inflow"),
+            "strength": sector.get("strength"),
+            "bk_code": sector.get("bk_code"),
+            "inflow_days": sector.get("inflow_days"),
+            "source": "stockapi:hotBkJlrDr",
+        })
+    if top:
+        return top, [], source_chain or ["stockapi:hotBkJlrDr"], ""
+    return [], [], source_chain or ["stockapi:hotBkJlrDr"], "StockAPI hot sectors rows missing sector names"
+
+
+def _get_eastmoney_industry_rankings_fast(top_n: int) -> tuple:
+    """Fast-path sector rankings from Eastmoney's industry-board quote page API."""
+    hosts = (
+        "https://push2.eastmoney.com/api/qt/clist/get",
+        "https://17.push2.eastmoney.com/api/qt/clist/get",
+        "https://16.push2.eastmoney.com/api/qt/clist/get",
+    )
+    params = {
+        "pn": "1",
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:90 t:2 f:!50",
+        "fields": "f12,f14,f2,f3,f4,f8,f20,f104,f105,f128,f136",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://quote.eastmoney.com/center/boardlist.html#industry_board",
+    }
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    def to_float(value: Any) -> Optional[float]:
+        try:
+            if value in (None, "", "-"):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def to_int(value: Any) -> Optional[int]:
+        try:
+            if value in (None, "", "-"):
+                return None
+            return int(float(value))
+        except Exception:
+            return None
+
+    for url in hosts:
+        started_at = time.time()
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=2.0)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            error = f"eastmoney:stock_board_industry_name_em:{type(exc).__name__}:{exc}"
+            errors.append(error)
+            source_chain.append({
+                "provider": "eastmoney:stock_board_industry_name_em",
+                "endpoint": url,
+                "result": "failed",
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "error": error,
+            })
+            continue
+
+        rows = ((payload or {}).get("data") or {}).get("diff") or []
+        sectors: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("f14") or "").strip()
+            if not name:
+                continue
+            sectors.append({
+                "name": name,
+                "bk_code": str(row.get("f12") or "").strip(),
+                "latest_price": to_float(row.get("f2")),
+                "change_pct": to_float(row.get("f3")),
+                "change_amount": to_float(row.get("f4")),
+                "turnover_rate": to_float(row.get("f8")),
+                "market_cap": to_float(row.get("f20")),
+                "rising_count": to_int(row.get("f104")),
+                "falling_count": to_int(row.get("f105")),
+                "leading_stock": str(row.get("f128") or "").strip(),
+                "leading_stock_change_pct": to_float(row.get("f136")),
+                "source": "eastmoney:stock_board_industry_name_em",
+            })
+        if sectors:
+            sectors.sort(
+                key=lambda item: item["change_pct"] if item.get("change_pct") is not None else -9999.0,
+                reverse=True,
+            )
+            top = sectors[:top_n]
+            bottom = list(reversed(sectors[-top_n:]))
+            return top, bottom, [{
+                "provider": "eastmoney:stock_board_industry_name_em",
+                "endpoint": url,
+                "result": "ok",
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "rows": len(sectors),
+            }], ""
+
+        error = "eastmoney:stock_board_industry_name_em:empty_data"
+        errors.append(error)
+        source_chain.append({
+            "provider": "eastmoney:stock_board_industry_name_em",
+            "endpoint": url,
+            "result": "empty",
+            "duration_ms": int((time.time() - started_at) * 1000),
+            "error": error,
+        })
+
+    return [], [], source_chain, " | ".join(errors) or "Eastmoney industry board empty"
+
+
 DEFAULT_WATCHLIST_SEEDS: List[Dict[str, Any]] = [
     {"code": "600519", "name": "贵州茅台", "reason": "大消费核心蓝筹，适合作为稳健配置参照。"},
     {"code": "300750", "name": "宁德时代", "reason": "新能源产业链龙头，适合观察成长主线弹性。"},
@@ -303,6 +452,8 @@ def _candidate_source_family(item: Dict[str, Any]) -> str:
         ("alphasift:", "alphasift"),
         ("sequoia:", "sequoia"),
         ("akshare:", "sector"),
+        ("sector_theme:", "sector"),
+        ("capital_flow:", "capital"),
         ("event_impact:", "event_impact"),
         ("news_momentum:", "news_momentum"),
         ("news_sentiment:", "news_sentiment"),
@@ -311,6 +462,8 @@ def _candidate_source_family(item: Dict[str, Any]) -> str:
     ):
         if any(src == prefix or src.startswith(prefix) for src in sources):
             return family
+    if source.startswith("tushare:") or source.startswith("capital_flow:tushare_"):
+        return "capital"
     return source or "unknown"
 
 
@@ -337,7 +490,7 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
     strategy_labels = _display_strategy_names(strategies)
     alphasift_sources = [src for src in sources if src.startswith("alphasift:")]
     sequoia_sources = [src for src in sources if src.startswith("sequoia:")]
-    sector_sources = [src for src in sources if src.startswith("akshare:")]
+    sector_sources = [src for src in sources if src.startswith(("akshare:", "sector_theme:"))]
 
     if alphasift_sources:
         detail = "AlphaSift YAML 多因子策略入池"
@@ -353,8 +506,26 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
         add("strategy", "策略", f"命中策略：{'、'.join(strategy_labels)}")
 
     for src in sector_sources:
-        sector = src.split(":")[-1] if ":" in src else ""
-        add("sentiment", "情绪/热点", f"来自强势板块「{sector}」成分股" if sector else "来自强势板块成分股")
+        if src.startswith("sector_theme:"):
+            label = {
+                "sector_theme:tushare_moneyflow_ind_ths": "TuShare THS行业资金流",
+                "sector_theme:tushare_moneyflow_cnt_ths": "TuShare THS概念资金流",
+                "sector_theme:tushare_moneyflow_ind_dc": "TuShare 东财板块资金流",
+            }.get(src, src.replace("sector_theme:", ""))
+            board_name = str(metrics.get("board_name") or "").strip()
+            board_flow = metrics.get("board_net_inflow")
+            board_change = metrics.get("board_change_ratio")
+            detail_parts = [f"来源：{label}"]
+            if board_name:
+                detail_parts.append(f"主题：{board_name}")
+            if board_flow is not None:
+                detail_parts.append(f"板块净流入={_short_metric(board_flow)}")
+            if board_change is not None:
+                detail_parts.append(f"板块涨跌幅={_short_metric(board_change)}")
+            add("sentiment", "板块主题", "；".join(detail_parts))
+        else:
+            sector = src.split(":")[-1] if ":" in src else ""
+            add("sentiment", "情绪/热点", f"来自强势板块「{sector}」成分股" if sector else "来自强势板块成分股")
 
     news_sources = [src for src in sources if src.startswith(("news_sentiment:", "news_momentum:"))]
     if news_sources:
@@ -394,6 +565,38 @@ def _candidate_reason_dimensions(item: Dict[str, Any]) -> List[Dict[str, str]]:
         if validation_title:
             detail_parts.append(f"后续事实：{validation_title}")
         add("sentiment", "情绪/事件", "；".join(detail_parts) or "事件传导验证后的主题成分候选")
+
+    capital_sources = [src for src in sources if src.startswith("capital_flow:")]
+    if capital_sources:
+        detail_parts = []
+        source_labels = {
+            "capital_flow:tushare_moneyflow_ths": "THS资金流",
+            "capital_flow:tushare_moneyflow_dc": "东财资金流",
+            "capital_flow:tushare_dragon_tiger_list": "龙虎榜",
+            "capital_flow:tushare_dragon_tiger_inst": "龙虎榜席位",
+            "capital_flow:tushare_limit_list_ths": "THS涨停榜",
+            "capital_flow:tushare_limit_list_d": "涨停榜",
+            "capital_flow:tushare_limit_step": "连板天梯",
+            "capital_flow:tushare_hot_rank": "热榜",
+            "capital_flow:limit_up_pool": "涨停池",
+            "capital_flow:popularity_rank": "人气榜",
+            "capital_flow:hot_money_activity": "游资/龙虎榜",
+            "capital_flow:multi_source": "多资金来源",
+        }
+        labels = [source_labels.get(src, src.replace("capital_flow:", "")) for src in capital_sources]
+        if labels:
+            detail_parts.append("来源：" + "、".join(list(dict.fromkeys(labels))[:3]))
+        for key, label in (
+            ("limit_up_streak", "连板数"),
+            ("ceiling_amount", "封单额"),
+            ("turnover_ratio", "换手率"),
+            ("popularity", "人气值"),
+            ("net_inflow", "净买入"),
+        ):
+            value = item.get(key, metrics.get(key))
+            if value is not None:
+                detail_parts.append(f"{label}={_short_metric(value)}")
+        add("capital", "资金面", "；".join(detail_parts) or "资金活跃度候选")
 
     reason = str(item.get("reason") or "").strip()
     if reason and not dimensions:
@@ -736,7 +939,7 @@ def _fetch_sector_constituents(
     limit: int,
     *,
     include_diagnostics: bool = False,
-) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
     diagnostics: List[Dict[str, Any]] = []
     try:
         import akshare as ak
@@ -814,6 +1017,78 @@ def _fetch_sector_constituents(
         if candidates:
             break
     return (candidates, diagnostics) if include_diagnostics else candidates
+
+
+def _data_tool_result(tool_name: str, *, limit: int, **kwargs: Any) -> Dict[str, Any]:
+    handler_name = f"_handle_{tool_name}"
+    if tool_name in {
+        "get_tushare_moneyflow_ind_ths",
+        "get_tushare_moneyflow_ind_dc",
+        "get_tushare_moneyflow_cnt_ths",
+        "get_tushare_ths_member",
+        "get_tushare_announcements",
+        "get_tushare_stock_alerts",
+        "get_tushare_stock_shock",
+        "get_tushare_pledge_stat",
+        "get_tushare_pledge_detail",
+        "get_tushare_share_float",
+        "get_tushare_holder_trade",
+        "get_tushare_repurchase",
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_forecast",
+        "get_tushare_express",
+        "get_tushare_dividend",
+        "get_tushare_adj_factor",
+        "get_tushare_index_daily",
+        "get_tushare_trade_calendar",
+        "get_tushare_moneyflow_ths",
+        "get_tushare_moneyflow_dc",
+        "get_tushare_dragon_tiger_list",
+        "get_tushare_dragon_tiger_inst",
+        "get_tushare_limit_list_ths",
+        "get_tushare_limit_list_d",
+        "get_tushare_limit_step",
+        "get_tushare_hot_rank",
+    }:
+        timeout = _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)
+    else:
+        timeout = 2.5 if tool_name != "get_stockapi_hot_money_activity" else 2.0
+    try:
+        from src.agent.tools import data_tools
+
+        handler = getattr(data_tools, handler_name)
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "items": [],
+            "errors": [f"{handler_name} unavailable: {exc}"],
+            "source_chain": [],
+        }
+    call_kwargs = dict(kwargs)
+    if "limit" not in call_kwargs:
+        call_kwargs["limit"] = max(1, min(int(limit or 10), 30))
+    result, err, duration_ms = _run_with_timeout(
+        lambda: handler(**call_kwargs),
+        timeout,
+        handler_name,
+    )
+    if err:
+        return {
+            "status": "timeout" if "timeout" in str(err).lower() else "failed",
+            "items": [],
+            "errors": [str(err)],
+            "source_chain": [{
+                "provider": handler_name,
+                "result": "timeout" if "timeout" in str(err).lower() else "failed",
+                "duration_ms": duration_ms,
+            }],
+        }
+    return result if isinstance(result, dict) else {"status": "failed", "items": [], "errors": [f"{handler_name} returned non-dict"]}
+
+
+def _stockapi_tool_result(tool_name: str, *, limit: int) -> Dict[str, Any]:
+    return _data_tool_result(tool_name, limit=limit)
 
 
 _NEWS_SENTIMENT_TOPICS = (
@@ -1563,94 +1838,134 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
-    manager = _get_fetcher_manager()
-    timeout = _get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0)
-    fast_result = _get_tushare_sector_rankings_fast(top_n, timeout)
-    if isinstance(fast_result, tuple) and len(fast_result) == 4:
-        top_sectors, bottom_sectors, source_chain, chain_error = fast_result
+    timeout = min(_get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0), 6.0)
+    started_at = time.time()
+    eastmoney_timeout = min(timeout, 3.0)
+    eastmoney_result, eastmoney_err, eastmoney_ms = _run_with_timeout(
+        lambda: _get_eastmoney_industry_rankings_fast(top_n),
+        eastmoney_timeout,
+        "eastmoney_industry_rankings",
+    )
+    if isinstance(eastmoney_result, tuple) and len(eastmoney_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = eastmoney_result
         if top_sectors or bottom_sectors:
             return {
                 "status": "ok",
                 "top_sectors": top_sectors or [],
                 "bottom_sectors": bottom_sectors or [],
                 "source_chain": source_chain,
-                "errors": [],
+                "errors": [chain_error] if chain_error else [],
             }
 
-    result, err, cost_ms = _run_with_timeout(
-        lambda: _get_sector_rankings_agent_probe(manager, top_n, timeout),
-        timeout,
-        "sector_rankings",
+    remaining_timeout = max(0.0, timeout - (time.time() - started_at))
+    stockapi_timeout = min(remaining_timeout, 2.0)
+    stockapi_result, stockapi_err, stockapi_ms = _run_with_timeout(
+        lambda: _get_stockapi_sector_rankings_fast(top_n),
+        stockapi_timeout,
+        "stockapi_hot_sectors",
     )
+    if isinstance(stockapi_result, tuple) and len(stockapi_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = stockapi_result
+        if top_sectors or bottom_sectors:
+            return {
+                "status": "ok",
+                "top_sectors": top_sectors or [],
+                "bottom_sectors": bottom_sectors or [],
+                "source_chain": source_chain,
+                "errors": [chain_error] if chain_error else [],
+            }
 
-    if err:
-        return {
-            "status": "timeout" if "timeout" in str(err).lower() else "failed",
-            "top_sectors": [],
-            "bottom_sectors": [],
-            "source_chain": [{
-                "provider": "sector_rankings",
-                "result": "timeout" if "timeout" in str(err).lower() else "failed",
-                "duration_ms": cost_ms,
-            }],
-            "errors": [str(err)],
-            "error_summary": str(err),
-        }
-
-    if result is None:
-        return {
-            "status": "empty",
-            "top_sectors": [],
-            "bottom_sectors": [],
-            "source_chain": [{"provider": "sector_rankings", "result": "empty", "duration_ms": cost_ms}],
-            "errors": ["No sector ranking data available"],
-        }
-
-    if isinstance(result, tuple) and len(result) == 4:
-        top_sectors, bottom_sectors, source_chain, chain_error = result
-        status = "ok" if top_sectors or bottom_sectors else "empty"
-        return {
-            "status": status,
-            "top_sectors": top_sectors or [],
-            "bottom_sectors": bottom_sectors or [],
-            "source_chain": source_chain or [{
-                "provider": "sector_rankings",
-                "result": status,
-                "duration_ms": cost_ms,
-            }],
-            "errors": [chain_error] if chain_error else [],
-        }
-    # get_sector_rankings returns Tuple[List[Dict], List[Dict]]
-    # (top_sectors, bottom_sectors)
-    if isinstance(result, tuple) and len(result) == 2:
-        top_sectors, bottom_sectors = result
-        return {
-            "status": "ok" if top_sectors or bottom_sectors else "empty",
-            "top_sectors": top_sectors,
-            "bottom_sectors": bottom_sectors,
-            "source_chain": [{"provider": "sector_rankings", "result": "ok", "duration_ms": cost_ms}],
-            "errors": [],
-        }
-    elif isinstance(result, list):
-        return {
-            "status": "ok" if result else "empty",
-            "sectors": result,
-            "source_chain": [{"provider": "sector_rankings", "result": "ok", "duration_ms": cost_ms}],
-            "errors": [],
-        }
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    if eastmoney_err:
+        source_chain.append({
+            "provider": "eastmoney:stock_board_industry_name_em",
+            "result": "timeout" if "timeout" in str(eastmoney_err).lower() else "failed",
+            "duration_ms": eastmoney_ms,
+            "error": eastmoney_err,
+        })
+        errors.append(str(eastmoney_err))
+    elif isinstance(eastmoney_result, tuple) and len(eastmoney_result) == 4:
+        _, _, eastmoney_chain, eastmoney_chain_error = eastmoney_result
+        source_chain.extend(eastmoney_chain or [])
+        if eastmoney_chain_error:
+            errors.append(str(eastmoney_chain_error))
     else:
+        source_chain.append({
+            "provider": "eastmoney:stock_board_industry_name_em",
+            "result": "empty",
+            "duration_ms": eastmoney_ms,
+        })
+
+    if stockapi_err:
+        source_chain.append({
+            "provider": "stockapi:hotBkJlrDr",
+            "result": "timeout" if "timeout" in str(stockapi_err).lower() else "failed",
+            "duration_ms": stockapi_ms,
+            "error": stockapi_err,
+        })
+        errors.append(str(stockapi_err))
+    elif isinstance(stockapi_result, tuple) and len(stockapi_result) == 4:
+        _, _, stockapi_chain, stockapi_chain_error = stockapi_result
+        for item in stockapi_chain or []:
+            if isinstance(item, dict):
+                source_chain.append(item)
+            else:
+                source_chain.append({"provider": str(item), "result": "failed", "duration_ms": stockapi_ms})
+        if stockapi_chain_error:
+            if not source_chain:
+                source_chain.append({
+                    "provider": "stockapi:hotBkJlrDr",
+                    "result": "failed",
+                    "duration_ms": stockapi_ms,
+                    "error": str(stockapi_chain_error),
+                })
+            errors.append(str(stockapi_chain_error))
+    else:
+        source_chain.append({
+            "provider": "stockapi:hotBkJlrDr",
+            "result": "empty",
+            "duration_ms": stockapi_ms,
+        })
+
+    if not source_chain:
+        source_chain.append({
+            "provider": "stockapi:hotBkJlrDr",
+            "result": "empty",
+            "duration_ms": stockapi_ms,
+        })
+
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    if any("timeout" in str(error).lower() for error in errors):
         return {
-            "status": "partial",
-            "data": str(result),
-            "source_chain": [{"provider": "sector_rankings", "result": "partial", "duration_ms": cost_ms}],
-            "errors": [],
+            "status": "timeout",
+            "top_sectors": [],
+            "bottom_sectors": [],
+            "source_chain": source_chain,
+            "errors": errors or ["sector_rankings timeout"],
+            "error_summary": " | ".join(errors) or "sector_rankings timeout",
+            "duration_ms": elapsed_ms,
         }
+    return {
+        "status": "failed" if errors else "empty",
+        "top_sectors": [],
+        "bottom_sectors": [],
+        "source_chain": source_chain,
+        "errors": errors or ["No sector ranking data available"],
+        "error_summary": " | ".join(errors) if errors else "No sector ranking data available",
+        "duration_ms": elapsed_ms,
+    }
 
 
 get_sector_rankings_tool = ToolDefinition(
     name="get_sector_rankings",
-    description="Get sector/industry performance rankings. Returns top N and bottom N "
-                "sectors by daily change percentage. Useful for sector rotation analysis.",
+    description=(
+        "Get sector rankings. Prefer Eastmoney industry-board realtime quotes "
+        "(stock_board_industry_name_em / quote.eastmoney boardlist page); fall back to "
+        "StockAPI /v1/hotBkJlrDr when available. Permission, quota, network and remote "
+        "disconnect failures are returned as structured failed/timeout diagnostics "
+        "without slow fetcher probing."
+    ),
     parameters=[
         ToolParameter(
             name="top_n",
@@ -1753,19 +2068,28 @@ def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict
 
     from src.services.history_loader import load_history_df
 
-    df, source = load_history_df(index_code, days=lookback_days)
-    if df is None or df.empty:
-        return [], source
-    rows = df.tail(lookback_days).to_dict(orient="records")
-    for row in rows:
-        if "date" in row:
-            row["date"] = str(row["date"])
-    return rows, source
+    fallback_to_network = not _is_supported_cn_index_proxy(index_code)
+    df, source = load_history_df(index_code, days=lookback_days, fallback_to_network=fallback_to_network)
+    if df is not None and not df.empty:
+        rows = df.tail(lookback_days).to_dict(orient="records")
+        for row in rows:
+            if "date" in row:
+                row["date"] = str(row["date"])
+        return rows, source
+
+    sdk_source = ""
+    if fallback_to_network:
+        sdk_rows, sdk_source = _load_index_history_from_tushare_sdk(index_code, lookback_days)
+        if sdk_rows:
+            return sdk_rows, sdk_source
+
+    sources = [s for s in [fast_source, source, sdk_source] if s]
+    return [], ";".join(sources) if sources else "all_sources_failed"
 
 
 def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
     try:
-        from data_provider.tushare_client import get_tushare_token, query_tushare_api
+        from data_provider.tushare_client import build_tushare_http_client, get_tushare_token
     except Exception:
         return [], ""
     if not get_tushare_token():
@@ -1775,18 +2099,18 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
     end_day = datetime.now().date()
     start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
     try:
-        df = query_tushare_api(
+        client = build_tushare_http_client(
+            timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 20.0)
+        )
+        df = client.query(
             "index_daily",
-            params={
-                "ts_code": ts_code,
-                "start_date": start_day.strftime("%Y%m%d"),
-                "end_date": end_day.strftime("%Y%m%d"),
-            },
             fields="ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
-            timeout=5,
+            ts_code=ts_code,
+            start_date=start_day.strftime("%Y%m%d"),
+            end_date=end_day.strftime("%Y%m%d"),
         )
     except Exception as exc:
-        logger.debug("Tushare index_daily failed for %s: %s", ts_code, exc)
+        logger.warning("Tushare HTTP index_daily failed for %s: %s", ts_code, exc)
         return [], "tushare:index_daily_failed"
     if df is None or df.empty:
         return [], "tushare:index_daily_empty"
@@ -1810,6 +2134,48 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
     return rows[-lookback_days:], "tushare:index_daily"
 
 
+def _load_index_history_from_tushare_sdk(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    """Fallback: use tushare SDK (pro_api) when the HTTP client fails."""
+    try:
+        from data_provider.tushare_client import build_tushare_sdk_client
+    except Exception:
+        return [], ""
+
+    ts_code = _normalize_index_ts_code(index_code)
+    end_day = datetime.now().date()
+    start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
+    try:
+        _ts, pro = build_tushare_sdk_client()
+        df = pro.index_daily(
+            ts_code=ts_code,
+            start_date=start_day.strftime("%Y%m%d"),
+            end_date=end_day.strftime("%Y%m%d"),
+        )
+    except Exception as exc:
+        logger.warning("Tushare SDK index_daily failed for %s: %s", ts_code, exc)
+        return [], "tushare_sdk:index_daily_failed"
+    if df is None or df.empty:
+        return [], "tushare_sdk:index_daily_empty"
+
+    rows: List[Dict[str, Any]] = []
+    for row in df.to_dict(orient="records"):
+        trade_date = str(row.get("trade_date") or "")
+        if len(trade_date) == 8 and trade_date.isdigit():
+            trade_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
+        rows.append({
+            "date": trade_date,
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("vol"),
+            "amount": row.get("amount"),
+            "pct_chg": row.get("pct_chg"),
+        })
+    rows = sorted(rows, key=lambda item: str(item.get("date") or ""))
+    return rows[-lookback_days:], "tushare_sdk:index_daily"
+
+
 def _normalize_index_ts_code(index_code: str) -> str:
     raw = str(index_code or "000300").strip().upper()
     if raw.endswith((".SH", ".SZ")):
@@ -1819,9 +2185,24 @@ def _normalize_index_ts_code(index_code: str) -> str:
     if raw.startswith("SZ"):
         return f"{raw[2:]}.SZ"
     code = re.sub(r"\D", "", raw) or "000300"
-    if code in {"000001", "000016", "000300", "000688"}:
+    sh_indices = {"000001", "000016", "000300", "000688", "000852", "000905"}
+    if code in sh_indices:
         return f"{code}.SH"
     return f"{code}.SZ"
+
+
+def _is_supported_cn_index_proxy(index_code: str) -> bool:
+    ts_code = _normalize_index_ts_code(index_code)
+    return ts_code in {
+        "000001.SH",
+        "000016.SH",
+        "000300.SH",
+        "000688.SH",
+        "000852.SH",
+        "000905.SH",
+        "399001.SZ",
+        "399006.SZ",
+    }
 
 
 def _handle_detect_market_regime(
@@ -1841,8 +2222,8 @@ def _handle_detect_market_regime(
         }
 
     lookback = max(120, min(int(lookback_days or 260), 520))
-    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 8.0)
-    auxiliary_timeout = max(1.0, min(3.0, component_timeout))
+    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 25.0)
+    auxiliary_timeout = max(3.0, component_timeout)
     history_result, history_err, history_ms = _run_with_timeout(
         lambda: _load_market_history(index_code or "000300", lookback),
         component_timeout,
@@ -1856,6 +2237,8 @@ def _handle_detect_market_regime(
         if history_err:
             data_errors.append(f"market_history: {history_err}")
     bars = coerce_bars(history_rows)
+    if not bars and not history_err and history_source not in {"", "none"}:
+        data_errors.append(f"market_history: {history_source}")
     try:
         from src.storage import get_db
 
@@ -1883,9 +2266,8 @@ def _handle_detect_market_regime(
             _handle_get_northbound_capital_flow,
         )
 
-        short_optional_timeout = max(1.0, min(1.5, auxiliary_timeout))
         component_tasks.update({
-            "market_flow": (lambda: _handle_get_market_capital_flow(top_n=5), short_optional_timeout),
+            "market_flow": (lambda: _handle_get_market_capital_flow(top_n=5), auxiliary_timeout),
             "northbound": (lambda: _handle_get_northbound_capital_flow(limit=10), auxiliary_timeout),
             "margin": (lambda: _handle_get_margin_trading_summary(limit=10), auxiliary_timeout),
         })
@@ -1996,7 +2378,29 @@ def _handle_detect_market_regime(
         },
     })
 
-    if persist and db is not None and payload["status"] != "insufficient_data":
+    if payload["status"] == "insufficient_data" and previous:
+        prev_regime = previous.get("regime") or (previous.get("payload") or {}).get("regime")
+        if prev_regime:
+            prev_payload = previous.get("payload") or previous
+            payload["status"] = "stale_fallback"
+            payload["regime"] = prev_regime
+            for key in ("volatility_bucket", "atr_percentile", "wyckoff_phase",
+                        "sentiment_score", "composite_score", "position_guidance"):
+                if key in prev_payload and (key not in payload or payload.get(key) is None):
+                    payload[key] = prev_payload[key]
+            payload["stale_source"] = "persisted_state"
+            payload["stale_note"] = (
+                "Fresh market data unavailable; returning last persisted regime. "
+                "Treat position_guidance as conservative until fresh data confirms."
+            )
+            logger.warning(
+                "detect_market_regime: insufficient fresh data, falling back to persisted state "
+                "(regime=%s, persisted_at=%s)",
+                prev_regime,
+                previous.get("updated_at") or previous.get("timestamp") or "unknown",
+            )
+
+    if persist and db is not None and payload["status"] not in ("insufficient_data", "stale_fallback"):
         try:
             db.save_market_regime_state(market_key, payload)
             payload["persisted"] = True
@@ -2109,7 +2513,7 @@ def _handle_discover_watchlist_candidates(
 
     if source_mode == "auto":
         orchestrator = CandidateExpertOrchestrator(
-            timeout_s=_get_agent_timeout_attr("agent_candidate_expert_timeout_seconds", 20.0),
+            timeout_s=_get_agent_timeout_attr("agent_candidate_expert_timeout_seconds", 60.0),
             max_candidates_to_deep_dive=effective_limit,
         )
         expert_result = orchestrator.discover(
@@ -2128,6 +2532,27 @@ def _handle_discover_watchlist_candidates(
                     market=market,
                     limit=limit,
                 ),
+                "tushare_moneyflow_ind_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_ind_ths", limit=limit),
+                "tushare_moneyflow_ind_dc": lambda limit: _data_tool_result("get_tushare_moneyflow_ind_dc", limit=limit),
+                "tushare_moneyflow_cnt_ths": lambda limit: _data_tool_result("get_tushare_moneyflow_cnt_ths", limit=limit),
+                "tushare_ths_member": lambda ts_code, limit: _data_tool_result("get_tushare_ths_member", ts_code=ts_code, limit=limit),
+                "tushare_moneyflow_dc": lambda limit: _data_tool_result("get_tushare_moneyflow_dc", limit=limit),
+                "tushare_dragon_tiger_list": lambda limit: _data_tool_result("get_tushare_dragon_tiger_list", limit=limit),
+                "tushare_dragon_tiger_inst": lambda limit: _data_tool_result("get_tushare_dragon_tiger_inst", limit=limit),
+                "tushare_limit_list_ths": lambda limit: _data_tool_result("get_tushare_limit_list_ths", limit=limit),
+                "tushare_limit_list_d": lambda limit: _data_tool_result("get_tushare_limit_list_d", limit=limit),
+                "tushare_limit_step": lambda limit: _data_tool_result("get_tushare_limit_step", limit=limit),
+                "tushare_hot_rank": lambda limit: _data_tool_result("get_tushare_hot_rank", limit=limit),
+                "tushare_announcements": lambda limit: _data_tool_result("get_tushare_announcements", limit=limit),
+                "tushare_stock_alerts": lambda limit: _data_tool_result("get_tushare_stock_alerts", limit=limit),
+                "tushare_stock_shock": lambda limit: _data_tool_result("get_tushare_stock_shock", limit=limit),
+                "tushare_share_float": lambda limit: _data_tool_result("get_tushare_share_float", limit=limit),
+                "tushare_holder_trade": lambda limit: _data_tool_result("get_tushare_holder_trade", limit=limit),
+                "tushare_repurchase": lambda limit: _data_tool_result("get_tushare_repurchase", limit=limit),
+                "tushare_daily_basic": lambda limit: _data_tool_result("get_tushare_daily_basic", limit=limit),
+                "stockapi_limit_up_pool": lambda limit: _stockapi_tool_result("get_stockapi_limit_up_pool", limit=limit),
+                "stockapi_popularity_rank": lambda limit: _stockapi_tool_result("get_stockapi_popularity_rank", limit=limit),
+                "stockapi_hot_money_activity": lambda limit: _stockapi_tool_result("get_stockapi_hot_money_activity", limit=limit),
                 "fallback": lambda limit: _dedupe_candidates(
                     [{**item, "source": "fallback_seed_pool"} for item in DEFAULT_WATCHLIST_SEEDS],
                     limit,
@@ -2427,7 +2852,19 @@ def _candidate_discovery_response(
         logger.warning("Candidate pool persistence skipped: %s", exc)
         payload["candidate_pool_persisted"] = False
         payload["candidate_pool_persist_error"] = str(exc)
-    return payload
+    return _sanitize_non_finite_numbers(payload)
+
+
+def _sanitize_non_finite_numbers(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _sanitize_non_finite_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_non_finite_numbers(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_non_finite_numbers(item) for item in value]
+    return value
 
 
 discover_watchlist_candidates_tool = ToolDefinition(

@@ -25,6 +25,7 @@ class IntelAgent(BaseAgent):
     agent_name = "intel"
     max_steps = 4
     tool_names = [
+        "get_tushare_today_news",
         "search_stock_news",
         "search_comprehensive_intel",
         "get_stock_info",
@@ -41,12 +42,14 @@ the given stock, then produce a structured JSON opinion.
 
 ## Workflow
 1. Search latest stock news (earnings, announcements, insider activity)
-2. Run comprehensive intel search — this covers latest news, company \
+2. For A-shares, call get_tushare_today_news when same-day market flash \
+news is needed; it only returns today's Tushare news window
+3. Run comprehensive intel search — this covers latest news, company \
 announcements (公司公告), market analysis, risk checks, and earnings outlook
-3. For A-share stocks, call get_capital_flow to obtain main-force (主力) \
+4. For A-share stocks, call get_capital_flow to obtain main-force (主力) \
 capital inflow/outflow data and include it in your analysis
-4. Classify positive catalysts and risk alerts
-5. Assess overall sentiment
+5. Classify positive catalysts and risk alerts
+6. Assess overall sentiment
 
 ## Risk Detection Priorities
 - Insider / major shareholder sell-downs (减持)
@@ -84,11 +87,12 @@ Return **only** a JSON object:
             parts[0] += f" ({ctx.stock_name})"
         parts.append(
             "Steps:\n"
-            "1. Call search_comprehensive_intel to get latest news, company announcements "
+            "1. For A-shares, call get_tushare_today_news if same-day flash news is relevant.\n"
+            "2. Call search_comprehensive_intel to get latest news, company announcements "
             "(公司公告), risk events, and earnings outlook.\n"
-            "2. Call get_capital_flow to obtain main-force (主力) capital flow data "
+            "3. Call get_capital_flow to obtain main-force (主力) capital flow data "
             "(A-share only; skip for HK/US).\n"
-            "3. Output the JSON opinion including capital_flow_signal."
+            "4. Output the JSON opinion including capital_flow_signal."
         )
         return "\n".join(parts)
 
@@ -114,5 +118,4 @@ Return **only** a JSON object:
             reasoning=parsed.get("reasoning", ""),
             raw_data=parsed,
         )
-
 

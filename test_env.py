@@ -361,6 +361,7 @@ def run_search_checks(config: Any, *, all_keys: bool) -> List[ApiCheckResult]:
 def run_tushare_check(token: Optional[str], *, timeout: float) -> ApiCheckResult:
     if not token:
         return ApiCheckResult(category="data", name="Tushare", configured=False, skipped=True, message="TUSHARE_TOKEN not configured")
+    from data_provider.tushare_client import get_tushare_http_url
 
     def post(api_name: str, params: Dict[str, Any], fields: str) -> Dict[str, Any]:
         payload = {
@@ -369,7 +370,7 @@ def run_tushare_check(token: Optional[str], *, timeout: float) -> ApiCheckResult
             "params": params,
             "fields": fields,
         }
-        response = requests.post("http://api.tushare.pro", json=payload, timeout=timeout)
+        response = requests.post(get_tushare_http_url(), json=payload, timeout=timeout)
         if response.status_code != 200:
             return {"ok": False, "message": f"HTTP {response.status_code}"}
         data = response.json()

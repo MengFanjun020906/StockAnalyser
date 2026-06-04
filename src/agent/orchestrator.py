@@ -401,6 +401,7 @@ class AgentOrchestrator:
             progress_callback=progress_callback,
             run_id=context.get("session_id") or "selection-run",
             orchestration_mode=getattr(self.config, "agent_orchestration_mode", "legacy"),
+            candidate_discovery_mode=context.get("candidate_discovery_mode"),
         )
         return AgentResult(
             success=selection.success,

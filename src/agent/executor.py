@@ -674,6 +674,7 @@ class AgentExecutor:
             progress_callback=progress_callback,
             max_wall_clock_seconds=self.timeout_seconds,
             tool_call_timeout_seconds=self.tool_call_timeout_seconds,
+            tool_argument_guard=_build_context_tool_argument_guard(context),
         )
 
         model_str = loop_result.model
@@ -748,6 +749,7 @@ class AgentExecutor:
             progress_callback=progress_callback,
             run_id=context.get("session_id") or "selection-run",
             orchestration_mode=self.orchestration_mode,
+            candidate_discovery_mode=context.get("candidate_discovery_mode"),
         )
 
     def _maybe_run_debate(
@@ -826,6 +828,56 @@ def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
     if isinstance(value, dict):
         return AgentUserContext(**value)
     return None
+
+
+def _build_context_tool_argument_guard(
+    context: Optional[Dict[str, Any]],
+) -> Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]]:
+    """Keep account and stock identity scoped to the injected user context."""
+    agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+    if agent_user_context is None:
+        return None
+
+    account_ids = [
+        account.account_id
+        for account in agent_user_context.accounts
+        if account.account_id is not None
+    ]
+    selected_account_id = account_ids[0] if len(account_ids) == 1 else None
+    position_names = _position_name_lookup(agent_user_context)
+
+    def guard(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        guarded = dict(arguments or {})
+        if (
+            tool_name == "get_portfolio_snapshot"
+            and selected_account_id is not None
+            and guarded.get("account_id") in (None, "")
+        ):
+            guarded["account_id"] = selected_account_id
+        if tool_name in {"search_stock_news", "search_comprehensive_intel", "score_stock_news_sentiment"}:
+            code = str(guarded.get("stock_code") or "").strip()
+            if code and code in position_names:
+                guarded["stock_name"] = position_names[code]
+        return guarded
+
+    return guard
+
+
+def _position_name_lookup(agent_user_context: AgentUserContext) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for position in agent_user_context.positions:
+        code = str(position.symbol or "").strip()
+        if not code:
+            continue
+        raw_name = getattr(position, "stock_name", None) or getattr(position, "name", None)
+        if not raw_name and getattr(position, "model_extra", None):
+            raw_name = position.model_extra.get("stock_name") or position.model_extra.get("name")
+        if not raw_name:
+            continue
+        name = str(raw_name).strip()
+        if name:
+            result[code] = name
+    return result
 
 
 def _is_planning_execute_context(context: Optional[AgentUserContext]) -> bool:

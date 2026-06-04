@@ -62,3 +62,21 @@ def test_trace_artifact_extractor_lands_compact_evidence_packets():
     assert artifacts["evidence_cards"][0]["card_id"].startswith("capital_flow:")
     assert artifacts["expert_packets"][0]["expert"] == "capital_chip_expert"
     assert artifacts["judge_input_packet"]["decision_matrix"][0]["dimension"] == "capital_chip"
+
+
+def test_trace_artifact_extractor_lands_balanced_candidate_evidence():
+    artifacts = _extract_evidence_artifacts({
+        "balanced_candidate_evidence": {
+            "full": {
+                "candidate_evidence_json": {
+                    "schema_version": "candidate_evidence.v1",
+                    "candidates": [{"code": "301028", "bucket": "strategy"}],
+                },
+                "candidate_evidence_md": "# 候选证据包\n\n| 类别 | 股票 |\n",
+            }
+        }
+    })
+
+    assert artifacts["candidate_evidence"]["schema_version"] == "candidate_evidence.v1"
+    assert artifacts["candidate_evidence"]["candidates"][0]["code"] == "301028"
+    assert artifacts["candidate_evidence.md"].startswith("# 候选证据包")

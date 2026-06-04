@@ -70,8 +70,8 @@ class SearchToolsPersistenceTest(unittest.TestCase):
              patch("src.agent.tools.search_tools._get_db", return_value=db):
             result = _handle_search_comprehensive_intel("600519", "贵州茅台")
 
-        self.assertEqual(result["report"], "report")
-        self.assertEqual(list(result["dimensions"].keys()), ["latest_news"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["dimensions_searched"], ["latest_news"])
         db.save_news_intel.assert_called_once_with(
             code="600519",
             name="贵州茅台",
@@ -80,6 +80,30 @@ class SearchToolsPersistenceTest(unittest.TestCase):
             response=latest,
             query_context=None,
         )
+
+    def test_search_comprehensive_intel_agent_tool_uses_bounded_dimensions(self) -> None:
+        latest = _response("latest")
+        service = SimpleNamespace(
+            is_available=True,
+            search_comprehensive_intel=MagicMock(return_value={"latest_news": latest}),
+        )
+        db = SimpleNamespace(save_news_intel=MagicMock(return_value=1))
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db), \
+             patch(
+                 "src.agent.tools.search_tools._preprocess_intel_with_llm",
+                 return_value={"items": [], "key_signals": [], "overall_sentiment": "unknown"},
+             ):
+            result = _handle_search_comprehensive_intel("600519", "贵州茅台")
+
+        service.search_comprehensive_intel.assert_called_once_with(
+            stock_code="600519",
+            stock_name="贵州茅台",
+            max_searches=2,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["source_chain"][0]["max_searches"], 2)
 
     def test_persistence_failure_keeps_search_result(self) -> None:
         response = _response("贵州茅台 600519 latest news")
@@ -147,7 +171,15 @@ class SearchToolsPersistenceTest(unittest.TestCase):
 
         with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
              patch("src.agent.tools.search_tools._get_db", return_value=db), \
-             patch("src.agent.tools.search_tools._fetch_tushare_announcements", return_value=[]):
+             patch(
+                 "src.agent.tools.search_tools._fetch_tushare_announcements_result",
+                 return_value={
+                     "status": "empty",
+                     "items": [],
+                     "provider": "Tushare.anns_d",
+                     "date_window": {"start_date": "20260511", "end_date": "20260514"},
+                 },
+             ):
             result = _handle_score_stock_news_sentiment("600001", "测试股份")
 
         self.assertEqual(result["status"], "ok")
@@ -156,6 +188,8 @@ class SearchToolsPersistenceTest(unittest.TestCase):
         self.assertEqual(result["uncertain_count"], 2)
         self.assertIn("contract_order", result["event_tags"])
         self.assertIn("rumor_high_heat", result["event_tags"])
+        self.assertEqual(result["sources"]["announcements"]["status"], "empty")
+        self.assertEqual(result["sources"]["announcements"]["date_window"]["start_date"], "20260511")
         db.save_news_intel.assert_called_once()
 
 

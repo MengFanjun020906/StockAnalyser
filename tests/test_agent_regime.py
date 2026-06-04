@@ -108,6 +108,68 @@ def test_detect_market_regime_tool_registered():
     assert detect_market_regime_tool.category == "market"
 
 
+def test_market_regime_timeout_defaults_favor_auxiliary_accuracy():
+    from src.config import Config
+    from src.core.config_registry import get_field_definition
+
+    cfg = Config()
+
+    assert cfg.agent_regime_component_timeout_seconds == 25.0
+    assert cfg.agent_sector_rankings_timeout_seconds == 10.0
+    assert cfg.agent_tushare_tool_timeout_seconds == 20.0
+    assert get_field_definition("AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS")["default_value"] == "25.0"
+    assert get_field_definition("AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS")["default_value"] == "10.0"
+    assert get_field_definition("AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS")["default_value"] == "20.0"
+
+
+def test_detect_market_regime_uses_full_auxiliary_component_timeout():
+    from src.agent.tools import market_tools
+
+    calls = []
+
+    history_rows = [
+        {
+            "date": str(row.date),
+            "open": row.open,
+            "high": row.high,
+            "low": row.low,
+            "close": row.close,
+            "volume": row.volume,
+            "amount": row.amount,
+        }
+        for row in _bars(180)
+    ]
+
+    def fake_get_timeout(attr_name: str, default: float) -> float:
+        if attr_name == "agent_regime_component_timeout_seconds":
+            return 25.0
+        return default
+
+    def fake_run_with_timeout(task, timeout_seconds: float, task_name: str):
+        calls.append((task_name, timeout_seconds))
+        if task_name == "market_history":
+            return (history_rows, "unit_test"), None, 1
+        if task_name == "market_indices":
+            return {"status": "ok", "indices": []}, None, 1
+        if task_name == "sector_rankings":
+            return {"status": "empty", "top_sectors": [], "bottom_sectors": []}, None, 1
+        return {"status": "ok", "source_chain": []}, None, 1
+
+    with patch("src.agent.tools.market_tools._get_agent_timeout_attr", side_effect=fake_get_timeout), \
+         patch("src.agent.tools.market_tools._run_with_timeout", side_effect=fake_run_with_timeout), \
+         patch("src.storage.get_db", side_effect=RuntimeError("db unavailable")):
+        result = market_tools._handle_detect_market_regime(persist=False)
+
+    assert result["status"] == "ok"
+    timeouts_by_name = {name: timeout for name, timeout in calls}
+    assert timeouts_by_name["market_history"] == 25.0
+    assert timeouts_by_name["market_indices"] == 25.0
+    assert timeouts_by_name["sector_rankings"] == 25.0
+    assert timeouts_by_name["market_flow"] == 25.0
+    assert timeouts_by_name["northbound"] == 25.0
+    assert timeouts_by_name["margin"] == 25.0
+
+
 def test_default_tool_registry_contains_detect_market_regime():
     from src.agent import factory
 
@@ -182,15 +244,32 @@ def test_market_history_prefers_tushare_index_daily_fast_path():
     import pandas as pd
     from src.agent.tools import market_tools
 
+    class FakeTushareHttpClient:
+        def query(self, *args, **kwargs):
+            return pd.DataFrame(rows)
+
     with patch("data_provider.tushare_client.get_tushare_token", return_value="token"), \
-         patch("data_provider.tushare_client.query_tushare_api", return_value=pd.DataFrame(rows)), \
+         patch("data_provider.tushare_client.build_tushare_http_client", return_value=FakeTushareHttpClient()) as build_client, \
          patch("src.services.history_loader.load_history_df") as fallback_loader:
         history, source = market_tools._load_market_history("000300", 260)
 
     assert source == "tushare:index_daily"
     assert history[0]["date"] == "2026-05-15"
     assert history[0]["close"] == 101
+    build_client.assert_called_once_with(timeout=20.0)
     fallback_loader.assert_not_called()
+
+
+def test_market_history_skips_stock_fallback_for_supported_index():
+    from src.agent.tools import market_tools
+
+    with patch("src.agent.tools.market_tools._load_index_history_from_tushare", return_value=([], "tushare:index_daily_failed")), \
+         patch("src.services.history_loader.load_history_df", return_value=(None, "db_cache_miss")) as fallback_loader:
+        history, source = market_tools._load_market_history("000300", 260)
+
+    assert history == []
+    assert source == "tushare:index_daily_failed;db_cache_miss"
+    fallback_loader.assert_called_once_with("000300", days=260, fallback_to_network=False)
 
 
 def test_detect_market_regime_tool_returns_structured_timeout_diagnostics():

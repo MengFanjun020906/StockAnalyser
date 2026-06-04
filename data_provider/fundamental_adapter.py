@@ -14,11 +14,12 @@ import copy
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from data_provider.tushare_client import query_tushare_api
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,10 @@ def _akshare_fund_flow_market(stock_code: str) -> str:
 
 
 def _stockapi_code_flow_url() -> str:
-    return "https://www.stockapi.com.cn/v1/base/codeFlow"
+    return (
+        os.getenv("STOCKAPI_URL", "").strip()
+        or "https://www.stockapi.com.cn/v1/base/codeFlow"
+    )
 
 
 def _stockapi_default_completed_date() -> str:
@@ -136,8 +140,61 @@ def _stockapi_code_flow_completed_date(now: Optional[datetime] = None) -> dateti
         microsecond=0,
     )
     if current < cutoff:
-        return (current - timedelta(days=1)).date()
-    return current.date()
+        return _previous_weekday((current - timedelta(days=1)).date())
+    return _previous_weekday(current.date())
+
+
+def _previous_weekday(value: date) -> date:
+    """Return *value* if it is a weekday, otherwise the previous Friday."""
+    result = value
+    while result.weekday() >= 5:
+        result = result - timedelta(days=1)
+    return result
+
+
+def _parse_stockapi_code_flow_date(value: Any, field_name: str) -> Optional[date]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"{field_name} must be YYYY-MM-DD or YYYYMMDD")
+
+
+def _normalize_stockapi_page_value(value: Any, default: int, minimum: int = 1, maximum: int = 200) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        normalized = default
+    return max(minimum, min(maximum, normalized))
+
+
+def _to_tushare_ts_code(stock_code: str) -> str:
+    raw = _safe_str(stock_code).upper()
+    if "." in raw and raw.endswith((".SH", ".SZ", ".BJ", ".HK")):
+        return raw
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return raw
+    if digits.startswith(("6", "9")):
+        return f"{digits}.SH"
+    if digits.startswith(("8", "4")):
+        return f"{digits}.BJ"
+    return f"{digits}.SZ"
+
+
+def _latest_completed_weekday(now: Optional[datetime] = None) -> date:
+    current = now or datetime.now()
+    cutoff = current.replace(hour=15, minute=30, second=0, microsecond=0)
+    base_day = current.date() if current >= cutoff else (current - timedelta(days=1)).date()
+    return _previous_weekday(base_day)
 
 
 def _stockapi_endpoint_url(path: str) -> str:
@@ -504,7 +561,13 @@ class AkshareFundamentalAdapter:
             "errors": errors,
         }
 
-    def get_stockapi_hot_sectors(self, date: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+    def get_stockapi_hot_sectors(
+        self,
+        date: Optional[str] = None,
+        limit: int = 20,
+        *,
+        allow_fallback: bool = True,
+    ) -> Dict[str, Any]:
         """Return StockAPI hot sectors ranked by capital inflow / strength."""
         trade_date = _safe_str(date) or _stockapi_default_completed_date()
         effective_limit = max(1, min(int(limit or 20), 100))
@@ -526,7 +589,7 @@ class AkshareFundamentalAdapter:
                 "time": _safe_str(row.get("time")) or trade_date,
             })
 
-        if not sectors and errors:
+        if not sectors and errors and allow_fallback:
             fallback_sectors, fallback_errors, fallback_source = self._fallback_hot_sectors(effective_limit)
             if fallback_sectors:
                 return {
@@ -681,6 +744,110 @@ class AkshareFundamentalAdapter:
             "bk_code": code,
             "history": history,
             "source_chain": ["stockapi:bkFlowHistory"] if history else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_hot_sector_leaders(
+        self,
+        date: Optional[str] = None,
+        bk_code: Optional[str] = None,
+        limit: int = 30,
+    ) -> Dict[str, Any]:
+        """Return StockAPI hot-sector leader stocks.
+
+        StockAPI documents this as the hot-sector leader endpoint
+        (``/v1/hotBkJlrLongTou``).  The endpoint may require package access in
+        some accounts; keep the response fail-open so callers can still use
+        ``hotBkJlrDr`` sector diagnostics when leaders are unavailable.
+        """
+        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        effective_limit = max(1, min(int(limit or 30), 100))
+        params: Dict[str, Any] = {"date": trade_date}
+        if _safe_str(bk_code):
+            params["bkCode"] = _safe_str(bk_code)
+        rows, errors = self._stockapi_data_rows("/v1/hotBkJlrLongTou", params)
+
+        items: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            code = _safe_str(
+                row.get("code")
+                or row.get("stockCode")
+                or row.get("f12")
+                or row.get("tsCode")
+            )
+            name = _safe_str(
+                row.get("name")
+                or row.get("stockName")
+                or row.get("f14")
+            )
+            items.append({
+                "code": _normalize_code(code),
+                "name": name,
+                "bk_code": _safe_str(row.get("bkCode") or row.get("bk_code") or bk_code),
+                "bk_name": _safe_str(row.get("bkName") or row.get("bk_name") or row.get("plateName")),
+                "rank": _safe_float(row.get("rank") or row.get("order") or row.get("pm")),
+                "change_ratio": _safe_float(row.get("zf") or row.get("changeRatio") or row.get("f3")),
+                "last_price": _safe_float(row.get("lastPrice") or row.get("close") or row.get("f2")),
+                "main_net_inflow": _safe_float(row.get("mainAmount") or row.get("main_net_inflow") or row.get("f62")),
+                "net_inflow": _safe_float(row.get("qjje") or row.get("netInflow") or row.get("net_inflow")),
+                "strength": _safe_float(row.get("qiangdu") or row.get("strength")),
+                "reason": _safe_str(row.get("reason") or row.get("analyse") or row.get("stock_reason")),
+                "time": _safe_str(row.get("time")) or trade_date,
+                "raw": row,
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "date": trade_date,
+            "bk_code": _safe_str(bk_code),
+            "items": [item for item in items if item.get("code")],
+            "source_chain": ["stockapi:hotBkJlrLongTou"] if items else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_change_all_history(
+        self,
+        date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Return StockAPI all-market historical intraday change events."""
+        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        start = _safe_str(start_date) or trade_date
+        end = _safe_str(end_date) or start
+        effective_limit = max(1, min(int(limit or 50), 300))
+        params: Dict[str, Any] = {"startDate": start, "endDate": end}
+        event_type_value = _safe_str(event_type)
+        if event_type_value:
+            params["type"] = event_type_value
+        rows, errors = self._stockapi_data_rows("/v1/change/allHistory", params)
+
+        items: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            code = _normalize_code(row.get("code"))
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": _safe_str(row.get("name")),
+                "event_type": _safe_str(row.get("type")),
+                "event_name": _safe_str(row.get("typeName") or row.get("type_name")),
+                "info": _safe_str(row.get("info")),
+                "time": _safe_str(row.get("time")),
+                "date": _safe_str(row.get("dateId") or row.get("date") or start),
+                "source": "stockapi:allHistory",
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "date": trade_date,
+            "start_date": start,
+            "end_date": end,
+            "event_type": event_type_value,
+            "items": items,
+            "source_chain": ["stockapi:allHistory"] if items else [],
             "errors": errors,
         }
 
@@ -1065,8 +1232,15 @@ class AkshareFundamentalAdapter:
             "status": "not_supported",
             "summary": {},
             "history": [],
+            "data_quality": {
+                "summary_numeric_fields": 0,
+                "history_rows": 0,
+                "history_rows_with_numeric": 0,
+                "core_numeric_available": False,
+            },
             "source_chain": [],
             "errors": [],
+            "warnings": [],
         }
 
         summary_df, summary_source, summary_errors = self._call_df_candidates([
@@ -1087,6 +1261,11 @@ class AkshareFundamentalAdapter:
                     },
                 ),
             }
+            result["data_quality"]["summary_numeric_fields"] = sum(
+                1
+                for key in ("northbound_net_inflow", "southbound_net_inflow", "buy_amount", "sell_amount")
+                if result["summary"].get(key) is not None
+            )
             result["source_chain"].append(f"northbound_summary:{summary_source}")
 
         hist_df, hist_source, hist_errors = self._call_df_candidates([
@@ -1096,9 +1275,23 @@ class AkshareFundamentalAdapter:
         if hist_df is not None and not hist_df.empty:
             rows = hist_df.tail(effective_limit).to_dict(orient="records")
             result["history"] = [self._compact_northbound_history_row(row) for row in rows]
+            result["data_quality"]["history_rows"] = len(result["history"])
+            result["data_quality"]["history_rows_with_numeric"] = sum(
+                1
+                for row in result["history"]
+                if any(row.get(key) is not None for key in ("net_inflow", "buy_amount", "sell_amount", "balance"))
+            )
             result["source_chain"].append(f"northbound_history:{hist_source}")
 
         has_content = bool(result["summary"] or result["history"])
+        result["data_quality"]["core_numeric_available"] = bool(
+            result["data_quality"]["summary_numeric_fields"]
+            or result["data_quality"]["history_rows_with_numeric"]
+        )
+        if has_content and not result["data_quality"]["core_numeric_available"]:
+            result["warnings"].append(
+                "northbound_source_returned_rows_but_no_numeric_flow_fields"
+            )
         result["status"] = "partial" if has_content else "not_supported"
         return result
 
@@ -1218,7 +1411,15 @@ class AkshareFundamentalAdapter:
             ),
         }
 
-    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+    def get_capital_flow(
+        self,
+        stock_code: str,
+        top_n: int = 5,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page_no: int = 1,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
         """
         Return stock capital flow.
         """
@@ -1230,7 +1431,28 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        stockapi_flow, stockapi_source, stockapi_errors = self._get_stockapi_capital_flow(stock_code)
+        tushare_flow, tushare_source, tushare_errors = self._get_tushare_capital_flow(
+            stock_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if tushare_flow:
+            result["stock_flow"] = tushare_flow
+            result["source_chain"].append(f"capital_stock:{tushare_source}")
+            result["status"] = "partial"
+            return result
+
+        result["errors"].extend(tushare_errors)
+        if tushare_errors:
+            result["source_chain"].append("capital_stock:tushare_moneyflow")
+
+        stockapi_flow, stockapi_source, stockapi_errors = self._get_stockapi_capital_flow(
+            stock_code,
+            start_date=start_date,
+            end_date=end_date,
+            page_no=page_no,
+            page_size=page_size,
+        )
         if stockapi_flow:
             result["stock_flow"] = stockapi_flow
             result["source_chain"].append(f"capital_stock:{stockapi_source}")
@@ -1246,7 +1468,90 @@ class AkshareFundamentalAdapter:
             result["status"] = "failed"
         return result
 
-    def _get_stockapi_capital_flow(self, stock_code: str) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
+    def _get_tushare_capital_flow(
+        self,
+        stock_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
+        code = _normalize_code(stock_code)
+        if not re.fullmatch(r"\d{6}", code or ""):
+            return {}, None, [f"tushare_moneyflow:not_supported:{stock_code}"]
+
+        try:
+            explicit_start = _parse_stockapi_code_flow_date(start_date, "start_date")
+            explicit_end = _parse_stockapi_code_flow_date(end_date, "end_date")
+        except ValueError as exc:
+            return {}, None, [f"tushare_moneyflow:invalid_date:{exc}"]
+
+        latest_queryable_date = _latest_completed_weekday()
+        window_end = explicit_end or latest_queryable_date
+        if explicit_start is not None:
+            window_start = explicit_start
+        elif explicit_end is not None:
+            window_start = explicit_end - timedelta(days=20)
+        else:
+            window_start = latest_queryable_date - timedelta(days=20)
+        if window_start > window_end:
+            return {}, None, ["tushare_moneyflow:invalid_date:start_date_after_end_date"]
+
+        params = {
+            "ts_code": _to_tushare_ts_code(code),
+            "start_date": window_start.strftime("%Y%m%d"),
+            "end_date": window_end.strftime("%Y%m%d"),
+        }
+        fields = (
+            "ts_code,trade_date,buy_lg_amount,sell_lg_amount,"
+            "buy_elg_amount,sell_elg_amount,net_mf_amount"
+        )
+        try:
+            df = query_tushare_api("moneyflow", params=params, fields=fields, timeout=10)
+        except Exception as exc:
+            return {}, None, [f"tushare_moneyflow:{type(exc).__name__}:{exc}"]
+
+        if df is None or df.empty:
+            return {}, None, ["tushare_moneyflow:empty_data"]
+
+        normalized_by_date: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            trade_date = _safe_str(row.get("trade_date")).replace("-", "")[:8]
+            if len(trade_date) != 8:
+                continue
+            amount = _safe_float(row.get("net_mf_amount"))
+            if amount is None:
+                buy_lg = _safe_float(row.get("buy_lg_amount")) or 0.0
+                sell_lg = _safe_float(row.get("sell_lg_amount")) or 0.0
+                buy_elg = _safe_float(row.get("buy_elg_amount")) or 0.0
+                sell_elg = _safe_float(row.get("sell_elg_amount")) or 0.0
+                amount = (buy_lg + buy_elg) - (sell_lg + sell_elg)
+            if amount is None:
+                continue
+            normalized_by_date[
+                f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+            ] = float(amount) * 10000.0
+
+        normalized_rows = sorted(normalized_by_date.items(), key=lambda item: item[0])
+        if not normalized_rows:
+            return {}, None, ["tushare_moneyflow:no_main_amount"]
+
+        amounts = [item[1] for item in normalized_rows]
+        latest_date, latest_main = normalized_rows[-1]
+        return {
+            "main_net_inflow": latest_main,
+            "inflow_5d": float(sum(amounts[-5:])),
+            "inflow_10d": float(sum(amounts[-10:])),
+            "latest_date": latest_date,
+            "source_update": "tushare_moneyflow_after_market_close",
+        }, "tushare_moneyflow", []
+
+    def _get_stockapi_capital_flow(
+        self,
+        stock_code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page_no: int = 1,
+        page_size: int = 50,
+    ) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
         """
         Fetch historical stock capital flow from stockapi.com.cn.
 
@@ -1260,8 +1565,22 @@ class AkshareFundamentalAdapter:
 
         token = os.getenv("STOCKAPI_TOKEN", "").strip()
         latest_queryable_date = _stockapi_code_flow_completed_date()
-        windows: List[Tuple[datetime.date, datetime.date]] = []
-        if token:
+        normalized_page_no = _normalize_stockapi_page_value(page_no, default=1)
+        normalized_page_size = _normalize_stockapi_page_value(page_size, default=50)
+        windows: List[Tuple[date, date]] = []
+        try:
+            explicit_start = _parse_stockapi_code_flow_date(start_date, "start_date")
+            explicit_end = _parse_stockapi_code_flow_date(end_date, "end_date")
+        except ValueError as exc:
+            return {}, None, [f"stockapi_codeFlow:invalid_date:{exc}"]
+
+        if explicit_start is not None or explicit_end is not None:
+            window_end = explicit_end or latest_queryable_date
+            window_start = explicit_start or window_end
+            if window_start > window_end:
+                return {}, None, ["stockapi_codeFlow:invalid_date:start_date_after_end_date"]
+            windows.append((window_start, window_end))
+        elif token:
             window_end = latest_queryable_date
             lower_bound = latest_queryable_date - timedelta(days=90)
             while window_end >= lower_bound and len(windows) < 4:
@@ -1284,8 +1603,8 @@ class AkshareFundamentalAdapter:
                 "code": code,
                 "startDate": start_date.isoformat(),
                 "endDate": window_end.isoformat(),
-                "pageNo": "1",
-                "pageSize": "20",
+                "pageNo": str(normalized_page_no),
+                "pageSize": str(normalized_page_size),
             }
             if token:
                 params["token"] = token
