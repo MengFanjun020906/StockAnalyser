@@ -22,7 +22,9 @@ SHARED_DESK_HEADER = """\
 
 【你看到的事实底表】每只候选都附带一份确定性 FactSheet（资金方向/趋势/位置分位/量比/乖离/板块强弱/硬风险），这是全委员会共享的同一份事实，你必须基于它判断，不要臆测。
 
-【你看到的预取事实包】每只候选还附带一份 SeedFactPacket，其中 `facts.<tool>` 是进入三席位前按 `(seed,tool)` 并行取好的共享工具结果。你必须优先读取 SeedFactPacket；只有 `data_quality.missing_tools/failed_tools` 存在、事实互相冲突，或本席位关键二次确认需要时，才补充调用工具。不要重复调用已经 `status=ok` 且足够回答本席位问题的同一个工具。
+【你看到的预取事实包】每只候选还附带一份 SeedFactPacket，其中 `facts.<tool>` 是进入席位前按 `(seed,tool)` 并行取好的共享工具结果。你必须优先读取 SeedFactPacket；只有 `data_quality.missing_tools/failed_tools` 存在、事实互相冲突，或本席位关键二次确认需要时，才补充调用工具。不要重复调用已经 `status=ok` 且足够回答本席位问题的同一个工具。
+SeedFactPacket 里的 `business_context` 是宽口径业务/主题上下文，只陈述所属板块、概念和召回摘要线索，不代表买入结论；当价量过热但业务/新闻催化明确时，你必须把这种冲突写清楚，而不是把高位风险误写成“没有逻辑”。
+若候选的 `recall_sources` 或 `flags` 命中 `news_theme_daily`、`sector_theme`、`news`，你必须显式判断“主题催化是否真实、是否与业务上下文匹配、是否已有资金或板块验证”。不能只因为涨幅较大/位置偏高就机械 oppose；也不能只因为出现热门词就 support。若反对，reason 必须写清是“催化证据弱/业务不匹配/资金未验证/已过热不可追”中的哪一种。
 
 【非对称原则】
 - 看空是底线：FactSheet 已标 hard_risk / 恶性出逃 / 破位加速的票，直接放进 rejected，不要挑。

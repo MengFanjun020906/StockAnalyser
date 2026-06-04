@@ -21,6 +21,10 @@ from src.agent.candidate_experts_v2.experts.quality_repair_desk import (
     QUALITY_REPAIR_DESK_TOOLS,
     QualityRepairDeskExpert,
 )
+from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import (
+    THEME_CATALYST_DESK_TOOLS,
+    ThemeCatalystDeskExpert,
+)
 
 __all__ = [
     "BaseExpert",
@@ -35,4 +39,6 @@ __all__ = [
     "MOMENTUM_DESK_TOOLS",
     "QualityRepairDeskExpert",
     "QUALITY_REPAIR_DESK_TOOLS",
+    "ThemeCatalystDeskExpert",
+    "THEME_CATALYST_DESK_TOOLS",
 ]

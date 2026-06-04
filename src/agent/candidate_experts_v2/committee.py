@@ -10,7 +10,7 @@ Both modes return a payload structurally compatible with the deterministic
 untouched.
 
 ``run_committee_discovery`` (llm_expert_committee mode) delegates to
-``run_thesis_desk_committee`` (P4 three-desk pipeline: recall → desks →
+``run_thesis_desk_committee`` (P4 thesis-desk pipeline: recall → desks →
 aggregate → allocate_slots) and preserves the legacy payload shape.
 
 Seed pool construction (four sources, deterministic, runs before any LLM call):
@@ -68,32 +68,26 @@ SEED_SOURCE_CAPS: Dict[str, int] = {
     "limit_up_pool": 10,
     "hot_rank": 8,
     "sector_theme": 6,
-    "event_impact": 6,
-    "news_momentum": 6,
+    "news_theme_daily": 8,
     "capital_flow_anomaly": 8,
-    "northbound_stock_connect": 6,
     "margin_financing": 6,
     "block_trade": 6,
     "dragon_tiger": 6,
     "valuation_liquidity": 6,
     "alphasift": 10,
     "sequoia": 8,
-    "fundamental_snapshot": 8,
     "low_base_structure": 8,
     "fallback": 4,
 }
 SEED_SOURCE_ORDER = [
     "user_watchlist",
     "daily_screener",
-    "fundamental_snapshot",
     "low_base_structure",
     "limit_up_pool",
     "hot_rank",
     "sector_theme",
-    "event_impact",
-    "news_momentum",
+    "news_theme_daily",
     "capital_flow_anomaly",
-    "northbound_stock_connect",
     "margin_financing",
     "block_trade",
     "dragon_tiger",
@@ -152,6 +146,13 @@ def _safe_float(value: Any) -> Optional[float]:
         return parsed if math.isfinite(parsed) else None
     except Exception:
         return None
+
+
+def _format_stockapi_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
 
 
 def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[str, Any]:
@@ -499,70 +500,6 @@ def _capital_flow_seed_from_item(
     )
 
 
-def _northbound_seed_from_item(
-    item: Dict[str, Any],
-    *,
-    market: str,
-    rank: int,
-    freshness: str,
-) -> Optional[SeedItem]:
-    code = str(item.get("code") or _ts_code_to_symbol(item.get("ts_code")) or "").strip()
-    if not code:
-        return None
-    net_amount = _safe_float(item.get("net_amount"))
-    amount = _safe_float(item.get("amount"))
-    if amount is None and net_amount is None:
-        return None
-    if abs(net_amount or 0.0) < 20_000_000 and (amount or 0.0) < 100_000_000:
-        return None
-    direction = "净买入" if (net_amount or 0.0) >= 0 else "净卖出"
-    signals = [
-        _build_signal(
-            dimension="capital",
-            signal_type="northbound_stock_connect_net_amount",
-            value=round(net_amount or 0.0, 2),
-            threshold=20_000_000,
-            deviation=round((net_amount or 0.0) / 100_000_000, 3),
-            label=f"陆股通{direction}",
-        )
-    ]
-    if amount is not None:
-        signals.append(
-            _build_signal(
-                dimension="attention",
-                signal_type="northbound_stock_connect_turnover",
-                value=round(amount, 2),
-                threshold=100_000_000,
-                deviation=round(amount / 100_000_000, 3),
-                label="陆股通成交额",
-            )
-        )
-    score = 63.0 + min(16.0, abs(net_amount or 0.0) / 100_000_000 * 4.0)
-    score += min(10.0, (amount or 0.0) / 500_000_000 * 4.0)
-    score += max(0.0, 6.0 - rank * 0.35)
-    return SeedItem(
-        code=code,
-        name=str(item.get("name") or code),
-        market=market,
-        source="northbound_stock_connect",
-        hint=f"陆股通{direction}，rank={item.get('rank') or rank}",
-        trigger_signals=signals,
-        priority_score=round(min(100.0, score), 2),
-        freshness=freshness,
-        context_hint="陆股通十大成交股种子源，只代表北向/互联互通成交活跃，后续需结合行业和价格位置核验。",
-        extras={
-            "metrics": {
-                "rank": rank,
-                "market_type": item.get("market_type"),
-                "amount": amount,
-                "net_amount": net_amount,
-                "buy": _safe_float(item.get("buy")),
-                "sell": _safe_float(item.get("sell")),
-            }
-        },
-    )
-
-
 def _margin_financing_seed_from_item(
     item: Dict[str, Any],
     *,
@@ -831,6 +768,229 @@ def _ts_code_to_symbol(value: Any) -> str:
     return text.split(".")[0].strip()
 
 
+def _sector_theme_seed_from_item(
+    item: Dict[str, Any],
+    *,
+    market: str,
+    rank: int,
+    freshness: str,
+    source_label: str,
+) -> Optional[SeedItem]:
+    code = str(item.get("code") or _ts_code_to_symbol(item.get("ts_code")) or "").strip()
+    name = str(item.get("name") or code).strip()
+    bk_code = str(item.get("bk_code") or item.get("bkCode") or "").strip()
+    bk_name = str(item.get("bk_name") or item.get("bkName") or item.get("plate_name") or "").strip()
+    if not code and not bk_code:
+        return None
+    net_inflow = _safe_float(item.get("net_inflow") or item.get("main_net_inflow"))
+    strength = _safe_float(item.get("strength"))
+    inflow_days = _safe_float(item.get("inflow_days"))
+    change_pct = _safe_float(item.get("change_ratio") or item.get("return_pct"))
+    signals = [
+        _build_signal(
+            dimension="sector_theme",
+            signal_type=source_label,
+            value=bk_name or bk_code or "sector_theme",
+            threshold="hot_sector",
+            deviation=rank,
+            label="热点板块/主题",
+        )
+    ]
+    if net_inflow is not None:
+        signals.append(
+            _build_signal(
+                dimension="capital",
+                signal_type=f"{source_label}_net_inflow",
+                value=round(net_inflow, 2),
+                threshold=0,
+                deviation=round(net_inflow / 100_000_000, 3),
+                label="板块/龙头资金净流入",
+            )
+        )
+    score = 64.0 + max(0.0, 8.0 - rank * 0.4)
+    if strength is not None:
+        score += min(14.0, max(0.0, strength) * 0.12)
+    if net_inflow is not None:
+        score += min(10.0, max(0.0, net_inflow) / 100_000_000 * 0.8)
+    if change_pct is not None:
+        score += min(6.0, max(0.0, change_pct) * 0.6)
+    if code:
+        hint = f"{bk_name or bk_code} 龙头股，rank={rank}"
+        context_hint = "StockAPI 热点板块龙头股种子源，用于补充 sector_theme 直接个股候选。"
+    else:
+        code = f"SECTOR:{bk_code or bk_name}"
+        name = bk_name or bk_code
+        hint = f"热点板块 {name}，rank={rank}"
+        context_hint = "StockAPI 热点板块种子源，只代表板块强度；后续需要从龙头股或成分股展开到个股。"
+    return SeedItem(
+        code=code,
+        name=name or code,
+        market=market,
+        source="sector_theme",
+        hint=hint,
+        trigger_signals=signals,
+        priority_score=round(min(100.0, score), 2),
+        freshness=freshness,
+        context_hint=context_hint,
+        extras={
+            "metrics": {
+                "rank": rank,
+                "bk_code": bk_code,
+                "bk_name": bk_name,
+                "net_inflow": net_inflow,
+                "strength": strength,
+                "inflow_days": inflow_days,
+                "change_ratio": change_pct,
+                "source_label": source_label,
+            }
+        },
+    )
+
+
+def _stockapi_event_seed_from_item(
+    item: Dict[str, Any],
+    *,
+    market: str,
+    rank: int,
+    freshness: str,
+    source: str,
+) -> Optional[SeedItem]:
+    code = str(item.get("code") or "").strip()
+    if not code:
+        return None
+    event_name = str(item.get("event_name") or item.get("typeName") or "异动").strip()
+    info = str(item.get("info") or "").strip()
+    event_type = str(item.get("event_type") or item.get("type") or "").strip()
+    if not event_name and not info:
+        return None
+    signal_type = "stockapi_news_momentum" if source == "news_momentum" else "stockapi_event_impact"
+    score = 62.0 + max(0.0, 8.0 - rank * 0.08)
+    if "封涨停" in event_name or "涨停" in event_name:
+        score += 10.0
+    elif "火箭" in event_name or "大笔买入" in event_name:
+        score += 7.0
+    elif "新高" in event_name:
+        score += 5.0
+    return SeedItem(
+        code=code,
+        name=str(item.get("name") or code),
+        market=market,
+        source=source,
+        hint=f"{event_name} {info}".strip(),
+        trigger_signals=[
+            _build_signal(
+                dimension="news_event",
+                signal_type=signal_type,
+                value={"event_type": event_type, "event_name": event_name, "info": info},
+                threshold="intraday_change",
+                deviation=rank,
+                label=event_name or "异动事件",
+            )
+        ],
+        priority_score=round(min(100.0, score), 2),
+        freshness=freshness,
+        context_hint="StockAPI 全量异动历史种子源，只代表盘中事件/消息动量，后续必须核验价格结构、资金和风险。",
+        extras={
+            "metrics": {
+                "rank": rank,
+                "event_type": event_type,
+                "event_name": event_name,
+                "info": info,
+                "time": item.get("time"),
+            }
+        },
+    )
+
+
+def _news_theme_daily_seed_from_item(
+    item: Dict[str, Any],
+    *,
+    market: str,
+    rank: int,
+    freshness: str,
+    theme: Dict[str, Any],
+    article: Dict[str, Any],
+) -> Optional[SeedItem]:
+    code = str(item.get("code") or "").strip()
+    if not code:
+        return None
+    name = str(item.get("name") or code).strip()
+    theme_name = str(theme.get("theme") or "").strip()
+    polarity = str(theme.get("polarity") or "neutral").strip().lower()
+    if polarity in {"negative", "deny_or_clarification"}:
+        return None
+    title = str(article.get("title") or "东方财富财经早餐").strip()
+    link = str(article.get("link") or "").strip()
+    evidence = str(theme.get("evidence") or "").strip()
+    keywords = [
+        str(keyword).strip()
+        for keyword in (theme.get("keywords") or [])
+        if str(keyword).strip()
+    ]
+    related_boards = [
+        str(board).strip()
+        for board in (theme.get("related_boards") or [])
+        if str(board).strip()
+    ]
+    high_impact_terms = [
+        str(term).strip()
+        for term in (theme.get("high_impact_terms") or [])
+        if str(term).strip()
+    ]
+    hint_theme = theme_name or "财经早餐"
+    score = 66.0 + max(0.0, 8.0 - rank * 0.5)
+    if polarity == "positive":
+        score += 8.0
+    elif polarity == "mixed":
+        score += 3.0
+    signals = [
+        _build_signal(
+            dimension="news_event",
+            signal_type="eastmoney_cjzc_daily_concept_mapping",
+            value={
+                "theme": theme_name,
+                "polarity": polarity,
+                "directness": "concept_board",
+                "keywords": keywords,
+                "high_impact_terms": high_impact_terms,
+                "related_boards": related_boards,
+                "title": title,
+                "link": link,
+            },
+            threshold="pre_market_daily",
+            deviation=rank,
+            label="盘前日报概念映射",
+        )
+    ]
+    return SeedItem(
+        code=code,
+        name=name,
+        market=market,
+        source="news_theme_daily",
+        hint=f"{hint_theme} 盘前日报概念映射: {name}",
+        trigger_signals=signals,
+        priority_score=round(min(100.0, score), 2),
+        freshness=freshness,
+        context_hint="东方财富财经早餐盘前主题种子源；仅代表日报主题与本地概念成分映射，后续必须核验业务相关性、价格结构和风险。",
+        extras={
+            "metrics": {
+                "rank": rank,
+                "theme": theme_name,
+                "polarity": polarity,
+                "directness": "concept_board",
+                "evidence_section": "财经早餐",
+                "matched_keywords": keywords,
+                "high_impact_terms": high_impact_terms,
+                "related_boards": related_boards,
+                "source_url": link,
+                "evidence": evidence[:240],
+                "source_title": title,
+                "mapping_role": item.get("role"),
+            }
+        },
+    )
+
+
 def _passes_hard_exclusion(seed: SeedItem) -> Tuple[bool, str]:
     code = str(seed.code or "").strip()
     if not re.fullmatch(r"\d{6}", code):
@@ -854,23 +1014,102 @@ def _assemble_seed_pool(
     total_limit: int,
     limit_per_source: int,
 ) -> List[SeedItem]:
+    """Assemble the final seed pool with source diversity.
+
+    User-provided watchlist symbols keep first priority.  Other usable sources
+    receive a quota from the remaining total limit, then any remainder is
+    assigned by source order and unfilled quota is redistributed.  This keeps
+    the final 20-stock pool close to evenly sampled across live sources instead
+    of letting early local buckets consume every slot.
+    """
+
     result_pool: List[SeedItem] = []
     seen_codes: Dict[str, bool] = {}
+
+    ordered_by_source: Dict[str, List[SeedItem]] = {}
+    caps: Dict[str, int] = {}
+    taken_by_source: Dict[str, int] = {}
+    cursors: Dict[str, int] = {}
+
     for source in SEED_SOURCE_ORDER:
         cap = max(0, min(SEED_SOURCE_CAPS.get(source, limit_per_source), total_limit))
-        ordered = sorted(
+        caps[source] = cap
+        taken_by_source[source] = 0
+        cursors[source] = 0
+        ordered_by_source[source] = sorted(
             seeds_by_source.get(source, []),
             key=lambda item: (-_safe_float(item.priority_score or 0.0) or 0.0, str(item.code or "")),
         )
-        for item in ordered[:cap]:
+
+    def _take_next_unique(source: str) -> Optional[SeedItem]:
+        ordered = ordered_by_source.get(source, [])
+        while cursors.get(source, 0) < len(ordered):
+            idx = cursors.get(source, 0)
+            cursors[source] = idx + 1
+            item = ordered[idx]
             code = str(item.code or "").strip()
             if not code or code in seen_codes:
                 continue
             seen_codes[code] = True
+            taken_by_source[source] = taken_by_source.get(source, 0) + 1
+            return item
+        return None
+
+    def _has_next_unique(source: str) -> bool:
+        ordered = ordered_by_source.get(source, [])
+        for item in ordered[cursors.get(source, 0) :]:
+            code = str(item.code or "").strip()
+            if code and code not in seen_codes:
+                return True
+        return False
+
+    for source in ("user_watchlist",):
+        while len(result_pool) < total_limit and taken_by_source.get(source, 0) < caps.get(source, 0):
+            item = _take_next_unique(source)
+            if item is None:
+                break
             result_pool.append(item)
+
+    quota_sources = [source for source in SEED_SOURCE_ORDER if source != "user_watchlist"]
+    while len(result_pool) < total_limit:
+        active_sources = [
+            source
+            for source in quota_sources
+            if taken_by_source.get(source, 0) < caps.get(source, 0) and _has_next_unique(source)
+        ]
+        if not active_sources:
+            break
+
+        remaining_slots = total_limit - len(result_pool)
+        base_quota = remaining_slots // len(active_sources)
+        remainder = remaining_slots % len(active_sources)
+        target_additions: Dict[str, int] = {}
+        for index, source in enumerate(active_sources):
+            if base_quota <= 0:
+                target = 1 if index < remaining_slots else 0
+            else:
+                target = base_quota + (1 if index < remainder else 0)
+            capacity = max(0, caps.get(source, 0) - taken_by_source.get(source, 0))
+            target_additions[source] = min(target, capacity)
+
+        progressed = False
+        max_target = max(target_additions.values(), default=0)
+        for pass_index in range(max_target):
+            for source in active_sources:
+                if len(result_pool) >= total_limit:
+                    break
+                if pass_index >= target_additions.get(source, 0):
+                    continue
+                item = _take_next_unique(source)
+                if item is None:
+                    continue
+                result_pool.append(item)
+                progressed = True
             if len(result_pool) >= total_limit:
                 break
-        if len(result_pool) >= total_limit:
+        if not progressed:
+            if len(result_pool) >= total_limit:
+                break
             break
     return result_pool
 
@@ -898,7 +1137,11 @@ def _seed_log_preview(seeds: Sequence[SeedItem], *, limit: int = 12) -> List[Dic
             {
                 "code": seed.code,
                 "source": seed.source,
-                "score": seed.priority_score,
+                "source_diagnostics": {
+                    "priority_score": seed.priority_score,
+                    "score_kind": "seed_recall_priority",
+                    "note": "source-local recall diagnostic only; not comparable across seed sources",
+                },
                 "freshness": seed.freshness,
                 "signals": [
                     str(signal.get("signal_type") or "")
@@ -1128,49 +1371,6 @@ def _build_seed_pool_result(
             _log_seed_source_diagnostic(diagnostic)
             source_quality[source_key] = _source_quality("failed", freshness=trade_date or "latest_trade_date", error=message)
 
-    # --- Source 3b: Stock Connect top traded stocks ---
-    try:
-        result = _safe_tool_call(
-            tool_registry,
-            "get_tushare_hsgt_top10",
-            trade_date=trade_date,
-            stock_code="",
-            limit=limit_per_source,
-        )
-        items = _extract_payload_items(result)
-        accepted = 0
-        for rank, item in enumerate(items, start=1):
-            if not isinstance(item, dict):
-                continue
-            seed = _northbound_seed_from_item(
-                item,
-                market=market,
-                rank=rank,
-                freshness=str(result.get("trade_date") or trade_date or "latest_trade_date"),
-            )
-            if seed is None:
-                continue
-            _collect(seed)
-            accepted += 1
-        status = str(result.get("status") or ("ok" if items else "empty")).lower()
-        diagnostic = _source_diagnostic(
-            "northbound_stock_connect",
-            status,
-            count=accepted,
-            error=str(result.get("error") or ""),
-            detail={"trade_date": result.get("trade_date") or trade_date, "raw_count": len(items)},
-        )
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["northbound_stock_connect"] = _source_quality(status, freshness=str(result.get("trade_date") or trade_date or "latest_trade_date"), error=str(result.get("error") or ""))
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {exc}"
-        logger.debug("seed pool: northbound_stock_connect failed: %s", exc)
-        diagnostic = _source_diagnostic("northbound_stock_connect", "failed", error=message, detail={"trade_date": trade_date})
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["northbound_stock_connect"] = _source_quality("failed", freshness=trade_date or "latest_trade_date", error=message)
-
     # --- Source 3c: margin financing detail ---
     try:
         result = _safe_tool_call(
@@ -1393,11 +1593,11 @@ def _build_seed_pool_result(
         _log_seed_source_diagnostic(diagnostic)
         source_quality["limit_up_pool"] = _source_quality("failed", freshness=trade_date or "latest_trade_date", error=message)
 
-    # --- Source 3: hot-rank ---
+    # --- Source 3: hot-rank via StockAPI popularity rank ---
     try:
         result = _safe_tool_call(
-            tool_registry, "get_tushare_hot_rank",
-            source="ths", trade_date=trade_date, limit=limit_per_source,
+            tool_registry, "get_stockapi_popularity_rank",
+            limit=limit_per_source,
         )
         items = _extract_payload_items(result)
         for item in items:
@@ -1424,21 +1624,217 @@ def _build_seed_pool_result(
                     )
                 ],
                 priority_score=72.0 + max(0.0, min(20.0, (limit_per_source - (_safe_float(rank) or limit_per_source)) * 1.2)),
-                freshness=trade_date or "latest_trade_date",
+                freshness=str(result.get("date") or "stockapi_latest"),
                 context_hint="热榜在线来源，只代表关注度异常，不直接代表方向。",
             ))
         status = str(result.get("status") or ("ok" if items else "empty")).lower()
-        diagnostic = _source_diagnostic("hot_rank", status, count=len(items), detail={"trade_date": trade_date})
+        diagnostic = _source_diagnostic(
+            "hot_rank",
+            status,
+            count=len(items),
+            error="; ".join(str(err) for err in (result.get("errors") or []) if err) if isinstance(result.get("errors"), list) else str(result.get("error") or ""),
+            detail={"provider": "stockapi:renQi"},
+        )
         diagnostics.append(diagnostic)
         _log_seed_source_diagnostic(diagnostic)
-        source_quality["hot_rank"] = _source_quality(status, freshness=trade_date or "latest_trade_date", error=str(result.get("error") or ""))
+        source_quality["hot_rank"] = _source_quality(status, freshness=str(result.get("date") or "stockapi_latest"), error=str(result.get("error") or ""))
     except Exception as exc:
         logger.debug("seed pool: hot_rank failed: %s", exc)
         message = f"{type(exc).__name__}: {exc}"
-        diagnostic = _source_diagnostic("hot_rank", "failed", error=message, detail={"trade_date": trade_date})
+        diagnostic = _source_diagnostic("hot_rank", "failed", error=message, detail={"provider": "stockapi:renQi"})
         diagnostics.append(diagnostic)
         _log_seed_source_diagnostic(diagnostic)
-        source_quality["hot_rank"] = _source_quality("failed", freshness=trade_date or "latest_trade_date", error=message)
+        source_quality["hot_rank"] = _source_quality("failed", freshness="stockapi_latest", error=message)
+
+    # --- Source 3f: StockAPI sector-theme seeds ---
+    try:
+        stockapi_date = _format_stockapi_date(trade_date)
+        sectors_result = _safe_tool_call(
+            tool_registry,
+            "get_stockapi_hot_sectors",
+            date=stockapi_date,
+            limit=max(3, min(limit_per_source, 10)),
+        )
+        leaders_result = _safe_tool_call(
+            tool_registry,
+            "get_stockapi_hot_sector_leaders",
+            date=stockapi_date,
+            limit=limit_per_source,
+        )
+        leaders = _extract_payload_items(leaders_result)
+        accepted = 0
+        for rank, item in enumerate(leaders, start=1):
+            if not isinstance(item, dict):
+                continue
+            seed = _sector_theme_seed_from_item(
+                item,
+                market=market,
+                rank=rank,
+                freshness=str(leaders_result.get("date") or stockapi_date),
+                source_label="stockapi_hot_sector_leader",
+            )
+            if seed is None:
+                continue
+            _collect(seed)
+            accepted += 1
+
+        # If the direct leader endpoint is unavailable, expand the top sectors
+        # through existing StockAPI bkList constituents and keep the leading
+        # constituents as sector_theme seeds.
+        if accepted == 0:
+            sectors = sectors_result.get("sectors") if isinstance(sectors_result.get("sectors"), list) else []
+            for sector_rank, sector in enumerate(sectors[:3], start=1):
+                if not isinstance(sector, dict):
+                    continue
+                bk_code = str(sector.get("bk_code") or "").strip()
+                if not bk_code:
+                    continue
+                constituent_result = _safe_tool_call(
+                    tool_registry,
+                    "get_stockapi_sector_constituents",
+                    bk_code=bk_code,
+                    page_no=1,
+                    page_size=max(3, min(limit_per_source, 10)),
+                )
+                for item in _extract_payload_items(constituent_result)[: max(1, limit_per_source - accepted)]:
+                    if not isinstance(item, dict):
+                        continue
+                    merged_item = {
+                        **item,
+                        "bk_code": bk_code,
+                        "bk_name": sector.get("bk_name"),
+                        "net_inflow": item.get("main_net_inflow") or sector.get("net_inflow"),
+                        "strength": sector.get("strength"),
+                    }
+                    seed = _sector_theme_seed_from_item(
+                        merged_item,
+                        market=market,
+                        rank=accepted + sector_rank,
+                        freshness=str(sectors_result.get("date") or stockapi_date),
+                        source_label="stockapi_hot_sector_constituent",
+                    )
+                    if seed is None:
+                        continue
+                    _collect(seed)
+                    accepted += 1
+                    if accepted >= limit_per_source:
+                        break
+                if accepted >= limit_per_source:
+                    break
+
+        status = "ok" if accepted else str(leaders_result.get("status") or sectors_result.get("status") or "empty").lower()
+        error = "; ".join(
+            str(err)
+            for err in [
+                *((leaders_result.get("errors") or []) if isinstance(leaders_result.get("errors"), list) else []),
+                *((sectors_result.get("errors") or []) if isinstance(sectors_result.get("errors"), list) else []),
+            ]
+            if err
+        )
+        diagnostic = _source_diagnostic(
+            "sector_theme",
+            status,
+            count=accepted,
+            error=error,
+            detail={
+                "date": stockapi_date,
+                "sector_count": len(sectors_result.get("sectors") or []) if isinstance(sectors_result.get("sectors"), list) else 0,
+                "leader_raw_count": len(leaders),
+            },
+        )
+        diagnostics.append(diagnostic)
+        _log_seed_source_diagnostic(diagnostic)
+        source_quality["sector_theme"] = _source_quality(status, freshness=stockapi_date, error=error)
+    except Exception as exc:
+        logger.debug("seed pool: sector_theme failed: %s", exc)
+        message = f"{type(exc).__name__}: {exc}"
+        diagnostic = _source_diagnostic("sector_theme", "failed", error=message, detail={"trade_date": trade_date})
+        diagnostics.append(diagnostic)
+        _log_seed_source_diagnostic(diagnostic)
+        source_quality["sector_theme"] = _source_quality("failed", freshness=trade_date or "latest_trade_date", error=message)
+
+    # --- Source 3f: Eastmoney pre-market daily news themes ---
+    try:
+        target_date = _format_stockapi_date(today or trade_date)
+        result = _safe_tool_call(
+            tool_registry,
+            "get_eastmoney_cjzc_daily",
+            target_date=target_date,
+            allow_previous=False,
+        )
+        requested_target_date = str(result.get("requested_target_date") or target_date)
+        effective_target_date = str(result.get("target_date") or result.get("trade_date") or target_date)
+        themes = result.get("themes") if isinstance(result.get("themes"), list) else []
+        accepted = 0
+        rank = 0
+        for theme in themes:
+            if not isinstance(theme, dict):
+                continue
+            polarity = str(theme.get("polarity") or "").lower()
+            if polarity in {"negative", "deny_or_clarification"}:
+                continue
+            mapped_stocks = theme.get("mapped_stocks") if isinstance(theme.get("mapped_stocks"), list) else []
+            per_theme = 0
+            for item in mapped_stocks:
+                if not isinstance(item, dict):
+                    continue
+                rank += 1
+                seed = _news_theme_daily_seed_from_item(
+                    item,
+                    market=market,
+                    rank=rank,
+                    freshness=str(result.get("matched_publish_date") or effective_target_date),
+                    theme=theme,
+                    article=result,
+                )
+                if seed is None:
+                    continue
+                _collect(seed)
+                accepted += 1
+                per_theme += 1
+                if accepted >= limit_per_source or per_theme >= 2:
+                    break
+            if accepted >= limit_per_source:
+                break
+        status = "ok" if accepted else str(result.get("status") or ("partial" if themes else "empty")).lower()
+        error = "; ".join(str(err) for err in (result.get("errors") or []) if err) if isinstance(result.get("errors"), list) else str(result.get("error") or "")
+        diagnostic = _source_diagnostic(
+            "news_theme_daily",
+            status,
+            count=accepted,
+            error=error,
+            detail={
+                "requested_target_date": requested_target_date,
+                "target_date": effective_target_date,
+                "target_date_rule": result.get("target_date_rule"),
+                "matched_publish_date": result.get("matched_publish_date"),
+                "theme_count": len(themes),
+                "mapped_stock_count": sum(
+                    len(theme.get("mapped_stocks") or [])
+                    for theme in themes
+                    if isinstance(theme, dict) and isinstance(theme.get("mapped_stocks"), list)
+                ),
+                "company_event_count": len(result.get("company_events") or []) if isinstance(result.get("company_events"), list) else 0,
+                "session": result.get("session"),
+                "link": result.get("link"),
+                "article_fetch_status": result.get("article_fetch_status"),
+                "article_text_length": result.get("article_text_length"),
+            },
+        )
+        diagnostics.append(diagnostic)
+        _log_seed_source_diagnostic(diagnostic)
+        source_quality["news_theme_daily"] = _source_quality(
+            status,
+            freshness=str(result.get("matched_publish_date") or effective_target_date),
+            error=error,
+        )
+    except Exception as exc:
+        logger.debug("seed pool: news_theme_daily failed: %s", exc)
+        message = f"{type(exc).__name__}: {exc}"
+        diagnostic = _source_diagnostic("news_theme_daily", "failed", error=message, detail={"trade_date": trade_date})
+        diagnostics.append(diagnostic)
+        _log_seed_source_diagnostic(diagnostic)
+        source_quality["news_theme_daily"] = _source_quality("failed", freshness=trade_date or "latest_trade_date", error=message)
 
     # --- Source 4a: AlphaSift ---
     try:
@@ -1514,90 +1910,7 @@ def _build_seed_pool_result(
         _log_seed_source_diagnostic(diagnostic)
         source_quality["sequoia"] = _source_quality("failed", error=message)
 
-    # --- Source 5a: fundamental low-base seeds ---
-    try:
-        from src.agent.candidate_providers.fundamental_provider import FundamentalCandidateProvider
-
-        fundamental_result = FundamentalCandidateProvider().discover(limit=limit_per_source)
-        fundamental_candidates = fundamental_result.get("candidates") or []
-        accepted_count = 0
-        for cand in fundamental_candidates:
-            if not isinstance(cand, dict):
-                continue
-            code = str(cand.get("code") or "").strip()
-            if not code:
-                continue
-            metrics = cand.get("metrics") if isinstance(cand.get("metrics"), dict) else {}
-            pe_ttm = metrics.get("pe_ttm")
-            pb = metrics.get("pb")
-            revenue_growth = metrics.get("revenue_growth")
-            profit_growth = metrics.get("profit_growth")
-            quality_score = metrics.get("quality_score")
-            value_score = metrics.get("value_score")
-            if (
-                (_safe_float(revenue_growth) or 0.0) <= 0
-                and (_safe_float(profit_growth) or 0.0) <= 0
-            ):
-                continue
-            if (_safe_float(pe_ttm) or 999.0) > 60.0 and (_safe_float(pb) or 999.0) > 8.0:
-                continue
-            hint_parts = []
-            if _safe_float(revenue_growth) is not None:
-                hint_parts.append(f"营收增速={_safe_float(revenue_growth):.1f}%")
-            if _safe_float(profit_growth) is not None:
-                hint_parts.append(f"利润增速={_safe_float(profit_growth):.1f}%")
-            if _safe_float(quality_score) is not None:
-                hint_parts.append(f"质量分={_safe_float(quality_score):.1f}")
-            if _safe_float(value_score) is not None:
-                hint_parts.append(f"价值分={_safe_float(value_score):.1f}")
-            _collect(
-                SeedItem(
-                    code=code,
-                    name=str(cand.get("name") or code),
-                    market=market,
-                    source="fundamental_snapshot",
-                    hint="；".join(hint_parts) or "成长改善但估值未明显扩张",
-                    trigger_signals=[
-                        _build_signal(
-                            dimension="fundamental",
-                            signal_type="growth_quality_value",
-                            value={
-                                "revenue_growth": revenue_growth,
-                                "profit_growth": profit_growth,
-                                "pe_ttm": pe_ttm,
-                                "pb": pb,
-                            },
-                            threshold={"growth": ">0", "valuation": "pe<=60 or pb<=8"},
-                            label="基本面改善",
-                        )
-                    ],
-                    priority_score=_safe_float(cand.get("signal_score")) or _safe_float(cand.get("screen_score")) or 68.0,
-                    freshness=str(fundamental_result.get("updated_at") or fundamental_result.get("latest_period") or "snapshot"),
-                    context_hint="本地预计算基本面快照命中，适合作为低位/修复候选补充。",
-                    extras={"metrics": metrics, "latest_period": fundamental_result.get("latest_period")},
-                )
-            )
-            accepted_count += 1
-        status = str(fundamental_result.get("status") or ("ok" if fundamental_candidates else "empty")).lower()
-        diagnostic = _source_diagnostic(
-            "fundamental_snapshot",
-            status,
-            count=accepted_count,
-            error=str(fundamental_result.get("error") or ""),
-            detail={"latest_period": fundamental_result.get("latest_period"), "updated_at": fundamental_result.get("updated_at")},
-        )
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["fundamental_snapshot"] = _source_quality(status, freshness=str(fundamental_result.get("updated_at") or fundamental_result.get("latest_period") or "snapshot"), error=str(fundamental_result.get("error") or ""))
-    except Exception as exc:
-        logger.debug("seed pool: fundamental_snapshot failed: %s", exc)
-        message = f"{type(exc).__name__}: {exc}"
-        diagnostic = _source_diagnostic("fundamental_snapshot", "failed", error=message)
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["fundamental_snapshot"] = _source_quality("failed", error=message)
-
-    # --- Source 5b: low-base structure seeds from shared daily DB ---
+    # --- Source 5: low-base structure seeds from shared daily DB ---
     try:
         structure_candidates = _build_low_base_structure_seeds(limit=limit_per_source)
         for seed in structure_candidates:
@@ -1615,9 +1928,9 @@ def _build_seed_pool_result(
         source_quality["low_base_structure"] = _source_quality("failed", error=message)
 
     # --- Source 6: deterministic auto candidates as richness supplement ---
-    # This reuses the broader existing L1 discovery stack (event/news/sector where
-    # available) as an online supplement, but keeps source caps and hard filters
-    # in this committee seed builder.
+    # This reuses the broader existing L1 discovery stack as a best-effort sector
+    # supplement, but event/news/fundamental buckets are intentionally not admitted
+    # into this committee seed builder because their historical precision was low.
     try:
         result = _safe_tool_call(
             tool_registry,
@@ -1628,20 +1941,14 @@ def _build_seed_pool_result(
             candidate_source="auto",
         )
         auto_candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+        auto_steps = result.get("discovery_steps") if isinstance(result.get("discovery_steps"), list) else []
+        auto_bucket_counts = {"sector_theme": 0}
         supplement_count = 0
         for cand in auto_candidates:
             if not isinstance(cand, dict):
                 continue
             raw_source = str(cand.get("source") or cand.get("candidate_source") or "").strip()
-            if raw_source.startswith("event_impact"):
-                source = "event_impact"
-                default_dimension = "news_event"
-                signal_type = "event_impact"
-            elif raw_source.startswith("news_momentum"):
-                source = "news_momentum"
-                default_dimension = "news_event"
-                signal_type = "news_momentum"
-            elif raw_source.startswith("sector"):
+            if raw_source.startswith("sector"):
                 source = "sector_theme"
                 default_dimension = "sector_theme"
                 signal_type = "sector_theme"
@@ -1668,6 +1975,7 @@ def _build_seed_pool_result(
                 continue
             seed.extras["supplement_source"] = raw_source
             _collect(seed)
+            auto_bucket_counts[source] = auto_bucket_counts.get(source, 0) + 1
             supplement_count += 1
         status = str(result.get("status") or ("ok" if auto_candidates else "empty")).lower()
         diagnostic = _source_diagnostic(
@@ -1683,6 +1991,39 @@ def _build_seed_pool_result(
             freshness="online_or_cached",
             error=str(result.get("error") or ""),
         )
+        for bucket in ("sector_theme",):
+            if bucket in source_quality:
+                continue
+            bucket_steps: List[Dict[str, Any]] = []
+            for step in auto_steps:
+                if not isinstance(step, dict):
+                    continue
+                step_source = str(step.get("source") or "")
+                if bucket == "sector_theme" and step_source in {"get_sector_rankings", "sector_constituents"}:
+                    bucket_steps.append(step)
+                elif step_source == bucket:
+                    bucket_steps.append(step)
+            bucket_count = int(auto_bucket_counts.get(bucket, 0))
+            step_statuses = [str(step.get("status") or "").lower() for step in bucket_steps]
+            if bucket_count > 0:
+                bucket_status = "ok"
+            elif any(status == "failed" for status in step_statuses):
+                bucket_status = "failed"
+            elif any(status in {"partial", "timeout"} for status in step_statuses):
+                bucket_status = "partial"
+            else:
+                bucket_status = "empty"
+            bucket_error = "; ".join(str(step.get("error") or "") for step in bucket_steps if step.get("error"))
+            diagnostic = _source_diagnostic(
+                bucket,
+                bucket_status,
+                count=bucket_count,
+                error=bucket_error,
+                detail={"via": "discover_watchlist_candidates_auto", "step_count": len(bucket_steps)},
+            )
+            diagnostics.append(diagnostic)
+            _log_seed_source_diagnostic(diagnostic)
+            source_quality[bucket] = _source_quality(bucket_status, freshness="online_or_cached", error=bucket_error)
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         logger.debug("seed pool: discover_watchlist_candidates_auto failed: %s", exc)
@@ -2542,6 +2883,17 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
             "detail": detail,
         })
     recall_sources = seed.extras.get("recall_sources") if isinstance(seed.extras, dict) else None
+    metrics = dict(seed.extras.get("metrics", {}) if isinstance(seed.extras, dict) else {})
+    source_diagnostics = dict(metrics.get("source_diagnostics") or {})
+    source_diagnostics.update({
+        "source": seed.source,
+        "priority_score": seed.priority_score,
+        "priority_score_raw": metrics.pop("priority_score_raw", None),
+        "score_kind": metrics.pop("score_kind", "seed_recall_priority"),
+        "note": "source-local recall diagnostic only; not comparable across seed sources",
+    })
+    metrics.pop("priority_score", None)
+    metrics["source_diagnostics"] = {key: value for key, value in source_diagnostics.items() if value is not None}
     return {
         "code": seed.code,
         "name": seed.name or seed.code,
@@ -2549,12 +2901,6 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         "source": seed.source,
         "candidate_source": "llm_expert_committee_seed_pool",
         "reason": seed.context_hint or seed.hint,
-        "signal_score": seed.priority_score,
-        "score": seed.priority_score,
-        "priority_score": seed.priority_score,
-        "score_kind": "seed_recall_priority",
-        "score_label": "入池优先级",
-        "score_note": "L1 种子池召回排序分，不代表买入推荐分或最终决策分。",
         "reason_dimensions": dimensions[:8],
         "recall_sources": list(recall_sources or [seed.source]),
         "matched_strategies": seed.extras.get("matched_strategies", []) if isinstance(seed.extras, dict) else [],
@@ -2562,7 +2908,7 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         "trigger_signals": seed.trigger_signals,
         "freshness": seed.freshness,
         "context_hint": seed.context_hint,
-        "metrics": seed.extras.get("metrics", {}) if isinstance(seed.extras, dict) else {},
+        "metrics": metrics,
         "seed_gate": seed.extras.get("seed_gate") if isinstance(seed.extras, dict) else None,
     }
 
@@ -2861,7 +3207,12 @@ def run_committee_discovery(
             "seed_count": len(seeds),
             "candidate_count": len(thesis_candidates),
             "degraded": not bool(thesis_candidates),
-            "dimensions_covered": ["early_turn_desk", "momentum_desk", "quality_repair_desk"],
+            "dimensions_covered": [
+                "early_turn_desk",
+                "momentum_desk",
+                "quality_repair_desk",
+                "theme_catalyst_desk",
+            ],
             "delegate": "thesis_desk_committee",
         }
         deterministic_payload["thesis_desk_committee"] = {
@@ -2935,7 +3286,7 @@ def run_thesis_desk_committee(
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
 
-    Flow: build_recall_pool → [EarlyTurn|Momentum|QualityRepair] desks
+    Flow: build_recall_pool → [EarlyTurn|Momentum|QualityRepair|ThemeCatalyst] desks
     (parallel) → aggregate_desk_picks → allocate_slots → payload.
 
     The returned dict has the same top-level shape as run_committee_discovery
@@ -2948,6 +3299,7 @@ def run_thesis_desk_committee(
     from src.agent.candidate_experts_v2.experts.early_turn_desk import EarlyTurnDeskExpert
     from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
     from src.agent.candidate_experts_v2.experts.quality_repair_desk import QualityRepairDeskExpert
+    from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import ThemeCatalystDeskExpert
     from src.agent.candidate_experts_v2.recall import build_recall_pool
     from src.agent.candidate_experts_v2.seed_facts import (
         build_seed_fact_packets_parallel,
@@ -3071,6 +3423,13 @@ def run_thesis_desk_committee(
             prompt_variables=prompt_variables,
             fallback_supplement_n=desk_fallback_supplement_n,
         )
+        theme_catalyst_desk = ThemeCatalystDeskExpert(
+            tool_registry=tool_registry,
+            tool_decls=tdecls,
+            llm=llm_callable,
+            prompt_variables=prompt_variables,
+            fallback_supplement_n=desk_fallback_supplement_n,
+        )
     except Exception as exc:
         tb = traceback.format_exc()
         logger.warning("thesis_desk_committee: desk init failed: %s\n%s", exc, tb)
@@ -3118,6 +3477,13 @@ def run_thesis_desk_committee(
             per_seed_timeout_s=per_seed_timeout_s,
         ),
         "quality_repair_desk": lambda: quality_repair_desk.run_desk(
+            rows,
+            market=market_value,
+            regime=regime,
+            deadline_s=desk_deadline_s,
+            per_seed_timeout_s=per_seed_timeout_s,
+        ),
+        "theme_catalyst_desk": lambda: theme_catalyst_desk.run_desk(
             rows,
             market=market_value,
             regime=regime,

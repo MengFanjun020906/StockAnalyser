@@ -19,9 +19,13 @@ from __future__ import annotations
 import pytest
 
 from src.agent.candidate_experts_v2.experts.early_turn_desk import EARLY_TURN_DESK_TOOLS
+from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import THEME_CATALYST_DESK_TOOLS
 from src.agent.candidate_experts_v2.prompts._renderer import render_manifest_block
 from src.agent.candidate_experts_v2.prompts.early_turn_desk import (
     build_early_turn_desk_system_prompt,
+)
+from src.agent.candidate_experts_v2.prompts.theme_catalyst_desk import (
+    build_theme_catalyst_desk_system_prompt,
 )
 from src.agent.candidate_experts_v2.tools_manifest import (
     DimensionManifest,
@@ -44,6 +48,14 @@ def test_load_early_turn_desk_manifest_returns_validated_dimension_manifest():
     assert m.dimension == "early_turn_desk"
     names = {e.tool for e in m.tools}
     assert names == set(EARLY_TURN_DESK_TOOLS)
+
+
+def test_load_theme_catalyst_desk_manifest_returns_validated_dimension_manifest():
+    m = load_manifest("theme_catalyst_desk")
+    assert isinstance(m, DimensionManifest)
+    assert m.dimension == "theme_catalyst_desk"
+    names = {e.tool for e in m.tools}
+    assert names == set(THEME_CATALYST_DESK_TOOLS)
 
 
 def test_load_early_turn_desk_manifest_all_priorities_in_range():
@@ -152,6 +164,21 @@ def test_validate_full_early_turn_desk_manifest_against_real_registry():
     validate_manifest(m, whitelist=EARLY_TURN_DESK_TOOLS, tool_registry=reg)
 
 
+def test_validate_full_theme_catalyst_desk_manifest_against_real_registry():
+    """The shipped theme_catalyst_desk.yaml must validate against the real ToolRegistry."""
+    from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
+    from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.registry import ToolRegistry
+    from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
+
+    reg = ToolRegistry()
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS:
+        reg.register(t)
+
+    m = load_manifest("theme_catalyst_desk")
+    validate_manifest(m, whitelist=THEME_CATALYST_DESK_TOOLS, tool_registry=reg)
+
+
 # ---------------------------------------------------------------------------
 # Placeholder substitution
 # ---------------------------------------------------------------------------
@@ -227,3 +254,14 @@ def test_build_early_turn_desk_system_prompt_no_vars():
     prompt = build_early_turn_desk_system_prompt()
     # prompt builds without error even with no variables
     assert len(prompt) > 100
+
+
+def test_build_theme_catalyst_desk_system_prompt_includes_catalyst_rules():
+    prompt = build_theme_catalyst_desk_system_prompt(
+        variables={"today": "20260602", "code": "000636", "name": "风华高科"}
+    )
+    assert "主题催化席" in prompt
+    assert "news_theme_daily" in prompt
+    assert "业务匹配" in prompt
+    assert "setup_type=theme_catalyst" in prompt
+    assert "`get_eastmoney_cjzc_daily`" in prompt

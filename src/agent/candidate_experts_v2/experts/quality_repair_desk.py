@@ -76,19 +76,13 @@ class QualityRepairDeskExpert(BaseDeskExpert):
         for row in rows:
             fs = row.fact_sheet
             flag_kinds = {f.kind for f in row.flags}
-            sources = set(row.recall_sources)
 
             # Criterion 1: has fundamental flag
             if flag_kinds & _ELIGIBLE_KINDS:
                 primary.append(row)
                 continue
 
-            # Criterion 2: source is fundamental_snapshot
-            if "fundamental_snapshot" in sources:
-                primary.append(row)
-                continue
-
-            # Criterion 3: FactSheet shows low position (potential value play)
+            # Criterion 2: FactSheet shows low position (potential value play)
             if fs is not None and fs.range_pct_120 is not None and fs.range_pct_120 <= 0.35:
                 primary.append(row)
                 continue

@@ -1038,7 +1038,7 @@ def _execute_tools(
                     "arguments": tc.arguments,
                 })
 
-        pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
+        pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 32))
         timeout_triggered = False
         try:
             futures = {pool.submit(contextvars.copy_context().run, _exec_single, tc): tc for tc in tool_calls}

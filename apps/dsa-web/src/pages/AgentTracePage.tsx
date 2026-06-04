@@ -51,7 +51,7 @@ const REPORT_INTENT_OPTIONS = [
   { value: 'event_impact', label: '事件影响' },
 ];
 const CANDIDATE_DISCOVERY_OPTIONS = [
-  { value: 'thesis_desk_committee', label: '打法席位委员会 (P4)', desc: '当前调试阶段只允许三席位链路：召回层 → 低位启动/动量/质量修复 → Regime 分配名额' },
+  { value: 'thesis_desk_committee', label: '打法席位委员会 (P4)', desc: '当前调试阶段只允许四席位链路：召回层 → 低位启动/动量/质量修复/主题催化 → Regime 分配名额' },
 ] as const;
 const CANDIDATE_DISCOVERY_STORAGE_KEY = 'dsa.candidateDiscoveryMode';
 const TRACE_HISTORY_KEY = 'dsa.agentTrace.history.v1';
@@ -484,7 +484,7 @@ type SeedPoolPreviewItem = {
   name: string;
   source: string;
   hint: string;
-  priorityScore?: number;
+  sourceDiagnostics?: Record<string, unknown>;
   freshness: string;
   triggerSignals: string[];
 };
@@ -633,12 +633,14 @@ const DESK_LABELS: Record<string, string> = {
   early_turn_desk: '低位启动席',
   momentum_desk: '动量席',
   quality_repair_desk: '质量修复席',
+  theme_catalyst_desk: '主题催化席',
 };
 
 const SETUP_TYPE_LABELS: Record<string, string> = {
   trend_continuation: '趋势延续',
   early_turn: '低位启动',
   theme_follow: '题材跟随',
+  theme_catalyst: '主题催化',
   quality_repair: '质量修复',
   capital_momentum: '资金动量',
   unknown: '未分类',
@@ -667,6 +669,7 @@ const CANDIDATE_EXPERT_LABELS: Record<string, string> = {
   early_turn_desk: '低位启动席',
   momentum_desk: '动量席',
   quality_repair_desk: '质量修复席',
+  theme_catalyst_desk: '主题催化席',
 };
 
 const CANDIDATE_EXPERT_META: Record<string, { goal: string; required: boolean; directStockCandidate: boolean }> = {
@@ -680,6 +683,7 @@ const CANDIDATE_EXPERT_META: Record<string, { goal: string; required: boolean; d
   early_turn_desk: { goal: '低位区间、资金回补、拐点启动', required: true, directStockCandidate: true },
   momentum_desk: { goal: '趋势延续、放量突破、强势动量', required: true, directStockCandidate: true },
   quality_repair_desk: { goal: '基本面质量、低估修复、困境反转', required: true, directStockCandidate: true },
+  theme_catalyst_desk: { goal: '日报主题、业务匹配、板块资金验证', required: true, directStockCandidate: true },
 };
 
 const DIMENSION_GROUP_LABELS: Record<string, string> = {
@@ -896,12 +900,12 @@ const inferCandidateActionFromScore = (candidate: DisplayCandidate): CandidateAc
       reason: '候选存在反证，需等待后续技术、资金或消息证据确认。',
     };
   }
-  if ((candidate.score ?? 0) >= 90) {
+  if (candidate.multiDeskConviction || candidate.recallSources.length > 1) {
     return {
       key: 'monitor',
       label: '重点观察',
       tone: 'info',
-      reason: '候选入池分较高，但尚未完成最终 Judge 裁决。',
+      reason: '候选具备多来源或多席位证据，但尚未完成最终 Judge 裁决。',
     };
   }
   return {
@@ -1058,7 +1062,7 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
   const code = String(item.code || item.stock_code || item.symbol || '').trim();
   if (!code) return null;
   const metrics = asRecord(item.metrics) || {};
-  const scoreValue = item.priority_score ?? item.signal_score ?? item.score;
+  const scoreValue = item.signal_score ?? item.score;
   const score = typeof scoreValue === 'number' ? scoreValue : Number(scoreValue);
   const source = String(item.source || item.candidate_source || '');
   const recallSources = toStringList(item.recall_sources);
@@ -1077,9 +1081,9 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
     tags: isFallbackSeed ? [] : toStringList(item.strategy_tags).filter((tag) => !STRATEGY_ONLY_TAGS.has(tag)).map(displayStrategyName),
     reason: displayReasonText(String(item.reason || item.candidate_reason || item.entry_reason || '')),
     score: Number.isFinite(score) ? score : undefined,
-    scoreKind: String(item.score_kind || 'seed_recall_priority'),
-    scoreLabel: String(item.score_label || '入池优先级'),
-    scoreNote: String(item.score_note || 'L1 候选发现的召回排序分，不等同于买入推荐分。'),
+    scoreKind: item.score_kind ? String(item.score_kind) : undefined,
+    scoreLabel: item.score_label ? String(item.score_label) : undefined,
+    scoreNote: item.score_note ? String(item.score_note) : undefined,
     latestDate: String(item.latest_date || item.date || ''),
     metrics,
     reasonDimensions: isFallbackSeed ? fallbackReasonDimensions : normalizeReasonDimensions(item),
@@ -1111,7 +1115,7 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     current.strategies = Array.from(new Set([...current.strategies, ...candidate.strategies]));
     current.tags = Array.from(new Set([...current.tags, ...candidate.tags]));
     current.reason = current.reason || candidate.reason;
-    if ((candidate.score ?? -1) > (current.score ?? -1)) {
+    if (candidate.score != null && (current.score == null || candidate.score > current.score)) {
       current.score = candidate.score;
       current.scoreKind = candidate.scoreKind || current.scoreKind;
       current.scoreLabel = candidate.scoreLabel || current.scoreLabel;
@@ -1172,7 +1176,7 @@ const extractSeedPoolDisplay = (
     name: String(item.name || ''),
     source: String(item.source || ''),
     hint: String(item.hint || ''),
-    priorityScore: typeof item.priority_score === 'number' ? item.priority_score : undefined,
+    sourceDiagnostics: asRecord(item.source_diagnostics) || undefined,
     freshness: String(item.freshness || ''),
     triggerSignals: toRecordList(item.trigger_signals)
       .map((signal) => String(signal.summary || signal.kind || signal.dimension || ''))
@@ -1606,15 +1610,15 @@ const toTraceCandidateDecisionRows = (
       const screening = screeningByCode.get(candidate.code);
       const hasDeepSummary = deepByCode.has(candidate.code);
       const screeningScore = finiteNumber(screening?.score);
-      const decisionScore = screeningScore ?? candidate.score;
+      const decisionScore = screeningScore;
       const sources = [candidate.source, ...candidate.recallSources].filter((source, index, arr) => source && arr.indexOf(source) === index);
       const screeningReason = String(screening?.primary_reason || '').trim();
       const reason = hasDeepSummary
         ? (action.reason || screeningReason || candidate.reasonDimensions[0]?.detail || candidate.reason || '')
         : (screeningReason || candidate.reasonDimensions[0]?.detail || candidate.reason || action.reason || '');
       const scoreNote = screeningScore != null
-        ? 'candidate_screening 阶段的取证分；入池优先级只保留为来源追溯。'
-        : candidate.scoreNote || 'L1 候选发现的召回排序分，不等同于买入推荐分。';
+        ? 'candidate_screening 阶段的取证分；seed pool 召回分只保留为来源诊断。'
+        : undefined;
       const evidence = [
         ...(screening ? [{
           label: `初筛：${displayCandidateAction(String(screening.screening_result || action.key)).label}`,
@@ -1632,11 +1636,9 @@ const toTraceCandidateDecisionRows = (
         code: candidate.code,
         name: candidate.name,
         score: decisionScore,
-        scoreLabel: screeningScore != null ? '初筛分' : (candidate.scoreLabel || '入池优先级'),
+        scoreLabel: screeningScore != null ? '初筛分' : undefined,
         scoreNote,
-        secondaryScores: screeningScore != null && candidate.score != null
-          ? [{ label: candidate.scoreLabel || '入池优先级', value: candidate.score, note: candidate.scoreNote }]
-          : [],
+        secondaryScores: [],
         action,
         primaryReason: displayReasonText(reason),
         dimensionLabels: candidate.reasonDimensions.map((item) => item.label || DIMENSION_GROUP_LABELS[item.dimension] || item.dimension),
@@ -1670,7 +1672,7 @@ const toTraceCandidateDecisionRows = (
     .sort((a, b) => {
       const actionDiff = candidateDecisionRank(a.action.key) - candidateDecisionRank(b.action.key);
       if (actionDiff !== 0) return actionDiff;
-      return (b.score ?? -1) - (a.score ?? -1);
+      return String(a.code).localeCompare(String(b.code));
     });
 };
 
@@ -2211,7 +2213,7 @@ const AgentTracePage: React.FC = () => {
 
   /* ─── Render ─── */
   return (
-    <div className="min-h-screen bg-surface-2" style={{ fontFamily: '"Noto Serif SC", "Source Han Serif SC", Georgia, "Times New Roman", serif' }}>
+    <div className="min-h-screen bg-surface-2">
       <div className="mx-auto max-w-[1100px] px-6 py-10">
         {/* Header */}
         <header className="mb-8">
@@ -2338,13 +2340,15 @@ const AgentTracePage: React.FC = () => {
                 <Trash2 className="h-3 w-3" /> 清空
               </button>
             </div>
-            <div className="flex gap-2 overflow-x-auto pb-1">
+            <div className="flex max-h-64 flex-col gap-2 overflow-y-auto pr-1">
               {historyItems.map((item) => (
                 <button key={`${item.id}-${item.createdAt}`} type="button" onClick={() => handleSelectHistory(item)}
-                  className="flex shrink-0 items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-xs transition-all hover:border-border hover:shadow-sm">
-                  <span className={cn('h-1.5 w-1.5 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
-                  <span className="font-mono text-foreground">{item.stockCode || '选股'}</span>
-                  <span className="max-w-[140px] truncate text-muted-text">{item.message}</span>
+                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-left text-xs transition-all hover:border-border hover:shadow-sm">
+                  <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
+                    <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
+                  </span>
                 </button>
               ))}
             </div>
@@ -2672,7 +2676,7 @@ const L1Detail: React.FC<{
       {(seedPool || thesisDeskPackets.length) ? (
         <div className="rounded-lg border border-border bg-card p-4">
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <p className="text-label font-medium uppercase tracking-wider text-muted-text">P4 三席位可观察性</p>
+            <p className="text-label font-medium uppercase tracking-wider text-muted-text">P4 四席位可观察性</p>
             {seedPool ? (
               <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">
                 Seed {seedPool.seedCount}{seedPool.totalLimit != null ? ` / ${seedPool.totalLimit}` : ''}
@@ -2715,7 +2719,7 @@ const L1Detail: React.FC<{
                         </div>
                         <div className="mt-1 flex flex-wrap gap-1">
                           <span className="rounded bg-card px-1.5 py-0.5 text-xxs text-secondary-text">{displaySourceName(seed.source)}</span>
-                          {seed.priorityScore != null ? <span className="rounded bg-card px-1.5 py-0.5 text-xxs text-secondary-text">{formatMetricValue(seed.priorityScore)}</span> : null}
+                          {seed.sourceDiagnostics ? <span className="rounded bg-card px-1.5 py-0.5 text-xxs text-secondary-text">来源诊断</span> : null}
                         </div>
                         <p className="mt-1 line-clamp-2 text-xxs leading-relaxed text-muted-text">
                           {seed.triggerSignals.slice(0, 2).join('；') || seed.hint || seed.freshness || '-'}
@@ -2984,7 +2988,7 @@ const L1Detail: React.FC<{
       {candidates.length ? (
         <CandidateDecisionTable
           title="候选入池榜"
-          description="优先展示初筛和深挖结论；入池优先级只表示 L1 召回排序，不等同于买入评分。"
+          description="优先展示初筛和深挖结论；seed pool 召回分只作为来源内诊断，不做跨来源评分比较。"
           items={candidateDecisionRows}
           scoreColumnLabel="评估口径"
           emptyTitle="本轮没有候选"
@@ -3007,7 +3011,6 @@ const L1Detail: React.FC<{
                       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                         <span className="font-mono text-xs font-semibold text-foreground">{candidate.code}</span>
                         {candidate.name ? <span className="text-xs font-medium text-foreground">{candidate.name}</span> : null}
-                        {candidate.score != null ? <span className="text-xxs text-muted-text">评分 {formatMetricValue(candidate.score)}</span> : null}
                       </div>
                       {details.length ? (
                         <p className="mt-1 text-label leading-relaxed text-secondary-text">{details.slice(0, 2).join('；')}</p>
@@ -3047,7 +3050,6 @@ const L1Detail: React.FC<{
                   <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                     <span className="font-mono text-xs font-semibold text-foreground">{candidate.code}</span>
                     {candidate.name ? <span className="text-xs font-medium text-foreground">{candidate.name}</span> : null}
-                    {candidate.score != null ? <span className="text-xxs text-muted-text">评分 {formatMetricValue(candidate.score)}</span> : null}
                   </div>
                   <p className="mt-1 text-label leading-relaxed text-secondary-text">{candidate.reason || '固定兜底观察样本'}</p>
                 </div>

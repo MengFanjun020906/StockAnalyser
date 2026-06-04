@@ -14,6 +14,22 @@ export default {
       },
     },
     extend: {
+      fontFamily: {
+        sans: [
+          'Noto Sans SC',
+          'Source Han Sans SC',
+          'Source Han Sans CN',
+          '思源黑体',
+          '思源黑体 CN',
+          'PingFang SC',
+          'Microsoft YaHei',
+          'system-ui',
+          '-apple-system',
+          'BlinkMacSystemFont',
+          'Segoe UI',
+          'sans-serif',
+        ],
+      },
       colors: {
         border: 'hsl(var(--border))',
         input: 'hsl(var(--input))',

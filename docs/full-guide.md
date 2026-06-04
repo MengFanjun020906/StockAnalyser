@@ -299,7 +299,7 @@ daily_stock_analysis/
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
 | `AGENT_SEED_FACT_MAX_WORKERS` | 三席位选股前 `SeedFactPacket` 取数层的 `(seed,tool)` 并发 worker 上限 | `12` | 可选 |
 | `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | `SeedFactPacket` 单个工具调用预算；失败会写入 trace，不会伪造成成功 facts | `12.0` | 可选 |
-| `AGENT_SEED_FACT_TOOLS` | 三席位共享的预取工具列表，逗号分隔；默认覆盖趋势、结构、均线、量能、资金与基础信息 | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_info` | 可选 |
+| `AGENT_SEED_FACT_TOOLS` | 三席位共享的预取工具列表，逗号分隔；默认覆盖趋势、结构、均线、量能、资金与轻量业务归属 | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context` | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
@@ -347,6 +347,7 @@ daily_stock_analysis/
 >   - `get_stock_info.belong_boards` = 个股所属板块列表；
 >   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；
 >   - `get_stock_info.sector_rankings` 与 `fundamental_context.boards.data` 保持一致。
+> - 选股前置 `SeedFactPacket` 默认使用 `get_stock_business_context` 补齐 `industry/boards/business_summary`，不再为了第一层业务归属调用完整 `get_stock_info`；`get_stock_info` 仍保留给深层基本面、估值和财务上下文。
 >   - `AnalysisReport.details.belong_boards` = 结构化报告详情中的关联板块列表；
 >   - `AnalysisReport.details.sector_rankings` = 结构化报告详情中的板块涨跌榜（用于前端板块联动展示）。
 > - 板块涨跌榜使用数据源顺序：与全局 priority 一致。

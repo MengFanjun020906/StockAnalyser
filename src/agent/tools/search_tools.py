@@ -10,8 +10,10 @@ Tools:
 
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -21,6 +23,29 @@ from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
 logger = logging.getLogger(__name__)
+
+
+def _run_search_task_with_timeout(
+    task: Callable[[], Any],
+    timeout_seconds: float,
+    task_name: str,
+) -> Tuple[Any, Optional[str], int]:
+    timeout_value = max(0.0, float(timeout_seconds or 0.0))
+    start = time.time()
+    if timeout_value <= 0:
+        return None, f"{task_name} timeout", 0
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(task)
+        try:
+            return future.result(timeout=timeout_value), None, int((time.time() - start) * 1000)
+        except FuturesTimeoutError:
+            future.cancel()
+            return None, f"{task_name} timeout", int(timeout_value * 1000)
+    except Exception as exc:
+        return None, str(exc), int((time.time() - start) * 1000)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _get_db():
@@ -102,25 +127,34 @@ def _persist_news_response(
         )
 
 
-def _fetch_tushare_announcements(stock_code: str, *, lookback_hours: int) -> List[Dict[str, Any]]:
+def _fetch_tushare_announcements_result(stock_code: str, *, lookback_hours: int) -> Dict[str, Any]:
     """Best-effort Tushare announcement fetch using the HTTP API directly."""
     try:
         from src.config import get_config
         token = str(getattr(get_config(), "tushare_token", "") or "").strip()
     except Exception:
         token = ""
-    if not token:
-        return []
-
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(hours=max(1, int(lookback_hours or 72)))
+    date_window = {
+        "start_date": start_dt.strftime("%Y%m%d"),
+        "end_date": end_dt.strftime("%Y%m%d"),
+    }
+    if not token:
+        return {
+            "status": "disabled",
+            "items": [],
+            "provider": "Tushare.anns_d",
+            "date_window": date_window,
+            "error": "TUSHARE_TOKEN is not configured",
+        }
     payload = {
         "api_name": "anns_d",
         "token": token,
         "params": {
             "ts_code": _to_tushare_ts_code(stock_code),
-            "start_date": start_dt.strftime("%Y%m%d"),
-            "end_date": end_dt.strftime("%Y%m%d"),
+            "start_date": date_window["start_date"],
+            "end_date": date_window["end_date"],
         },
         "fields": "ann_date,ts_code,name,title,url",
     }
@@ -132,11 +166,23 @@ def _fetch_tushare_announcements(stock_code: str, *, lookback_hours: int) -> Lis
         body = response.json()
     except Exception as exc:
         logger.debug("Tushare announcement fetch skipped for %s: %s", stock_code, exc)
-        return []
+        return {
+            "status": "error",
+            "items": [],
+            "provider": "Tushare.anns_d",
+            "date_window": date_window,
+            "error": str(exc),
+        }
 
     if body.get("code") not in (0, "0", None):
         logger.debug("Tushare announcement fetch failed for %s: %s", stock_code, body.get("msg"))
-        return []
+        return {
+            "status": "error",
+            "items": [],
+            "provider": "Tushare.anns_d",
+            "date_window": date_window,
+            "error": str(body.get("msg") or body.get("code")),
+        }
     data = body.get("data") or {}
     fields = data.get("fields") or []
     items = data.get("items") or []
@@ -155,7 +201,19 @@ def _fetch_tushare_announcements(stock_code: str, *, lookback_hours: int) -> Lis
             "source": "Tushare.anns_d",
             "published_date": str(record.get("ann_date") or "").strip(),
         })
-    return announcements
+    return {
+        "status": "ok" if announcements else "empty",
+        "items": announcements,
+        "provider": "Tushare.anns_d",
+        "date_window": date_window,
+    }
+
+
+def _fetch_tushare_announcements(stock_code: str, *, lookback_hours: int) -> List[Dict[str, Any]]:
+    return list(
+        _fetch_tushare_announcements_result(stock_code, lookback_hours=lookback_hours).get("items")
+        or []
+    )
 
 
 def _response_to_news_items(response) -> List[Dict[str, Any]]:
@@ -266,8 +324,23 @@ def _handle_score_stock_news_sentiment(
         search_payload = {"success": False, "error": "No search engine available"}
 
     announcements: List[Dict[str, Any]] = []
+    announcements_payload: Dict[str, Any] = {
+        "provider": "Tushare.anns_d",
+        "enabled": include_announcements,
+        "count": 0,
+        "status": "disabled",
+    }
     if include_announcements:
-        announcements = _fetch_tushare_announcements(stock_code, lookback_hours=lookback_hours)
+        announcements_result = _fetch_tushare_announcements_result(stock_code, lookback_hours=lookback_hours)
+        announcements = list(announcements_result.get("items") or [])
+        announcements_payload = {
+            "provider": announcements_result.get("provider") or "Tushare.anns_d",
+            "enabled": include_announcements,
+            "count": len(announcements),
+            "status": announcements_result.get("status") or ("ok" if announcements else "empty"),
+            "date_window": announcements_result.get("date_window"),
+            **({"error": announcements_result.get("error")} if announcements_result.get("error") else {}),
+        }
         news_items.extend(announcements)
 
     scored = score_news_items(news_items)
@@ -289,11 +362,7 @@ def _handle_score_stock_news_sentiment(
         "summary": scored["summary"],
         "sources": {
             "search": search_payload,
-            "announcements": {
-                "provider": "Tushare.anns_d",
-                "enabled": include_announcements,
-                "count": len(announcements),
-            },
+            "announcements": announcements_payload,
         },
     }
 
@@ -367,6 +436,7 @@ score_stock_news_sentiment_tool = ToolDefinition(
 def _preprocess_intel_with_llm(
     raw_items: List[Dict[str, Any]],
     stock_name: str,
+    timeout_seconds: float = 4.0,
 ) -> Dict[str, Any]:
     """Lightweight LLM pass to produce a fixed-schema intel summary."""
     import json as _json
@@ -400,8 +470,8 @@ def _preprocess_intel_with_llm(
         resp = LLMToolAdapter().call_text(
             [{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=800,
-            timeout=10.0,
+            max_tokens=500,
+            timeout=max(1.0, float(timeout_seconds or 4.0)),
         )
         text = (resp.content or "").strip()
         if text.startswith("```"):
@@ -425,11 +495,31 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
 
-    intel_results = service.search_comprehensive_intel(
-        stock_code=stock_code,
-        stock_name=stock_name,
-        max_searches=7,
+    intel_results, search_err, search_ms = _run_search_task_with_timeout(
+        lambda: service.search_comprehensive_intel(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            max_searches=2,
+        ),
+        24.0,
+        "search_comprehensive_intel",
     )
+    if search_err or not isinstance(intel_results, dict):
+        status = "timeout" if search_err and "timeout" in str(search_err).lower() else "error"
+        return {
+            "status": status,
+            "stock_code": _canonical_search_code(stock_code),
+            "stock_name": stock_name,
+            "intel": {"items": [], "key_signals": [], "overall_sentiment": "unknown"},
+            "dimensions_searched": [],
+            "dimensions_empty": [],
+            "source_chain": [{
+                "provider": "search_comprehensive_intel",
+                "result": status,
+                "duration_ms": search_ms,
+            }],
+            "errors": [str(search_err or "invalid search result")],
+        }
 
     if not intel_results:
         return {"error": "Comprehensive intel search returned no results"}
@@ -454,9 +544,10 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
                 })
 
     # Lightweight LLM pass → fixed schema; fallback to raw compact list on failure
-    intel = _preprocess_intel_with_llm(raw_items, stock_name)
+    intel = _preprocess_intel_with_llm(raw_items, stock_name, timeout_seconds=4.0)
 
     return {
+        "status": "ok" if raw_items else "empty",
         "stock_code": _canonical_search_code(stock_code),
         "stock_name": stock_name,
         "intel": intel,
@@ -466,6 +557,12 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
         "dimensions_empty": [
             dim for dim, resp in intel_results.items() if not (resp and resp.success)
         ],
+        "source_chain": [{
+            "provider": "search_comprehensive_intel",
+            "result": "ok",
+            "duration_ms": search_ms,
+            "max_searches": 2,
+        }],
     }
 
 

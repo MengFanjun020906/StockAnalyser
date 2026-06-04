@@ -21,6 +21,7 @@ from data_provider.fundamental_adapter import (
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
     _stockapi_code_flow_completed_date,
+    _stockapi_default_completed_date,
 )
 
 
@@ -37,6 +38,22 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(_akshare_fund_flow_market("600519"), "sh")
         self.assertEqual(_akshare_fund_flow_market("688001"), "sh")
         self.assertEqual(_akshare_fund_flow_market("BJ920748"), "bj")
+
+    def test_stockapi_default_completed_date_uses_1600_cutoff_for_hot_sectors(self) -> None:
+        class _MorningDateTime(datetime):
+            @classmethod
+            def now(cls):
+                return cls(2026, 6, 2, 15, 59, 0)
+
+        class _AfternoonDateTime(datetime):
+            @classmethod
+            def now(cls):
+                return cls(2026, 6, 2, 16, 0, 0)
+
+        with patch("data_provider.fundamental_adapter.datetime", _MorningDateTime):
+            self.assertEqual(_stockapi_default_completed_date(), "2026-06-01")
+        with patch("data_provider.fundamental_adapter.datetime", _AfternoonDateTime):
+            self.assertEqual(_stockapi_default_completed_date(), "2026-06-02")
 
     def test_capital_flow_fails_when_tushare_and_stockapi_both_fail(self) -> None:
         adapter = AkshareFundamentalAdapter()
@@ -433,6 +450,76 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("missing_bk_code", result["errors"][0])
 
+    def test_stockapi_hot_sector_leaders_normalizes_rows(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "code": 20000,
+                    "msg": "success",
+                    "data": [
+                        {
+                            "code": "600001",
+                            "name": "测试龙头",
+                            "bkCode": "BK1234",
+                            "bkName": "机器人",
+                            "mainAmount": "1230000",
+                            "qiangdu": "91.2",
+                        }
+                    ],
+                }
+
+        with patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            result = adapter.get_stockapi_hot_sector_leaders(date="2026-05-15", limit=5)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["items"][0]["code"], "600001")
+        self.assertEqual(result["items"][0]["bk_code"], "BK1234")
+        self.assertEqual(result["items"][0]["main_net_inflow"], 1230000.0)
+        self.assertIn("/v1/hotBkJlrLongTou", mock_get.call_args.args[0])
+
+    def test_stockapi_change_all_history_normalizes_rows(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "code": 20000,
+                    "msg": "success",
+                    "data": [
+                        {
+                            "time": "145051",
+                            "code": "603398",
+                            "name": "测试异动",
+                            "type": 8201,
+                            "info": "4.67%",
+                            "typeName": "火箭发射",
+                            "dateId": "2026-05-15",
+                        }
+                    ],
+                }
+
+        with patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()) as mock_get:
+            result = adapter.get_stockapi_change_all_history(
+                start_date="2026-05-15",
+                end_date="2026-05-15",
+                event_type="8201",
+                limit=5,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["items"][0]["code"], "603398")
+        self.assertEqual(result["items"][0]["event_name"], "火箭发射")
+        self.assertIn("/v1/change/allHistory", mock_get.call_args.args[0])
+        self.assertEqual(mock_get.call_args.kwargs["params"]["type"], "8201")
+
     def test_stockapi_popularity_rank_normalizes_rows(self) -> None:
         adapter = AkshareFundamentalAdapter()
 
@@ -664,6 +751,33 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["summary"]["northbound_net_inflow"], 1200.0)
         self.assertEqual(len(result["history"]), 2)
         self.assertTrue(result["source_chain"])
+        self.assertTrue(result["data_quality"]["core_numeric_available"])
+
+    def test_northbound_capital_flow_marks_rows_without_numeric_fields(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        summary_df = pd.DataFrame({"日期": ["2026-05-07"], "说明": ["北向资金暂无数据"]})
+        hist_df = pd.DataFrame({"日期": ["2026-05-06", "2026-05-07"], "状态": ["休市", "暂无"]})
+        seen = []
+
+        def _fake_call_df_candidates(candidates):
+            seen.append(candidates)
+            if len(seen) == 1:
+                return summary_df, "stock_hsgt_fund_flow_summary_em", []
+            if len(seen) == 2:
+                return hist_df, "stock_hsgt_hist_em", []
+            return None, None, []
+
+        with patch.object(adapter, "_call_df_candidates", side_effect=_fake_call_df_candidates):
+            result = adapter.get_northbound_capital_flow(limit=2)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertFalse(result["data_quality"]["core_numeric_available"])
+        self.assertEqual(result["data_quality"]["history_rows"], 2)
+        self.assertEqual(result["data_quality"]["history_rows_with_numeric"], 0)
+        self.assertIn(
+            "northbound_source_returned_rows_but_no_numeric_flow_fields",
+            result["warnings"],
+        )
 
     def test_margin_trading_summary_returns_exchange_data(self) -> None:
         adapter = AkshareFundamentalAdapter()

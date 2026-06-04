@@ -13,6 +13,10 @@ from src.agent.candidate_experts_v2.prompts.quality_repair_desk import (
     QUALITY_REPAIR_DESK_SYSTEM_PROMPT,
     build_quality_repair_desk_system_prompt,
 )
+from src.agent.candidate_experts_v2.prompts.theme_catalyst_desk import (
+    THEME_CATALYST_DESK_SYSTEM_PROMPT,
+    build_theme_catalyst_desk_system_prompt,
+)
 
 __all__ = [
     "EARLY_TURN_DESK_SYSTEM_PROMPT",
@@ -21,4 +25,6 @@ __all__ = [
     "build_momentum_desk_system_prompt",
     "QUALITY_REPAIR_DESK_SYSTEM_PROMPT",
     "build_quality_repair_desk_system_prompt",
+    "THEME_CATALYST_DESK_SYSTEM_PROMPT",
+    "build_theme_catalyst_desk_system_prompt",
 ]

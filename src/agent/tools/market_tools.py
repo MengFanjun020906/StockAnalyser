@@ -13,6 +13,7 @@ import math
 import re
 import concurrent.futures
 import time
+import requests
 from datetime import datetime, timedelta
 from threading import Thread
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -246,6 +247,153 @@ def _get_tushare_sector_rankings_fast(top_n: int, timeout: float) -> Optional[tu
     if source_chain or errors:
         return [], [], source_chain, " | ".join(errors) or "Tushare sector rankings empty"
     return None
+
+
+def _get_stockapi_sector_rankings_fast(top_n: int) -> tuple:
+    """Fast-path sector rankings via StockAPI hot sectors without AkShare fallback."""
+    try:
+        from data_provider.fundamental_adapter import AkshareFundamentalAdapter
+    except Exception as exc:
+        return [], [], [], f"stockapi_hot_sectors_import_failed:{exc}"
+
+    result = AkshareFundamentalAdapter().get_stockapi_hot_sectors(
+        limit=max(top_n, 20),
+        allow_fallback=False,
+    )
+    sectors = result.get("sectors") or []
+    source_chain = result.get("source_chain") or []
+    errors = list(result.get("errors") or [])
+    if not sectors:
+        return [], [], source_chain, " | ".join(errors) or "StockAPI hot sectors empty"
+
+    top: List[Dict[str, Any]] = []
+    for sector in sectors[:top_n]:
+        name = str(sector.get("bk_name") or sector.get("name") or "").strip()
+        if not name:
+            continue
+        top.append({
+            "name": name,
+            "change_pct": sector.get("return_pct"),
+            "net_inflow": sector.get("net_inflow"),
+            "strength": sector.get("strength"),
+            "bk_code": sector.get("bk_code"),
+            "inflow_days": sector.get("inflow_days"),
+            "source": "stockapi:hotBkJlrDr",
+        })
+    if top:
+        return top, [], source_chain or ["stockapi:hotBkJlrDr"], ""
+    return [], [], source_chain or ["stockapi:hotBkJlrDr"], "StockAPI hot sectors rows missing sector names"
+
+
+def _get_eastmoney_industry_rankings_fast(top_n: int) -> tuple:
+    """Fast-path sector rankings from Eastmoney's industry-board quote page API."""
+    hosts = (
+        "https://push2.eastmoney.com/api/qt/clist/get",
+        "https://17.push2.eastmoney.com/api/qt/clist/get",
+        "https://16.push2.eastmoney.com/api/qt/clist/get",
+    )
+    params = {
+        "pn": "1",
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:90 t:2 f:!50",
+        "fields": "f12,f14,f2,f3,f4,f8,f20,f104,f105,f128,f136",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://quote.eastmoney.com/center/boardlist.html#industry_board",
+    }
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    def to_float(value: Any) -> Optional[float]:
+        try:
+            if value in (None, "", "-"):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    def to_int(value: Any) -> Optional[int]:
+        try:
+            if value in (None, "", "-"):
+                return None
+            return int(float(value))
+        except Exception:
+            return None
+
+    for url in hosts:
+        started_at = time.time()
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=2.0)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            error = f"eastmoney:stock_board_industry_name_em:{type(exc).__name__}:{exc}"
+            errors.append(error)
+            source_chain.append({
+                "provider": "eastmoney:stock_board_industry_name_em",
+                "endpoint": url,
+                "result": "failed",
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "error": error,
+            })
+            continue
+
+        rows = ((payload or {}).get("data") or {}).get("diff") or []
+        sectors: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("f14") or "").strip()
+            if not name:
+                continue
+            sectors.append({
+                "name": name,
+                "bk_code": str(row.get("f12") or "").strip(),
+                "latest_price": to_float(row.get("f2")),
+                "change_pct": to_float(row.get("f3")),
+                "change_amount": to_float(row.get("f4")),
+                "turnover_rate": to_float(row.get("f8")),
+                "market_cap": to_float(row.get("f20")),
+                "rising_count": to_int(row.get("f104")),
+                "falling_count": to_int(row.get("f105")),
+                "leading_stock": str(row.get("f128") or "").strip(),
+                "leading_stock_change_pct": to_float(row.get("f136")),
+                "source": "eastmoney:stock_board_industry_name_em",
+            })
+        if sectors:
+            sectors.sort(
+                key=lambda item: item["change_pct"] if item.get("change_pct") is not None else -9999.0,
+                reverse=True,
+            )
+            top = sectors[:top_n]
+            bottom = list(reversed(sectors[-top_n:]))
+            return top, bottom, [{
+                "provider": "eastmoney:stock_board_industry_name_em",
+                "endpoint": url,
+                "result": "ok",
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "rows": len(sectors),
+            }], ""
+
+        error = "eastmoney:stock_board_industry_name_em:empty_data"
+        errors.append(error)
+        source_chain.append({
+            "provider": "eastmoney:stock_board_industry_name_em",
+            "endpoint": url,
+            "result": "empty",
+            "duration_ms": int((time.time() - started_at) * 1000),
+            "error": error,
+        })
+
+    return [], [], source_chain, " | ".join(errors) or "Eastmoney industry board empty"
 
 
 DEFAULT_WATCHLIST_SEEDS: List[Dict[str, Any]] = [
@@ -1690,94 +1838,134 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
-    manager = _get_fetcher_manager()
-    timeout = _get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0)
-    fast_result = _get_tushare_sector_rankings_fast(top_n, timeout)
-    if isinstance(fast_result, tuple) and len(fast_result) == 4:
-        top_sectors, bottom_sectors, source_chain, chain_error = fast_result
+    timeout = min(_get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0), 6.0)
+    started_at = time.time()
+    eastmoney_timeout = min(timeout, 3.0)
+    eastmoney_result, eastmoney_err, eastmoney_ms = _run_with_timeout(
+        lambda: _get_eastmoney_industry_rankings_fast(top_n),
+        eastmoney_timeout,
+        "eastmoney_industry_rankings",
+    )
+    if isinstance(eastmoney_result, tuple) and len(eastmoney_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = eastmoney_result
         if top_sectors or bottom_sectors:
             return {
                 "status": "ok",
                 "top_sectors": top_sectors or [],
                 "bottom_sectors": bottom_sectors or [],
                 "source_chain": source_chain,
-                "errors": [],
+                "errors": [chain_error] if chain_error else [],
             }
 
-    result, err, cost_ms = _run_with_timeout(
-        lambda: _get_sector_rankings_agent_probe(manager, top_n, timeout),
-        timeout,
-        "sector_rankings",
+    remaining_timeout = max(0.0, timeout - (time.time() - started_at))
+    stockapi_timeout = min(remaining_timeout, 2.0)
+    stockapi_result, stockapi_err, stockapi_ms = _run_with_timeout(
+        lambda: _get_stockapi_sector_rankings_fast(top_n),
+        stockapi_timeout,
+        "stockapi_hot_sectors",
     )
+    if isinstance(stockapi_result, tuple) and len(stockapi_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = stockapi_result
+        if top_sectors or bottom_sectors:
+            return {
+                "status": "ok",
+                "top_sectors": top_sectors or [],
+                "bottom_sectors": bottom_sectors or [],
+                "source_chain": source_chain,
+                "errors": [chain_error] if chain_error else [],
+            }
 
-    if err:
-        return {
-            "status": "timeout" if "timeout" in str(err).lower() else "failed",
-            "top_sectors": [],
-            "bottom_sectors": [],
-            "source_chain": [{
-                "provider": "sector_rankings",
-                "result": "timeout" if "timeout" in str(err).lower() else "failed",
-                "duration_ms": cost_ms,
-            }],
-            "errors": [str(err)],
-            "error_summary": str(err),
-        }
-
-    if result is None:
-        return {
-            "status": "empty",
-            "top_sectors": [],
-            "bottom_sectors": [],
-            "source_chain": [{"provider": "sector_rankings", "result": "empty", "duration_ms": cost_ms}],
-            "errors": ["No sector ranking data available"],
-        }
-
-    if isinstance(result, tuple) and len(result) == 4:
-        top_sectors, bottom_sectors, source_chain, chain_error = result
-        status = "ok" if top_sectors or bottom_sectors else "empty"
-        return {
-            "status": status,
-            "top_sectors": top_sectors or [],
-            "bottom_sectors": bottom_sectors or [],
-            "source_chain": source_chain or [{
-                "provider": "sector_rankings",
-                "result": status,
-                "duration_ms": cost_ms,
-            }],
-            "errors": [chain_error] if chain_error else [],
-        }
-    # get_sector_rankings returns Tuple[List[Dict], List[Dict]]
-    # (top_sectors, bottom_sectors)
-    if isinstance(result, tuple) and len(result) == 2:
-        top_sectors, bottom_sectors = result
-        return {
-            "status": "ok" if top_sectors or bottom_sectors else "empty",
-            "top_sectors": top_sectors,
-            "bottom_sectors": bottom_sectors,
-            "source_chain": [{"provider": "sector_rankings", "result": "ok", "duration_ms": cost_ms}],
-            "errors": [],
-        }
-    elif isinstance(result, list):
-        return {
-            "status": "ok" if result else "empty",
-            "sectors": result,
-            "source_chain": [{"provider": "sector_rankings", "result": "ok", "duration_ms": cost_ms}],
-            "errors": [],
-        }
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    if eastmoney_err:
+        source_chain.append({
+            "provider": "eastmoney:stock_board_industry_name_em",
+            "result": "timeout" if "timeout" in str(eastmoney_err).lower() else "failed",
+            "duration_ms": eastmoney_ms,
+            "error": eastmoney_err,
+        })
+        errors.append(str(eastmoney_err))
+    elif isinstance(eastmoney_result, tuple) and len(eastmoney_result) == 4:
+        _, _, eastmoney_chain, eastmoney_chain_error = eastmoney_result
+        source_chain.extend(eastmoney_chain or [])
+        if eastmoney_chain_error:
+            errors.append(str(eastmoney_chain_error))
     else:
+        source_chain.append({
+            "provider": "eastmoney:stock_board_industry_name_em",
+            "result": "empty",
+            "duration_ms": eastmoney_ms,
+        })
+
+    if stockapi_err:
+        source_chain.append({
+            "provider": "stockapi:hotBkJlrDr",
+            "result": "timeout" if "timeout" in str(stockapi_err).lower() else "failed",
+            "duration_ms": stockapi_ms,
+            "error": stockapi_err,
+        })
+        errors.append(str(stockapi_err))
+    elif isinstance(stockapi_result, tuple) and len(stockapi_result) == 4:
+        _, _, stockapi_chain, stockapi_chain_error = stockapi_result
+        for item in stockapi_chain or []:
+            if isinstance(item, dict):
+                source_chain.append(item)
+            else:
+                source_chain.append({"provider": str(item), "result": "failed", "duration_ms": stockapi_ms})
+        if stockapi_chain_error:
+            if not source_chain:
+                source_chain.append({
+                    "provider": "stockapi:hotBkJlrDr",
+                    "result": "failed",
+                    "duration_ms": stockapi_ms,
+                    "error": str(stockapi_chain_error),
+                })
+            errors.append(str(stockapi_chain_error))
+    else:
+        source_chain.append({
+            "provider": "stockapi:hotBkJlrDr",
+            "result": "empty",
+            "duration_ms": stockapi_ms,
+        })
+
+    if not source_chain:
+        source_chain.append({
+            "provider": "stockapi:hotBkJlrDr",
+            "result": "empty",
+            "duration_ms": stockapi_ms,
+        })
+
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    if any("timeout" in str(error).lower() for error in errors):
         return {
-            "status": "partial",
-            "data": str(result),
-            "source_chain": [{"provider": "sector_rankings", "result": "partial", "duration_ms": cost_ms}],
-            "errors": [],
+            "status": "timeout",
+            "top_sectors": [],
+            "bottom_sectors": [],
+            "source_chain": source_chain,
+            "errors": errors or ["sector_rankings timeout"],
+            "error_summary": " | ".join(errors) or "sector_rankings timeout",
+            "duration_ms": elapsed_ms,
         }
+    return {
+        "status": "failed" if errors else "empty",
+        "top_sectors": [],
+        "bottom_sectors": [],
+        "source_chain": source_chain,
+        "errors": errors or ["No sector ranking data available"],
+        "error_summary": " | ".join(errors) if errors else "No sector ranking data available",
+        "duration_ms": elapsed_ms,
+    }
 
 
 get_sector_rankings_tool = ToolDefinition(
     name="get_sector_rankings",
-    description="Get sector/industry performance rankings. Returns top N and bottom N "
-                "sectors by daily change percentage. Useful for sector rotation analysis.",
+    description=(
+        "Get sector rankings. Prefer Eastmoney industry-board realtime quotes "
+        "(stock_board_industry_name_em / quote.eastmoney boardlist page); fall back to "
+        "StockAPI /v1/hotBkJlrDr when available. Permission, quota, network and remote "
+        "disconnect failures are returned as structured failed/timeout diagnostics "
+        "without slow fetcher probing."
+    ),
     parameters=[
         ToolParameter(
             name="top_n",

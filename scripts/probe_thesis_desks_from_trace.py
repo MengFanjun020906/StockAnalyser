@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Probe thesis-desk execution from a saved Agent trace.
 
-This script reuses the seed preview saved in a trace and runs the three thesis
+This script reuses the seed preview saved in a trace and runs the thesis
 desks without rebuilding the seed pool.  It is intended for isolating whether a
 stall happens before the first LLM turn, inside the desk loop, or after a tool
 call.
@@ -32,6 +32,7 @@ from src.agent.candidate_experts_v2.experts.base import LLMTurn
 from src.agent.candidate_experts_v2.experts.early_turn_desk import EarlyTurnDeskExpert
 from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
 from src.agent.candidate_experts_v2.experts.quality_repair_desk import QualityRepairDeskExpert
+from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import ThemeCatalystDeskExpert
 from src.agent.candidate_experts_v2.recall import build_recall_pool
 from src.agent.candidate_experts_v2.schemas import SeedFactPacket, SeedItem
 
@@ -63,6 +64,11 @@ def _extract_seed_preview(trace_dir: Path) -> List[Dict[str, Any]]:
         for node in nodes:
             if not isinstance(node, dict):
                 continue
+            seeds = node.get("seeds")
+            if isinstance(seeds, list):
+                candidates = [x for x in seeds if isinstance(x, dict)]
+                if candidates:
+                    return candidates
             summary = node.get("seed_pool_summary")
             if isinstance(summary, dict) and isinstance(summary.get("preview"), list):
                 candidates = [x for x in summary["preview"] if isinstance(x, dict)]
@@ -353,6 +359,12 @@ def _make_desks(
             llm=llm,
             max_llm_rounds=max_llm_rounds,
         ),
+        "theme_catalyst_desk": ThemeCatalystDeskExpert(
+            tool_registry=tool_registry,
+            tool_decls=tool_decls,
+            llm=llm,
+            max_llm_rounds=max_llm_rounds,
+        ),
     }
 
 
@@ -446,7 +458,7 @@ def _run_probe(
         print(f"wrote_json={json_path}")
         print(f"wrote_md={md_path}")
         if label.startswith("real_llm"):
-            reports_path = output_dir / "three_desk_final_reports.md"
+            reports_path = output_dir / "thesis_desk_final_reports.md"
             reports_path.write_text(markdown, encoding="utf-8")
             print(f"wrote_reports_md={reports_path}")
 
@@ -459,7 +471,7 @@ def _packets_to_markdown(payload: Dict[str, Any]) -> str:
             calls_by_desk.setdefault(str(call.get("desk") or "unknown"), []).append(call)
 
     lines = [
-        "# 三席位最终输出报告",
+        "# 席位委员会最终输出报告",
         "",
         f"- probe_label: `{payload.get('label')}`",
         f"- generated_at: `{payload.get('generated_at')}`",
@@ -649,6 +661,7 @@ def _run_direct_llm_probe(
         ]
         started = time.time()
         try:
+            real.set_context(desk=name)
             turn = real(messages, list(desk.tool_decls))
             elapsed_ms = int((time.time() - started) * 1000)
             print(
@@ -737,6 +750,7 @@ def main() -> None:
         tool_registry={},
         per_seed_timeout_s=args.per_seed_timeout_s,
         max_llm_rounds=args.max_llm_rounds,
+        output_dir=args.output_dir,
     )
 
     if args.real_llm:

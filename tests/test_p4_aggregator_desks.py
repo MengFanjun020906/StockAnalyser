@@ -112,6 +112,17 @@ class TestComputeConfidence:
         conf = _compute_confidence("quality_repair_desk", evidence)
         assert conf == 1.0
 
+    def test_theme_catalyst_desk_full_coverage(self):
+        evidence = [
+            EvidenceItem(tool="get_eastmoney_cjzc_daily", summary="ok"),
+            EvidenceItem(tool="get_stock_business_context", summary="ok"),
+            EvidenceItem(tool="get_stockapi_hot_sectors", summary="ok"),
+            EvidenceItem(tool="get_capital_flow", summary="ok"),
+            EvidenceItem(tool="analyze_price_structure", summary="ok"),
+        ]
+        conf = _compute_confidence("theme_catalyst_desk", evidence)
+        assert conf == 1.0
+
     def test_empty_evidence_returns_zero(self):
         assert _compute_confidence("early_turn_desk", []) == 0.0
 
@@ -179,6 +190,12 @@ class TestDetectConflicts:
         flags = _detect_conflicts("A", "quality_repair_desk", {}, fs, "quality_repair")
         assert "quality_price_mismatch" in flags
 
+    def test_theme_catalyst_outflow_and_chase_risk(self):
+        fs = FactSheet(code="A", capital_direction="outflow", gain_5d=35.0)
+        flags = _detect_conflicts("A", "theme_catalyst_desk", {}, fs, "theme_catalyst")
+        assert "theme_without_capital_validation" in flags
+        assert "theme_chase_risk" in flags
+
     def test_no_conflicts_no_factsheet(self):
         flags = _detect_conflicts("A", "early_turn_desk", {}, None, "early_turn")
         assert flags == []
@@ -204,6 +221,12 @@ class TestSelectPrimaryDesk:
         result = _select_primary_desk(desks, stance, {})
         # early_turn has higher priority (lower index)
         assert result == "early_turn_desk"
+
+    def test_theme_catalyst_priority_wins_same_stance(self):
+        desks = ["momentum_desk", "theme_catalyst_desk"]
+        stance = {"momentum_desk": "support", "theme_catalyst_desk": "support"}
+        result = _select_primary_desk(desks, stance, {})
+        assert result == "theme_catalyst_desk"
 
     def test_empty_returns_unknown(self):
         assert _select_primary_desk([], {}, {}) == "unknown"
@@ -529,7 +552,8 @@ class TestParseAllocation:
     def test_none_returns_default(self):
         result = _parse_allocation(None, "risk_off")
         assert result["momentum_desk"] == 0
-        assert result["quality_repair_desk"] == 5
+        assert result["quality_repair_desk"] == 4
+        assert result["theme_catalyst_desk"] == 2
 
     def test_invalid_json_returns_default(self):
         result = _parse_allocation("{invalid}", "trending_up")
@@ -644,11 +668,11 @@ class TestQualityRepairDeskEligibility:
         filtered = expert._filter_eligible_rows(rows)
         assert len(filtered) == 1
 
-    def test_fundamental_snapshot_source_included(self):
+    def test_fundamental_snapshot_source_no_longer_primary(self):
         expert = self._make_expert()
         rows = [_make_row("A", recall_sources=["fundamental_snapshot"])]
         filtered = expert._filter_eligible_rows(rows)
-        assert len(filtered) == 1
+        assert len(filtered) == 1  # fallback only, because no quality primary matched
 
     def test_low_position_included(self):
         expert = self._make_expert()
@@ -660,6 +684,38 @@ class TestQualityRepairDeskEligibility:
         expert = self._make_expert()
         expert._fallback_supplement_n = 3
         rows = [_make_row("A", fact_sheet=FactSheet(code="A", range_pct_120=0.8))]
+        filtered = expert._filter_eligible_rows(rows)
+        assert len(filtered) == 1
+
+
+# ---------------------------------------------------------------------------
+# Desk eligibility (ThemeCatalystDeskExpert)
+# ---------------------------------------------------------------------------
+
+class TestThemeCatalystDeskEligibility:
+    def _make_expert(self):
+        from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import ThemeCatalystDeskExpert
+        return ThemeCatalystDeskExpert(
+            tool_registry={},
+            tool_decls=[],
+            llm=MagicMock(),
+        )
+
+    def test_news_theme_source_included(self):
+        expert = self._make_expert()
+        rows = [_make_row("A", recall_sources=["news_theme_daily"])]
+        filtered = expert._filter_eligible_rows(rows)
+        assert len(filtered) == 1
+
+    def test_sector_flag_included(self):
+        expert = self._make_expert()
+        rows = [_make_row("A", flags=[FeatureFlag(detector="sector_theme", kind="sector")])]
+        filtered = expert._filter_eligible_rows(rows)
+        assert len(filtered) == 1
+
+    def test_strong_sector_fallback_when_no_direct_theme(self):
+        expert = self._make_expert()
+        rows = [_make_row("A", fact_sheet=FactSheet(code="A", sector_strength="strong"))]
         filtered = expert._filter_eligible_rows(rows)
         assert len(filtered) == 1
 

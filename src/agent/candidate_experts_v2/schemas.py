@@ -23,6 +23,7 @@ CandidateSetupTypeV2 = Literal[
     "trend_continuation",
     "early_turn",
     "theme_follow",
+    "theme_catalyst",
     "quality_repair",
     "capital_momentum",
     "unknown",
@@ -35,6 +36,7 @@ SeedSource = Literal[
     "hot_rank",
     "strong_sector",
     "sector_theme",
+    "news_theme_daily",
     "event_impact",
     "news_momentum",
     "capital_flow_anomaly",
@@ -208,6 +210,7 @@ class SeedFactPacket(BaseModel):
     recall_sources: List[str] = Field(default_factory=list)
     flags: List[Dict[str, Any]] = Field(default_factory=list)
     fact_sheet: Dict[str, Any] = Field(default_factory=dict)
+    business_context: Dict[str, Any] = Field(default_factory=dict)
     facts: Dict[str, SeedFactToolResult] = Field(default_factory=dict)
     data_quality: SeedFactDataQuality = Field(default_factory=SeedFactDataQuality)
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)

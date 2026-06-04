@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 
 from src.agent.candidate_experts_v2 import committee as committee_module
 from src.agent.candidate_experts_v2.committee import (
+    _assemble_seed_pool,
     _build_seed_pool,
     _build_seed_pool_result,
     run_committee_discovery,
@@ -39,6 +40,68 @@ from src.agent.candidate_experts_v2.seed_facts import (
     build_seed_fact_packets_parallel,
     compact_seed_fact_packets_for_model,
 )
+
+
+def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_sources():
+    def seed(code: str, source: str, score: float = 80.0):
+        return committee_module.SeedItem(code=code, name=code, source=source, priority_score=score)
+
+    seeds_by_source = {
+        "daily_screener": [seed(f"60000{i}", "daily_screener", 90 - i) for i in range(5)],
+        "news_theme_daily": [seed(f"60010{i}", "news_theme_daily", 90 - i) for i in range(5)],
+        "low_base_structure": [seed(f"60020{i}", "low_base_structure", 90 - i) for i in range(5)],
+        "capital_flow_anomaly": [seed(f"60030{i}", "capital_flow_anomaly", 90 - i) for i in range(3)],
+        "margin_financing": [seed("600400", "margin_financing", 88)],
+        "block_trade": [seed("600500", "block_trade", 87)],
+        "dragon_tiger": [seed("600600", "dragon_tiger", 86)],
+        "limit_up_pool": [seed("600700", "limit_up_pool", 85)],
+        "alphasift": [seed("600800", "alphasift", 84)],
+        "sequoia": [seed("600900", "sequoia", 83)],
+    }
+
+    result = _assemble_seed_pool(seeds_by_source, total_limit=10, limit_per_source=5)
+    sources = [item.source for item in result]
+
+    assert len(result) == 10
+    assert sources[:3] == ["daily_screener", "low_base_structure", "limit_up_pool"]
+    assert "news_theme_daily" in sources
+    assert "capital_flow_anomaly" in sources
+    assert "limit_up_pool" in sources
+    assert "alphasift" in sources
+    assert "sequoia" in sources
+    assert sources.count("daily_screener") < 5
+
+
+def test_seed_pool_assembly_allocates_total_limit_evenly_across_live_sources():
+    def seed(code: str, source: str, score: float = 80.0):
+        return committee_module.SeedItem(code=code, name=code, source=source, priority_score=score)
+
+    live_sources = [
+        "daily_screener",
+        "low_base_structure",
+        "news_theme_daily",
+        "limit_up_pool",
+        "capital_flow_anomaly",
+        "margin_financing",
+        "block_trade",
+        "dragon_tiger",
+        "valuation_liquidity",
+        "alphasift",
+        "sequoia",
+    ]
+    seeds_by_source = {
+        source: [seed(f"{index:03d}{offset:03d}", source, 90 - offset) for offset in range(3)]
+        for index, source in enumerate(live_sources)
+    }
+
+    result = _assemble_seed_pool(seeds_by_source, total_limit=20, limit_per_source=5)
+    counts = committee_module._seed_source_counts(result)
+
+    assert len(result) == 20
+    assert set(counts) == set(live_sources)
+    assert max(counts.values()) - min(counts.values()) <= 1
+    assert sum(1 for count in counts.values() if count == 2) == 9
+    assert sum(1 for count in counts.values() if count == 1) == 2
 
 
 def test_seed_fact_packets_run_seed_tool_tasks_once_and_record_failures():
@@ -80,6 +143,55 @@ def test_seed_fact_packets_run_seed_tool_tasks_once_and_record_failures():
     assert by_code["600001"].data_quality.ok_tools == 1
     assert by_code["600001"].data_quality.failed_tools == ["bad_tool"]
     assert by_code["600001"].data_quality.missing_tools == ["missing_tool"]
+
+
+def test_seed_fact_packets_build_wide_business_context_for_model():
+    def _business_context_tool(stock_code):
+        return {
+            "status": "ok",
+            "code": stock_code,
+            "name": "风华高科",
+            "industry": "电子元件",
+            "boards": ["电子元件", "MLCC", "被动元件"],
+            "business_summary": "业务归属线索：行业/板块归属为电子元件；相关主题/概念包括MLCC、被动元件。",
+            "source": "data_fetcher:get_belong_boards",
+            "as_of": "2026-06-02",
+        }
+
+    rows = [
+        FeatureRow(
+            code="000636",
+            name="风华高科",
+            flags=[
+                FeatureFlag(
+                    detector="news_momentum",
+                    kind="news",
+                    summary="MLCC 概念活跃，AI 服务器需求推动高端被动元件。",
+                    metrics={"concept": "MLCC"},
+                )
+            ],
+        )
+    ]
+
+    packets = build_seed_fact_packets_parallel(
+        rows,
+        tool_registry={"get_stock_business_context": _business_context_tool},
+        tools=["get_stock_business_context"],
+        max_workers=1,
+        tool_timeout_seconds=3.0,
+    )
+
+    context = packets[0].business_context
+    assert context["status"] == "ok"
+    assert "电子器件/元器件" in context["broad_industries"]
+    assert [item["name"] for item in context["board_names"][:3]] == ["电子元件", "MLCC", "被动元件"]
+    assert any("MLCC 概念活跃" in clue["evidence"] for clue in context["theme_clues"])
+
+    compact = compact_seed_fact_packets_for_model(packets, limit=1)[0]
+    assert "business_context" in compact
+    assert "电子器件/元器件" in compact["business_context"]["broad_industries"]
+    assert compact["business_context"]["board_names"][1]["name"] == "MLCC"
+    assert "data" not in compact["facts"]["get_stock_business_context"]
 
 
 def test_desk_prompt_includes_seed_fact_packet_before_tool_calls():
@@ -186,6 +298,19 @@ def test_seed_fact_compaction_preserves_decision_facts_not_raw_payload():
                     },
                 },
             ),
+            "get_stock_business_context": SeedFactToolResult(
+                status="ok",
+                data={
+                    "status": "ok",
+                    "code": "600001",
+                    "name": "事实保真",
+                    "industry": "电力",
+                    "boards": ["电力", "火电"],
+                    "business_summary": "业务归属线索：行业/板块归属为电力；相关主题/概念包括火电。",
+                    "source": "data_fetcher:get_belong_boards",
+                    "as_of": "2026-06-02",
+                },
+            ),
             "get_stock_info": SeedFactToolResult(
                 status="ok",
                 data={
@@ -202,7 +327,7 @@ def test_seed_fact_compaction_preserves_decision_facts_not_raw_payload():
                 },
             ),
         },
-        data_quality=SeedFactDataQuality(status="ok", tool_count=4, ok_tools=4),
+        data_quality=SeedFactDataQuality(status="ok", tool_count=5, ok_tools=5),
     )
 
     compact = compact_seed_fact_packets_for_model([packet], limit=1)[0]
@@ -216,6 +341,7 @@ def test_seed_fact_compaction_preserves_decision_facts_not_raw_payload():
     assert facts["analyze_trend"]["summary"]["macd_status"] == "金叉初期"
     assert facts["get_capital_flow"]["summary"]["inflow_10d"] == -5000000
     assert "source_chain" not in facts["get_capital_flow"]["summary"]
+    assert facts["get_stock_business_context"]["summary"]["boards"] == ["电力", "火电"]
     assert facts["get_stock_info"]["summary"]["fundamental_context"]["valuation"]["data"]["pe_ratio"] == 12.3
     assert facts["get_stock_info"]["summary"]["belong_boards"][0]["name"] == "电力"
 
@@ -363,7 +489,7 @@ def test_run_committee_discovery_coerces_non_dict_deterministic_payload():
     assert result["status"] in ("ok", "failed")
 
 
-def test_build_seed_pool_includes_fundamental_and_low_base_sources():
+def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_sources():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={
@@ -397,8 +523,9 @@ def test_build_seed_pool_includes_fundamental_and_low_base_sources():
         )
 
     by_code = {seed.code: seed for seed in seeds}
-    assert by_code["600001"].source == "fundamental_snapshot"
+    assert "600001" not in by_code
     assert by_code["600002"].source == "low_base_structure"
+    assert all(seed.source != "fundamental_snapshot" for seed in seeds)
 
 
 def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
@@ -440,7 +567,7 @@ def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
             seed_symbols=[],
             tool_registry={
                 "get_tushare_limit_list_d": lambda **kwargs: {"items": [{"code": f"6005{i:02d}", "name": f"涨停{i}", "limit_status": "U"} for i in range(20)]},
-                "get_tushare_hot_rank": lambda **kwargs: {"items": [{"code": f"6006{i:02d}", "name": f"热榜{i}", "rank": i + 1} for i in range(20)]},
+                "get_stockapi_popularity_rank": lambda **kwargs: {"items": [{"code": f"6006{i:02d}", "name": f"热榜{i}", "rank": i + 1} for i in range(20)]},
                 "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
             },
             today="20260523",
@@ -452,13 +579,12 @@ def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
     for seed in seeds:
         source_counts[seed.source] = source_counts.get(seed.source, 0) + 1
 
-    assert source_counts["fundamental_snapshot"] <= 8
     assert source_counts["low_base_structure"] <= 8
     assert source_counts["alphasift"] <= 10
     assert source_counts["hot_rank"] <= 8
     assert source_counts["limit_up_pool"] <= 10
     assert source_counts["low_base_structure"] > 0
-    assert source_counts["fundamental_snapshot"] > 0
+    assert "fundamental_snapshot" not in source_counts
 
 
 def test_build_seed_pool_result_caps_total_limit_to_twenty():
@@ -485,7 +611,7 @@ def test_build_seed_pool_result_caps_total_limit_to_twenty():
             seed_symbols=[],
             tool_registry={
                 "get_tushare_limit_list_d": lambda **kwargs: {"items": [{"code": f"6005{i:02d}", "name": f"涨停{i}", "limit_status": "U"} for i in range(20)]},
-                "get_tushare_hot_rank": lambda **kwargs: {"items": [{"code": f"6006{i:02d}", "name": f"热榜{i}", "rank": i + 1} for i in range(20)]},
+                "get_stockapi_popularity_rank": lambda **kwargs: {"items": [{"code": f"6006{i:02d}", "name": f"热榜{i}", "rank": i + 1} for i in range(20)]},
                 "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
             },
             today="20260523",
@@ -547,6 +673,52 @@ def test_build_seed_pool_result_records_quality_and_structured_signals():
     assert result.seeds[0].priority_score == 82
 
 
+def test_build_seed_pool_result_exposes_only_sector_auto_supplement_bucket_diagnostics():
+    with patch.object(
+        committee_module,
+        "_build_daily_screener_seeds",
+        return_value=([], {"source": "daily_screener", "status": "empty", "count": 0}),
+    ), patch(
+        "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.alphasift_provider.AlphaSiftCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.sequoia_provider.SequoiaCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch.object(committee_module, "_build_low_base_structure_seeds", return_value=[]):
+        result = _build_seed_pool_result(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={
+                "get_stockapi_hot_sectors": lambda **kwargs: {"status": "empty", "sectors": []},
+                "get_stockapi_hot_sector_leaders": lambda **kwargs: {"status": "empty", "items": []},
+                "get_stockapi_change_all_history": lambda **kwargs: {"status": "failed", "items": [], "errors": ["should_not_be_called"]},
+                "discover_watchlist_candidates": lambda **kwargs: {
+                    "status": "ok",
+                    "candidates": [],
+                    "discovery_steps": [
+                        {"source": "event_impact", "status": "empty", "count": 0},
+                        {"source": "news_momentum", "status": "failed", "count": 0, "error": "request limit"},
+                        {"source": "get_sector_rankings", "status": "empty", "sectors": []},
+                    ],
+                },
+            },
+            today="20260523",
+            limit_per_source=5,
+            total_limit=20,
+        )
+
+    diagnostics_by_source = {item["source"]: item for item in result.diagnostics}
+    assert diagnostics_by_source["sector_theme"]["status"] == "empty"
+    assert result.source_quality["sector_theme"]["available"] is True
+    assert "event_impact" not in diagnostics_by_source
+    assert "news_momentum" not in diagnostics_by_source
+    assert "event_impact" not in result.source_quality
+    assert "news_momentum" not in result.source_quality
+
+
 def test_build_seed_pool_result_records_screener_diagnostic():
     with patch.object(
         committee_module,
@@ -595,6 +767,73 @@ def test_build_seed_pool_result_records_screener_diagnostic():
     assert result.seeds[0].trigger_signals[0]["signal_type"] == "daily_screener"
 
 
+def test_build_seed_pool_result_includes_news_theme_daily_concept_mapping():
+    with patch.object(
+        committee_module,
+        "_build_daily_screener_seeds",
+        return_value=([], {"source": "daily_screener", "status": "empty", "count": 0}),
+    ), patch(
+        "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.alphasift_provider.AlphaSiftCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.sequoia_provider.SequoiaCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch.object(committee_module, "_build_low_base_structure_seeds", return_value=[]):
+        with patch("src.agent.tools.data_tools._latest_tushare_trade_date", return_value="20260601"):
+            result = _build_seed_pool_result(
+                market="cn",
+                seed_symbols=[],
+                tool_registry={
+                    "get_stockapi_hot_sectors": lambda **kwargs: {"status": "empty", "sectors": []},
+                    "get_stockapi_hot_sector_leaders": lambda **kwargs: {"status": "empty", "items": []},
+                    "get_stockapi_change_all_history": lambda **kwargs: {"status": "empty", "items": []},
+                    "get_eastmoney_cjzc_daily": lambda **kwargs: {
+                        "status": "ok",
+                        "target_date": kwargs.get("target_date"),
+                        "trade_date": kwargs.get("target_date"),
+                        "matched_publish_date": kwargs.get("target_date"),
+                        "session": "pre_market_daily",
+                        "title": "东方财富财经早餐 6月2日周二",
+                        "link": "https://finance.eastmoney.com/a/20260602.html",
+                        "themes": [
+                            {
+                                "theme": "MLCC",
+                                "keywords": ["MLCC"],
+                                "polarity": "positive",
+                                "evidence": "MLCC 涨价，AI服务器需求提升。",
+                                "related_boards": ["电子元件", "被动元件"],
+                                "mapped_stocks": [
+                                    {"code": "000636", "name": "风华高科", "role": "passive_component"},
+                                    {"code": "300408", "name": "三环集团", "role": "ceramic_component"},
+                                ],
+                            }
+                        ],
+                        "mentioned_stocks": [],
+                        "company_events": [{"name": "春秋电子", "polarity": "deny_or_clarification", "seed_allowed": False}],
+                        "errors": [],
+                    },
+                    "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
+                },
+                today="20260602",
+                limit_per_source=5,
+                total_limit=20,
+            )
+
+    by_code = {seed.code: seed for seed in result.seeds}
+    assert by_code["000636"].source == "news_theme_daily"
+    assert by_code["000636"].trigger_signals[0]["signal_type"] == "eastmoney_cjzc_daily_concept_mapping"
+    assert by_code["000636"].extras["metrics"]["theme"] == "MLCC"
+    assert by_code["000636"].extras["metrics"]["directness"] == "concept_board"
+    diagnostics_by_source = {item["source"]: item for item in result.diagnostics}
+    assert diagnostics_by_source["news_theme_daily"]["status"] == "ok"
+    assert diagnostics_by_source["news_theme_daily"]["target_date"] == "2026-06-02"
+    assert diagnostics_by_source["news_theme_daily"]["mapped_stock_count"] == 2
+    assert diagnostics_by_source["news_theme_daily"]["company_event_count"] == 1
+
+
 def test_build_seed_pool_result_includes_capital_dragon_and_valuation_sources():
     with patch.object(
         committee_module,
@@ -624,11 +863,6 @@ def test_build_seed_pool_result_includes_capital_dragon_and_valuation_sources():
                     "trade_date": "20260522",
                     "items": [{"code": "600101", "name": "资金一", "net_inflow": 80_000_000, "net_5d_inflow": 120_000_000, "pct_change": 3.2}],
                 },
-                "get_tushare_hsgt_top10": lambda **kwargs: {
-                    "status": "ok",
-                    "trade_date": "20260522",
-                    "items": [{"code": "600104", "name": "北向一", "rank": 1, "amount": 200_000_000, "net_amount": 80_000_000}],
-                },
                 "get_tushare_margin_detail": lambda **kwargs: {
                     "status": "ok",
                     "trade_date": "20260522",
@@ -648,6 +882,17 @@ def test_build_seed_pool_result_includes_capital_dragon_and_valuation_sources():
                     "status": "ok",
                     "items": [{"ts_code": "600103.SH", "turnover_rate": 6.0, "volume_ratio": 2.2, "pe_ttm": 22.0, "pb": 2.1}],
                 },
+                "get_stockapi_hot_sectors": lambda **kwargs: {"status": "empty", "sectors": []},
+                "get_stockapi_hot_sector_leaders": lambda **kwargs: {
+                    "status": "ok",
+                    "date": "2026-05-22",
+                    "items": [{"code": "600104", "name": "板块一", "bk_code": "BK1", "bk_name": "机器人", "main_net_inflow": 30_000_000, "strength": 88}],
+                },
+                "get_stockapi_change_all_history": lambda **kwargs: {
+                    "status": "ok",
+                    "date": "2026-05-22",
+                    "items": [{"code": "600107", "name": "异动一", "event_name": "火箭发射", "event_type": kwargs.get("event_type"), "info": "5%"}],
+                },
                 "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
             },
             today="20260523",
@@ -659,11 +904,13 @@ def test_build_seed_pool_result_includes_capital_dragon_and_valuation_sources():
     assert by_code["600101"].source == "capital_flow_anomaly"
     assert by_code["600102"].source == "dragon_tiger"
     assert by_code["600103"].source == "valuation_liquidity"
-    assert by_code["600104"].source == "northbound_stock_connect"
+    assert by_code["600104"].source == "sector_theme"
     assert by_code["600105"].source == "margin_financing"
     assert by_code["600106"].source == "block_trade"
+    assert "600107" not in by_code
     assert any(item["source"] == "capital_flow_anomaly:moneyflow_dc" for item in result.diagnostics)
-    assert any(item["source"] == "northbound_stock_connect" for item in result.diagnostics)
+    assert not any(item["source"] == "northbound_stock_connect" for item in result.diagnostics)
+    assert not any(item["source"] in {"event_impact", "news_momentum"} for item in result.diagnostics)
 
 
 def test_seed_priority_score_soft_caps_high_local_scores():
@@ -672,7 +919,7 @@ def test_seed_priority_score_soft_caps_high_local_scores():
     assert committee_module._compress_seed_priority_score(130.0) > committee_module._compress_seed_priority_score(105.0)
 
 
-def test_seed_candidate_payload_marks_score_as_recall_priority():
+def test_seed_candidate_payload_keeps_recall_score_as_source_diagnostic():
     seed = committee_module.SeedItem(
         code="600001",
         name="测试股",
@@ -686,9 +933,9 @@ def test_seed_candidate_payload_marks_score_as_recall_priority():
 
     payload = committee_module._seed_to_candidate_payload(seed)
 
-    assert payload["signal_score"] == 96.2
-    assert payload["priority_score"] == 96.2
-    assert payload["score_kind"] == "seed_recall_priority"
-    assert payload["score_label"] == "入池优先级"
-    assert "买入推荐分" in payload["score_note"]
-    assert payload["metrics"]["priority_score_raw"] == 108.0
+    assert "signal_score" not in payload
+    assert "score" not in payload
+    assert "priority_score" not in payload
+    assert payload["metrics"]["source_diagnostics"]["priority_score"] == 96.2
+    assert payload["metrics"]["source_diagnostics"]["priority_score_raw"] == 108.0
+    assert payload["metrics"]["source_diagnostics"]["score_kind"] == "seed_recall_priority"

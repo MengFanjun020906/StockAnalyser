@@ -561,7 +561,13 @@ class AkshareFundamentalAdapter:
             "errors": errors,
         }
 
-    def get_stockapi_hot_sectors(self, date: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+    def get_stockapi_hot_sectors(
+        self,
+        date: Optional[str] = None,
+        limit: int = 20,
+        *,
+        allow_fallback: bool = True,
+    ) -> Dict[str, Any]:
         """Return StockAPI hot sectors ranked by capital inflow / strength."""
         trade_date = _safe_str(date) or _stockapi_default_completed_date()
         effective_limit = max(1, min(int(limit or 20), 100))
@@ -583,7 +589,7 @@ class AkshareFundamentalAdapter:
                 "time": _safe_str(row.get("time")) or trade_date,
             })
 
-        if not sectors and errors:
+        if not sectors and errors and allow_fallback:
             fallback_sectors, fallback_errors, fallback_source = self._fallback_hot_sectors(effective_limit)
             if fallback_sectors:
                 return {
@@ -738,6 +744,110 @@ class AkshareFundamentalAdapter:
             "bk_code": code,
             "history": history,
             "source_chain": ["stockapi:bkFlowHistory"] if history else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_hot_sector_leaders(
+        self,
+        date: Optional[str] = None,
+        bk_code: Optional[str] = None,
+        limit: int = 30,
+    ) -> Dict[str, Any]:
+        """Return StockAPI hot-sector leader stocks.
+
+        StockAPI documents this as the hot-sector leader endpoint
+        (``/v1/hotBkJlrLongTou``).  The endpoint may require package access in
+        some accounts; keep the response fail-open so callers can still use
+        ``hotBkJlrDr`` sector diagnostics when leaders are unavailable.
+        """
+        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        effective_limit = max(1, min(int(limit or 30), 100))
+        params: Dict[str, Any] = {"date": trade_date}
+        if _safe_str(bk_code):
+            params["bkCode"] = _safe_str(bk_code)
+        rows, errors = self._stockapi_data_rows("/v1/hotBkJlrLongTou", params)
+
+        items: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            code = _safe_str(
+                row.get("code")
+                or row.get("stockCode")
+                or row.get("f12")
+                or row.get("tsCode")
+            )
+            name = _safe_str(
+                row.get("name")
+                or row.get("stockName")
+                or row.get("f14")
+            )
+            items.append({
+                "code": _normalize_code(code),
+                "name": name,
+                "bk_code": _safe_str(row.get("bkCode") or row.get("bk_code") or bk_code),
+                "bk_name": _safe_str(row.get("bkName") or row.get("bk_name") or row.get("plateName")),
+                "rank": _safe_float(row.get("rank") or row.get("order") or row.get("pm")),
+                "change_ratio": _safe_float(row.get("zf") or row.get("changeRatio") or row.get("f3")),
+                "last_price": _safe_float(row.get("lastPrice") or row.get("close") or row.get("f2")),
+                "main_net_inflow": _safe_float(row.get("mainAmount") or row.get("main_net_inflow") or row.get("f62")),
+                "net_inflow": _safe_float(row.get("qjje") or row.get("netInflow") or row.get("net_inflow")),
+                "strength": _safe_float(row.get("qiangdu") or row.get("strength")),
+                "reason": _safe_str(row.get("reason") or row.get("analyse") or row.get("stock_reason")),
+                "time": _safe_str(row.get("time")) or trade_date,
+                "raw": row,
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "date": trade_date,
+            "bk_code": _safe_str(bk_code),
+            "items": [item for item in items if item.get("code")],
+            "source_chain": ["stockapi:hotBkJlrLongTou"] if items else [],
+            "errors": errors,
+        }
+
+    def get_stockapi_change_all_history(
+        self,
+        date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Return StockAPI all-market historical intraday change events."""
+        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        start = _safe_str(start_date) or trade_date
+        end = _safe_str(end_date) or start
+        effective_limit = max(1, min(int(limit or 50), 300))
+        params: Dict[str, Any] = {"startDate": start, "endDate": end}
+        event_type_value = _safe_str(event_type)
+        if event_type_value:
+            params["type"] = event_type_value
+        rows, errors = self._stockapi_data_rows("/v1/change/allHistory", params)
+
+        items: List[Dict[str, Any]] = []
+        for row in rows[:effective_limit]:
+            code = _normalize_code(row.get("code"))
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": _safe_str(row.get("name")),
+                "event_type": _safe_str(row.get("type")),
+                "event_name": _safe_str(row.get("typeName") or row.get("type_name")),
+                "info": _safe_str(row.get("info")),
+                "time": _safe_str(row.get("time")),
+                "date": _safe_str(row.get("dateId") or row.get("date") or start),
+                "source": "stockapi:allHistory",
+            })
+
+        return {
+            "status": "partial" if items else "failed",
+            "date": trade_date,
+            "start_date": start,
+            "end_date": end,
+            "event_type": event_type_value,
+            "items": items,
+            "source_chain": ["stockapi:allHistory"] if items else [],
             "errors": errors,
         }
 
@@ -1122,8 +1232,15 @@ class AkshareFundamentalAdapter:
             "status": "not_supported",
             "summary": {},
             "history": [],
+            "data_quality": {
+                "summary_numeric_fields": 0,
+                "history_rows": 0,
+                "history_rows_with_numeric": 0,
+                "core_numeric_available": False,
+            },
             "source_chain": [],
             "errors": [],
+            "warnings": [],
         }
 
         summary_df, summary_source, summary_errors = self._call_df_candidates([
@@ -1144,6 +1261,11 @@ class AkshareFundamentalAdapter:
                     },
                 ),
             }
+            result["data_quality"]["summary_numeric_fields"] = sum(
+                1
+                for key in ("northbound_net_inflow", "southbound_net_inflow", "buy_amount", "sell_amount")
+                if result["summary"].get(key) is not None
+            )
             result["source_chain"].append(f"northbound_summary:{summary_source}")
 
         hist_df, hist_source, hist_errors = self._call_df_candidates([
@@ -1153,9 +1275,23 @@ class AkshareFundamentalAdapter:
         if hist_df is not None and not hist_df.empty:
             rows = hist_df.tail(effective_limit).to_dict(orient="records")
             result["history"] = [self._compact_northbound_history_row(row) for row in rows]
+            result["data_quality"]["history_rows"] = len(result["history"])
+            result["data_quality"]["history_rows_with_numeric"] = sum(
+                1
+                for row in result["history"]
+                if any(row.get(key) is not None for key in ("net_inflow", "buy_amount", "sell_amount", "balance"))
+            )
             result["source_chain"].append(f"northbound_history:{hist_source}")
 
         has_content = bool(result["summary"] or result["history"])
+        result["data_quality"]["core_numeric_available"] = bool(
+            result["data_quality"]["summary_numeric_fields"]
+            or result["data_quality"]["history_rows_with_numeric"]
+        )
+        if has_content and not result["data_quality"]["core_numeric_available"]:
+            result["warnings"].append(
+                "northbound_source_returned_rows_but_no_numeric_flow_fields"
+            )
         result["status"] = "partial" if has_content else "not_supported"
         return result
 

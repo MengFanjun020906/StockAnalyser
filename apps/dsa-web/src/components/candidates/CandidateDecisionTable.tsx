@@ -289,20 +289,21 @@ export const CandidateDecisionTable: React.FC<CandidateDecisionTableProps> = ({
                   </div>
                 </div>
 
-                {/* Row 2: Scores + Reason */}
+                {/* Row 2: Evaluation + Reason */}
                 <div className="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-start sm:gap-3">
-                  {/* Score inline */}
-                  <div className="flex shrink-0 items-baseline gap-2">
-                    <span className={cn('font-mono text-lg font-bold', scoreColor(item.score))}>{formatScore(item.score)}</span>
-                    {(item.secondaryScores || []).slice(0, 2).map((score) => (
-                      <span key={score.label} className="flex items-baseline gap-1 text-xs text-muted-text">
-                        <span className="text-secondary-text">/</span>
-                        <span className={cn('font-mono font-semibold', scoreColor(score.value))}>{formatScore(score.value)}</span>
-                        <span>{score.label}</span>
-                      </span>
-                    ))}
-                    {item.scoreNote ? <span className="text-xs text-muted-text">{item.scoreNote}</span> : null}
-                  </div>
+                  {(item.score != null || (item.secondaryScores || []).some((score) => score.value != null)) ? (
+                    <div className="flex shrink-0 items-baseline gap-2">
+                      {item.score != null ? <span className={cn('font-mono text-lg font-bold', scoreColor(item.score))}>{formatScore(item.score)}</span> : null}
+                      {(item.secondaryScores || []).slice(0, 2).filter((score) => score.value != null).map((score) => (
+                        <span key={score.label} className="flex items-baseline gap-1 text-xs text-muted-text">
+                          {item.score != null ? <span className="text-secondary-text">/</span> : null}
+                          <span className={cn('font-mono font-semibold', scoreColor(score.value))}>{formatScore(score.value)}</span>
+                          <span>{score.label}</span>
+                        </span>
+                      ))}
+                      {item.scoreNote ? <span className="text-xs text-muted-text">{item.scoreNote}</span> : null}
+                    </div>
+                  ) : null}
                   {/* Reason text */}
                   <p className="line-clamp-2 text-sm leading-6 text-secondary-text">{humanizeReason(item.primaryReason || '')}</p>
                 </div>
@@ -347,7 +348,7 @@ export const CandidateDecisionTable: React.FC<CandidateDecisionTableProps> = ({
                       const scoreItems: CandidateDecisionScore[] = [
                         { label: item.scoreLabel || '入池优先级', value: item.score, note: item.scoreNote },
                         ...(item.secondaryScores || []),
-                      ];
+                      ].filter((score) => score.value != null);
                       return (
                         <div className="grid gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(240px,0.6fr)]">
                           <div>
@@ -369,14 +370,16 @@ export const CandidateDecisionTable: React.FC<CandidateDecisionTableProps> = ({
                             )}
                           </div>
                           <div className="space-y-3">
-                            <div>
-                              <div className="mb-1.5 text-xs font-semibold text-foreground">评估口径</div>
-                              <div className="grid grid-cols-2 gap-2">
-                                {scoreItems.slice(0, 4).map((score) => (
-                                  <ScoreBlock key={score.label} label={score.label} value={score.value} note={score.note} />
-                                ))}
+                            {scoreItems.length ? (
+                              <div>
+                                <div className="mb-1.5 text-xs font-semibold text-foreground">评估口径</div>
+                                <div className="grid grid-cols-2 gap-2">
+                                  {scoreItems.slice(0, 4).map((score) => (
+                                    <ScoreBlock key={score.label} label={score.label} value={score.value} note={score.note} />
+                                  ))}
+                                </div>
                               </div>
-                            </div>
+                            ) : null}
                             <div>
                               <div className="mb-1.5 text-xs font-semibold text-foreground">动作依据</div>
                               <p className="rounded-md border border-border/60 bg-card/75 px-3 py-2 text-xs leading-5 text-secondary-text">

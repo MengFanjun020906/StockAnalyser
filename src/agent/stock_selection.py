@@ -85,6 +85,33 @@ HARD_BEARISH_RISK_MARKERS = (
     "panic",
     "extreme",
 )
+OPPORTUNITY_HARD_EXCLUSION_MARKERS = (
+    "*st",
+    "st股",
+    "st风险",
+    "退市",
+    "停牌",
+    "不可成交",
+    "名称代码不一致",
+    "股票身份无法确认",
+    "强势空头",
+    "趋势空头",
+    "跌破关键支撑",
+    "跌破止损",
+    "破位",
+    "资金流出",
+    "净流出",
+    "卖出主导",
+    "监管处罚",
+    "业绩预警",
+    "重大减持",
+    "债务",
+    "流动性风险",
+    "重大诉讼",
+    "数据过期",
+    "严重过期",
+    "行情严重过期",
+)
 
 
 @dataclass
@@ -637,16 +664,21 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         if isinstance(item, dict) and _normalize_stock_identity_code(item.get("code"))
     }
     recommended_items = [recommendation_by_code[code] for code in deep_dive_order if code in recommendation_by_code]
+    displayed_recommendations = recommended_items[:5]
+    headline_opportunity_items = _headline_opportunity_items(displayed_recommendations=displayed_recommendations)
     execution_recommendations = [
         item
-        for item in recommended_items
+        for item in displayed_recommendations
         if _execution_mode(item) in {"immediate_open", "conditional_open"}
     ]
+    headline_watch_items = _headline_watch_items(
+        displayed_recommendations=displayed_recommendations,
+        primary_items=execution_recommendations or headline_opportunity_items,
+    )
     observation_items = [
         item for item in recommendations
         if not item.get("has_deep_dive") and _execution_mode(item) not in {"immediate_open", "conditional_open"} and _is_observable_item(item)
     ]
-    displayed_recommendations = recommended_items[:5]
 
     lines = [
         "# 选股分析报告：下周可关注候选",
@@ -657,8 +689,9 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         "| --- | --- |",
         f"| 最终动作 | {judge.get('final_action') or allocation.get('portfolio_action') or '-'} |",
         f"| 裁决 | {judge.get('primary_plan_verdict') or '-'} |",
-        f"| 首选标的 | {_markdown_cell(_preferred_candidate_label(execution_recommendations))} |",
-        f"| 可观察标的 | {_markdown_cell(_watch_candidate_labels(observation_items))} |",
+        f"| 机会首选 | {_markdown_cell(_opportunity_candidate_label(headline_opportunity_items))} |",
+        f"| 执行首选 | {_markdown_cell(_execution_candidate_label(execution_recommendations))} |",
+        f"| 可观察标的 | {_markdown_cell(_watch_candidate_labels(headline_watch_items))} |",
         f"| 核心原因 | {_markdown_cell(core_reason)} |",
         f"| 最大约束 | {_markdown_cell(allocation.get('main_constraint') or '-')} |",
         f"| 候选池规模 | {_markdown_cell(discovery_summary.get('source_count') or discovery.get('candidate_count') or candidate_quality.get('candidate_count') or len(candidates))} 只 |",
@@ -909,20 +942,21 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
         for item in sorted(matrix, key=_point_calc_item_rank, reverse=True)
         if isinstance(item, dict)
     ]
-    codes: List[str] = []
-    for source in (list(recommendation_by_code), sorted_pricing_codes, list(package_by_code), list(desk_by_code)):
-        for code in source:
-            if code and code not in codes:
-                codes.append(code)
+    codes: List[str] = list(recommendation_by_code)
+    if not codes:
+        for source in (sorted_pricing_codes, list(package_by_code), list(desk_by_code)):
+            for code in source:
+                if code and code not in codes:
+                    codes.append(code)
+                if len(codes) >= 5:
+                    break
             if len(codes) >= 5:
                 break
-        if len(codes) >= 5:
-            break
 
     lines = [
-        "## 二、Meta-Agent 选股链路",
+        "## 二、Meta-Agent 链路对齐（非推荐排序）",
         "",
-        "本节只复用三席位、Meta-Agent、点位计算层已落盘结果，不重新抓取数据。字段缺失会直接标为缺失，不用隐含假设补齐。",
+        "本节只解释每只深挖标的如何从三席位传到 Meta-Agent 和点位计算层，不代表另一套推荐排序。字段缺失会直接标为缺失，不用隐含假设补齐。",
         "",
         "### 字段说明",
         "",
@@ -954,7 +988,7 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
         rec = recommendation_by_code.get(code) or {}
         name = stock.get("name") or pricing.get("name") or rec.get("name") or ""
         lines.extend([
-            f"### {idx}. {_markdown_cell(f'{code} {name}'.strip())}",
+            f"### 链路对齐：{_markdown_cell(f'{code} {name}'.strip())}",
             "",
             "#### 三席位意见",
             "",
@@ -2762,12 +2796,18 @@ def _summarize_seed_items(seeds: Sequence[Any], *, total_limit: int) -> Dict[str
             if dimension:
                 dimension_counts[dimension] = dimension_counts.get(dimension, 0) + 1
         if len(preview) < 20:
+            source_diagnostics = {
+                "source": source,
+                "priority_score": getattr(seed, "priority_score", None),
+                "score_kind": "seed_recall_priority",
+                "note": "source-local recall diagnostic only; not comparable across seed sources",
+            }
             preview.append({
                 "code": getattr(seed, "code", ""),
                 "name": getattr(seed, "name", ""),
                 "source": source,
                 "hint": _truncate(str(getattr(seed, "hint", "") or ""), 120),
-                "priority_score": getattr(seed, "priority_score", None),
+                "source_diagnostics": {key: value for key, value in source_diagnostics.items() if value is not None},
                 "freshness": getattr(seed, "freshness", None),
                 "trigger_signals": trigger_signals[:4],
             })
@@ -5286,10 +5326,79 @@ def _is_observable_item(item: Dict[str, Any]) -> bool:
     return bool(item.get("has_candidate") or item.get("has_deep_dive") or item.get("has_plan"))
 
 
-def _preferred_candidate_label(items: List[Dict[str, Any]]) -> str:
+def _has_opportunity_hard_exclusion(item: Dict[str, Any]) -> bool:
+    values: List[str] = []
+    for key in ("risk_flags", "missing_evidence"):
+        values.extend(_as_text_list(item.get(key)))
+    for key in ("plan_reason", "reason", "candidate_reason", "candidate_source"):
+        if item.get(key):
+            values.append(str(item.get(key)))
+    text = "；".join(values).lower()
+    if re.search(r"(?<![a-z0-9])\*?st(?![a-z0-9])", text, flags=re.IGNORECASE):
+        return True
+    return any(marker.lower() in text for marker in OPPORTUNITY_HARD_EXCLUSION_MARKERS)
+
+
+def _is_headline_opportunity_item(item: Dict[str, Any]) -> bool:
+    action = str(item.get("action") or "").strip().lower()
+    if action in {"reject", "avoid"}:
+        return False
+    if _has_opportunity_hard_exclusion(item):
+        return False
+    mode = _execution_mode(item)
+    if mode in {"immediate_open", "conditional_open", "strong_watch"}:
+        return True
+    if not item.get("has_deep_dive"):
+        return False
+    if not _strength_at_least(item.get("action_strength"), "medium"):
+        return False
+    return bool(item.get("supporting_evidence") or item.get("reason") or _has_entry_condition(item))
+
+
+def _headline_opportunity_items(*, displayed_recommendations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [item for item in displayed_recommendations if _is_headline_opportunity_item(item)]
+
+
+def _headline_watch_items(
+    *,
+    displayed_recommendations: List[Dict[str, Any]],
+    primary_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep the conclusion table aligned with the body recommendation list."""
+
+    if not displayed_recommendations:
+        return []
+    primary_code = (
+        _normalize_stock_identity_code(primary_items[0].get("code"))
+        if primary_items and isinstance(primary_items[0], dict)
+        else None
+    )
+    items: List[Dict[str, Any]] = []
+    for item in displayed_recommendations:
+        code = _normalize_stock_identity_code(item.get("code"))
+        if primary_code and code == primary_code:
+            continue
+        if _is_observable_item(item):
+            items.append(item)
+    return items
+
+
+def _opportunity_candidate_label(items: List[Dict[str, Any]]) -> str:
     if not items:
-        return "暂无可入手标的"
+        return "暂无高质量机会标的"
     return _stock_label(items[0])
+
+
+def _execution_candidate_label(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "暂无可执行标的"
+    label = _stock_label(items[0])
+    mode = _execution_mode(items[0])
+    if mode == "conditional_open":
+        return f"{label}（条件触发）"
+    if mode == "immediate_open":
+        return f"{label}（可执行）"
+    return label
 
 
 def _watch_candidate_labels(items: List[Dict[str, Any]]) -> str:

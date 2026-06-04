@@ -9,31 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
-- [修复] 三席位 LLM 首轮输入改用压缩版 `SeedFactPacket`，保留结构、支撑压力、趋势、均线、量能、资金、板块和基本面等决策事实，同时让 LLM fallback 共享超时预算，避免单个慢模型吃完整个 60s 后导致席位连续失败熔断；Trace probe 会回挂落盘的 `seed_facts.json`，用于真实复跑排障。
+- [新功能] 四席位 seed pool 新增 `news_theme_daily` 盘前日报主题来源，接入东方财富财经早餐 `stock_info_cjzc_em`，按 `trade_date` 匹配当天 6 点日报，并通过本地概念字典、可选 `jieba` 分词和规则引擎映射主题成分股；日报直接点名公司仅做诊断与避雷，不直接生成 seed。
+- [文档] 重写根 README 为专业化项目首页，突出账户感知 AI 投资研究、四席位选股、Meta 约束、点位计算、组合配置、Judge 和 Trace 复盘；新增 `docs/stock-selection-pipeline.md` 专题文档说明选股链路输入输出、机会首选/执行首选双轴语义和 Trace artifact。
+- [文档] 在 README 与 `docs/stock-selection-pipeline.md` 的 L1 seed pool 说明中显式列出 `AlphaSift` 与 `Sequoia` 本地主干候选源，避免把两者泛化成“本地价量与形态”。
+- [新功能] 四席位委员会新增 `theme_catalyst_desk` 主题催化席，专门判断日报/当日主题是否与个股业务归属匹配、是否已有板块或资金验证，并输出 `theme_catalyst` setup；聚合默认名额表同步给主题席保留 2 个常规名额、事件驱动 regime 保留 4 个名额。
+- [修复] `news_theme_daily` 不再只读取东方财富财经早餐列表摘要；工具会根据文章链接抓取东财原文 `ContentBody`，按 `每日精选/热点题材/公司新闻` 分区抽取主题并在 Trace 暴露 `article_fetch_status/article_sections/evidence_section`，避免摘要漏掉 MLCC 等正文主题。
+- [改进] `news_theme_daily` 主题评分新增高影响产业催化词加权，命中 `英伟达/NVIDIA/黄仁勋/CUDA/Blackwell` 等词的非公司新闻主题会提高 `theme_score` 并在 Trace 暴露 `high_impact_terms`；公司新闻否认/澄清仍只做诊断不产 seed。
+- [改进] 扩充 `news_theme_daily` 本地概念映射字典，覆盖 AI服务器、GPU算力芯片、先进封装、PCB、CPO光通信、AI玩具、低空经济、数据中心、钠离子电池、创新药、航运、房地产等常见财经早餐主题，便于原文主题召回后的成分股映射查询。
+- [改进] 四席位 seed pool 移除 `event_impact`、`news_momentum`、`fundamental_snapshot` 三个低精度主召回来源，并将 `news_theme_daily` source cap 从 6 提高到 8，给高质量盘前消息池多 2 个候选名额。
+- [改进] `news_theme_daily` 本地概念映射补充存储领域、光模块和光连接主题，覆盖 `存储领域/存储产业链/光器件/高速光模块/光互连/光引擎/光I/O` 等别名及对应宽口径成分股。
+- [改进] `news_theme_daily` 日期路由改为每日 06:00 前自动使用上一自然日财经早餐、06:00 后使用当日财经早餐，并在 Trace 暴露 `requested_target_date`、`target_date`、`target_date_rule`。
+- [修复] Agent 主分析工具批次改为正常宽度真正并行执行，并为 `get_stock_info`、`get_market_capital_flow`、`search_comprehensive_intel` 增加工具内硬超时/快搜边界，避免 Step 1 大批量工具排队后被统一 30s 标记为 `Tool execution timed out`。
+- [改进] Agent Trace 工具诊断细化 `score_stock_news_sentiment`、`get_tushare_announcements`、`get_northbound_capital_flow` 的空结果与部分数据语义：公告/新闻暴露查询窗口和状态，北向资金暴露 `data_quality` 与无核心数值字段 warning，避免把 `empty`、`partial-null` 和 `error` 混读。
+- [修复] `get_sector_rankings` 改为快路径板块工具，优先东方财富行业板块实时行情 `stock_board_industry_name_em` 背后的 boardlist 数据接口，StockAPI `/v1/hotBkJlrDr` 仅作可用时兜底；权限/额度/网络失败时直接返回结构化 `failed/timeout`，不再进入 Tushare/AkShare/Efinance 慢速轮询导致外层 30 秒超时。
+- [改进] Agent Trace 页历史记录由横向 pill 列表改为竖向列表，历史问题摘要支持多行显示，避免横向滚动时内容显示不完整。
+- [修复] 选股最终报告核心结论表改为“机会首选/执行首选”双轴展示：机会首选不因账户过于谨慎而被抹掉，执行首选才受账户、市场和风控约束；未深挖候选仅进入观察池，Meta-Agent 链路标题改为“链路对齐（非推荐排序）”，避免表头与后续章节像两套独立排序。
+- [新功能] Agent 新增 `get_stock_business_context` 轻量业务归属工具，只返回名称、行业、板块、业务线索摘要、来源与日期；四席位 `SeedFactPacket` 默认改用该工具补齐第一层业务上下文，`get_stock_info` 保留给深层基本面。
+- [改进] 四席位 `SeedFactPacket` 新增宽口径 `business_context`，从所属板块、FactSheet 和召回特征中合并宽行业、原始板块名与主题线索，避免高位事件票只因价量过热而丢失业务催化证据。
+- [改进] Web 全局字体切换为优先使用 `Noto Sans SC` / 思源黑体，并移除 Agent Trace 页面的衬线字体覆盖，提升中文页面清晰度。
+- [改进] 四席位 seed pool 移除当前权限不可用的 `northbound_stock_connect/hsgt_top10` 主来源，`hot_rank` 改用 StockAPI `renQi` 人气榜，并用 StockAPI `hotBkJlrDr/hotBkJlrLongTou` 补充 `sector_theme` 板块来源。
+- [修复] 四席位 seed pool 最终合并改为除 `user_watchlist` 外按可用 source 总数平均分配名额，并将不足来源的空余名额再分配；Trace 同步拆出 `sector_theme` 在线补充 bucket 的诊断，避免成功返回的来源被前三类挤出或被汇总入口遮蔽。
+- [修复] 四席位 LLM 首轮输入改用压缩版 `SeedFactPacket`，保留结构、支撑压力、趋势、均线、量能、资金、板块和基本面等决策事实，同时让 LLM fallback 共享超时预算，避免单个慢模型吃完整个 60s 后导致席位连续失败熔断；Trace probe 会回挂落盘的 `seed_facts.json`，用于真实复跑排障。
 - [新功能] Agent 新增 Tushare `get_tushare_today_news` 当日新闻快讯工具，固定查询今天 `00:00:00` 到当前时刻的 `news` 数据，并复用 `TUSHARE_TOKEN`/`TUSHARE_HTTP_URL` 环境配置。
-- [新功能] 选股流水线接入 `meta_orchestrator` 与 `pricing_agent` 两个真实阶段：三席位深挖后生成资产定性、硬约束与必算场景包，再由点位计算层输出 If-Then 条件单矩阵并传递给组合配置、反方审查、Judge 和最终报告。
-- [改进] 选股 `final.md` 改为面向 Meta-Agent 链路展示：新增“三席位 → Meta 约束包 → 点位计算 If-Then 条件单”专章，显式解释 Meta 字段语义、硬约束、必算场景、入场区间、止盈止损和缺失证据；深挖/报告标的数量收敛为 1-5 只。
+- [新功能] 选股流水线接入 `meta_orchestrator` 与 `pricing_agent` 两个真实阶段：四席位深挖后生成资产定性、硬约束与必算场景包，再由点位计算层输出 If-Then 条件单矩阵并传递给组合配置、反方审查、Judge 和最终报告。
+- [改进] 选股 `final.md` 改为面向 Meta-Agent 链路展示：新增“四席位 → Meta 约束包 → 点位计算 If-Then 条件单”专章，显式解释 Meta 字段语义、硬约束、必算场景、入场区间、止盈止损和缺失证据；深挖/报告标的数量收敛为 1-5 只。
 - [文档] 明确 Meta-Agent 后续运行顺序：Meta → 点位计算 → 组合规划 → 反方审查 → Judge 为 5 次串行 LLM stage 调用，`final.md` 只读取已落盘 JSON 做确定性渲染。
 - [改进] 选股 Meta-Agent 后续阶段新增 prompt 控长保护：下游只接收最多 5 只股票、每只最多 3 个必算场景的压缩约束包和条件单矩阵，并按可执行性稳定排序，避免完整 Meta/深挖结果撑爆模型上下文。
-- [改进] 暂停三席位主链路主动使用 `moneyflow_ths`：种子池资金异常源和动量席工具白名单不再调用 THS 个股资金流；单票资金验证继续走 `get_capital_flow`，由 Tushare `moneyflow` 失败后回退 StockAPI `codeFlow`。
+- [改进] 暂停四席位主链路主动使用 `moneyflow_ths`：种子池资金异常源和动量席工具白名单不再调用 THS 个股资金流；单票资金验证继续走 `get_capital_flow`，由 Tushare `moneyflow` 失败后回退 StockAPI `codeFlow`。
 - [改进] StockAPI 历史资金流 fallback 支持 `STOCKAPI_URL` 覆盖 codeFlow 地址，默认仍为 `https://www.stockapi.com.cn/v1/base/codeFlow`。
-- [改进] L1 三席位种子池新增 `AGENT_SEED_POOL_TOTAL_LIMIT` 上限配置，默认 20 保持原行为；单票真实 smoke 或排障时可临时设为 1-3，避免候选事实包补数拖慢 Meta/点位计算闭环验证。
-- [修复] 三席位种子池恢复 `user_watchlist` 最高优先级，显式传入的 `target_symbols` 会先进入 seed pool；当 `AGENT_SEED_POOL_TOTAL_LIMIT` 已被用户 seed 填满时不再继续拉在线候选源，保证单票排障稳定命中指定股票。
-- [修复] 三席位最终 JSON 解析兼容真实模型输出的短前后缀文本，自动提取首尾大括号中的 JSON object；纯自然语言仍按 `final_output_not_json` 失败处理。
-- [文档] 补充选股链路 Meta-Agent / Orchestrator 架构：明确三席位报告如何被整理成资产定性、市场环境过滤、硬约束与必算场景包，并定义点位计算层只做 If-Then 条件单计算的职责边界。
-- [改进] 三席位选股链路新增 `SeedFactPacket` 前置并行取数层，按 `(seed,tool)` 构建共享 facts JSON，并把压缩后的模型输入版 `seed_facts.json` 写入 Trace 便于定位取数慢、缺失或失败，避免原始工具数据撑爆后续模型上下文。
+- [改进] L1 四席位种子池新增 `AGENT_SEED_POOL_TOTAL_LIMIT` 上限配置，默认 20 保持原行为；单票真实 smoke 或排障时可临时设为 1-3，避免候选事实包补数拖慢 Meta/点位计算闭环验证。
+- [修复] 四席位种子池恢复 `user_watchlist` 最高优先级，显式传入的 `target_symbols` 会先进入 seed pool；当 `AGENT_SEED_POOL_TOTAL_LIMIT` 已被用户 seed 填满时不再继续拉在线候选源，保证单票排障稳定命中指定股票。
+- [修复] 四席位最终 JSON 解析兼容真实模型输出的短前后缀文本，自动提取首尾大括号中的 JSON object；纯自然语言仍按 `final_output_not_json` 失败处理。
+- [文档] 补充选股链路 Meta-Agent / Orchestrator 架构：明确四席位报告如何被整理成资产定性、市场环境过滤、硬约束与必算场景包，并定义点位计算层只做 If-Then 条件单计算的职责边界。
+- [改进] 四席位选股链路新增 `SeedFactPacket` 前置并行取数层，按 `(seed,tool)` 构建共享 facts JSON，并把压缩后的模型输入版 `seed_facts.json` 写入 Trace 便于定位取数慢、缺失或失败，避免原始工具数据撑爆后续模型上下文。
 - [改进] `detect_market_regime` 准确性优先：上调市场环境辅助组件默认预算，`AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` 从 `8.0` 调至 `25.0`、`AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` 从 `3.0` 调至 `10.0`、`AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` 从 `5.0` 调至 `20.0`；指数历史快路径和北向/两融/市场资金/板块排行均使用完整组件预算，降低短超时导致辅助输入缺失的概率。
 - [文档] 补充选股链路重构方案的深入探究层设计：将选股候选深挖从通用 `planning_prompts.py`/个股分析 prompt 中拆出，明确最多 3 只、最少 1 只的深挖目标选择、默认 3 次单股 prompt 调用、输入 payload、输出 schema 与报告消费规则。
 - [修复] 放宽 `get_stock_info` 默认超时预算：基本面阶段总预算从 1.5s 调整为 8s，单源 fetch 从 0.8s 调整为 3s，所属板块补充从 1s 调整为 3s，降低 AkShare/efinance 慢响应导致的 `partial` 与板块缺失。
-- [修复] 三席位最终输出收紧为 JSON contract + Few-shot JSON 示例，并在席位 LLM 调用中启用 `response_format={"type":"json_object"}`，减少工具调用后回灌阶段输出自然语言导致的 `final_output_not_json`。
-- [文档] 补充 `docs/选股链路重构-实施方案.md` 的端到端链路总览，明确种子池 17 个来源、三打法席位输出、聚合层和后续 screening/deep dive/judge 的传递关系。
-- [修复] 三席位单 seed LLM 默认超时从 20s 调整为 60s，并将外层 per-seed guard 上限提高到 180s、整体 committee 预算按「首轮 LLM + 工具 + 后续 LLM」同步放宽；实测工具本身多为 1-8s，主要耗时来自工具结果回灌后的 LLM 二/三轮。
-- [修复] 三席位候选发现的 LLM 调用增加 adapter 级硬超时并关闭限时调用内的 LiteLLM 重试拖延；LLM provider 超时/错误会作为逐 seed `failed` 暴露并触发连续失败熔断，不再被外层 seed guard 提前吞成无原因 `timeout`。
-- [chore] 新增 `scripts/probe_thesis_desks_from_trace.py`，可从保存的 Agent Trace 复用 seed preview 直接驱动三席位，隔离验证 seed/recall/desk loop、工具 schema 和真实 LLM 首轮调用耗时。
-- [修复] 三席位候选发现取消 seed pool 失败兜底：seed pool 只作为输入与诊断，三席位未产出 L1 候选时 `candidate_discovery.status=failed`、`candidates=[]`，选股流水线直接终止并在 Trace/报告错误中暴露席位与逐 seed 失败原因，不再继续 screening/deep dive。
-- [修复] 三席位逐 seed 执行增加 seed 级 wall-clock 保护与连续 timeout 熔断：单只 seed 超时会保存为 `per_seed_packets[]`，席位返回 `partial` 而不是等整席位 400s 后被外层合成空 timeout；Trace 页面同步展示每个席位下逐 seed 的状态、耗时、工具数和错误。
-- [修复] 三席位候选发现改为逐 seed 调用 LLM 并逐票保存 `per_seed_packets`，同时显式把 `AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS` 传给每次 LLM 工具调用，避免 LiteLLM 默认 `6000s` 导致席位线程晚到、Trace 先报 timeout，并透传 `thesis_desk_packets` 供前端查看三席位报告。
-- [改进] 选股候选发现当前调试阶段收敛到 `thesis_desk_committee` 三席位链路：后端默认模式改为三席位，前端 Trace 只暴露三席位选项；若 API/旧配置显式传 `deterministic` 或 `llm_expert_committee`，流水线会在候选发现前直接退出并写入 `candidate_discovery.status=skipped`，避免误跑旧链路干扰三席位排障。
+- [修复] 四席位最终输出收紧为 JSON contract + Few-shot JSON 示例，并在席位 LLM 调用中启用 `response_format={"type":"json_object"}`，减少工具调用后回灌阶段输出自然语言导致的 `final_output_not_json`。
+- [文档] 补充 `docs/选股链路重构-实施方案.md` 的端到端链路总览，明确种子池多来源、三打法席位输出、聚合层和后续 screening/deep dive/judge 的传递关系。
+- [修复] 四席位单 seed LLM 默认超时从 20s 调整为 60s，并将外层 per-seed guard 上限提高到 180s、整体 committee 预算按「首轮 LLM + 工具 + 后续 LLM」同步放宽；实测工具本身多为 1-8s，主要耗时来自工具结果回灌后的 LLM 二/三轮。
+- [修复] 四席位候选发现的 LLM 调用增加 adapter 级硬超时并关闭限时调用内的 LiteLLM 重试拖延；LLM provider 超时/错误会作为逐 seed `failed` 暴露并触发连续失败熔断，不再被外层 seed guard 提前吞成无原因 `timeout`。
+- [chore] 新增 `scripts/probe_thesis_desks_from_trace.py`，可从保存的 Agent Trace 复用 seed preview 直接驱动四席位，隔离验证 seed/recall/desk loop、工具 schema 和真实 LLM 首轮调用耗时。
+- [修复] 四席位候选发现取消 seed pool 失败兜底：seed pool 只作为输入与诊断，四席位未产出 L1 候选时 `candidate_discovery.status=failed`、`candidates=[]`，选股流水线直接终止并在 Trace/报告错误中暴露席位与逐 seed 失败原因，不再继续 screening/deep dive。
+- [修复] seed pool 入池后不再对外展示跨来源统一分数：`priority_score` 降级为 `source_diagnostics`，Agent Trace 与候选池页只展示来源证据/初筛分，避免把 AlphaSift、新闻主题等不同来源的 90 分直接比较。
+- [修复] 四席位逐 seed 执行增加 seed 级 wall-clock 保护与连续 timeout 熔断：单只 seed 超时会保存为 `per_seed_packets[]`，席位返回 `partial` 而不是等整席位 400s 后被外层合成空 timeout；Trace 页面同步展示每个席位下逐 seed 的状态、耗时、工具数和错误。
+- [修复] 四席位候选发现改为逐 seed 调用 LLM 并逐票保存 `per_seed_packets`，同时显式把 `AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS` 传给每次 LLM 工具调用，避免 LiteLLM 默认 `6000s` 导致席位线程晚到、Trace 先报 timeout，并透传 `thesis_desk_packets` 供前端查看四席位报告。
+- [改进] 选股候选发现当前调试阶段收敛到 `thesis_desk_committee` 四席位链路：后端默认模式改为四席位，前端 Trace 只暴露四席位选项；若 API/旧配置显式传 `deterministic` 或 `llm_expert_committee`，流水线会在候选发现前直接退出并写入 `candidate_discovery.status=skipped`，避免误跑旧链路干扰四席位排障。
 - [修复] 选股打法席位委员会：修复 LLM 适配器 `_convert_messages` 只识别扁平 `tool_calls` 结构、遇到候选专家委员会的嵌套 OpenAI 结构（`{"function": {"name", "arguments"}}`）时抛 `KeyError('name')` 的问题，曾导致三个打法席位（低位启动/动量/质量修复）在多轮工具调用后全部 failed/timeout、候选池静默回退到 60 只召回结果。
 - [改进] 打法席位聚合诊断（`thesis_desk_diagnostics`）补充每个席位的真实 `errors`/`warnings`，降级时不再只记 `status` 而丢失失败原因，避免靠盲目重跑定位问题。
 - [改进] 统一后端入口日志落盘：`server.py` 和 `webui.py` 改为复用项目日志配置并关闭 uvicorn 默认日志配置，避免 uvicorn / FastAPI 日志只停留在终端，方便后续排查时直接查看 `logs/*.log`。

@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """Tests for extended capital flow tools registration and planner mapping."""
 
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.agent.candidate_experts.orchestrator import CandidateExpertOrchestrator
 from src.agent.factory import get_tool_registry
+from src.agent.tools.data_tools import _handle_get_market_capital_flow
 
 
 def test_capital_flow_tools_are_registered():
@@ -56,8 +59,26 @@ def test_stockapi_market_microstructure_tools_are_registered():
     assert "get_stockapi_hot_sectors" in registry
     assert "get_stockapi_sector_constituents" in registry
     assert "get_stockapi_sector_flow_history" in registry
+    assert "get_stockapi_hot_sector_leaders" in registry
+    assert "get_stockapi_change_all_history" in registry
     assert "get_stockapi_popularity_rank" in registry
     assert "get_stockapi_hot_money_activity" in registry
+
+
+def test_get_market_capital_flow_returns_structured_timeout_inside_tool():
+    class _SlowAdapter:
+        def get_market_capital_flow(self, top_n=5):
+            time.sleep(0.2)
+            return {"status": "ok"}
+
+    cfg = SimpleNamespace(agent_tushare_tool_timeout_seconds=0.01)
+    with patch("src.agent.tools.data_tools._get_fundamental_adapter", return_value=_SlowAdapter()), \
+         patch("src.config.get_config", return_value=cfg):
+        result = _handle_get_market_capital_flow(top_n=2)
+
+    assert result["status"] == "timeout"
+    assert result["source_chain"][0]["result"] == "timeout"
+    assert result["market_flow"] == {}
 
 
 def test_tushare_moneyflow_dc_is_first_capital_expert_source():

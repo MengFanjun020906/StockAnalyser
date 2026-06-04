@@ -1,0 +1,233 @@
+dimension: theme_catalyst_desk
+description: >-
+  主题催化席位可调用的工具集。目标是核实「盘前/当日高质量主题催化 + 业务归属匹配
+  + 资金或板块验证」，避免把泛概念、澄清公告或已透支高位票误判为利好。
+
+tools:
+  - tool: get_eastmoney_cjzc_daily
+    priority: 5
+    when_to_use: >-
+      回看当天东方财富财经早餐原文主题，确认候选是否来自盘前日报主题，
+      并读取 evidence_section、matched_keywords、polarity、high_impact_terms。
+    typical_args:
+      target_date: "{today}"
+      allow_previous: false
+    returns_summary: >-
+      返回当天财经早餐标题、链接、原文抓取状态、主题列表、公司新闻诊断和映射股票。
+    key_fields:
+      - themes
+      - article_fetch_status
+      - evidence_section
+      - matched_keywords
+      - high_impact_terms
+      - company_events
+    combo_hints:
+      - 与 get_stock_business_context 联动：日报主题与业务归属一致才是有效催化。
+      - 与 get_stockapi_hot_sectors 联动：盘前主题若盘中成为强板块，优先级提高。
+    cost: cheap
+    failure_modes:
+      - 盘前 6 点前当天日报可能 missing。
+      - 原文抓取失败时只能使用摘要降级，必须降低结论强度。
+
+  - tool: get_stock_business_context
+    priority: 8
+    when_to_use: >-
+      核实个股行业、概念板块和业务归属线索，判断是否真正属于日报主题产业链。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回名称、行业、所属板块、业务线索摘要、来源和日期。
+    key_fields:
+      - industry
+      - boards
+      - business_summary
+      - source
+    combo_hints:
+      - 业务归属与日报主题不匹配时，不得仅凭热门词 support。
+      - 宽口径映射可以 watch，但 reason 必须写清产业链角色。
+    cost: cheap
+    failure_modes:
+      - 所属板块缺失时只能作为业务不明，不能臆测主营。
+
+  - tool: get_stockapi_hot_sectors
+    priority: 10
+    when_to_use: >-
+      查看热点板块资金净流入、强度和持续天数，确认主题是否已被市场验证。
+    typical_args:
+      date: "{today}"
+      limit: 20
+    returns_summary: >-
+      返回热点板块列表、板块净额、强度、资金净流入天数。
+    key_fields:
+      - bk_name
+      - main_net_inflow
+      - strength
+      - net_inflow_days
+    combo_hints:
+      - 日报主题 + 热点板块强 = 主题催化被资金验证。
+      - 板块净流出时，主题只保留观察或剔除。
+    cost: medium
+    failure_modes:
+      - StockAPI 网络失败或当天无数据时返回 empty/failed。
+
+  - tool: get_stockapi_hot_sector_leaders
+    priority: 12
+    when_to_use: >-
+      查看热点板块龙头股，判断候选是龙头、跟随补涨还是弱相关边缘票。
+    typical_args:
+      date: "{today}"
+      limit: 30
+    returns_summary: >-
+      返回热点板块龙头股、板块代码、板块名称和资金指标。
+    key_fields:
+      - code
+      - name
+      - bk_name
+      - main_net_inflow
+      - strength
+    combo_hints:
+      - 候选同时是热点板块龙头 = support 权重提高。
+      - 非龙头但业务匹配且未涨透 = watch，等待资金扩散。
+    cost: medium
+    failure_modes:
+      - 板块代码缺失时只能看全量龙头列表。
+
+  - tool: get_stockapi_hot_money_activity
+    priority: 14
+    when_to_use: >-
+      补充个股或全市场热门资金活跃数据，观察主题票是否已有资金关注。
+    typical_args:
+      stock_code: "{code}"
+      limit: 10
+    returns_summary: >-
+      返回个股或热门资金活跃记录、资金方向、金额和排名。
+    key_fields:
+      - code
+      - name
+      - net_inflow
+      - rank
+      - reason
+    combo_hints:
+      - 主题匹配 + 资金活跃上升 = 催化落地。
+      - 主题匹配但资金持续缺席 = watch 或 rejected。
+    cost: medium
+    failure_modes:
+      - 部分日期或个股可能无活跃记录。
+
+  - tool: get_capital_flow
+    priority: 18
+    when_to_use: >-
+      核实个股主力资金方向，判断主题催化是否被个股资金承接。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回近 N 日主力净流入、方向及净流入比例。
+    key_fields:
+      - main_net_inflow
+      - direction
+      - net_ratio
+      - net_5d_inflow
+    combo_hints:
+      - 主题强但主力持续净流出 = 不可 support。
+      - 主题强 + 主力由负转正 = 催化启动信号。
+    cost: medium
+    failure_modes:
+      - 非交易日无数据；资金源失败时返回空。
+
+  - tool: get_realtime_quote
+    priority: 22
+    when_to_use: >-
+      检查今日涨跌幅、换手率、量比和追高风险，确认是否还有交易窗口。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回最新价、涨跌幅、换手率、量比和行情时效。
+    key_fields:
+      - price
+      - change_pct
+      - turnover_rate
+      - volume_ratio
+    combo_hints:
+      - 涨幅过大但换手温和，可 watch 等分歧；巨量冲高回落则 rejected。
+    cost: cheap
+    failure_modes:
+      - 休市时返回最近可用价，不代表盘中实时状态。
+
+  - tool: get_volume_analysis
+    priority: 24
+    when_to_use: >-
+      判断主题票是否有放量承接、缩量回踩或巨量出货。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回量比、成交量趋势和量价配合评估。
+    key_fields:
+      - volume_ratio
+      - volume_trend
+      - volume_price_fit
+    combo_hints:
+      - 放量上涨且未巨量透支 = 主题资金确认。
+      - 巨量长上影 = 情绪兑现风险。
+    cost: cheap
+    failure_modes:
+      - 停牌或历史数据不足时结论弱化。
+
+  - tool: analyze_price_structure
+    priority: 28
+    when_to_use: >-
+      查看主题票当前位置、支撑压力和是否已处拥挤高位，给出等待回踩条件。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回区间位置、支撑压力位和平台结构。
+    key_fields:
+      - position_zone
+      - support_levels
+      - resistance_levels
+    combo_hints:
+      - 主题催化强但价格贴近压力位，只能 watch 并给出回踩确认点。
+    cost: cheap
+    failure_modes:
+      - 新股或历史不足时 position_zone 可能 unknown。
+
+  - tool: search_stock_news
+    priority: 35
+    when_to_use: >-
+      当 SeedFactPacket 的消息证据缺失或冲突时，补查个股最新新闻摘要。
+      只用于补证，不替代盘前日报主题。
+    typical_args:
+      stock_code: "{code}"
+      stock_name: "{name}"
+    returns_summary: >-
+      返回最新新闻标题、摘要、来源、发布时间和链接。
+    key_fields:
+      - title
+      - snippet
+      - source
+      - published_at
+    combo_hints:
+      - 若查到澄清、减持、处罚等负向新闻，主题催化必须降级或剔除。
+    cost: expensive
+    failure_modes:
+      - 搜索源网络失败或中文结果不足。
+
+  - tool: score_stock_news_sentiment
+    priority: 38
+    when_to_use: >-
+      公司新闻存在正负混杂、澄清/否认风险时，补做公司级消息情绪归类。
+    typical_args:
+      stock_code: "{code}"
+      stock_name: "{name}"
+    returns_summary: >-
+      返回公司新闻情绪、事件类型、正负面关键词和风险提示。
+    key_fields:
+      - sentiment
+      - event_type
+      - positive_keywords
+      - negative_keywords
+      - risk_flags
+    combo_hints:
+      - 公司级负面或澄清风险优先于主题热度。
+    cost: expensive
+    failure_modes:
+      - 搜索结果为空时不能据此判断无风险。

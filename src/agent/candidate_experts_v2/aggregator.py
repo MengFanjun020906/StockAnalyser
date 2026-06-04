@@ -49,6 +49,13 @@ _DESK_DIM_TOOL_MAP: Dict[str, Dict[str, Set[str]]] = {
         "valuation": {"get_tushare_daily_basic"},
         "position":  {"analyze_price_structure"},
     },
+    "theme_catalyst_desk": {
+        "theme":    {"get_eastmoney_cjzc_daily", "search_stock_news", "score_stock_news_sentiment"},
+        "business": {"get_stock_business_context"},
+        "sector":   {"get_stockapi_hot_sectors", "get_stockapi_hot_sector_leaders"},
+        "capital":  {"get_stockapi_hot_money_activity", "get_capital_flow", "get_volume_analysis"},
+        "position": {"get_realtime_quote", "analyze_price_structure"},
+    },
 }
 
 # Conflict detection thresholds
@@ -66,33 +73,34 @@ _STANCE_STRENGTH: Dict[str, int] = {
 
 # Desk priority order for primary_desk resolution (lower = higher priority)
 _DESK_PRIORITY: Dict[str, int] = {
-    "early_turn_desk": 0,
-    "quality_repair_desk": 1,
-    "momentum_desk": 2,
+    "theme_catalyst_desk": 0,
+    "early_turn_desk": 1,
+    "quality_repair_desk": 2,
+    "momentum_desk": 3,
 }
 
 # Default slot allocation (used when no config JSON provided)
 _DEFAULT_ALLOCATION: Dict[str, Dict[str, int]] = {
-    "trending_up":     {"early_turn_desk": 2, "momentum_desk": 4, "quality_repair_desk": 2},
-    "range_bound":     {"early_turn_desk": 4, "momentum_desk": 2, "quality_repair_desk": 2},
-    "high_volatility": {"early_turn_desk": 3, "momentum_desk": 1, "quality_repair_desk": 4},
-    "risk_off":        {"early_turn_desk": 3, "momentum_desk": 0, "quality_repair_desk": 5},
-    "panic":           {"early_turn_desk": 3, "momentum_desk": 0, "quality_repair_desk": 5},
-    "trending_down":   {"early_turn_desk": 4, "momentum_desk": 0, "quality_repair_desk": 4},
-    "event_driven":    {"early_turn_desk": 2, "momentum_desk": 3, "quality_repair_desk": 3},
-    "unknown":         {"early_turn_desk": 3, "momentum_desk": 3, "quality_repair_desk": 2},
+    "trending_up":     {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 3, "quality_repair_desk": 1},
+    "range_bound":     {"theme_catalyst_desk": 2, "early_turn_desk": 3, "momentum_desk": 1, "quality_repair_desk": 2},
+    "high_volatility": {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 1, "quality_repair_desk": 3},
+    "risk_off":        {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 0, "quality_repair_desk": 4},
+    "panic":           {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 0, "quality_repair_desk": 4},
+    "trending_down":   {"theme_catalyst_desk": 2, "early_turn_desk": 3, "momentum_desk": 0, "quality_repair_desk": 3},
+    "event_driven":    {"theme_catalyst_desk": 4, "early_turn_desk": 1, "momentum_desk": 2, "quality_repair_desk": 1},
+    "unknown":         {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 2, "quality_repair_desk": 2},
 }
 
 # Default backfill rules: regime → {donor_desk: [recipient_desks]}
 _DEFAULT_BACKFILL_RULES: Dict[str, Dict[str, List[str]]] = {
     "risk_off":       {"momentum_desk": ["quality_repair_desk"],
-                       "early_turn_desk": ["quality_repair_desk"]},
+                       "early_turn_desk": ["quality_repair_desk", "theme_catalyst_desk"]},
     "panic":          {"momentum_desk": ["quality_repair_desk"],
-                       "early_turn_desk": ["quality_repair_desk"]},
+                       "early_turn_desk": ["quality_repair_desk", "theme_catalyst_desk"]},
     "trending_down":  {"momentum_desk": ["quality_repair_desk"],
-                       "early_turn_desk": ["quality_repair_desk"]},
+                       "early_turn_desk": ["quality_repair_desk", "theme_catalyst_desk"]},
     "trending_up":    {"early_turn_desk": ["momentum_desk"],
-                       "quality_repair_desk": ["momentum_desk"]},
+                       "quality_repair_desk": ["momentum_desk", "theme_catalyst_desk"]},
 }
 
 
@@ -386,6 +394,13 @@ def _detect_conflicts(
         g = fs.gain_5d
         if g is not None and g >= _HIGH_GAIN_THRESHOLD:
             flags.append("quality_price_mismatch")
+
+    if primary_desk == "theme_catalyst_desk":
+        if fs.capital_direction == "outflow":
+            flags.append("theme_without_capital_validation")
+        g = fs.gain_5d
+        if g is not None and g >= _HIGH_GAIN_THRESHOLD:
+            flags.append("theme_chase_risk")
 
     return flags
 

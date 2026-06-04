@@ -702,6 +702,8 @@ def test_get_tushare_event_fundamental_and_technical_tools_query_expected_apis()
 
     assert announcements["api_name"] == "anns_d"
     assert announcements["items"][0]["title"] == "年度权益分派公告"
+    assert announcements["date_window"]["start_date"]
+    assert announcements["date_window"]["end_date"]
     assert alerts["api_name"] == "stk_alert"
     assert shock["api_name"] == "stk_shock"
     assert pledge_stat["api_name"] == "pledge_stat"

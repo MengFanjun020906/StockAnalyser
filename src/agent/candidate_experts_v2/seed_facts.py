@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import math
+import re
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -28,7 +29,7 @@ DEFAULT_SEED_FACT_TOOLS: Tuple[str, ...] = (
     "calculate_ma",
     "get_volume_analysis",
     "get_capital_flow",
-    "get_stock_info",
+    "get_stock_business_context",
 )
 
 
@@ -126,6 +127,7 @@ def build_seed_fact_packets_parallel(
     total_elapsed_ms = int((time.time() - started) * 1000)
     for packet in packets.values():
         _finalize_packet_quality(packet, elapsed_ms=total_elapsed_ms)
+        packet.business_context = _build_business_context(packet)
     return list(packets.values())
 
 
@@ -187,6 +189,7 @@ def compact_seed_fact_packets_for_model(
                 "recall_sources": packet_dict.get("recall_sources") or [],
                 "flags": _compact_flags(packet_dict.get("flags")),
                 "fact_sheet": _compact_fact_sheet(packet_dict.get("fact_sheet")),
+                "business_context": _compact_business_context(packet_dict.get("business_context")),
                 "data_quality": _compact_data_quality(packet_dict.get("data_quality")),
                 "facts": {
                     str(tool_name): _compact_tool_fact(str(tool_name), result)
@@ -246,6 +249,31 @@ def _compact_fact_sheet(value: Any) -> Dict[str, Any]:
         key: fs.get(key)
         for key in keep
         if key in fs and fs.get(key) not in (None, "", [], {})
+    }
+
+
+def _compact_business_context(value: Any) -> Dict[str, Any]:
+    context = value if isinstance(value, dict) else {}
+    if not context:
+        return {}
+    compact = {
+        "status": context.get("status"),
+        "broad_industries": _compact_string_list(context.get("broad_industries"), limit=5),
+        "board_names": _compact_board_names(context.get("board_names"), limit=8),
+        "theme_clues": _compact_theme_clues(context.get("theme_clues"), limit=6),
+        "confidence": context.get("confidence"),
+    }
+    source_quality = context.get("source_quality")
+    if isinstance(source_quality, dict):
+        compact["source_quality"] = {
+            key: value
+            for key, value in source_quality.items()
+            if value not in (None, "", [], {})
+        }
+    return {
+        key: value
+        for key, value in compact.items()
+        if value not in (None, "", [], {})
     }
 
 
@@ -397,6 +425,18 @@ def _slim_tool_summary(tool_name: str, summary: Dict[str, Any]) -> Dict[str, Any
         if compact_sectors:
             result["sector_rankings"] = compact_sectors
         return result
+    if tool_name == "get_stock_business_context":
+        keep = (
+            "status",
+            "code",
+            "name",
+            "industry",
+            "boards",
+            "business_summary",
+            "source",
+            "as_of",
+        )
+        return {key: summary.get(key) for key in keep if summary.get(key) not in (None, "", [], {})}
     if tool_name == "get_stock_info":
         boards = summary.get("belong_boards") if isinstance(summary.get("belong_boards"), list) else []
         fundamental = summary.get("fundamental_context")
@@ -530,6 +570,64 @@ def _compact_errors(value: Any) -> List[str]:
     return [str(item)[:240] for item in errors[:3] if str(item).strip()]
 
 
+def _compact_string_list(value: Any, *, limit: int) -> List[str]:
+    values = value if isinstance(value, list) else []
+    out: List[str] = []
+    for item in values:
+        text = _clean_business_text(item)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _compact_board_names(value: Any, *, limit: int) -> List[Dict[str, Any]]:
+    items = value if isinstance(value, list) else []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_business_text(item.get("name"))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        compact = {
+            key: _clean_business_text(item.get(key)) if key != "confidence" else item.get(key)
+            for key in ("name", "code", "type", "source", "confidence")
+            if item.get(key) not in (None, "", [], {})
+        }
+        if compact:
+            out.append(compact)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _compact_theme_clues(value: Any, *, limit: int) -> List[Dict[str, Any]]:
+    clues = value if isinstance(value, list) else []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for clue in clues:
+        if not isinstance(clue, dict):
+            continue
+        evidence = _clean_business_text(clue.get("evidence"))
+        source = _clean_business_text(clue.get("source"))
+        label = _clean_business_text(clue.get("label"))
+        key = (label, source, evidence)
+        if not evidence or key in seen:
+            continue
+        seen.add(key)
+        item = {"source": source, "evidence": evidence[:180]}
+        if label:
+            item["label"] = label
+        out.append({k: v for k, v in item.items() if v not in (None, "", [], {})})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _extract_tool_summary(tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
     fields_by_tool: Dict[str, Tuple[str, ...]] = {
         "analyze_price_structure": (
@@ -603,6 +701,17 @@ def _extract_tool_summary(tool_name: str, data: Dict[str, Any]) -> Dict[str, Any
             "source_chain",
             "error_summary",
         ),
+        "get_stock_business_context": (
+            "status",
+            "code",
+            "name",
+            "industry",
+            "boards",
+            "business_summary",
+            "source",
+            "source_chain",
+            "as_of",
+        ),
         "get_stock_info": (
             "status",
             "code",
@@ -650,6 +759,323 @@ def _compact_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, str) and len(value) > 300:
         return value[:300] + "...[truncated]"
     return value
+
+
+BROAD_INDUSTRY_KEYWORDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("电子器件/元器件", ("电子", "元件", "器件", "半导体", "芯片", "集成电路", "被动元件", "电容", "MLCC", "PCB", "光学", "显示", "LED")),
+    ("软件算力/通信", ("软件", "算力", "云计算", "人工智能", "AI", "数据中心", "服务器", "通信", "5G", "6G", "互联网")),
+    ("机械设备/机器人", ("机械", "设备", "机器人", "工业母机", "机床", "自动化", "专用设备", "通用设备")),
+    ("汽车产业链", ("汽车", "整车", "零部件", "新能源车", "无人驾驶", "智能驾驶", "车联网")),
+    ("新能源/电力设备", ("光伏", "锂电", "储能", "风电", "电池", "电力设备", "充电桩", "新能源")),
+    ("电力能源", ("电力", "火电", "水电", "核电", "发电", "煤炭", "石油", "天然气", "燃气")),
+    ("资源金属", ("有色", "黄金", "白银", "铜", "铝", "锂", "稀土", "小金属", "贵金属", "矿")),
+    ("化工材料", ("化工", "材料", "塑料", "橡胶", "玻璃", "化纤", "涂料", "氟化工")),
+    ("医药生物", ("医药", "医疗", "生物", "创新药", "中药", "器械", "疫苗")),
+    ("食品消费", ("食品", "饮料", "白酒", "消费", "零售", "家电", "旅游", "酒店")),
+    ("金融地产", ("银行", "证券", "保险", "金融", "地产", "房地产", "物业")),
+    ("基建交运", ("基建", "建筑", "建材", "港口", "航运", "铁路", "公路", "物流", "机场")),
+    ("军工", ("军工", "航天", "航空", "船舶", "卫星", "北斗")),
+    ("农业环保", ("农业", "养殖", "种业", "环保", "污水", "固废")),
+    ("传媒教育", ("传媒", "影视", "游戏", "教育", "出版", "广告")),
+)
+
+
+def _build_business_context(packet: SeedFactPacket) -> Dict[str, Any]:
+    board_names = _collect_business_boards(packet)
+    theme_clues = _collect_theme_clues(packet)
+    broad_industries = _derive_broad_industries(board_names, theme_clues, packet.fact_sheet)
+
+    board_count = len(board_names)
+    business_context_board_count = sum(
+        1
+        for item in board_names
+        if isinstance(item, dict) and item.get("source") == "get_stock_business_context"
+    )
+    stock_info_board_count = sum(
+        1
+        for item in board_names
+        if isinstance(item, dict) and item.get("source") == "get_stock_info"
+    )
+    clue_count = len(theme_clues)
+    if business_context_board_count:
+        status = "ok"
+    elif stock_info_board_count:
+        status = "partial"
+    elif board_count or clue_count or broad_industries:
+        status = "partial"
+    else:
+        status = "missing"
+
+    confidence = "low"
+    if business_context_board_count >= 2:
+        confidence = "high"
+    elif (
+        business_context_board_count == 1
+        or stock_info_board_count >= 2
+        or board_count >= 2
+        or clue_count >= 2
+        or broad_industries
+    ):
+        confidence = "medium"
+
+    return {
+        "status": status,
+        "broad_industries": broad_industries[:5],
+        "board_names": board_names[:10],
+        "theme_clues": theme_clues[:8],
+        "confidence": confidence,
+        "source_quality": {
+            "board_count": board_count,
+            "business_context_board_count": business_context_board_count,
+            "business_context_status": _business_context_status(packet),
+            "stock_info_board_count": stock_info_board_count,
+            "theme_clue_count": clue_count,
+            "stock_info_status": _stock_info_status(packet),
+        },
+    }
+
+
+def _collect_business_boards(packet: SeedFactPacket) -> List[Dict[str, Any]]:
+    boards: List[Dict[str, Any]] = []
+    fact_sheet = packet.fact_sheet if isinstance(packet.fact_sheet, dict) else {}
+    sector_name = _clean_business_text(fact_sheet.get("sector_name"))
+    if sector_name:
+        boards.append({"name": sector_name, "source": "fact_sheet", "confidence": "medium"})
+
+    business_context = packet.facts.get("get_stock_business_context")
+    business_data = business_context.data if isinstance(business_context, SeedFactToolResult) else {}
+    if isinstance(business_data, dict):
+        industry = _clean_business_text(business_data.get("industry"))
+        if industry:
+            boards.append(
+                {
+                    "name": industry,
+                    "type": "industry",
+                    "source": "get_stock_business_context",
+                    "confidence": "high" if business_context and business_context.status in {"ok", "partial"} else "medium",
+                }
+            )
+        for name in business_data.get("boards") or []:
+            cleaned = _clean_business_text(name)
+            if not cleaned:
+                continue
+            boards.append(
+                {
+                    "name": cleaned,
+                    "source": "get_stock_business_context",
+                    "confidence": "high" if business_context and business_context.status in {"ok", "partial"} else "medium",
+                }
+            )
+
+    stock_info = packet.facts.get("get_stock_info")
+    stock_data = stock_info.data if isinstance(stock_info, SeedFactToolResult) else {}
+    if isinstance(stock_data, dict):
+        for item in _extract_board_items(stock_data):
+            name = _clean_business_text(item.get("name"))
+            if not name:
+                continue
+            boards.append(
+                {
+                    "name": name,
+                    "code": _clean_business_text(item.get("code")),
+                    "type": _clean_business_text(item.get("type")),
+                    "source": "get_stock_info",
+                    "confidence": "high" if stock_info and stock_info.status in {"ok", "partial"} else "medium",
+                }
+            )
+
+    for flag in packet.flags or []:
+        if not isinstance(flag, dict):
+            continue
+        for name in _extract_business_names_from_value(flag.get("metrics")):
+            boards.append({"name": name, "source": "feature_flag", "confidence": "medium"})
+
+    return _dedupe_business_items(boards)
+
+
+def _extract_board_items(stock_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Any] = [
+        stock_data.get("belong_boards"),
+        stock_data.get("boards"),
+    ]
+    fundamental = stock_data.get("fundamental_context")
+    if isinstance(fundamental, dict):
+        boards_block = fundamental.get("boards")
+        if isinstance(boards_block, dict):
+            candidates.append(boards_block.get("data"))
+    out: List[Dict[str, Any]] = []
+    for value in candidates:
+        if isinstance(value, list):
+            out.extend(item for item in value if isinstance(item, dict))
+        elif isinstance(value, dict):
+            out.extend(item for item in value.values() if isinstance(item, dict))
+    return out
+
+
+def _collect_theme_clues(packet: SeedFactPacket) -> List[Dict[str, Any]]:
+    clues: List[Dict[str, Any]] = []
+    for flag in packet.flags or []:
+        if not isinstance(flag, dict):
+            continue
+        kind = _clean_business_text(flag.get("kind"))
+        detector = _clean_business_text(flag.get("detector")) or "feature_flag"
+        summary = _clean_business_text(flag.get("summary"))
+        metrics = flag.get("metrics")
+        label = _best_business_label(metrics)
+        if summary:
+            clues.append(
+                {
+                    "source": detector,
+                    "label": label or kind,
+                    "evidence": summary,
+                }
+            )
+        for name in _extract_business_names_from_value(metrics):
+            clues.append(
+                {
+                    "source": detector,
+                    "label": name,
+                    "evidence": f"召回指标包含业务/主题线索:{name}",
+                }
+            )
+
+    fact_sheet = packet.fact_sheet if isinstance(packet.fact_sheet, dict) else {}
+    sector_name = _clean_business_text(fact_sheet.get("sector_name"))
+    sector_strength = _clean_business_text(fact_sheet.get("sector_strength"))
+    if sector_name:
+        evidence = f"FactSheet sector_name={sector_name}"
+        if sector_strength and sector_strength != "unknown":
+            evidence += f", sector_strength={sector_strength}"
+        clues.append({"source": "fact_sheet", "label": sector_name, "evidence": evidence})
+    return _dedupe_theme_clues(clues)
+
+
+def _derive_broad_industries(
+    board_names: Sequence[Dict[str, Any]],
+    theme_clues: Sequence[Dict[str, Any]],
+    fact_sheet: Any,
+) -> List[str]:
+    texts: List[str] = []
+    for item in board_names:
+        if isinstance(item, dict):
+            texts.append(_clean_business_text(item.get("name")))
+            texts.append(_clean_business_text(item.get("type")))
+    for clue in theme_clues:
+        if isinstance(clue, dict):
+            texts.append(_clean_business_text(clue.get("label")))
+            texts.append(_clean_business_text(clue.get("evidence")))
+    if isinstance(fact_sheet, dict):
+        texts.append(_clean_business_text(fact_sheet.get("sector_name")))
+    joined = " ".join(text for text in texts if text)
+    matched: List[str] = []
+    for broad_name, keywords in BROAD_INDUSTRY_KEYWORDS:
+        if any(keyword and keyword in joined for keyword in keywords):
+            matched.append(broad_name)
+    return matched
+
+
+def _extract_business_names_from_value(value: Any) -> List[str]:
+    names: List[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key or "").lower()
+            if key_text in {"sector", "sector_name", "industry", "industry_name", "concept", "concepts", "theme", "themes", "board", "board_name", "bk_name", "name"}:
+                names.extend(_extract_business_names_from_value(item))
+            elif isinstance(item, (dict, list)):
+                names.extend(_extract_business_names_from_value(item))
+    elif isinstance(value, list):
+        for item in value:
+            names.extend(_extract_business_names_from_value(item))
+    else:
+        text = _clean_business_text(value)
+        if text:
+            if "," in text or "，" in text or "/" in text:
+                for part in re.split(r"[,，/、|]+", text):
+                    part = _clean_business_text(part)
+                    if part:
+                        names.append(part)
+            else:
+                names.append(text)
+    return list(dict.fromkeys(names))
+
+
+def _best_business_label(value: Any) -> str:
+    names = _extract_business_names_from_value(value)
+    return names[0] if names else ""
+
+
+def _dedupe_business_items(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items:
+        name = _clean_business_text(item.get("name"))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(
+            {
+                key: value
+                for key, value in {
+                    "name": name,
+                    "code": _clean_business_text(item.get("code")),
+                    "type": _clean_business_text(item.get("type")),
+                    "source": _clean_business_text(item.get("source")),
+                    "confidence": _clean_business_text(item.get("confidence")),
+                }.items()
+                if value not in (None, "", [], {})
+            }
+        )
+    return out
+
+
+def _dedupe_theme_clues(clues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for clue in clues:
+        evidence = _clean_business_text(clue.get("evidence"))
+        if not evidence:
+            continue
+        source = _clean_business_text(clue.get("source"))
+        label = _clean_business_text(clue.get("label"))
+        key = (source, label, evidence)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                key: value
+                for key, value in {
+                    "source": source,
+                    "label": label,
+                    "evidence": evidence[:240],
+                }.items()
+                if value not in (None, "", [], {})
+            }
+        )
+    return out
+
+
+def _stock_info_status(packet: SeedFactPacket) -> str:
+    result = packet.facts.get("get_stock_info")
+    if isinstance(result, SeedFactToolResult):
+        return result.status
+    return "missing"
+
+
+def _business_context_status(packet: SeedFactPacket) -> str:
+    result = packet.facts.get("get_stock_business_context")
+    if isinstance(result, SeedFactToolResult):
+        return result.status
+    return "missing"
+
+
+def _clean_business_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "null", "unknown"}:
+        return ""
+    return re.sub(r"\s+", " ", text)
 
 
 def _normalize_tools(tools: Optional[Sequence[str]]) -> List[str]:

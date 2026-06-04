@@ -784,7 +784,7 @@ class Config:
             "calculate_ma",
             "get_volume_analysis",
             "get_capital_flow",
-            "get_stock_info",
+            "get_stock_business_context",
         ]
     )
     agent_risk_override: bool = True  # Allow risk agent to veto buy signals
@@ -1610,7 +1610,7 @@ class Config:
                 name.strip()
                 for name in os.getenv(
                     'AGENT_SEED_FACT_TOOLS',
-                    'analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_info',
+                    'analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context',
                 ).split(',')
                 if name.strip()
             ],

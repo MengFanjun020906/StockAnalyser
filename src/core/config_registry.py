@@ -536,14 +536,14 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "AGENT_SEED_FACT_TOOLS": {
         "title": "Agent Seed Fact Tools",
-        "description": "Comma-separated tools collected once per seed before thesis desks. The resulting SeedFactPacket is shared by all desks.",
+        "description": "Comma-separated tools collected once per seed before thesis desks. The resulting SeedFactPacket is shared by all desks; default business attribution uses lightweight get_stock_business_context instead of deep get_stock_info.",
         "category": "agent",
         "data_type": "string",
         "ui_control": "textarea",
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_info",
+        "default_value": "analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context",
         "options": [],
         "validation": {},
         "display_order": 32,
@@ -664,7 +664,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     # P4 thesis desk committee --------------------------------------------------
     "DESK_SLOT_ALLOCATION_JSON": {
         "title": "Desk Slot Allocation JSON",
-        "description": "JSON mapping MarketRegime key → {desk_key: slot_count}. Controls how many candidates each thesis desk contributes per regime. Falls back to built-in defaults when omitted or invalid.",
+        "description": "JSON mapping MarketRegime key → {desk_key: slot_count}. Controls how many candidates each thesis desk contributes per regime. Built-in defaults cover early_turn_desk, momentum_desk, quality_repair_desk, and theme_catalyst_desk; falls back when omitted or invalid.",
         "category": "agent",
         "data_type": "string",
         "ui_control": "textarea",

@@ -108,6 +108,40 @@ class ExecuteToolsFrozenContextTestCase(unittest.TestCase):
         self.assertEqual(len(observed), num_tools)
         self.assertTrue(all(d == frozen_date for d in observed))
 
+    def test_parallel_tool_batch_does_not_queue_normal_step_width(self):
+        """A normal planning_execute tool batch should start all tools together.
+
+        The production trace that motivated this test had 16 requested tools, but
+        only 5 workers; later tools were still queued when the shared batch
+        timeout fired. This barrier catches that regression.
+        """
+        from src.agent.runner import _execute_tools
+
+        num_tools = 8
+        barrier = threading.Barrier(num_tools, timeout=3)
+        observed: list[str] = []
+
+        def _barrier_spy(**kwargs):
+            barrier.wait()
+            observed.append(threading.current_thread().name)
+            return json.dumps({"ok": True})
+
+        registry = ToolRegistry()
+        names = [f"wide_spy_{i}" for i in range(num_tools)]
+        for name in names:
+            registry.register(ToolDefinition(name=name, description="spy", parameters=[], handler=_barrier_spy))
+
+        _execute_tools(
+            tool_calls=[_FakeToolCall(name) for name in names],
+            tool_registry=registry,
+            step=1,
+            progress_callback=None,
+            tool_calls_log=[],
+            tool_wait_timeout_seconds=5.0,
+        )
+
+        self.assertEqual(len(observed), num_tools)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -118,7 +118,6 @@ function fundamentalStatusTone(status?: string): 'default' | 'good' | 'warn' | '
 
 function candidateActionFor(item: CandidatePoolItem): { key: string; label: string; tone: CandidateDecisionTone; strength?: string; reason: string } {
   const source = String(item.source || '');
-  const score = Number(item.signalScore || 0);
   const recurrence = Number(item.recurrenceCount || 1);
   const lifecycle = String(item.lifecycleStatus || 'new');
   if (source === 'fallback' || source.startsWith('fallback:')) {
@@ -148,22 +147,22 @@ function candidateActionFor(item: CandidatePoolItem): { key: string; label: stri
       reason: '候选已降权，需等待新的证据。',
     };
   }
-  if (score >= 95 || (score >= 88 && recurrence >= 3)) {
+  if ((item.recallSources || []).length > 1 || recurrence >= 3) {
     return {
       key: 'deep_dive',
       label: '进入深挖',
       tone: 'success',
       strength: '强',
-      reason: '入池优先级较高且具备重复出现，适合进入下一轮深度分析。',
+      reason: '候选具备多源或多次出现证据，适合进入下一轮深度分析。',
     };
   }
-  if (score >= 80) {
+  if (item.reasonDimensions?.length || recurrence >= 2) {
     return {
       key: 'monitor',
       label: '重点观察',
       tone: 'info',
       strength: '中',
-      reason: '当前入池优先级和证据质量适合继续跟踪。',
+      reason: '当前来源证据适合继续跟踪。',
     };
   }
   return {
@@ -211,9 +210,9 @@ function candidateItemToDecisionRow(item: CandidatePoolItem): CandidateDecisionR
     id: `${item.runId}-${item.code}`,
     code: item.code,
     name: item.name,
-    score: item.signalScore,
-    scoreLabel: '入池优先级',
-    scoreNote: 'L1 候选发现的召回排序分，不等同于买入推荐分。',
+    score: undefined,
+    scoreLabel: undefined,
+    scoreNote: undefined,
     action,
     primaryReason: displayReasonText(item.reason || '暂无入池理由'),
     dimensionLabels: (item.candidateDimensions || ['unknown']).map((dimension) => labelFor(dimensionLabels, dimension)),
@@ -366,7 +365,7 @@ const CandidatePoolPage: React.FC = () => {
           </div>
           <h1 className="mt-2 text-2xl font-semibold text-foreground">候选池</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-secondary-text">
-            面向日常看盘的候选入池榜：先看后续动作、入池优先级和核心依据，再展开查看专家来源、证据拆解和风险。
+            面向日常看盘的候选入池榜：先看后续动作、来源证据和核心依据，再展开查看专家来源、证据拆解和风险。
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
@@ -509,9 +508,9 @@ const CandidatePoolPage: React.FC = () => {
 
           <CandidateDecisionTable
             title="候选入池榜"
-            description="按入池优先级和证据质量排序；这里不是最终买入评分，展开后可查看来源、指标和风险。"
+            description="按动作建议和证据质量展示；seed pool 召回分只作为来源内诊断，不做跨来源评分比较。"
             items={decisionRows}
-            scoreColumnLabel="入池优先级"
+            scoreColumnLabel="评估口径"
             emptyTitle="当前筛选下没有候选"
             emptyDescription="切换到全部维度可查看本轮完整候选池。"
           />

@@ -13,8 +13,11 @@ import logging
 import math
 import re
 import time
+from html import unescape
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import date, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -39,6 +42,14 @@ _TUSHARE_NEWS_SOURCES = {
     "cls",
     "yicai",
 }
+_CJZC_RESOURCE_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "candidate_experts_v2"
+    / "resources"
+    / "news_theme_daily"
+)
+_CJZC_DAILY_PUBLISH_CUTOFF_HOUR = 6
+_CJZC_COMPANY_LINE_RE = re.compile(r"(?:(?:^)|[。！？；;\n\r]\s*|(?:\d+[、.]\s*))([\u4e00-\u9fa5A-Za-z0-9（）()]{2,24})\s*[：:](.*?)(?=(?:[。！？；;\n\r]\s*|\s+|(?:\d+[、.]\s*))[\u4e00-\u9fa5A-Za-z0-9（）()]{2,24}\s*[：:]|$)")
 
 
 def _run_manager_task_with_timeout(
@@ -57,6 +68,30 @@ def _run_manager_task_with_timeout(
         return task(), None, int((time.time() - start) * 1000)
     except Exception as exc:
         return None, str(exc), int((time.time() - start) * 1000)
+
+
+def _run_data_task_with_timeout(
+    task: Callable[[], Any],
+    timeout_seconds: float,
+    task_name: str,
+) -> Tuple[Any, Optional[str], int]:
+    """Run a data-provider task with a hard Agent-tool boundary timeout."""
+    timeout_value = max(0.0, float(timeout_seconds or 0.0))
+    start = time.time()
+    if timeout_value <= 0:
+        return None, f"{task_name} timeout", 0
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(task)
+        try:
+            return future.result(timeout=timeout_value), None, int((time.time() - start) * 1000)
+        except FuturesTimeoutError:
+            future.cancel()
+            return None, f"{task_name} timeout", int(timeout_value * 1000)
+    except Exception as exc:
+        return None, str(exc), int((time.time() - start) * 1000)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _get_agent_timeout_attr(attr_name: str, default: float) -> float:
@@ -762,11 +797,22 @@ get_analysis_context_tool = ToolDefinition(
 def _handle_get_stock_info(stock_code: str) -> dict:
     """Get stock fundamental information through unified fundamental context."""
     manager = _get_fetcher_manager()
-    try:
-        fundamental_context = manager.get_fundamental_context(stock_code)
-    except Exception as e:
-        logger.warning(f"get_stock_info via fundamental pipeline failed for {stock_code}: {e}")
-        fundamental_context = manager.build_failed_fundamental_context(stock_code, str(e))
+    fundamental_timeout = _get_agent_timeout_attr("fundamental_stage_timeout_seconds", 8.0)
+
+    def _load_fundamental_context() -> dict:
+        try:
+            return manager.get_fundamental_context(stock_code, budget_seconds=fundamental_timeout)
+        except TypeError:
+            return manager.get_fundamental_context(stock_code)
+
+    fundamental_context, fundamental_err, fundamental_ms = _run_data_task_with_timeout(
+        _load_fundamental_context,
+        fundamental_timeout,
+        "get_stock_info.fundamental_context",
+    )
+    if fundamental_err or not isinstance(fundamental_context, dict):
+        logger.warning("get_stock_info via fundamental pipeline failed for %s: %s", stock_code, fundamental_err)
+        fundamental_context = manager.build_failed_fundamental_context(stock_code, str(fundamental_err or "invalid result"))
 
     compact_context = _compact_fundamental_context(fundamental_context)
     valuation = compact_context.get("valuation", {}).get("data", {})
@@ -799,6 +845,8 @@ def _handle_get_stock_info(stock_code: str) -> dict:
         pass
 
     stock_info_status = str(compact_context.get("status") or "partial")
+    if stock_info_status in {"failed", "error", "timeout"} and (fundamental_err or boards_err or belong_boards):
+        stock_info_status = "partial"
     if belong_boards_errors and stock_info_status == "ok":
         stock_info_status = "partial"
 
@@ -812,12 +860,121 @@ def _handle_get_stock_info(stock_code: str) -> dict:
         "circ_mv": valuation.get("circ_mv"),
         "fundamental_context": compact_context,
         "belong_boards": belong_boards,
+        "fundamental_source_chain": [{
+            "provider": "fundamental_context",
+            "result": "ok" if fundamental_err is None else ("timeout" if "timeout" in str(fundamental_err).lower() else "failed"),
+            "duration_ms": fundamental_ms,
+        }],
+        "fundamental_errors": [str(fundamental_err)] if fundamental_err else [],
         "belong_boards_source_chain": belong_boards_source_chain,
         "belong_boards_errors": belong_boards_errors,
         # Compatibility alias for existing callers; prefer belong_boards.
         # Planned for future deprecation in a major version.
         "boards": belong_boards,
         "sector_rankings": sector_rankings,
+    }
+
+
+def _clean_business_context_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "nan", "null", "unknown"}:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def _board_name_list(boards: Any, limit: int = 8) -> List[str]:
+    names: List[str] = []
+    if not isinstance(boards, list):
+        return names
+    for item in boards:
+        if isinstance(item, dict):
+            name = _clean_business_context_text(item.get("name"))
+        else:
+            name = _clean_business_context_text(item)
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _pick_business_industry(boards: Any) -> str:
+    if not isinstance(boards, list):
+        return ""
+    for item in boards:
+        if not isinstance(item, dict):
+            continue
+        board_type = _clean_business_context_text(item.get("type"))
+        name = _clean_business_context_text(item.get("name"))
+        if name and ("行业" in board_type or "industry" in board_type.lower()):
+            return name
+    for item in boards:
+        if isinstance(item, dict):
+            name = _clean_business_context_text(item.get("name"))
+        else:
+            name = _clean_business_context_text(item)
+        if name:
+            return name
+    return ""
+
+
+def _build_business_summary(industry: str, boards: List[str]) -> str:
+    if not industry and not boards:
+        return "缺失：未获取到行业或板块归属。"
+    related = [name for name in boards if name != industry]
+    if industry and related:
+        return f"业务归属线索：行业/板块归属为{industry}；相关主题/概念包括{'、'.join(related[:4])}。"
+    if industry:
+        return f"业务归属线索：行业/板块归属为{industry}。"
+    return f"业务归属线索：相关主题/概念包括{'、'.join(boards[:5])}。"
+
+
+def _handle_get_stock_business_context(stock_code: str) -> dict:
+    """Return lightweight business/board context without fundamental blocks."""
+    manager = _get_fetcher_manager()
+    code = str(stock_code or "").strip().upper()
+    boards_timeout = _get_agent_timeout_attr("agent_stock_info_boards_timeout_seconds", 3.0)
+    belong_boards, boards_err, boards_ms = _run_manager_task_with_timeout(
+        manager,
+        lambda: manager.get_belong_boards(stock_code),
+        boards_timeout,
+        "stock_business_context.belong_boards",
+    )
+    if not isinstance(belong_boards, list):
+        belong_boards = []
+
+    stock_name = code
+    try:
+        stock_name = manager.get_stock_name(stock_code, allow_realtime=False) or stock_name
+    except TypeError:
+        try:
+            stock_name = manager.get_stock_name(stock_code) or stock_name
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    industry = _pick_business_industry(belong_boards)
+    board_names = _board_name_list(belong_boards, limit=8)
+    errors = [str(boards_err)] if boards_err else []
+    status = "ok" if board_names else ("failed" if errors else "missing")
+    return {
+        "status": status,
+        "code": code,
+        "name": stock_name,
+        "industry": industry or None,
+        "boards": board_names,
+        "business_summary": _build_business_summary(industry, board_names),
+        "source": "data_fetcher:get_belong_boards",
+        "source_chain": [
+            {
+                "provider": "get_belong_boards",
+                "result": "ok" if board_names else ("timeout" if boards_err and "timeout" in str(boards_err).lower() else status),
+                "duration_ms": boards_ms,
+            }
+        ],
+        "errors": errors,
+        "as_of": date.today().isoformat(),
     }
 
 
@@ -834,6 +991,23 @@ get_stock_info_tool = ToolDefinition(
         ),
     ],
     handler=_handle_get_stock_info,
+    category="data",
+)
+
+
+get_stock_business_context_tool = ToolDefinition(
+    name="get_stock_business_context",
+    description="Get lightweight stock business context: name, industry/board membership, "
+                "simple business-context summary and source diagnostics. Does not fetch "
+                "fundamental valuation, financial statements, capital flow or dragon-tiger data.",
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="A-share stock code, e.g., '000636'",
+        ),
+    ],
+    handler=_handle_get_stock_business_context,
     category="data",
 )
 
@@ -955,6 +1129,7 @@ ALL_DATA_TOOLS = [
     get_chip_distribution_tool,
     get_analysis_context_tool,
     get_stock_info_tool,
+    get_stock_business_context_tool,
     get_portfolio_snapshot_tool,
 ]
 
@@ -2995,6 +3170,541 @@ def _handle_get_tushare_today_news(src: str = "sina", limit: int = 50) -> dict:
     return result
 
 
+def _normalize_cjzc_target_date(value: str = "") -> date:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now().date()
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"target_date must be YYYY-MM-DD or YYYYMMDD, got {value!r}")
+
+
+def _resolve_cjzc_effective_target_date(value: str = "") -> Tuple[date, date, str]:
+    requested = _normalize_cjzc_target_date(value)
+    now = datetime.now()
+    if requested == now.date():
+        if now.hour < _CJZC_DAILY_PUBLISH_CUTOFF_HOUR:
+            return requested, requested - timedelta(days=1), "pre_6_use_previous_daily"
+        return requested, requested, "post_6_use_today_daily"
+    return requested, requested, "historical_replay_exact"
+
+
+def _parse_cjzc_publish_date(value: Any) -> Optional[date]:
+    if value in (None, ""):
+        return None
+    if hasattr(value, "date") and callable(value.date):
+        try:
+            parsed = value.date()
+            if isinstance(parsed, date):
+                return parsed
+        except Exception:
+            pass
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text[: len(fmt)], fmt).date()
+        except ValueError:
+            continue
+    match = re.search(r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})", text)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def _dataframe_records(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return [dict(item) for item in value.to_dict("records") if isinstance(item, dict)]
+        except Exception:
+            return []
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+def _compact_cjzc_text(value: Any, limit: int = 1200) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > limit:
+        text = text[:limit] + "...[truncated]"
+    return text
+
+
+def _strip_cjzc_html(fragment: str, *, limit: int = 6000) -> str:
+    text = str(fragment or "")
+    text = re.sub(r"(?is)<script\b.*?</script>|<style\b.*?</style>", " ", text)
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>|</\s*p\s*>|</\s*h[1-6]\s*>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = unescape(text)
+    lines = [_compact_cjzc_text(line, limit=limit) for line in text.splitlines()]
+    text = "\n".join(line for line in lines if line)
+    return _compact_cjzc_text(text, limit=limit)
+
+
+def _extract_eastmoney_content_body_html(html_text: str) -> str:
+    match = re.search(r"<div\b[^>]*\bid=[\"']ContentBody[\"'][^>]*>", html_text or "", flags=re.IGNORECASE)
+    if not match:
+        return ""
+    start = match.end()
+    end = (html_text or "").find("</div>", start)
+    if end < 0:
+        return (html_text or "")[start:]
+    return (html_text or "")[start:end]
+
+
+def _extract_eastmoney_article_sections_from_html(html_text: str) -> List[Dict[str, str]]:
+    body_html = _extract_eastmoney_content_body_html(html_text)
+    if not body_html:
+        return []
+
+    marker_re = re.compile(r"(?is)<h[1-6]\b[^>]*>(.*?)</h[1-6]>")
+    parts: List[Tuple[str, str]] = []
+    cursor = 0
+    current_section = "正文"
+    for match in marker_re.finditer(body_html):
+        before = body_html[cursor:match.start()]
+        if before.strip():
+            parts.append((current_section, before))
+        heading = _strip_cjzc_html(match.group(1), limit=80)
+        current_section = heading or current_section
+        cursor = match.end()
+    tail = body_html[cursor:]
+    if tail.strip():
+        parts.append((current_section, tail))
+
+    sections: List[Dict[str, str]] = []
+    for section, fragment in parts:
+        text = _strip_cjzc_html(fragment, limit=5000)
+        if text:
+            sections.append({"section": section, "text": text})
+    return sections
+
+
+def _fetch_eastmoney_article_sections(url: str, *, timeout_seconds: float = 8.0) -> Dict[str, Any]:
+    link = str(url or "").strip()
+    if not link:
+        return {"status": "missing", "sections": [], "errors": ["article link missing"]}
+    try:
+        import requests
+
+        normalized_url = link.replace("http://", "https://", 1)
+        response = requests.get(
+            normalized_url,
+            timeout=max(1.0, float(timeout_seconds or 8.0)),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Referer": "https://finance.eastmoney.com/",
+            },
+        )
+        response.raise_for_status()
+        if not response.encoding or response.encoding.lower() == "iso-8859-1":
+            response.encoding = response.apparent_encoding or "utf-8"
+        sections = _extract_eastmoney_article_sections_from_html(response.text)
+        if not sections:
+            return {"status": "empty", "sections": [], "errors": ["ContentBody not found or empty"]}
+        return {
+            "status": "ok",
+            "sections": sections,
+            "text_length": sum(len(item.get("text") or "") for item in sections),
+            "errors": [],
+        }
+    except Exception as exc:
+        return {"status": "failed", "sections": [], "errors": [str(exc)]}
+
+
+def _load_json_resource(path: Path, default: Any) -> Any:
+    try:
+        import json
+
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("failed to load news-theme resource %s: %s", path, exc)
+        return default
+
+
+@lru_cache(maxsize=1)
+def _cjzc_concept_mapping() -> Dict[str, Dict[str, Any]]:
+    data = _load_json_resource(_CJZC_RESOURCE_DIR / "concept_mapping.json", {})
+    return data if isinstance(data, dict) else {}
+
+
+@lru_cache(maxsize=1)
+def _cjzc_event_keywords() -> Dict[str, List[str]]:
+    data = _load_json_resource(_CJZC_RESOURCE_DIR / "event_keywords.json", {})
+    if not isinstance(data, dict):
+        return {"bullish": [], "bearish": [], "deny": []}
+    return {
+        key: [str(item).strip() for item in value if str(item).strip()]
+        for key, value in data.items()
+        if isinstance(value, list)
+    }
+
+
+def _cjzc_all_concept_terms() -> List[str]:
+    terms: List[str] = []
+    for concept, payload in _cjzc_concept_mapping().items():
+        if concept and concept not in terms:
+            terms.append(str(concept))
+        aliases = payload.get("aliases") if isinstance(payload, dict) else []
+        if isinstance(aliases, list):
+            for alias in aliases:
+                alias_text = str(alias or "").strip()
+                if alias_text and alias_text not in terms:
+                    terms.append(alias_text)
+    return terms
+
+
+def _jieba_cut_for_cjzc(text: str) -> List[str]:
+    try:
+        import jieba
+
+        for term in _cjzc_all_concept_terms():
+            if term:
+                jieba.add_word(term, freq=200000)
+        return [token.strip() for token in jieba.lcut(text) if token and token.strip()]
+    except Exception:
+        return re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fa5]{2,}", text)
+
+
+def _classify_cjzc_polarity(text: str) -> str:
+    keywords = _cjzc_event_keywords()
+    deny = any(term in text for term in keywords.get("deny", []))
+    if deny:
+        return "deny_or_clarification"
+    negative = any(term in text for term in keywords.get("bearish", []))
+    positive = any(term in text for term in keywords.get("bullish", []))
+    if negative and not positive:
+        return "negative"
+    if positive and not negative:
+        return "positive"
+    if positive and negative:
+        return "mixed"
+    return "neutral"
+
+
+def _extract_cjzc_concepts(text: str) -> List[Tuple[str, List[str]]]:
+    tokens = set(_jieba_cut_for_cjzc(text))
+    upper_text = text.upper()
+    matched: List[Tuple[str, List[str]]] = []
+    for concept, payload in _cjzc_concept_mapping().items():
+        if not isinstance(payload, dict):
+            continue
+        aliases = [str(concept)]
+        aliases.extend(str(item) for item in (payload.get("aliases") or []) if str(item).strip())
+        hit_aliases: List[str] = []
+        for alias in aliases:
+            alias_text = str(alias or "").strip()
+            if not alias_text:
+                continue
+            if alias_text in tokens:
+                hit_aliases.append(alias_text)
+                continue
+            haystack = upper_text if re.search(r"[A-Za-z]", alias_text) else text
+            needle = alias_text.upper() if re.search(r"[A-Za-z]", alias_text) else alias_text
+            if needle in haystack:
+                hit_aliases.append(alias_text)
+        deduped = list(dict.fromkeys(hit_aliases))
+        if deduped:
+            matched.append((str(concept), deduped))
+    return matched[:12]
+
+
+def _cjzc_sentence_window(text: str, index: int, term: str, *, fallback_limit: int = 240) -> str:
+    if index < 0:
+        return _compact_cjzc_text(text, limit=fallback_limit)
+    boundaries = "。！？；;.!?\n\r"
+    previous = -1
+    for boundary in boundaries:
+        previous = max(previous, text.rfind(boundary, 0, index))
+    next_positions = [text.find(boundary, index + len(term)) for boundary in boundaries]
+    next_positions = [position for position in next_positions if position >= 0]
+    start = previous + 1 if previous >= 0 else max(0, index - 40)
+    end = min(next_positions) + 1 if next_positions else min(len(text), index + len(term) + 120)
+    return _compact_cjzc_text(text[start:end], limit=fallback_limit)
+
+
+def _cjzc_topic_block_window(text: str, index: int, term: str, *, fallback_limit: int = 520) -> str:
+    if index < 0:
+        return _compact_cjzc_text(text, limit=fallback_limit)
+    left = max(0, index - 30)
+    prefix = text[left:index]
+    suffix = text[index + len(term): index + len(term) + 8]
+    heading_like = bool(
+        re.search(r"(^|[。！？；;\n\r]\s*)[\u4e00-\u9fa5A-Za-z0-9（）() ]{1,24}\s*[：:]\s*$", prefix)
+        or re.match(r"\s*[：:]", suffix)
+    )
+    if not heading_like:
+        return _cjzc_sentence_window(text, index, term, fallback_limit=fallback_limit)
+    next_heading = re.search(
+        r"[。！？；;\n\r]\s*[\u4e00-\u9fa5A-Za-z0-9（）() ]{2,24}\s*[：:]",
+        text[index + len(term):],
+    )
+    end = index + len(term) + next_heading.start() if next_heading else min(len(text), index + fallback_limit)
+    start = max(0, text.rfind("。", 0, index) + 1)
+    return _compact_cjzc_text(text[start:end], limit=fallback_limit)
+
+
+def _cjzc_section_weight(section: str) -> float:
+    text = str(section or "")
+    if "每日精选" in text:
+        return 20.0
+    if "热点题材" in text:
+        return 14.0
+    if "公司新闻" in text:
+        return -8.0
+    if "摘要" in text:
+        return 4.0
+    return 8.0
+
+
+def _cjzc_high_impact_terms(text: str) -> List[str]:
+    keywords = _cjzc_event_keywords()
+    terms = keywords.get("high_impact", [])
+    if not isinstance(terms, list):
+        return []
+    upper_text = str(text or "").upper()
+    matched: List[str] = []
+    for term in terms:
+        term_text = str(term or "").strip()
+        if not term_text:
+            continue
+        haystack = upper_text if re.search(r"[A-Za-z]", term_text) else str(text or "")
+        needle = term_text.upper() if re.search(r"[A-Za-z]", term_text) else term_text
+        if needle in haystack:
+            matched.append(term_text)
+    return list(dict.fromkeys(matched))[:8]
+
+
+def _cjzc_theme_score(
+    *,
+    section: str,
+    polarity: str,
+    aliases: List[str],
+    mapped_count: int,
+    high_impact_terms: List[str],
+) -> float:
+    score = _cjzc_section_weight(section)
+    if polarity == "positive":
+        score += 10.0
+    elif polarity == "mixed":
+        score += 4.0
+    elif polarity in {"negative", "deny_or_clarification"}:
+        score -= 30.0
+    score += min(4.0, len(aliases) * 0.8)
+    score += min(4.0, mapped_count * 0.6)
+    if "公司新闻" not in str(section or ""):
+        score += min(8.0, len(high_impact_terms) * 2.5)
+    return round(score, 2)
+
+
+def _build_cjzc_theme_items(text: str, source_url: str = "", section: str = "摘要") -> List[Dict[str, Any]]:
+    concepts = _extract_cjzc_concepts(text)
+    items: List[Dict[str, Any]] = []
+    for concept, aliases in concepts:
+        first_alias = aliases[0] if aliases else concept
+        index = text.upper().find(first_alias.upper()) if re.search(r"[A-Za-z]", first_alias) else text.find(first_alias)
+        evidence = _cjzc_topic_block_window(text, index, first_alias)
+        payload = _cjzc_concept_mapping().get(concept, {})
+        mapped = payload.get("mapped_stocks") if isinstance(payload, dict) else []
+        related_boards = payload.get("related_boards") if isinstance(payload, dict) else []
+        polarity = _classify_cjzc_polarity(evidence)
+        high_impact_terms = _cjzc_high_impact_terms(evidence)
+        mapped_items = mapped[:5] if isinstance(mapped, list) else []
+        items.append(
+            {
+                "theme": concept,
+                "keywords": aliases,
+                "polarity": polarity,
+                "evidence": evidence,
+                "evidence_section": section,
+                "mapped_stocks": mapped_items,
+                "related_boards": related_boards[:6] if isinstance(related_boards, list) else [],
+                "source_url": source_url,
+                "high_impact_terms": high_impact_terms,
+                "theme_score": _cjzc_theme_score(
+                    section=section,
+                    polarity=polarity,
+                    aliases=aliases,
+                    mapped_count=len(mapped_items),
+                    high_impact_terms=high_impact_terms,
+                ),
+            }
+        )
+    return items
+
+
+def _dedupe_cjzc_themes(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_theme: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        theme = str(item.get("theme") or "").strip()
+        if not theme:
+            continue
+        previous = by_theme.get(theme)
+        if previous is None or float(item.get("theme_score") or 0.0) > float(previous.get("theme_score") or 0.0):
+            by_theme[theme] = item
+    return sorted(
+        by_theme.values(),
+        key=lambda item: (
+            -float(item.get("theme_score") or 0.0),
+            str(item.get("theme") or ""),
+        ),
+    )[:12]
+
+
+def _extract_cjzc_company_events(text: str) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for match in _CJZC_COMPANY_LINE_RE.finditer(text):
+        name = str(match.group(1) or "").strip()
+        content = _compact_cjzc_text(match.group(2), limit=300)
+        if not name or not content:
+            continue
+        polarity = _classify_cjzc_polarity(content)
+        events.append(
+            {
+                "name": name,
+                "content": content,
+                "polarity": polarity,
+                "event_tag": "deny_or_clarification" if polarity == "deny_or_clarification" else polarity,
+                "seed_allowed": False,
+            }
+        )
+        if len(events) >= 20:
+            break
+    return events
+
+
+def _handle_get_eastmoney_cjzc_daily(target_date: str = "", allow_previous: bool = False) -> dict:
+    """Get Eastmoney 财经早餐 article metadata for a target trade date."""
+    try:
+        requested_target, target, target_date_rule = _resolve_cjzc_effective_target_date(target_date)
+    except ValueError as exc:
+        return {"status": "failed", "api_name": "stock_info_cjzc_em", "items": [], "errors": [str(exc)]}
+
+    try:
+        import akshare as ak
+
+        df = ak.stock_info_cjzc_em()
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "api_name": "stock_info_cjzc_em",
+            "requested_target_date": requested_target.isoformat(),
+            "target_date": target.isoformat(),
+            "trade_date": target.isoformat(),
+            "target_date_rule": target_date_rule,
+            "items": [],
+            "errors": [str(exc)],
+        }
+
+    records = _dataframe_records(df)
+    exact: Optional[Dict[str, Any]] = None
+    previous: Optional[Tuple[date, Dict[str, Any]]] = None
+    for row in records:
+        publish_date = _parse_cjzc_publish_date(row.get("发布时间"))
+        if publish_date is None:
+            continue
+        if publish_date == target:
+            exact = row
+            break
+        if allow_previous and publish_date < target:
+            if previous is None or publish_date > previous[0]:
+                previous = (publish_date, row)
+
+    stale_previous = False
+    selected = exact
+    publish_date = target
+    if selected is None and previous is not None:
+        publish_date, selected = previous
+        stale_previous = True
+    if selected is None:
+        return {
+            "status": "missing",
+            "api_name": "stock_info_cjzc_em",
+            "requested_target_date": requested_target.isoformat(),
+            "target_date": target.isoformat(),
+            "trade_date": target.isoformat(),
+            "target_date_rule": target_date_rule,
+            "session": "pre_market_daily",
+            "items": [],
+            "themes": [],
+            "mentioned_stocks": [],
+            "errors": [f"Eastmoney 财经早餐 not found for {target.isoformat()}"],
+        }
+
+    title = _compact_cjzc_text(selected.get("标题"), limit=180)
+    summary = _compact_cjzc_text(selected.get("摘要"), limit=2000)
+    link = str(selected.get("链接") or "").strip()
+    article_fetch = _fetch_eastmoney_article_sections(link)
+    raw_sections = article_fetch.get("sections") if isinstance(article_fetch.get("sections"), list) else []
+    article_sections = [
+        {
+            "section": str(item.get("section") or "正文"),
+            "text": _compact_cjzc_text(item.get("text"), limit=1200),
+        }
+        for item in raw_sections
+        if isinstance(item, dict) and str(item.get("text") or "").strip()
+    ]
+    if raw_sections:
+        theme_items: List[Dict[str, Any]] = []
+        for section in raw_sections:
+            if not isinstance(section, dict):
+                continue
+            section_name = str(section.get("section") or "正文").strip() or "正文"
+            section_text = str(section.get("text") or "").strip()
+            if not section_text or "公司新闻" in section_name:
+                continue
+            theme_items.extend(_build_cjzc_theme_items(section_text, source_url=link, section=section_name))
+        themes = _dedupe_cjzc_themes(theme_items)
+        company_source_text = "\n".join(
+            str(section.get("text") or "")
+            for section in raw_sections
+            if isinstance(section, dict) and "公司新闻" in str(section.get("section") or "")
+        ) or "\n".join(str(section.get("text") or "") for section in raw_sections if isinstance(section, dict))
+    else:
+        source_text = f"{title} {summary}".strip()
+        themes = _dedupe_cjzc_themes(_build_cjzc_theme_items(source_text, source_url=link, section="摘要"))
+        company_source_text = summary
+    company_events = _extract_cjzc_company_events(company_source_text)
+    status = "partial" if stale_previous else "ok"
+    if status == "ok" and article_fetch.get("status") not in {"ok", "missing"}:
+        status = "partial"
+    return {
+        "status": status,
+        "api_name": "stock_info_cjzc_em",
+        "requested_target_date": requested_target.isoformat(),
+        "target_date": target.isoformat(),
+        "trade_date": target.isoformat(),
+        "target_date_rule": target_date_rule,
+        "matched_publish_date": publish_date.isoformat(),
+        "session": "pre_market_daily" if not stale_previous else "stale_previous_daily",
+        "title": title,
+        "summary": summary,
+        "publish_time": str(selected.get("发布时间") or ""),
+        "link": link,
+        "themes": themes,
+        "company_events": company_events,
+        "mentioned_stocks": [],
+        "article_fetch_status": article_fetch.get("status"),
+        "article_text_length": article_fetch.get("text_length", 0),
+        "article_sections": article_sections[:8],
+        "stale_previous": stale_previous,
+        "source": "akshare:stock_info_cjzc_em",
+        "errors": list(article_fetch.get("errors") or []),
+    }
+
+
 get_tushare_today_news_tool = ToolDefinition(
     name="get_tushare_today_news",
     description=(
@@ -3027,6 +3737,39 @@ get_tushare_today_news_tool = ToolDefinition(
 )
 
 
+get_eastmoney_cjzc_daily_tool = ToolDefinition(
+    name="get_eastmoney_cjzc_daily",
+    description=(
+        "Get Eastmoney 财经早餐 for a target trade date via AkShare stock_info_cjzc_em. "
+        "This is a pre-market daily theme source: it matches the article by target_date "
+        "instead of blindly using the latest row. Before 06:00 local time, today's "
+        "request resolves to the previous natural day's daily; from 06:00 onward it "
+        "resolves to today. Historical replay dates stay exact."
+    ),
+    parameters=[
+        ToolParameter(
+            name="target_date",
+            type="string",
+            description=(
+                "Requested target date, YYYY-MM-DD or YYYYMMDD. Defaults to today; "
+                "today before 06:00 local time is routed to yesterday's daily."
+            ),
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="allow_previous",
+            type="boolean",
+            description="When true, use the nearest previous article if target_date is missing and mark it stale.",
+            required=False,
+            default=False,
+        ),
+    ],
+    handler=_handle_get_eastmoney_cjzc_daily,
+    category="data",
+)
+
+
 def _handle_get_tushare_announcements(
     stock_code: str = "",
     ann_date: str = "",
@@ -3035,19 +3778,27 @@ def _handle_get_tushare_announcements(
     limit: int = 30,
 ) -> dict:
     start, end = _default_recent_date_range(7)
+    requested_ann_date = _normalize_tushare_date(ann_date)
+    requested_start_date = _normalize_tushare_date(start_date) or ("" if requested_ann_date else start)
+    requested_end_date = _normalize_tushare_date(end_date) or ("" if requested_ann_date else end)
     result = _tushare_query(
         "anns_d",
         {
             "ts_code": _to_tushare_ts_code(stock_code) if stock_code else "",
-            "ann_date": _normalize_tushare_date(ann_date),
-            "start_date": _normalize_tushare_date(start_date) or ("" if ann_date else start),
-            "end_date": _normalize_tushare_date(end_date) or ("" if ann_date else end),
+            "ann_date": requested_ann_date,
+            "start_date": requested_start_date,
+            "end_date": requested_end_date,
         },
         "ann_date,ts_code,name,title,url,rec_time",
         limit,
         timeout=max(5.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
     )
     result["stock_code"] = stock_code
+    result["date_window"] = {
+        "ann_date": requested_ann_date,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
+    }
     return result
 
 
@@ -3661,11 +4412,28 @@ get_tushare_trade_calendar_tool = ToolDefinition(
 
 def _handle_get_market_capital_flow(top_n: int = 5) -> dict:
     """Get market-level fund-flow rankings and broad money movement."""
-    try:
-        result = _get_fundamental_adapter().get_market_capital_flow(top_n=top_n)
-    except Exception as exc:
-        logger.warning("get_market_capital_flow failed: %s", exc)
-        return {"status": "error", "error": f"market capital flow fetch failed: {exc}"}
+    timeout = _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 20.0)
+    result, err, cost_ms = _run_data_task_with_timeout(
+        lambda: _get_fundamental_adapter().get_market_capital_flow(top_n=top_n),
+        timeout,
+        "get_market_capital_flow",
+    )
+    if err or not isinstance(result, dict):
+        logger.warning("get_market_capital_flow failed: %s", err)
+        status = "timeout" if err and "timeout" in str(err).lower() else "error"
+        return {
+            "status": status,
+            "market_flow": {},
+            "individual_rankings": {"top": [], "bottom": []},
+            "industry_rankings": {"top": [], "bottom": []},
+            "concept_rankings": {"top": [], "bottom": []},
+            "source_chain": [{
+                "provider": "market_capital_flow",
+                "result": status,
+                "duration_ms": cost_ms,
+            }],
+            "errors": [f"market capital flow fetch failed: {err or 'invalid result'}"],
+        }
     return result
 
 
@@ -4289,6 +5057,7 @@ ALL_DATA_TOOLS.extend([
     get_tushare_moneyflow_cnt_ths_tool,
     get_tushare_ths_member_tool,
     get_tushare_today_news_tool,
+    get_eastmoney_cjzc_daily_tool,
     get_tushare_announcements_tool,
     get_tushare_stock_alerts_tool,
     get_tushare_stock_shock_tool,
@@ -4480,6 +5249,122 @@ get_stockapi_sector_flow_history_tool = ToolDefinition(
 )
 
 
+def _handle_get_stockapi_hot_sector_leaders(date: str = "", bk_code: str = "", limit: int = 30) -> dict:
+    """Get StockAPI hot-sector leader stocks."""
+    try:
+        return _get_fundamental_adapter().get_stockapi_hot_sector_leaders(
+            date=date or None,
+            bk_code=bk_code or None,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.warning("get_stockapi_hot_sector_leaders failed: %s", exc)
+        return {"status": "error", "error": f"StockAPI hot-sector leaders fetch failed: {exc}"}
+
+
+get_stockapi_hot_sector_leaders_tool = ToolDefinition(
+    name="get_stockapi_hot_sector_leaders",
+    description=(
+        "Get StockAPI hot-sector leader stocks from /v1/hotBkJlrLongTou. Useful for "
+        "turning a hot sector into direct stock candidates."
+    ),
+    parameters=[
+        ToolParameter(
+            name="date",
+            type="string",
+            description="Trade date in YYYY-MM-DD. Blank uses latest completed StockAPI daily date.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="bk_code",
+            type="string",
+            description="Optional StockAPI sector/concept code returned by get_stockapi_hot_sectors.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max leader stocks to return (default: 30, max: 100).",
+            required=False,
+            default=30,
+        ),
+    ],
+    handler=_handle_get_stockapi_hot_sector_leaders,
+    category="data",
+)
+
+
+def _handle_get_stockapi_change_all_history(
+    date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    event_type: str = "",
+    limit: int = 50,
+) -> dict:
+    """Get StockAPI all-market intraday change history."""
+    try:
+        return _get_fundamental_adapter().get_stockapi_change_all_history(
+            date=date or None,
+            start_date=start_date or None,
+            end_date=end_date or None,
+            event_type=event_type or None,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.warning("get_stockapi_change_all_history failed: %s", exc)
+        return {"status": "error", "error": f"StockAPI all-history change fetch failed: {exc}"}
+
+
+get_stockapi_change_all_history_tool = ToolDefinition(
+    name="get_stockapi_change_all_history",
+    description=(
+        "Get StockAPI all-market historical intraday change events from /v1/change/allHistory. "
+        "Useful for event_impact and news_momentum seed discovery."
+    ),
+    parameters=[
+        ToolParameter(
+            name="date",
+            type="string",
+            description="Single trade date in YYYY-MM-DD. Blank uses latest completed StockAPI date.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="start_date",
+            type="string",
+            description="Optional start date in YYYY-MM-DD.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="end_date",
+            type="string",
+            description="Optional end date in YYYY-MM-DD.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="event_type",
+            type="string",
+            description="Optional StockAPI event type code, e.g. 8201 火箭发射, 8193 大笔买入.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max event rows to return (default: 50, max: 300).",
+            required=False,
+            default=50,
+        ),
+    ],
+    handler=_handle_get_stockapi_change_all_history,
+    category="data",
+)
+
+
 def _handle_get_stockapi_popularity_rank(limit: int = 30) -> dict:
     """Get StockAPI popularity ranking."""
     try:
@@ -4575,6 +5460,8 @@ ALL_DATA_TOOLS.extend([
     get_stockapi_hot_sectors_tool,
     get_stockapi_sector_constituents_tool,
     get_stockapi_sector_flow_history_tool,
+    get_stockapi_hot_sector_leaders_tool,
+    get_stockapi_change_all_history_tool,
     get_stockapi_popularity_rank_tool,
     get_stockapi_hot_money_activity_tool,
 ])

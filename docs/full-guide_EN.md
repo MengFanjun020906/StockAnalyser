@@ -267,7 +267,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | Sector-ranking data-source probing budget; `detect_market_regime` uses it for sector context and breadth inputs. | `10.0` | Optional |
 | `AGENT_SEED_FACT_MAX_WORKERS` | Max concurrent `(seed, tool)` workers for pre-desk `SeedFactPacket` collection. | `12` | Optional |
 | `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | Per-tool budget for `SeedFactPacket` collection; failures are written to trace instead of being treated as successful facts. | `12.0` | Optional |
-| `AGENT_SEED_FACT_TOOLS` | Comma-separated shared prefetch tools for thesis desks; defaults cover structure, trend, MA, volume, capital flow, and stock info. | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_info` | Optional |
+| `AGENT_SEED_FACT_TOOLS` | Comma-separated shared prefetch tools for thesis desks; defaults cover structure, trend, MA, volume, capital flow, and lightweight business context. | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context` | Optional |
 | `ENABLE_EASTMONEY_PATCH` | Eastmoney API patch: Recommended to set to `true` when Eastmoney APIs fail frequently (e.g., RemoteDisconnected, connection closed). Injects NID tokens and random User-Agents to reduce rate limiting probability. | `false` | Optional |
 | `REALTIME_SOURCE_PRIORITY` | Real-time quote source priority (comma-separated), e.g., `tencent,akshare_sina,efinance,akshare_em` | See .env.example | Optional |
 | `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia-style quantitative candidate SQLite path. `watchlist_scan` candidate discovery reads `stock_daily(symbol,date,open,high,low,close,volume,turnover)` and runs pattern strategies. | `Sequoia-X/data/sequoia_v2.db` | Optional |
@@ -299,6 +299,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 >   - `get_stock_info.belong_boards` = list of sectors the individual stock belongs to;
 >   - `get_stock_info.boards` is a compatibility alias, value is identical to `belong_boards` (removal considered only in major version updates);
 >   - `get_stock_info.sector_rankings` stays consistent with `fundamental_context.boards.data`.
+> - The pre-desk `SeedFactPacket` now uses `get_stock_business_context` by default for `industry/boards/business_summary`, instead of invoking full `get_stock_info` for first-layer business attribution. `get_stock_info` remains available for deeper fundamentals, valuation, and financial context.
 >   - `AnalysisReport.details.belong_boards` = related board list in structured report details;
 >   - `AnalysisReport.details.sector_rankings` = sector leaderboard in structured report details for board-linkage display.
 > - **Sector leaderboard** uses a fixed fallback order: consistent with global priority.
