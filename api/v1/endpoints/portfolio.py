@@ -15,6 +15,8 @@ from api.v1.schemas.portfolio import (
     PortfolioAccountItem,
     PortfolioAccountListResponse,
     PortfolioAccountUpdateRequest,
+    PortfolioBaselineResetRequest,
+    PortfolioBaselineResetResponse,
     PortfolioCashLedgerListResponse,
     PortfolioCashLedgerCreateRequest,
     PortfolioCorporateActionListResponse,
@@ -168,6 +170,31 @@ def delete_account(account_id: int):
         raise
     except Exception as exc:
         raise _internal_error("Deactivate account failed", exc)
+
+
+@router.post(
+    "/accounts/{account_id}/baseline-reset",
+    response_model=PortfolioBaselineResetResponse,
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Reset one account to a point-in-time cash and position baseline",
+)
+def reset_account_baseline(account_id: int, request: PortfolioBaselineResetRequest) -> PortfolioBaselineResetResponse:
+    service = PortfolioService()
+    try:
+        data = service.reset_account_baseline(
+            account_id=account_id,
+            as_of=request.as_of,
+            cash_amount=request.cash_amount,
+            positions=[item.model_dump() for item in request.positions],
+            note=request.note,
+        )
+        return PortfolioBaselineResetResponse(**data)
+    except PortfolioBusyError as exc:
+        raise _conflict_error(error="portfolio_busy", message=str(exc))
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Reset account baseline failed", exc)
 
 
 @router.post(

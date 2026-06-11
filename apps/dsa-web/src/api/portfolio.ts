@@ -4,6 +4,8 @@ import type {
   PortfolioAccountItem,
   PortfolioAccountCreateRequest,
   PortfolioAccountListResponse,
+  PortfolioBaselineResetRequest,
+  PortfolioBaselineResetResponse,
   PortfolioCashLedgerCreateRequest,
   PortfolioCashLedgerListResponse,
   PortfolioCorporateActionCreateRequest,
@@ -116,6 +118,22 @@ export const portfolioApi = {
       owner_id: payload.ownerId,
     });
     return toCamelCase<PortfolioAccountItem>(response.data);
+  },
+
+  async resetBaseline(accountId: number, payload: PortfolioBaselineResetRequest): Promise<PortfolioBaselineResetResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(`/api/v1/portfolio/accounts/${accountId}/baseline-reset`, {
+      as_of: payload.asOf,
+      cash_amount: payload.cashAmount,
+      positions: payload.positions.map((item) => ({
+        symbol: item.symbol,
+        quantity: item.quantity,
+        price: item.price,
+        market: item.market,
+        currency: item.currency,
+      })),
+      note: payload.note,
+    });
+    return toCamelCase<PortfolioBaselineResetResponse>(response.data);
   },
 
   async getSnapshot(query: SnapshotQuery = {}): Promise<PortfolioSnapshotResponse> {

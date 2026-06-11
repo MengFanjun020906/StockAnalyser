@@ -461,6 +461,29 @@ class PortfolioRepository:
         session.flush()
         return True
 
+    def clear_account_events_in_session(self, *, session: Any, account_id: int) -> Dict[str, int]:
+        """Delete all event rows for one account and invalidate derived portfolio caches."""
+        self._invalidate_account_cache_in_session(
+            session=session,
+            account_id=account_id,
+            from_date=date(1900, 1, 1),
+        )
+        trade_result = session.execute(
+            delete(PortfolioTrade).where(PortfolioTrade.account_id == account_id)
+        )
+        cash_result = session.execute(
+            delete(PortfolioCashLedger).where(PortfolioCashLedger.account_id == account_id)
+        )
+        corporate_result = session.execute(
+            delete(PortfolioCorporateAction).where(PortfolioCorporateAction.account_id == account_id)
+        )
+        session.flush()
+        return {
+            "deleted_trades": int(trade_result.rowcount or 0),
+            "deleted_cash_ledger": int(cash_result.rowcount or 0),
+            "deleted_corporate_actions": int(corporate_result.rowcount or 0),
+        }
+
     # ------------------------------------------------------------------
     # Event reads
     # ------------------------------------------------------------------

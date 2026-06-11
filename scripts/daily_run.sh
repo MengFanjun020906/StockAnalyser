@@ -8,7 +8,7 @@
 #   bash scripts/daily_run.sh --dry-run              # 只打印，不执行
 #
 # 执行顺序:
-#   1. update_sequoia_candidates.py   (baostock, 更新 stock_daily 日线)
+#   1. update_sequoia_candidates.py   (baostock, 更新 stock_daily 个股日线 + 上证指数)
 #   2. update_fundamental_candidates.py (tushare, 更新财务快照, 可跳过)
 #
 # 续跑机制:
@@ -70,7 +70,7 @@ db_stat() {
         2>/dev/null) || { echo "读取失败"; return; }
     local rows symbols dmin dmax
     IFS='|' read -r rows symbols dmin dmax <<< "$out"
-    printf "%s 行 / %s 只股票 / %s ~ %s" "$rows" "$symbols" "${dmin:-(空)}" "${dmax:-(空)}"
+    printf "%s 行 / %s 个标的 / %s ~ %s" "$rows" "$symbols" "${dmin:-(空)}" "${dmax:-(空)}"
 }
 
 # ---------- 续跑状态管理 ----------
@@ -129,14 +129,15 @@ info "STOCK_LIST           : ${STOCK_LIST:-(未配置，使用默认)}"
 info "CANDIDATE_MODE       : ${AGENT_CANDIDATE_DISCOVERY_MODE:-(未配置)}"
 
 SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db}"
+STEP1_KEY="step1_stock_daily_with_index"
 
 # ============================================================
 # Step 1: 更新 stock_daily 日线
 # ============================================================
 sep
-log ">>> [1/2] 更新 stock_daily 日线缓存  (baostock)"
+log ">>> [1/2] 更新 stock_daily 日线缓存 + 上证指数  (baostock)"
 
-if step_done "step1"; then
+if step_done "$STEP1_KEY"; then
     ok "已完成（跳过）  —  使用上次结果: $(db_stat "$SEQUOIA_DB")"
 else
     info "目标 DB : $SEQUOIA_DB"
@@ -149,7 +150,7 @@ else
         if "$PYTHON" scripts/update_sequoia_candidates.py --trading-days 260; then
             ok "stock_daily 更新完成  (耗时: $(elapsed $((SECONDS - T1))))"
             info "更新后: $(db_stat "$SEQUOIA_DB")"
-            mark_done "step1"
+            mark_done "$STEP1_KEY"
         else
             warn "更新失败（baostock 不可用），已有 $(db_stat "$SEQUOIA_DB") 仍可用"
             warn "step1 未标记完成，下次续跑会重试"

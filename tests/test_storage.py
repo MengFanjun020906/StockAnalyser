@@ -100,6 +100,20 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_get_instance_recovers_from_uninitialized_singleton(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager.__new__(DatabaseManager)
+        db._initialized = False
+        DatabaseManager._instance = db
+
+        recovered = DatabaseManager.get_instance()
+
+        self.assertIs(recovered, db)
+        with recovered.get_session() as session:
+            self.assertIsNotNone(session)
+
+        DatabaseManager.reset_instance()
+
     def test_file_sqlite_enables_wal_and_busy_timeout(self):
         temp_dir = tempfile.TemporaryDirectory()
         db_path = os.path.join(temp_dir.name, "sqlite_pragmas.db")

@@ -39,8 +39,15 @@ class _DummyManagerOk:
             "data": {
                 "stock_flow": {
                     "main_net_inflow": 1500000.0,
+                    "main_inflow_5d": 8000000.0,
+                    "main_inflow_10d": 15000000.0,
                     "inflow_5d": 8000000.0,
                     "inflow_10d": 15000000.0,
+                    "net_inflow": -500000.0,
+                    "net_inflow_5d": -3000000.0,
+                    "net_inflow_10d": -7000000.0,
+                    "amount_unit": "CNY",
+                    "raw_amount_unit": "10k CNY",
                     "latest_date": "2026-05-08",
                     "source_update": "after_market_close",
                 },
@@ -113,8 +120,15 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(manager.budget_seconds, 4.2)
         self.assertEqual(result["main_net_inflow"], 1500000.0)
+        self.assertEqual(result["main_inflow_5d"], 8000000.0)
+        self.assertEqual(result["main_inflow_10d"], 15000000.0)
         self.assertEqual(result["inflow_5d"], 8000000.0)
         self.assertEqual(result["inflow_10d"], 15000000.0)
+        self.assertEqual(result["net_inflow"], -500000.0)
+        self.assertEqual(result["net_inflow_5d"], -3000000.0)
+        self.assertEqual(result["net_inflow_10d"], -7000000.0)
+        self.assertEqual(result["amount_unit"], "CNY")
+        self.assertEqual(result["raw_amount_unit"], "10k CNY")
         self.assertEqual(result["latest_date"], "2026-05-08")
         self.assertEqual(result["source_update"], "after_market_close")
         self.assertEqual(
@@ -233,8 +247,22 @@ class TestGetCapitalFlowContract(unittest.TestCase):
             return {
                 "status": "ok",
                 "items": [
-                    {"trade_date": "20260515", "net_mf_amount": 1686.43},
-                    {"trade_date": "20260514", "net_mf_amount": -2774.06},
+                    {
+                        "trade_date": "20260515",
+                        "net_mf_amount": 1686.43,
+                        "buy_lg_amount": 20.0,
+                        "sell_lg_amount": 10.0,
+                        "buy_elg_amount": 3.0,
+                        "sell_elg_amount": 5.0,
+                    },
+                    {
+                        "trade_date": "20260514",
+                        "net_mf_amount": -2774.06,
+                        "buy_lg_amount": 8.0,
+                        "sell_lg_amount": 12.0,
+                        "buy_elg_amount": 1.0,
+                        "sell_elg_amount": 2.0,
+                    },
                 ],
                 "source_chain": [{"provider": f"tushare:{api_name}", "result": "ok"}],
                 "errors": [],
@@ -296,7 +324,14 @@ class TestGetCapitalFlowContract(unittest.TestCase):
                 }
             return {
                 "status": "ok",
-                "items": [{"trade_date": "20260515", "net_mf_amount": 1686.43}],
+                "items": [{
+                    "trade_date": "20260515",
+                    "net_mf_amount": 1686.43,
+                    "buy_lg_amount": 20.0,
+                    "sell_lg_amount": 10.0,
+                    "buy_elg_amount": 3.0,
+                    "sell_elg_amount": 5.0,
+                }],
                 "source_chain": [{"provider": "tushare:moneyflow", "result": "ok", "params": params}],
                 "errors": [],
             }
@@ -312,7 +347,12 @@ class TestGetCapitalFlowContract(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(len(calls), 2)
-        self.assertEqual(result["main_net_inflow"], 16864300.0)
+        self.assertEqual(result["net_inflow"], 16864300.0)
+        self.assertEqual(result["main_net_inflow"], 80000.0)
+        self.assertEqual(result["main_inflow_5d"], 80000.0)
+        self.assertEqual(result["net_inflow_5d"], 16864300.0)
+        self.assertEqual(result["amount_unit"], "CNY")
+        self.assertEqual(result["raw_amount_unit"], "10k CNY")
         self.assertEqual(result["source_chain"][0]["result"], "empty")
         self.assertEqual(result["source_chain"][1]["result"], "ok")
 

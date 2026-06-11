@@ -10,6 +10,7 @@ import ChatPage from './pages/ChatPage';
 import PortfolioPage from './pages/PortfolioPage';
 import AgentTracePage from './pages/AgentTracePage';
 import CandidatePoolPage from './pages/CandidatePoolPage';
+import SeedPoolQualityPage from './pages/SeedPoolQualityPage';
 import { ApiErrorAlert, Shell } from './components/common';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { useAgentChatStore } from './stores/agentChatStore';
@@ -68,6 +69,7 @@ const AppContent: React.FC = () => {
         <Route path="/agent-trace" element={<AgentTracePage />} />
         <Route path="/agent-trace/:sessionId" element={<AgentTracePage />} />
         <Route path="/candidate-pool" element={<CandidatePoolPage />} />
+        <Route path="/seed-pool-quality" element={<SeedPoolQualityPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/settings" element={<SettingsPage />} />

@@ -332,7 +332,7 @@ Planner 必须先选择主维度，再选择辅助维度。
 | `realtime_quote` | 需要判断当前是否行动 | 当前价、涨跌幅、量价、是否跌破/突破关键位 |
 | `technical_analysis` | 需要价格计划、止损止盈、趋势判断 | 趋势、均线、支撑压力、量价结构、缠论/SMC 结构 |
 | `news_event` | 用户问事件、异动、风险催化 | 公告、新闻、监管、减持、业绩预告 |
-| `capital_flow` | 用户问主力、短线承接、出货风险 | 主力流入流出、资金持续性 |
+| `capital_flow` | 用户问主力、短线承接、出货风险 | 主力口径流入流出、全口径主动净流入、资金持续性；`main_*` 才是主力，`net_*` 是 Tushare `net_mf_amount` 全口径 |
 | `chip_distribution` | A 股持仓成本区、套牢盘/获利盘压力 | 筹码集中度、获利比例、成本压力 |
 | `fundamental_analysis` | 中线持仓、估值、业绩逻辑 | 估值、盈利质量、现金流、成长性 |
 | `sector_industry` | 个股是否跟随主线或板块拖累 | 板块强弱、行业位置、主题共振 |
@@ -414,9 +414,10 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure`
 - `news_event` -> `search_comprehensive_intel`, `search_stock_news`, `score_stock_news_sentiment`
 - `capital_flow` -> `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary`
+- `get_capital_flow` 字段语义必须保留：`main_net_inflow/main_inflow_5d/main_inflow_10d` 是大单+特大单主力口径；`net_inflow/net_inflow_5d/net_inflow_10d` 是 Tushare `net_mf_amount` 全口径主动净流入，不能写成主力资金。
 - StockAPI 增强工具按需调用，不属于资金面默认全量必查：`get_stockapi_hot_sectors` 用于热点板块/概念资金确认；`get_stockapi_sector_constituents` 和 `get_stockapi_sector_flow_history` 仅在已有 `bkCode` 后展开；`get_stockapi_limit_up_pool` 用于涨停/短线情绪；`get_stockapi_popularity_rank` 用于人气/关注度；`get_stockapi_hot_money_activity` 用于游资或龙虎榜验证。
 - `chip_distribution` -> `get_chip_distribution`
-- `fundamental_analysis` -> `get_stock_info`
+- `fundamental_analysis` -> `get_stock_info`, `get_tushare_daily_basic`, `get_tushare_financial_indicators`, `get_tushare_financial_statements`
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`
 - `regime_detection` -> `detect_market_regime`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`
 - `backtest_memory` -> `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary`

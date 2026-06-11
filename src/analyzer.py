@@ -457,14 +457,13 @@ def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> N
             chip_data,
             language=getattr(result, "report_language", "zh"),
         )
-        # Start from a copy of cs to preserve any extra keys the LLM may have added
+        # Preserve extra LLM keys, but source-backed chip metrics override model prose.
         merged = dict(cs)
         for k in _CHIP_KEYS:
-            if _is_value_placeholder(merged.get(k)):
-                merged[k] = filled[k]
+            merged[k] = filled[k]
         if merged != cs:
             dp["chip_structure"] = merged
-            logger.info("[chip_structure] Filled placeholder chip fields from data source (Issue #589)")
+            logger.info("[chip_structure] Reconciled chip fields from data source")
     except Exception as e:
         logger.warning("[chip_structure] Fill failed, skipping: %s", e)
 

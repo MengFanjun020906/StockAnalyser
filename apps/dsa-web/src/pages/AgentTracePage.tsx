@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   BrainCircuit,
+  ChartCandlestick,
   Check,
   ChevronDown,
   Circle,
@@ -178,6 +179,13 @@ const asRecord = (value: unknown): Record<string, unknown> | null => (
     ? value as Record<string, unknown>
     : null
 );
+
+const normalizeSeedDateForUrl = (value?: string | null): string => {
+  const text = String(value || '').trim();
+  const compact = /^(\d{4})(\d{2})(\d{2})$/.exec(text);
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
+  return text;
+};
 
 const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   success: false, session_id: '', content: '', error: null,
@@ -490,6 +498,7 @@ type SeedPoolPreviewItem = {
 };
 
 type SeedPoolDisplay = {
+  seedDate?: string;
   seedCount: number;
   totalLimit?: number;
   sourceCounts: Record<string, number>;
@@ -1183,6 +1192,7 @@ const extractSeedPoolDisplay = (
       .filter(Boolean),
   })).filter((item) => item.code);
   return {
+    seedDate: String(summary.seed_date || summary.trade_date || '').trim() || undefined,
     seedCount: Number(summary.seed_count || preview.length || 0),
     totalLimit: typeof summary.total_limit === 'number' ? summary.total_limit : undefined,
     sourceCounts: Object.fromEntries(Object.entries(asRecord(summary.seed_sources) || {}).map(([key, value]) => [key, Number(value || 0)])),
@@ -2217,8 +2227,24 @@ const AgentTracePage: React.FC = () => {
       <div className="mx-auto max-w-[1100px] px-6 py-10">
         {/* Header */}
         <header className="mb-8">
-          <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
-          <p className="mt-1 text-sm text-muted-text">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
+              <p className="mt-1 text-sm text-muted-text">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const rawSeedDate = result ? extractSeedPoolDisplay(result, stockSelection)?.seedDate : undefined;
+                const seedDate = normalizeSeedDateForUrl(rawSeedDate);
+                navigate(seedDate ? `/seed-pool-quality?seed_date=${encodeURIComponent(seedDate)}` : '/seed-pool-quality');
+              }}
+              className="inline-flex h-9 items-center gap-2 border border-border bg-card px-3 text-sm text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+            >
+              <ChartCandlestick className="h-4 w-4" />
+              种子池质量
+            </button>
+          </div>
         </header>
 
         {/* Input area */}

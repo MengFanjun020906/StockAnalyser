@@ -734,7 +734,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "LOW_BASE_RANGE_PCT_MAX": {
         "title": "Low Base Range Pct Max",
-        "description": "FactSheet range_pct_120 ceiling for the early_turn_desk eligibility filter. Stocks with range_pct_120 <= this value are considered low-base candidates. Stocks missing this field fall through to the fallback supplement bucket.",
+        "description": "FactSheet range_pct_120 ceiling for the early_turn_desk/reversal-structure eligibility filter. Stocks must be below this range ceiling and have explicit turn evidence; low position alone and missing range data do not qualify.",
         "category": "agent",
         "data_type": "float",
         "ui_control": "number",
@@ -776,7 +776,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "THESIS_COMMITTEE_TIMEOUT_S": {
         "title": "Thesis Committee Timeout Seconds",
-        "description": "Wall-clock budget in seconds for the full thesis_desk_committee run (all three desks combined).",
+        "description": "Wall-clock budget in seconds for the full thesis_desk_committee run (all desks combined).",
         "category": "agent",
         "data_type": "float",
         "ui_control": "number",

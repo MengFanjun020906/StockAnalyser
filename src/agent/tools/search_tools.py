@@ -5,6 +5,7 @@ Search tools — wraps SearchService methods as agent-callable tools.
 Tools:
 - search_stock_news: search latest stock news
 - score_stock_news_sentiment: score company-level news and announcement events
+- search_stock_prompt_intel: search a user's single-stock prompt with the stock anchor
 - search_comprehensive_intel: multi-dimensional intelligence search
 """
 
@@ -367,6 +368,171 @@ def _handle_score_stock_news_sentiment(
     }
 
 
+_PROMPT_QUERY_STOPWORDS = {
+    "这个",
+    "一下",
+    "看看",
+    "帮我",
+    "有吗",
+    "了吗",
+    "如何",
+    "怎么样",
+    "为什么",
+    "什么",
+    "现在",
+    "最近",
+    "今天",
+    "昨天",
+}
+
+
+def _extract_prompt_search_terms(user_prompt: str, limit: int = 8) -> List[str]:
+    text = str(user_prompt or "").strip()
+    if not text:
+        return []
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._%+-]*|[\u4e00-\u9fa5]{2,}", text)
+    terms: List[str] = []
+    seen = set()
+    for token in tokens:
+        cleaned = token.strip(" ，。！？；;：:、（）()[]【】\"'")
+        if not cleaned or cleaned in _PROMPT_QUERY_STOPWORDS:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        terms.append(cleaned)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _build_stock_prompt_query(
+    stock_code: str,
+    stock_name: str = "",
+    user_prompt: str = "",
+    search_scope: str = "auto",
+) -> str:
+    code = str(stock_code or "").strip()
+    name = _resolve_stock_name(code, stock_name)
+    prompt = str(user_prompt or "").strip()
+    scope = str(search_scope or "auto").strip().lower()
+    terms = _extract_prompt_search_terms(prompt)
+    anchors = [item for item in [name, code] if item]
+    scope_terms: List[str] = []
+
+    if scope == "announcement" or any(word in prompt for word in ("公告", "年报", "季报", "互动", "投资者关系", "监管函", "问询函")):
+        scope_terms.extend(["公告", "投资者关系", "年报"])
+    elif scope == "price" or any(word in prompt for word in ("走势", "股价", "涨停", "跌停", "K线", "资金")):
+        scope_terms.extend(["走势", "股价", "资金"])
+    elif scope == "news" or any(word in prompt for word in ("新闻", "消息", "传闻", "订单", "合同", "合作")):
+        scope_terms.extend(["新闻", "消息"])
+    elif scope == "risk" or any(word in prompt for word in ("风险", "处罚", "减持", "诉讼", "立案", "问询")):
+        scope_terms.extend(["风险", "处罚", "减持", "问询"])
+
+    query_parts: List[str] = []
+    for item in anchors + terms + scope_terms:
+        if item and item not in query_parts:
+            query_parts.append(item)
+
+    if not query_parts:
+        return prompt
+    return " ".join(query_parts[:14])
+
+
+def _handle_search_stock_prompt_intel(
+    stock_code: str,
+    stock_name: Optional[str] = None,
+    user_prompt: str = "",
+    search_scope: str = "auto",
+    days: int = 30,
+    max_results: int = 6,
+) -> dict:
+    """Search the user's single-stock prompt using the configured search providers."""
+    service = _get_search_service()
+    resolved_name = _resolve_stock_name(stock_code, stock_name)
+    query = _build_stock_prompt_query(stock_code, resolved_name, user_prompt, search_scope)
+    effective_days = max(1, min(int(days or 30), 365))
+    effective_limit = max(1, min(int(max_results or 6), 10))
+
+    if not getattr(service, "is_available", False):
+        return {
+            "status": "disabled",
+            "stock_code": _canonical_search_code(stock_code),
+            "stock_name": resolved_name,
+            "user_prompt": str(user_prompt or ""),
+            "query": query,
+            "results_count": 0,
+            "results": [],
+            "source_chain": [{
+                "provider": "search_general_news",
+                "result": "disabled",
+                "days": effective_days,
+                "max_results": effective_limit,
+            }],
+            "errors": ["No search engine available (no API keys configured)"],
+        }
+
+    response = service.search_general_news(
+        query,
+        max_results=effective_limit,
+        days=effective_days,
+    )
+
+    if not getattr(response, "success", False):
+        return {
+            "status": "failed",
+            "stock_code": _canonical_search_code(stock_code),
+            "stock_name": resolved_name,
+            "user_prompt": str(user_prompt or ""),
+            "query": getattr(response, "query", query),
+            "provider": getattr(response, "provider", ""),
+            "results_count": 0,
+            "results": [],
+            "source_chain": [{
+                "provider": getattr(response, "provider", "") or "search_general_news",
+                "result": "failed",
+                "days": effective_days,
+                "max_results": effective_limit,
+            }],
+            "errors": [str(getattr(response, "error_message", "") or "search failed")],
+        }
+
+    _persist_news_response(
+        stock_code=stock_code,
+        stock_name=resolved_name,
+        dimension="prompt_intel",
+        response=response,
+    )
+
+    results = [
+        {
+            "title": r.title,
+            "snippet": r.snippet,
+            "url": r.url,
+            "source": r.source,
+            "published_date": r.published_date,
+        }
+        for r in getattr(response, "results", []) or []
+    ]
+    return {
+        "status": "ok" if results else "empty",
+        "stock_code": _canonical_search_code(stock_code),
+        "stock_name": resolved_name,
+        "user_prompt": str(user_prompt or ""),
+        "query": getattr(response, "query", query),
+        "provider": getattr(response, "provider", ""),
+        "results_count": len(results),
+        "results": results,
+        "source_chain": [{
+            "provider": getattr(response, "provider", "") or "search_general_news",
+            "result": "ok" if results else "empty",
+            "days": effective_days,
+            "max_results": effective_limit,
+        }],
+        "errors": [],
+    }
+
+
 search_stock_news_tool = ToolDefinition(
     name="search_stock_news",
     description="Search for the latest news articles about a specific stock. "
@@ -385,6 +551,58 @@ search_stock_news_tool = ToolDefinition(
         ),
     ],
     handler=_handle_search_stock_news,
+    category="search",
+)
+
+
+search_stock_prompt_intel_tool = ToolDefinition(
+    name="search_stock_prompt_intel",
+    description=(
+        "Search the configured search engines for a user's single-stock question. "
+        "Use this when the user asks about one stock's announcements, latest events, regulatory letters, "
+        "orders/contracts, rumors, capital-flow news, or price-move context in natural language."
+    ),
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code, e.g. '688126'.",
+        ),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name in Chinese. If omitted, the local stock-name index is used.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="user_prompt",
+            type="string",
+            description="The user's original single-stock question, e.g. '有什么公告，你看看走势'.",
+        ),
+        ToolParameter(
+            name="search_scope",
+            type="string",
+            description="Optional search hint: auto, announcement, news, price, or risk.",
+            required=False,
+            default="auto",
+        ),
+        ToolParameter(
+            name="days",
+            type="integer",
+            description="Search freshness window in days (default: 30, max: 365).",
+            required=False,
+            default=30,
+        ),
+        ToolParameter(
+            name="max_results",
+            type="integer",
+            description="Max results to return (default: 6, max: 10).",
+            required=False,
+            default=6,
+        ),
+    ],
+    handler=_handle_search_stock_prompt_intel,
     category="search",
 )
 
@@ -590,6 +808,7 @@ search_comprehensive_intel_tool = ToolDefinition(
 
 ALL_SEARCH_TOOLS = [
     search_stock_news_tool,
+    search_stock_prompt_intel_tool,
     score_stock_news_sentiment_tool,
     search_comprehensive_intel_tool,
 ]

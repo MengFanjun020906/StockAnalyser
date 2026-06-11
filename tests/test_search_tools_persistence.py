@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 from src.agent.tools.search_tools import (
     _handle_search_comprehensive_intel,
     _handle_score_stock_news_sentiment,
+    _handle_search_stock_prompt_intel,
     _handle_search_stock_news,
+    search_stock_prompt_intel_tool,
+    ALL_SEARCH_TOOLS,
 )
 from src.search_service import SearchResponse, SearchResult
 
@@ -53,6 +56,78 @@ class SearchToolsPersistenceTest(unittest.TestCase):
             response=response,
             query_context=None,
         )
+
+    def test_search_stock_prompt_intel_searches_user_prompt_with_stock_anchor(self) -> None:
+        response = _response("沪硅产业 688126 有什么公告 走势 公告 投资者关系 年报")
+        service = SimpleNamespace(
+            is_available=True,
+            search_general_news=MagicMock(return_value=response),
+        )
+        db = SimpleNamespace(save_news_intel=MagicMock(return_value=1))
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db):
+            result = _handle_search_stock_prompt_intel(
+                "688126",
+                "沪硅产业",
+                "有什么公告，你看看走势",
+                days=45,
+                max_results=4,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["results_count"], 1)
+        service.search_general_news.assert_called_once()
+        query_arg = service.search_general_news.call_args.args[0]
+        self.assertIn("沪硅产业", query_arg)
+        self.assertIn("688126", query_arg)
+        self.assertIn("公告", query_arg)
+        self.assertIn("走势", query_arg)
+        self.assertEqual(service.search_general_news.call_args.kwargs["days"], 45)
+        self.assertEqual(service.search_general_news.call_args.kwargs["max_results"], 4)
+        db.save_news_intel.assert_called_once_with(
+            code="688126",
+            name="沪硅产业",
+            dimension="prompt_intel",
+            query=response.query,
+            response=response,
+            query_context=None,
+        )
+        self.assertIn(search_stock_prompt_intel_tool, ALL_SEARCH_TOOLS)
+
+    def test_search_stock_prompt_intel_reports_unavailable_search(self) -> None:
+        service = SimpleNamespace(is_available=False)
+        db = SimpleNamespace(save_news_intel=MagicMock())
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db):
+            result = _handle_search_stock_prompt_intel(
+                "688126",
+                "沪硅产业",
+                "有没有投资者关系活动记录表",
+            )
+
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["results"], [])
+        self.assertIn("No search engine", result["errors"][0])
+        db.save_news_intel.assert_not_called()
+
+    def test_search_stock_prompt_intel_reports_failed_search_without_persisting(self) -> None:
+        response = _response("沪硅产业 公告", success=False)
+        service = SimpleNamespace(
+            is_available=True,
+            search_general_news=MagicMock(return_value=response),
+        )
+        db = SimpleNamespace(save_news_intel=MagicMock())
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db):
+            result = _handle_search_stock_prompt_intel("688126", "沪硅产业", "有什么公告")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["results_count"], 0)
+        self.assertEqual(result["errors"], ["search failed"])
+        db.save_news_intel.assert_not_called()
 
     def test_search_comprehensive_intel_persists_successful_dimensions_only(self) -> None:
         latest = _response("latest")

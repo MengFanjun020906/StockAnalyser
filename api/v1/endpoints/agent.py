@@ -365,7 +365,7 @@ def _infer_stock_code_from_message(message: str) -> str:
     import re
 
     patterns = [
-        r"\b(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ|SS))?\b",
+        r"(?<!\d)(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ|SS))?(?!\d)",
         r"\bHK\s?(\d{1,5})\b",
         r"\b(\d{5})\.HK\b",
         r"\b([A-Z]{1,5}(?:\.[A-Z])?)\b",
@@ -474,6 +474,21 @@ def _normalize_injected_report_intent(agent_user_context: Any, *, stock_code: st
     if isinstance(report, dict):
         primary_symbol = report.get("primary_symbol")
     target = str(stock_code or primary_symbol or (target_symbols[0] if target_symbols else "") or "").strip()
+    if stock_code:
+        target = stock_code
+        if stock_code not in target_symbols:
+            target_symbols.insert(0, stock_code)
+        else:
+            target_symbols = [stock_code] + [symbol for symbol in target_symbols if symbol != stock_code]
+        if isinstance(report, dict):
+            report["primary_symbol"] = stock_code
+            report["target_symbols"] = target_symbols
+        else:
+            try:
+                setattr(report, "primary_symbol", stock_code)
+                setattr(report, "target_symbols", target_symbols)
+            except Exception:
+                logger.debug("Agent trace report target normalization skipped")
     positions = getattr(agent_user_context, "positions", []) or []
     has_position = bool(target and hasattr(agent_user_context, "has_position_for") and agent_user_context.has_position_for(target))
     has_any_position = any(getattr(position, "quantity", 0) for position in positions)
@@ -495,12 +510,18 @@ def _should_override_injected_report_intent(intent_resolution: TraceIntentResolu
     """Only override portfolio-derived intent when the user or classifier said so.
 
     Portfolio context can already resolve a holding review from real positions.
-    A classifier failure falls back to a generic default; that default must not
-    overwrite an injected ``position_review`` context.
+    A classifier failure can still fall back to a deterministic explicit
+    watchlist request; that user intent must override an injected
+    ``position_review`` context, otherwise the staged stock-selection pipeline
+    never starts.
     """
     return bool(
         intent_resolution.get("requested_intent")
         or (intent_resolution.get("source") == "mimo" and intent_resolution.get("classifier_success"))
+        or (
+            intent_resolution.get("intent") == "watchlist_scan"
+            and intent_resolution.get("explicit_watchlist_request")
+        )
     )
 
 

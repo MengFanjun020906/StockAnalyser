@@ -43,6 +43,8 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         logger.warning("analyze_trend(%s): Trend analysis failed", stock_code, exc_info=True)
         return {"error": f"Trend analysis failed for {stock_code}"}
 
+    bollinger = _calculate_bollinger(df["close"])
+
     return {
         "code": result.code,
         "trend_status": result.trend_status.value,
@@ -73,10 +75,45 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         "rsi_24": round(result.rsi_24, 2),
         "rsi_status": result.rsi_status.value,
         "rsi_signal": result.rsi_signal,
+        "bollinger": bollinger,
         "buy_signal": result.buy_signal.value,
         "signal_score": result.signal_score,
         "signal_reasons": result.signal_reasons,
         "risk_factors": result.risk_factors,
+    }
+
+
+def _calculate_bollinger(close, period: int = 20, width: float = 2.0) -> dict:
+    if close is None or len(close) < period:
+        return {"status": "insufficient_data", "period": period}
+    latest_close = float(close.iloc[-1])
+    mid = float(close.rolling(window=period).mean().iloc[-1])
+    std = float(close.rolling(window=period).std(ddof=0).iloc[-1])
+    upper = mid + width * std
+    lower = mid - width * std
+    bandwidth = (upper - lower) / mid * 100 if mid else None
+    if latest_close > upper:
+        position = "above_upper"
+        position_label = "布林上轨外运行"
+    elif latest_close >= mid:
+        position = "upper_half"
+        position_label = "布林中上轨运行"
+    elif latest_close >= lower:
+        position = "lower_half"
+        position_label = "布林中下轨运行"
+    else:
+        position = "below_lower"
+        position_label = "布林下轨外运行"
+    return {
+        "status": "ok",
+        "period": period,
+        "mid": round(mid, 2),
+        "upper": round(upper, 2),
+        "lower": round(lower, 2),
+        "bandwidth_pct": round(bandwidth, 2) if bandwidth is not None else None,
+        "position": position,
+        "position_label": position_label,
+        "close": round(latest_close, 2),
     }
 
 

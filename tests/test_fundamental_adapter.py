@@ -93,9 +93,30 @@ class TestFundamentalAdapter(unittest.TestCase):
     def test_capital_flow_prefers_tushare_moneyflow(self) -> None:
         adapter = AkshareFundamentalAdapter()
         tushare_df = pd.DataFrame([
-            {"trade_date": "20260506", "net_mf_amount": 100.0},
-            {"trade_date": "20260507", "net_mf_amount": -20.0},
-            {"trade_date": "20260508", "net_mf_amount": 30.0},
+            {
+                "trade_date": "20260506",
+                "net_mf_amount": 100.0,
+                "buy_lg_amount": 20.0,
+                "sell_lg_amount": 15.0,
+                "buy_elg_amount": 8.0,
+                "sell_elg_amount": 3.0,
+            },
+            {
+                "trade_date": "20260507",
+                "net_mf_amount": -20.0,
+                "buy_lg_amount": 10.0,
+                "sell_lg_amount": 12.0,
+                "buy_elg_amount": 1.0,
+                "sell_elg_amount": 4.0,
+            },
+            {
+                "trade_date": "20260508",
+                "net_mf_amount": 30.0,
+                "buy_lg_amount": 7.0,
+                "sell_lg_amount": 8.0,
+                "buy_elg_amount": 5.0,
+                "sell_elg_amount": 1.0,
+            },
         ])
 
         with patch("data_provider.fundamental_adapter.query_tushare_api", return_value=tushare_df), \
@@ -104,9 +125,16 @@ class TestFundamentalAdapter(unittest.TestCase):
             result = adapter.get_capital_flow("600004")
 
         self.assertEqual(result["status"], "partial")
-        self.assertEqual(result["stock_flow"]["main_net_inflow"], 300000.0)
-        self.assertEqual(result["stock_flow"]["inflow_5d"], 1100000.0)
-        self.assertEqual(result["stock_flow"]["inflow_10d"], 1100000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow"], 300000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow_5d"], 1100000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow_10d"], 1100000.0)
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 30000.0)
+        self.assertEqual(result["stock_flow"]["main_inflow_5d"], 80000.0)
+        self.assertEqual(result["stock_flow"]["main_inflow_10d"], 80000.0)
+        self.assertEqual(result["stock_flow"]["inflow_5d"], 80000.0)
+        self.assertEqual(result["stock_flow"]["inflow_10d"], 80000.0)
+        self.assertEqual(result["stock_flow"]["amount_unit"], "CNY")
+        self.assertEqual(result["stock_flow"]["raw_amount_unit"], "10k CNY")
         self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
         self.assertEqual(result["stock_flow"]["source_update"], "tushare_moneyflow_after_market_close")
         self.assertIn("capital_stock:tushare_moneyflow", result["source_chain"])

@@ -23,6 +23,7 @@ from src.agent.candidate_experts_v2.committee import (
     _assemble_seed_pool,
     _build_seed_pool,
     _build_seed_pool_result,
+    _market_regime_key,
     run_committee_discovery,
     run_thesis_desk_committee,
 )
@@ -49,7 +50,6 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     seeds_by_source = {
         "daily_screener": [seed(f"60000{i}", "daily_screener", 90 - i) for i in range(5)],
         "news_theme_daily": [seed(f"60010{i}", "news_theme_daily", 90 - i) for i in range(5)],
-        "low_base_structure": [seed(f"60020{i}", "low_base_structure", 90 - i) for i in range(5)],
         "capital_flow_anomaly": [seed(f"60030{i}", "capital_flow_anomaly", 90 - i) for i in range(3)],
         "margin_financing": [seed("600400", "margin_financing", 88)],
         "block_trade": [seed("600500", "block_trade", 87)],
@@ -63,7 +63,8 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     sources = [item.source for item in result]
 
     assert len(result) == 10
-    assert sources[:3] == ["daily_screener", "low_base_structure", "limit_up_pool"]
+    assert set(sources[:3]) == {"daily_screener", "alphasift", "sequoia"}
+    assert "low_base_structure" not in sources
     assert "news_theme_daily" in sources
     assert "capital_flow_anomaly" in sources
     assert "limit_up_pool" in sources
@@ -72,13 +73,18 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     assert sources.count("daily_screener") < 5
 
 
+def test_market_regime_key_accepts_market_regime_payload_dict():
+    assert _market_regime_key({"regime": "risk_off", "volatility": "high"}) == "risk_off"
+    assert _market_regime_key({"market_regime": "TRENDING_UP"}) == "trending_up"
+    assert _market_regime_key({}) == "unknown"
+
+
 def test_seed_pool_assembly_allocates_total_limit_evenly_across_live_sources():
     def seed(code: str, source: str, score: float = 80.0):
         return committee_module.SeedItem(code=code, name=code, source=source, priority_score=score)
 
     live_sources = [
         "daily_screener",
-        "low_base_structure",
         "news_theme_daily",
         "limit_up_pool",
         "capital_flow_anomaly",
@@ -99,9 +105,9 @@ def test_seed_pool_assembly_allocates_total_limit_evenly_across_live_sources():
 
     assert len(result) == 20
     assert set(counts) == set(live_sources)
-    assert max(counts.values()) - min(counts.values()) <= 1
-    assert sum(1 for count in counts.values() if count == 2) == 9
-    assert sum(1 for count in counts.values() if count == 1) == 2
+    assert counts["alphasift"] == 3
+    assert counts["sequoia"] == 3
+    assert max(counts.values()) - min(counts.values()) <= 2
 
 
 def test_seed_fact_packets_run_seed_tool_tasks_once_and_record_failures():
@@ -489,7 +495,7 @@ def test_run_committee_discovery_coerces_non_dict_deterministic_payload():
     assert result["status"] in ("ok", "failed")
 
 
-def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_sources():
+def test_build_seed_pool_excludes_fundamental_snapshot_and_low_base_sources():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={
@@ -511,7 +517,7 @@ def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_source
     ), patch.object(
         committee_module,
         "_build_low_base_structure_seeds",
-        return_value=[committee_module.SeedItem(code="600002", name="低位结构候选", source="low_base_structure")],
+        side_effect=AssertionError("low_base_structure should not be called by default"),
     ):
         seeds = _build_seed_pool(
             market="cn",
@@ -524,11 +530,12 @@ def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_source
 
     by_code = {seed.code: seed for seed in seeds}
     assert "600001" not in by_code
-    assert by_code["600002"].source == "low_base_structure"
+    assert "600002" not in by_code
     assert all(seed.source != "fundamental_snapshot" for seed in seeds)
+    assert all(seed.source != "low_base_structure" for seed in seeds)
 
 
-def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
+def test_build_seed_pool_applies_source_caps_and_weights_strategy_sources():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={
@@ -557,10 +564,7 @@ def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
     ), patch.object(
         committee_module,
         "_build_low_base_structure_seeds",
-        return_value=[
-            committee_module.SeedItem(code=f"6004{i:02d}", name=f"低位{i}", source="low_base_structure")
-            for i in range(12)
-        ],
+        side_effect=AssertionError("low_base_structure should not be called by default"),
     ):
         seeds = _build_seed_pool(
             market="cn",
@@ -579,15 +583,17 @@ def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
     for seed in seeds:
         source_counts[seed.source] = source_counts.get(seed.source, 0) + 1
 
-    assert source_counts["low_base_structure"] <= 8
-    assert source_counts["alphasift"] <= 10
+    assert "low_base_structure" not in source_counts
+    assert source_counts["alphasift"] <= 14
+    assert source_counts["sequoia"] <= 12
+    assert source_counts["alphasift"] >= source_counts["hot_rank"]
+    assert source_counts["sequoia"] >= source_counts["hot_rank"]
     assert source_counts["hot_rank"] <= 8
     assert source_counts["limit_up_pool"] <= 10
-    assert source_counts["low_base_structure"] > 0
     assert "fundamental_snapshot" not in source_counts
 
 
-def test_build_seed_pool_result_caps_total_limit_to_twenty():
+def test_build_seed_pool_result_caps_total_limit_to_thirty_two():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={"status": "ok", "candidates": [{"code": f"6001{i:02d}", "name": f"基本面{i}"} for i in range(20)]},
@@ -604,7 +610,7 @@ def test_build_seed_pool_result_caps_total_limit_to_twenty():
     ), patch.object(
         committee_module,
         "_build_low_base_structure_seeds",
-        return_value=[committee_module.SeedItem(code=f"6004{i:02d}", name=f"低位{i}", source="low_base_structure") for i in range(20)],
+        side_effect=AssertionError("low_base_structure should not be called by default"),
     ):
         result = committee_module._build_seed_pool_result(
             market="cn",
@@ -615,11 +621,11 @@ def test_build_seed_pool_result_caps_total_limit_to_twenty():
                 "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
             },
             today="20260523",
-            total_limit=20,
+            total_limit=32,
         )
 
-    assert result.total_limit == 20
-    assert len(result.seeds) <= 20
+    assert result.total_limit == 32
+    assert len(result.seeds) <= 32
 
 
 def test_build_seed_pool_result_records_quality_and_structured_signals():

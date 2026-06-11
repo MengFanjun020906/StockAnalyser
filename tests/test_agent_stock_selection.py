@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,6 +27,7 @@ from src.agent.stock_selection import (
     _compact_candidate_seed,
     _compact_tool_result_for_trace,
     _normalize_deep_dive_payload,
+    _persist_seed_pool_quality_snapshot,
     _resolve_candidate_discovery_mode,
     _run_candidate_discovery_tool,
     _select_deep_dive_targets,
@@ -2479,6 +2481,35 @@ def test_fallback_candidate_discovery_preserves_seed_pool_metadata():
     assert payload["full"]["seed_gate"]["status"] == "ok"
     assert payload["full"]["seed_pool_diagnostics"][0]["source"] == "user_watchlist"
     assert payload["full"]["seed_market_regime"]["regime"] == "range_bound"
+
+
+def test_seed_pool_quality_snapshot_before_open_uses_previous_seed_date():
+    ctx = SelectionRunContext(run_id="selection-run", user_message="m", candidate_discovery_mode="llm_expert_committee")
+    payload = {
+        "status": "ok",
+        "seed_pool_summary": {
+            "seed_count": 1,
+            "preview": [{"code": "600001", "name": "测试一", "source": "daily_screener"}],
+        },
+    }
+
+    service_instance = MagicMock()
+    service_instance.persist_candidate_discovery_snapshot.return_value = {"status": "ok", "snapshot_id": 1}
+    fixed_now = datetime(2026, 6, 10, 8, 59)
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is None else fixed_now.replace(tzinfo=tz)
+
+    with patch("src.services.seed_pool_quality_service.SeedPoolQualityService", return_value=service_instance), \
+            patch("src.agent.stock_selection.datetime", FixedDateTime):
+        _persist_seed_pool_quality_snapshot(ctx=ctx, payload=payload, today="20260610")
+
+    kwargs = service_instance.persist_candidate_discovery_snapshot.call_args.kwargs
+    assert kwargs["seed_date"].isoformat() == "2026-06-09"
+    assert kwargs["run_id"] == "selection-run:2026-06-09"
+    assert kwargs["trace_id"] == "selection-run:2026-06-09"
+    assert kwargs["generated_at"] == fixed_now
 
 
 def test_run_candidate_discovery_tool_returns_failed_payload_when_thesis_committee_raises():

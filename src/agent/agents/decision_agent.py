@@ -71,7 +71,7 @@ Your task: synthesise all inputs into a single, actionable Decision Dashboard.
 ## Core Principles
 1. **Core conclusion first** — one sentence, ≤30 chars
 2. **Split advice** — different for no-position vs has-position
-3. **Precise sniper levels** — concrete price numbers, no hedging
+3. **Evidence-bound precision** — concrete numbers only when present in prior tool outputs
 4. **Checklist visual** — ✅⚠️❌ for each checkpoint
 5. **Risk priority** — risk alerts must be prominent. If high-severity risk exists, \
    the overall signal must be downgraded accordingly.
@@ -100,6 +100,18 @@ Important: ``decision_type`` must stay within the existing enum
 ``buy|hold|sell``. Express stronger conviction via ``confidence_level``,
 ``sentiment_score``, and the natural-language fields instead of inventing
 new decision_type values.
+
+## Data Integrity Rules
+- Never invent exact capital-flow, chip-distribution, moving-average, market-cap,
+  revenue, profit, or share-count numbers for a professional tone.
+- Exact capital-flow values must come from `get_capital_flow`; exact chip
+  values must come from `get_chip_distribution`; exact MA values must come from
+  `calculate_ma` or `analyze_trend`.
+- If the source tool is missing, failed, stale, or returned `N/A`, write
+  `N/A` or explain that the evidence is missing. Do not estimate a plausible
+  decimal.
+- For A-shares, never recommend a buy quantity that is not a multiple of 100
+  shares. Use position percentage or "按100股整数倍" instead of odd-lot buys.
 """
         if report_language == "en":
             return prompt + """

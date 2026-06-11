@@ -21,6 +21,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import requests
+
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,13 @@ _CJZC_RESOURCE_DIR = (
 )
 _CJZC_DAILY_PUBLISH_CUTOFF_HOUR = 6
 _CJZC_COMPANY_LINE_RE = re.compile(r"(?:(?:^)|[。！？；;\n\r]\s*|(?:\d+[、.]\s*))([\u4e00-\u9fa5A-Za-z0-9（）()]{2,24})\s*[：:](.*?)(?=(?:[。！？；;\n\r]\s*|\s+|(?:\d+[、.]\s*))[\u4e00-\u9fa5A-Za-z0-9（）()]{2,24}\s*[：:]|$)")
+_DISCLOSURE_KEYWORD_GROUPS: Dict[str, List[str]] = {
+    "storage_material": ["存储用抛光片", "抛光片", "存储领域", "存储芯片", "DRAM", "NAND"],
+    "soi_silicon_photonics": ["SOI", "SOI硅片", "硅光", "光互连", "12英寸SOI", "12 英寸SOI"],
+    "capacity_300mm": ["300mm", "300 mm", "12英寸", "12 英寸", "近完美单晶", "85万片/月", "85 万片/月", "半导体硅片"],
+    "investor_relation": ["投资者关系活动记录表", "投资者关系", "调研活动", "机构调研"],
+    "annual_report": ["年度报告", "年报"],
+}
 
 
 def _run_manager_task_with_timeout(
@@ -1191,6 +1200,11 @@ def _handle_get_capital_flow(
             "stock_code": stock_code,
             "status": "error",
             "error": f"capital flow fetch failed: {exc}",
+            "errors": [str(exc)],
+            "source_chain": [{
+                "provider": "capital_flow",
+                "result": "failed",
+            }],
         }
 
     status = ctx.get("status", "not_supported")
@@ -1199,6 +1213,10 @@ def _handle_get_capital_flow(
             "stock_code": stock_code,
             "status": "not_supported",
             "note": "Capital flow data is only available for A-share stocks (not ETFs/indices).",
+            "source_chain": [{
+                "provider": "capital_flow",
+                "result": "not_supported",
+            }],
         }
 
     data = ctx.get("data", {})
@@ -1240,10 +1258,20 @@ def _handle_get_capital_flow(
             "page_size": normalized_page_size,
         },
         "main_net_inflow": stock_flow.get("main_net_inflow"),
+        "main_inflow_5d": stock_flow.get("main_inflow_5d"),
+        "main_inflow_10d": stock_flow.get("main_inflow_10d"),
         "inflow_5d": stock_flow.get("inflow_5d"),
         "inflow_10d": stock_flow.get("inflow_10d"),
+        "net_inflow": stock_flow.get("net_inflow"),
+        "net_inflow_5d": stock_flow.get("net_inflow_5d"),
+        "net_inflow_10d": stock_flow.get("net_inflow_10d"),
         "latest_date": stock_flow.get("latest_date"),
         "source_update": stock_flow.get("source_update"),
+        "amount_unit": stock_flow.get("amount_unit", "CNY"),
+        "raw_amount_unit": stock_flow.get("raw_amount_unit"),
+        "main_inflow_definition": stock_flow.get("main_inflow_definition"),
+        "net_inflow_definition": stock_flow.get("net_inflow_definition"),
+        "latest_raw": stock_flow.get("latest_raw"),
         "source_chain": source_chain,
         "sector_rankings": {
             "top_inflow_sectors": sector_rankings.get("top", [])[:3],
@@ -1257,8 +1285,12 @@ def _handle_get_capital_flow(
 get_capital_flow_tool = ToolDefinition(
     name="get_capital_flow",
     description=(
-        "Get main-force (主力) capital flow data for an A-share stock. "
-        "Returns the latest daily net inflow, 5-day and 10-day cumulative inflows. "
+        "Get A-share stock capital flow with explicit semantics and units. "
+        "`main_net_inflow`, `main_inflow_5d`, and `main_inflow_10d` are the main-force口径: "
+        "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000, in CNY. "
+        "`net_inflow`, `net_inflow_5d`, and `net_inflow_10d` are Tushare all-order net_mf_amount * 10000, in CNY. "
+        "`inflow_5d`/`inflow_10d` are backward-compatible aliases for the main-force口径. "
+        "Do not describe `net_inflow*` as 主力资金. "
         "Only supported for A-share individual stocks (not ETFs, indices, HK, or US stocks)."
     ),
     parameters=[
@@ -1751,22 +1783,35 @@ def _query_tushare_stock_moneyflow(stock_code: str, timeout_seconds: Optional[fl
         result["stock_code"] = stock_code
         return result
 
-    dated_amounts: List[Tuple[str, float]] = []
+    net_amounts_by_date: Dict[str, float] = {}
+    main_amounts_by_date: Dict[str, float] = {}
+    raw_by_date: Dict[str, Dict[str, Any]] = {}
     for row in result.get("items") or []:
         trade_date = str(row.get("trade_date") or "").replace("-", "")[:8]
-        amount = _safe_number(row.get("net_mf_amount"))
-        if amount is None:
-            buy_lg = _safe_number(row.get("buy_lg_amount")) or 0.0
-            sell_lg = _safe_number(row.get("sell_lg_amount")) or 0.0
-            buy_elg = _safe_number(row.get("buy_elg_amount")) or 0.0
-            sell_elg = _safe_number(row.get("sell_elg_amount")) or 0.0
-            amount = (buy_lg + buy_elg) - (sell_lg + sell_elg)
-        if trade_date and amount is not None:
+        if len(trade_date) != 8:
+            continue
+        net_amount = _safe_number(row.get("net_mf_amount"))
+        buy_lg = _safe_number(row.get("buy_lg_amount"))
+        sell_lg = _safe_number(row.get("sell_lg_amount"))
+        buy_elg = _safe_number(row.get("buy_elg_amount"))
+        sell_elg = _safe_number(row.get("sell_elg_amount"))
+        if net_amount is not None:
             # Tushare moneyflow amount columns are in 10k yuan; keep tool output in yuan.
-            dated_amounts.append((trade_date, float(amount) * 10000.0))
+            net_amounts_by_date[trade_date] = float(net_amount) * 10000.0
+        if any(value is not None for value in (buy_lg, sell_lg, buy_elg, sell_elg)):
+            main_amount = (buy_lg or 0.0) + (buy_elg or 0.0) - (sell_lg or 0.0) - (sell_elg or 0.0)
+            main_amounts_by_date[trade_date] = float(main_amount) * 10000.0
+        raw_by_date[trade_date] = {
+            "net_mf_amount_10k_cny": net_amount,
+            "buy_lg_amount_10k_cny": buy_lg,
+            "sell_lg_amount_10k_cny": sell_lg,
+            "buy_elg_amount_10k_cny": buy_elg,
+            "sell_elg_amount_10k_cny": sell_elg,
+        }
 
-    dated_amounts.sort(key=lambda item: item[0])
-    if not dated_amounts:
+    net_rows = sorted(net_amounts_by_date.items(), key=lambda item: item[0])
+    main_rows = sorted(main_amounts_by_date.items(), key=lambda item: item[0])
+    if not net_rows and not main_rows:
         return {
             "stock_code": stock_code,
             "status": "empty",
@@ -1774,16 +1819,30 @@ def _query_tushare_stock_moneyflow(stock_code: str, timeout_seconds: Optional[fl
             "errors": ["tushare:moneyflow empty usable rows"],
             "source_chain": result.get("source_chain", []),
         }
-    amounts = [item[1] for item in dated_amounts]
-    latest_date, latest_amount = dated_amounts[-1]
+    latest_date = (main_rows or net_rows)[-1][0]
+    latest_main = main_amounts_by_date.get(latest_date)
+    latest_net = net_amounts_by_date.get(latest_date)
+    main_amounts = [item[1] for item in main_rows]
+    net_amounts = [item[1] for item in net_rows]
     return {
         "stock_code": stock_code,
         "status": "ok",
-        "main_net_inflow": latest_amount,
-        "inflow_5d": float(sum(amounts[-5:])),
-        "inflow_10d": float(sum(amounts[-10:])),
+        "main_net_inflow": latest_main,
+        "main_inflow_5d": float(sum(main_amounts[-5:])) if main_amounts else None,
+        "main_inflow_10d": float(sum(main_amounts[-10:])) if main_amounts else None,
+        "net_inflow": latest_net,
+        "net_inflow_5d": float(sum(net_amounts[-5:])) if net_amounts else None,
+        "net_inflow_10d": float(sum(net_amounts[-10:])) if net_amounts else None,
+        # Backward-compatible aliases now point to the main-force口径.
+        "inflow_5d": float(sum(main_amounts[-5:])) if main_amounts else None,
+        "inflow_10d": float(sum(main_amounts[-10:])) if main_amounts else None,
         "latest_date": f"{latest_date[:4]}-{latest_date[4:6]}-{latest_date[6:8]}",
         "source_update": "tushare_moneyflow_after_market_close",
+        "amount_unit": "CNY",
+        "raw_amount_unit": "10k CNY",
+        "main_inflow_definition": "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000",
+        "net_inflow_definition": "net_mf_amount * 10000",
+        "latest_raw": raw_by_date.get(latest_date, {}),
         "source_chain": result.get("source_chain", []),
         "errors": [],
     }
@@ -3856,6 +3915,347 @@ get_tushare_stock_alerts_tool = ToolDefinition(
 )
 
 
+def _normalize_disclosure_date(value: str = "") -> str:
+    return _normalize_tushare_date(value)
+
+
+def _display_disclosure_date(value: str = "") -> str:
+    normalized = _normalize_disclosure_date(value)
+    if len(normalized) == 8:
+        return f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+    return str(value or "").strip()
+
+
+def _cninfo_plate_for_stock(stock_code: str) -> str:
+    code = str(stock_code or "").strip()
+    if code.startswith(("6", "9")):
+        return "sh"
+    if code.startswith(("0", "3")):
+        return "sz"
+    if code.startswith(("8", "4")):
+        return "bj"
+    return ""
+
+
+def _disclosure_doc_type(title: str) -> str:
+    text = str(title or "")
+    if "投资者关系" in text or "调研" in text:
+        return "investor_relation"
+    if "年度报告" in text or "年报" in text:
+        return "annual_report"
+    if "半年度报告" in text:
+        return "semi_annual_report"
+    if "季度报告" in text:
+        return "quarterly_report"
+    return "announcement"
+
+
+def _match_disclosure_terms(text: str, keywords: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
+    haystack = str(text or "")
+    groups: List[str] = []
+    terms: List[str] = []
+    keyword_set = set(str(item).strip() for item in (keywords or []) if str(item).strip())
+    for group, group_terms in _DISCLOSURE_KEYWORD_GROUPS.items():
+        matched = [term for term in group_terms if term and term in haystack]
+        if matched:
+            groups.append(group)
+            terms.extend(matched)
+    for term in keyword_set:
+        if term in haystack:
+            terms.append(term)
+            if "custom_keyword" not in groups:
+                groups.append("custom_keyword")
+    return sorted(set(groups)), sorted(set(terms), key=lambda item: (len(item), item))
+
+
+def _compact_disclosure_summary(text: str, matched_terms: List[str], limit: int = 260) -> str:
+    body = _compact_cjzc_text(text, limit=4000)
+    if not body:
+        return ""
+    for term in matched_terms:
+        idx = body.find(term)
+        if idx >= 0:
+            start = max(0, idx - 80)
+            end = min(len(body), idx + max(120, len(term) + 120))
+            return _compact_cjzc_text(body[start:end], limit=limit)
+    return _compact_cjzc_text(body, limit=limit)
+
+
+def _cninfo_full_url(adjunct_url: str) -> str:
+    url = str(adjunct_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://static.cninfo.com.cn/{url.lstrip('/')}"
+
+
+def _fetch_disclosure_text(url: str, *, timeout_seconds: float = 8.0) -> Dict[str, Any]:
+    if not url:
+        return {"status": "missing", "text": "", "errors": ["missing disclosure url"]}
+    start = time.time()
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout_seconds,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.cninfo.com.cn/",
+            },
+        )
+        response.raise_for_status()
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        raw = response.content or b""
+        elapsed_ms = int((time.time() - start) * 1000)
+        if "pdf" in content_type or url.lower().endswith(".pdf"):
+            # PDF text extraction is intentionally optional at the bottom layer.
+            # The announcement list remains usable even when PDF parsing is unavailable.
+            return {
+                "status": "skipped_pdf",
+                "text": "",
+                "elapsed_ms": elapsed_ms,
+                "errors": ["PDF body extraction is not enabled; title and metadata were used"],
+            }
+        text = raw.decode(response.encoding or "utf-8", errors="ignore")
+        return {
+            "status": "ok",
+            "text": _strip_cjzc_html(text, limit=6000),
+            "elapsed_ms": elapsed_ms,
+            "errors": [],
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "text": "",
+            "elapsed_ms": int((time.time() - start) * 1000),
+            "errors": [str(exc)],
+        }
+
+
+def _query_cninfo_disclosures(
+    stock_code: str,
+    stock_name: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    keywords: Optional[List[str]] = None,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    start = _display_disclosure_date(start_date)
+    end = _display_disclosure_date(end_date)
+    se_date = f"{start}~{end}" if start and end else ""
+    page_size = max(1, min(int(limit or 20), 50))
+    base_payload = {
+        "pageNum": 1,
+        "pageSize": page_size,
+        "column": "sse" if _cninfo_plate_for_stock(stock_code) == "sh" else "szse",
+        "tabName": "fulltext",
+        "plate": _cninfo_plate_for_stock(stock_code),
+        "stock": str(stock_code or "").strip(),
+        "searchkey": "",
+        "secid": "",
+        "category": "",
+        "trade": "",
+        "seDate": se_date,
+        "sortName": "",
+        "sortType": "",
+        "isHLtitle": "true",
+    }
+    query_variants: List[Dict[str, Any]] = [dict(base_payload)]
+    # CNInfo often returns empty for bare `stock=code`; full-text `searchkey`
+    # is the reliable open-web fallback for SSE/KCB announcements.
+    for searchkey in [str(stock_code or "").strip(), str(stock_name or "").strip()]:
+        if searchkey:
+            variant = dict(base_payload)
+            variant["stock"] = ""
+            variant["searchkey"] = searchkey
+            query_variants.append(variant)
+    for term in [str(item).strip() for item in (keywords or []) if str(item).strip()]:
+        if term in {"抛光片", "SOI", "300mm", "85万片/月", "半导体硅片", "存储领域"}:
+            continue
+        variant = dict(base_payload)
+        variant["stock"] = ""
+        variant["searchkey"] = f"{stock_code} {term}".strip()
+        query_variants.append(variant)
+
+    rows_by_key: Dict[str, Dict[str, Any]] = {}
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for payload in query_variants:
+        start_ts = time.time()
+        try:
+            response = requests.post(
+                "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+                data=payload,
+                timeout=max(8.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            rows = data.get("announcements") if isinstance(data, dict) else []
+            source_chain.append({
+                "provider": "cninfo:hisAnnouncement",
+                "result": "ok" if rows else "empty",
+                "duration_ms": int((time.time() - start_ts) * 1000),
+                "params": {key: value for key, value in payload.items() if value not in ("", None)},
+            })
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("announcementId") or row.get("adjunctUrl") or row.get("announcementTitle") or "")
+                if key and key not in rows_by_key:
+                    rows_by_key[key] = row
+        except Exception as exc:
+            source_chain.append({
+                "provider": "cninfo:hisAnnouncement",
+                "result": "failed",
+                "duration_ms": int((time.time() - start_ts) * 1000),
+                "params": {key: value for key, value in payload.items() if value not in ("", None)},
+            })
+            errors.append(str(exc))
+    rows = list(rows_by_key.values())
+    if rows:
+        return {
+            "status": "ok",
+            "items": rows,
+            "source_chain": source_chain,
+            "errors": errors,
+        }
+    return {
+        "status": "failed" if errors and not any(chain.get("result") == "empty" for chain in source_chain) else "empty",
+        "items": [],
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+def _normalize_cninfo_announcement(row: Dict[str, Any]) -> Dict[str, Any]:
+    title = _strip_cjzc_html(str(row.get("announcementTitle") or row.get("title") or ""), limit=240)
+    sec_name = str(row.get("secName") or row.get("name") or "").strip()
+    sec_code = str(row.get("secCode") or row.get("stock_code") or "").strip()
+    announcement_time = row.get("announcementTime") or row.get("ann_date") or row.get("date") or ""
+    if isinstance(announcement_time, (int, float)):
+        ann_date = datetime.fromtimestamp(float(announcement_time) / 1000.0).strftime("%Y-%m-%d")
+    else:
+        ann_date = _display_disclosure_date(str(announcement_time))
+    url = _cninfo_full_url(str(row.get("adjunctUrl") or row.get("url") or ""))
+    return {
+        "stock_code": sec_code,
+        "stock_name": sec_name,
+        "title": title,
+        "ann_date": ann_date,
+        "url": url,
+        "doc_type": _disclosure_doc_type(title),
+        "source": "cninfo",
+    }
+
+
+def _handle_get_stock_disclosure_events(
+    stock_code: str,
+    stock_name: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    keywords: Optional[List[str]] = None,
+    include_body: bool = False,
+    limit: int = 20,
+) -> dict:
+    """Get public company disclosure/IR evidence from open announcement sources."""
+    code = str(stock_code or "").strip()
+    if not code:
+        return {"status": "failed", "stock_code": code, "items": [], "events": [], "errors": ["stock_code is required"]}
+
+    start_default, end_default = _default_recent_date_range(120)
+    start = _normalize_disclosure_date(start_date) or start_default
+    end = _normalize_disclosure_date(end_date) or end_default
+    effective_limit = max(1, min(int(limit or 20), 50))
+    custom_keywords = [str(item).strip() for item in (keywords or []) if str(item).strip()]
+
+    cninfo = _query_cninfo_disclosures(code, stock_name, start, end, custom_keywords, effective_limit)
+    raw_rows = cninfo.get("items") or []
+    items: List[Dict[str, Any]] = []
+    errors: List[str] = list(cninfo.get("errors") or [])
+    source_chain: List[Dict[str, Any]] = list(cninfo.get("source_chain") or [])
+
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        item = _normalize_cninfo_announcement(raw)
+        item["stock_code"] = item.get("stock_code") or code
+        item["stock_name"] = item.get("stock_name") or stock_name
+        body_text = ""
+        body_status = "not_requested"
+        body_errors: List[str] = []
+        if include_body:
+            fetched = _fetch_disclosure_text(str(item.get("url") or ""))
+            body_text = str(fetched.get("text") or "")
+            body_status = str(fetched.get("status") or "unknown")
+            body_errors = list(fetched.get("errors") or [])
+            if body_errors:
+                errors.extend(body_errors)
+        match_text = " ".join([str(item.get("title") or ""), body_text])
+        groups, terms = _match_disclosure_terms(match_text, custom_keywords)
+        item.update({
+            "matched_groups": groups,
+            "matched_terms": terms,
+            "evidence_summary": _compact_disclosure_summary(match_text, terms),
+            "body_status": body_status,
+            "body_errors": body_errors[:3],
+        })
+        items.append(item)
+
+    def _item_sort_key(item: Dict[str, Any]) -> Tuple[int, int]:
+        relevant = bool(item.get("matched_terms")) or item.get("doc_type") in {"investor_relation", "annual_report"}
+        date_digits = re.sub(r"\D", "", str(item.get("ann_date") or ""))
+        try:
+            date_value = int(date_digits or "0")
+        except ValueError:
+            date_value = 0
+        return (0 if relevant else 1, -date_value)
+
+    items = sorted(items, key=_item_sort_key)[:effective_limit]
+
+    # Keep all disclosure items for audit, but expose event candidates separately.
+    events = [
+        item for item in items
+        if item.get("matched_terms") or item.get("doc_type") in {"investor_relation", "annual_report"}
+    ]
+
+    status = "ok" if events else ("partial" if items else str(cninfo.get("status") or "failed"))
+    return {
+        "status": status,
+        "stock_code": code,
+        "stock_name": stock_name,
+        "date_window": {"start_date": start, "end_date": end},
+        "items": items,
+        "events": events,
+        "event_count": len(events),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_stock_disclosure_events_tool = ToolDefinition(
+    name="get_stock_disclosure_events",
+    description=(
+        "Get public disclosure/IR/annual-report evidence for one A-share from open announcement sources. "
+        "Use it to verify company-level theme fit such as SOI, 300mm wafers, polishing wafers and capacity."
+    ),
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 688126."),
+        ToolParameter(name="stock_name", type="string", description="Optional stock name.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="keywords", type="array", description="Optional custom keywords to match in titles/body.", required=False, default=[]),
+        ToolParameter(name="include_body", type="boolean", description="Fetch announcement body when available; PDF extraction may be skipped.", required=False, default=False),
+        ToolParameter(name="limit", type="integer", description="Max announcements to inspect (default: 20, max: 50).", required=False, default=20),
+    ],
+    handler=_handle_get_stock_disclosure_events,
+    category="data",
+)
+
+
 def _handle_get_tushare_stock_shock(
     stock_code: str = "",
     trade_date: str = "",
@@ -5058,6 +5458,7 @@ ALL_DATA_TOOLS.extend([
     get_tushare_ths_member_tool,
     get_tushare_today_news_tool,
     get_eastmoney_cjzc_daily_tool,
+    get_stock_disclosure_events_tool,
     get_tushare_announcements_tool,
     get_tushare_stock_alerts_tool,
     get_tushare_stock_shock_tool,

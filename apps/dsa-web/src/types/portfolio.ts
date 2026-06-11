@@ -27,6 +27,33 @@ export interface PortfolioAccountCreateRequest {
   ownerId?: string;
 }
 
+export interface PortfolioBaselinePositionInput {
+  symbol: string;
+  quantity: number;
+  price: number;
+  market?: 'cn' | 'hk' | 'us';
+  currency?: string;
+}
+
+export interface PortfolioBaselineResetRequest {
+  asOf: string;
+  cashAmount: number;
+  positions: PortfolioBaselinePositionInput[];
+  note?: string;
+}
+
+export interface PortfolioBaselineResetResponse {
+  accountId: number;
+  asOf: string;
+  cashAmount: number;
+  positionCount: number;
+  cashLedgerCount: number;
+  tradeCount: number;
+  deletedTrades: number;
+  deletedCashLedger: number;
+  deletedCorporateActions: number;
+}
+
 export interface PortfolioPositionItem {
   symbol: string;
   market: string;

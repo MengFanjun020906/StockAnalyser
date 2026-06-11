@@ -758,7 +758,7 @@ class Config:
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
     agent_candidate_expert_timeout_seconds: float = 60.0  # Max seconds for one L1 candidate expert discovery packet
-    agent_seed_pool_total_limit: int = 20  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
+    agent_seed_pool_total_limit: int = 32  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
     agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
     agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
     agent_veto_gate_enabled: bool = True  # Enable shared bearish red-line veto gate (thesis_desk_committee); default only hard_risk_flags trigger
@@ -1513,7 +1513,7 @@ class Config:
             ),
             agent_seed_pool_total_limit=parse_env_int(
                 os.getenv('AGENT_SEED_POOL_TOTAL_LIMIT'),
-                20,
+                32,
                 field_name='AGENT_SEED_POOL_TOTAL_LIMIT',
                 minimum=1,
                 maximum=40,

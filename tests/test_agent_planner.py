@@ -49,6 +49,26 @@ def test_get_tools_for_capability_includes_extended_capital_flow_tools():
     assert plan.missing_tools == []
 
 
+def test_get_tools_for_capability_includes_tushare_fundamental_fallbacks():
+    plan = get_tools_for_capability(
+        "fundamental_analysis",
+        tool_registry=_registry(
+            "get_stock_info",
+            "get_tushare_daily_basic",
+            "get_tushare_financial_indicators",
+            "get_tushare_financial_statements",
+        ),
+    )
+
+    assert plan.tools == [
+        "get_stock_info",
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_financial_statements",
+    ]
+    assert plan.missing_tools == []
+
+
 def test_get_tools_for_capability_prefers_detect_market_regime():
     plan = get_tools_for_capability(
         "regime_detection",
@@ -112,13 +132,25 @@ def test_build_planning_result_defaults_to_entry_analysis_without_position():
         ),
     )
 
-    result = build_planning_result(context, tool_registry=_registry("get_realtime_quote", "get_stock_info"))
+    result = build_planning_result(
+        context,
+        tool_registry=_registry(
+            "get_realtime_quote",
+            "get_stock_info",
+            "get_tushare_daily_basic",
+            "get_tushare_financial_indicators",
+            "get_tushare_financial_statements",
+        ),
+    )
 
     assert result.intent == "entry_analysis"
     assert result.has_position is False
     assert result.expected_output == "entry_analysis_report"
     assert "portfolio_context" not in result.capabilities
     assert "fundamental_analysis" in result.capabilities
+    assert "get_tushare_daily_basic" in result.required_tools
+    assert "get_tushare_financial_indicators" in result.required_tools
+    assert "get_tushare_financial_statements" in result.required_tools
 
 
 def test_build_planning_result_watchlist_scan_starts_with_candidate_discovery():

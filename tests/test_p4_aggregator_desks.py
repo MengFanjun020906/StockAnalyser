@@ -219,8 +219,8 @@ class TestSelectPrimaryDesk:
         desks = ["momentum_desk", "early_turn_desk"]
         stance = {"momentum_desk": "support", "early_turn_desk": "support"}
         result = _select_primary_desk(desks, stance, {})
-        # early_turn has higher priority (lower index)
-        assert result == "early_turn_desk"
+        # Trend/pattern continuation is the main seat when evidence ties.
+        assert result == "momentum_desk"
 
     def test_theme_catalyst_priority_wins_same_stance(self):
         desks = ["momentum_desk", "theme_catalyst_desk"]
@@ -553,7 +553,8 @@ class TestParseAllocation:
         result = _parse_allocation(None, "risk_off")
         assert result["momentum_desk"] == 0
         assert result["quality_repair_desk"] == 4
-        assert result["theme_catalyst_desk"] == 2
+        assert result["theme_catalyst_desk"] == 3
+        assert result["early_turn_desk"] == 1
 
     def test_invalid_json_returns_default(self):
         result = _parse_allocation("{invalid}", "trending_up")
@@ -574,9 +575,21 @@ class TestEarlyTurnDeskEligibility:
             llm=MagicMock(),
         )
 
-    def test_low_range_pct_included(self):
+    def test_low_range_pct_without_turn_evidence_excluded(self):
         expert = self._make_expert()
         rows = [_make_row("A", fact_sheet=FactSheet(code="A", range_pct_120=0.2))]
+        filtered = expert._filter_eligible_rows(rows)
+        assert len(filtered) == 0
+
+    def test_low_range_pct_with_turn_evidence_included(self):
+        expert = self._make_expert()
+        rows = [
+            _make_row(
+                "A",
+                flags=[FeatureFlag(detector="pattern:breakout", kind="pattern")],
+                fact_sheet=FactSheet(code="A", range_pct_120=0.2),
+            )
+        ]
         filtered = expert._filter_eligible_rows(rows)
         assert len(filtered) == 1
 
@@ -587,26 +600,30 @@ class TestEarlyTurnDeskEligibility:
         # Should go to fallback, not primary
         assert len(filtered) == 0  # no primary, no fallback (no None range)
 
-    def test_low_base_source_included(self):
+    def test_low_base_source_requires_low_range(self):
         expert = self._make_expert()
         rows = [_make_row("A", recall_sources=["low_base_structure"],
                           fact_sheet=FactSheet(code="A", range_pct_120=0.9))]
         filtered = expert._filter_eligible_rows(rows)
-        assert len(filtered) == 1
+        assert len(filtered) == 0
 
-    def test_missing_range_pct_goes_to_fallback(self):
+    def test_missing_range_pct_excluded(self):
         expert = self._make_expert()
-        # No fact_sheet → None range → fallback bucket
         rows = [_make_row("A")]
         filtered = expert._filter_eligible_rows(rows)
-        assert len(filtered) == 1  # fallback supplement kicks in when primary empty
+        assert len(filtered) == 0
 
-    def test_fallback_capped(self):
+    def test_low_range_low_base_source_included(self):
         expert = self._make_expert()
-        expert._fallback_supplement_n = 2
-        rows = [_make_row(str(i)) for i in range(10)]
+        rows = [
+            _make_row(
+                "A",
+                recall_sources=["low_base_structure"],
+                fact_sheet=FactSheet(code="A", range_pct_120=0.2),
+            )
+        ]
         filtered = expert._filter_eligible_rows(rows)
-        assert len(filtered) <= 2
+        assert len(filtered) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +644,17 @@ class TestMomentumDeskEligibility:
         rows = [_make_row("A", flags=[FeatureFlag(detector="limit_up", kind="limit")])]
         filtered = expert._filter_eligible_rows(rows)
         assert len(filtered) == 1
+
+    def test_main_strategy_sources_included(self):
+        expert = self._make_expert()
+        rows = [
+            _make_row("A", recall_sources=["sequoia"]),
+            _make_row("B", recall_sources=["alphasift"]),
+            _make_row("C", recall_sources=["limit_up_pool"]),
+            _make_row("D", recall_sources=["capital_flow_anomaly"]),
+        ]
+        filtered = expert._filter_eligible_rows(rows)
+        assert [row.code for row in filtered] == ["A", "B", "C", "D"]
 
     def test_bullish_trend_included(self):
         expert = self._make_expert()

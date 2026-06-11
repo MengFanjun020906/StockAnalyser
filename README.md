@@ -119,7 +119,7 @@ OPENAI_MODEL=
 SEQUOIA_CANDIDATE_DB_PATH=Sequoia-X/data/sequoia_v2.db
 ALPHASIFT_STRATEGY_DIR=alphasift/alphasift/strategies
 ALPHASIFT_CANDIDATE_DB_PATH=Sequoia-X/data/sequoia_v2.db
-AGENT_SEED_POOL_TOTAL_LIMIT=20
+AGENT_SEED_POOL_TOTAL_LIMIT=32
 ```
 
 长期记忆可选配置：

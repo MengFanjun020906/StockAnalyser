@@ -74,30 +74,30 @@ _STANCE_STRENGTH: Dict[str, int] = {
 # Desk priority order for primary_desk resolution (lower = higher priority)
 _DESK_PRIORITY: Dict[str, int] = {
     "theme_catalyst_desk": 0,
-    "early_turn_desk": 1,
+    "momentum_desk": 1,
     "quality_repair_desk": 2,
-    "momentum_desk": 3,
+    "early_turn_desk": 3,
 }
 
 # Default slot allocation (used when no config JSON provided)
 _DEFAULT_ALLOCATION: Dict[str, Dict[str, int]] = {
-    "trending_up":     {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 3, "quality_repair_desk": 1},
-    "range_bound":     {"theme_catalyst_desk": 2, "early_turn_desk": 3, "momentum_desk": 1, "quality_repair_desk": 2},
-    "high_volatility": {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 1, "quality_repair_desk": 3},
-    "risk_off":        {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 0, "quality_repair_desk": 4},
-    "panic":           {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 0, "quality_repair_desk": 4},
-    "trending_down":   {"theme_catalyst_desk": 2, "early_turn_desk": 3, "momentum_desk": 0, "quality_repair_desk": 3},
+    "trending_up":     {"theme_catalyst_desk": 2, "early_turn_desk": 1, "momentum_desk": 4, "quality_repair_desk": 1},
+    "range_bound":     {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 2, "quality_repair_desk": 2},
+    "high_volatility": {"theme_catalyst_desk": 2, "early_turn_desk": 1, "momentum_desk": 1, "quality_repair_desk": 4},
+    "risk_off":        {"theme_catalyst_desk": 3, "early_turn_desk": 1, "momentum_desk": 0, "quality_repair_desk": 4},
+    "panic":           {"theme_catalyst_desk": 3, "early_turn_desk": 1, "momentum_desk": 0, "quality_repair_desk": 4},
+    "trending_down":   {"theme_catalyst_desk": 3, "early_turn_desk": 1, "momentum_desk": 0, "quality_repair_desk": 4},
     "event_driven":    {"theme_catalyst_desk": 4, "early_turn_desk": 1, "momentum_desk": 2, "quality_repair_desk": 1},
-    "unknown":         {"theme_catalyst_desk": 2, "early_turn_desk": 2, "momentum_desk": 2, "quality_repair_desk": 2},
+    "unknown":         {"theme_catalyst_desk": 2, "early_turn_desk": 1, "momentum_desk": 3, "quality_repair_desk": 2},
 }
 
 # Default backfill rules: regime → {donor_desk: [recipient_desks]}
 _DEFAULT_BACKFILL_RULES: Dict[str, Dict[str, List[str]]] = {
-    "risk_off":       {"momentum_desk": ["quality_repair_desk"],
+    "risk_off":       {"momentum_desk": ["quality_repair_desk", "theme_catalyst_desk"],
                        "early_turn_desk": ["quality_repair_desk", "theme_catalyst_desk"]},
-    "panic":          {"momentum_desk": ["quality_repair_desk"],
+    "panic":          {"momentum_desk": ["quality_repair_desk", "theme_catalyst_desk"],
                        "early_turn_desk": ["quality_repair_desk", "theme_catalyst_desk"]},
-    "trending_down":  {"momentum_desk": ["quality_repair_desk"],
+    "trending_down":  {"momentum_desk": ["quality_repair_desk", "theme_catalyst_desk"],
                        "early_turn_desk": ["quality_repair_desk", "theme_catalyst_desk"]},
     "trending_up":    {"early_turn_desk": ["momentum_desk"],
                        "quality_repair_desk": ["momentum_desk", "theme_catalyst_desk"]},

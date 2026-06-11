@@ -36,7 +36,12 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
         "get_northbound_capital_flow",
         "get_margin_trading_summary",
     ],
-    "fundamental_analysis": ["get_stock_info"],
+    "fundamental_analysis": [
+        "get_stock_info",
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_financial_statements",
+    ],
     "chip_distribution": ["get_chip_distribution"],
     "regime_detection": [
         "detect_market_regime",

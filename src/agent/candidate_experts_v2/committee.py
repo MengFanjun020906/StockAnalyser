@@ -46,6 +46,7 @@ from src.agent.candidate_experts_v2.schemas import (
     ExpertPacketV2,
     FeatureRow,
     SeedItem,
+    SeedSummaryV2,
 )
 from src.agent.candidate_experts_v2.runtime import ExpertTask  # noqa: F401 — re-export for callers
 
@@ -74,15 +75,19 @@ SEED_SOURCE_CAPS: Dict[str, int] = {
     "block_trade": 6,
     "dragon_tiger": 6,
     "valuation_liquidity": 6,
-    "alphasift": 10,
-    "sequoia": 8,
-    "low_base_structure": 8,
+    "alphasift": 14,
+    "sequoia": 12,
     "fallback": 4,
+}
+SEED_SOURCE_WEIGHTS: Dict[str, int] = {
+    "alphasift": 2,
+    "sequoia": 2,
 }
 SEED_SOURCE_ORDER = [
     "user_watchlist",
     "daily_screener",
-    "low_base_structure",
+    "alphasift",
+    "sequoia",
     "limit_up_pool",
     "hot_rank",
     "sector_theme",
@@ -92,11 +97,9 @@ SEED_SOURCE_ORDER = [
     "block_trade",
     "dragon_tiger",
     "valuation_liquidity",
-    "alphasift",
-    "sequoia",
     "fallback",
 ]
-SEED_BUILD_LIMIT = 20
+SEED_BUILD_LIMIT = 32
 SEED_GATE_INPUT_LIMIT = 20
 SEED_GATE_OUTPUT_LIMIT = 12
 SEED_GATE_MIN_KEEP = 6
@@ -250,6 +253,16 @@ def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
         return LLMTurn(tool_calls=[], text=str(raw))
 
     return _call
+
+
+def _market_regime_key(regime: Any) -> str:
+    """Normalize a MarketRegime payload into the enum key used by allocation."""
+    if isinstance(regime, dict):
+        value = regime.get("regime") or regime.get("market_regime") or regime.get("name")
+    else:
+        value = regime
+    key = str(value or "unknown").strip().lower()
+    return key or "unknown"
 
 
 def _to_seed_items(seed_symbols: Sequence[str], market: str) -> List[SeedItem]:
@@ -1081,16 +1094,26 @@ def _assemble_seed_pool(
             break
 
         remaining_slots = total_limit - len(result_pool)
-        base_quota = remaining_slots // len(active_sources)
-        remainder = remaining_slots % len(active_sources)
-        target_additions: Dict[str, int] = {}
-        for index, source in enumerate(active_sources):
-            if base_quota <= 0:
-                target = 1 if index < remaining_slots else 0
-            else:
-                target = base_quota + (1 if index < remainder else 0)
-            capacity = max(0, caps.get(source, 0) - taken_by_source.get(source, 0))
-            target_additions[source] = min(target, capacity)
+        order_rank = {source: index for index, source in enumerate(SEED_SOURCE_ORDER)}
+        target_additions: Dict[str, int] = {source: 0 for source in active_sources}
+        allocated = 0
+        while allocated < remaining_slots:
+            candidates = [
+                source
+                for source in active_sources
+                if target_additions.get(source, 0) < max(0, caps.get(source, 0) - taken_by_source.get(source, 0))
+            ]
+            if not candidates:
+                break
+            source = max(
+                candidates,
+                key=lambda item: (
+                    float(SEED_SOURCE_WEIGHTS.get(item, 1)) / float(target_additions.get(item, 0) + 1),
+                    -order_rank.get(item, 999),
+                ),
+            )
+            target_additions[source] = target_additions.get(source, 0) + 1
+            allocated += 1
 
         progressed = False
         max_target = max(target_additions.values(), default=0)
@@ -1216,10 +1239,10 @@ def _build_seed_pool_result(
 
     Priority order (first occurrence of each code wins):
     1. User-provided seed_symbols → source="user_watchlist"
-    2. Local price-volume anomaly scan → source="local_price_volume"
-    3. Fundamental / low-base local providers
+    2. Local price-volume anomaly scan → source="daily_screener"
+    3. Online capital / theme / momentum supplements
     4. Daily limit-up + hot-rank online supplements
-    5. AlphaSift quant candidates → source="alphasift"
+    5. AlphaSift quant candidates → source="alphasift" (weighted trunk source)
        Sequoia quant candidates  → source="sequoia"
     """
     seeds_by_source: Dict[str, List[SeedItem]] = {key: [] for key in SEED_SOURCE_CAPS}
@@ -1910,24 +1933,7 @@ def _build_seed_pool_result(
         _log_seed_source_diagnostic(diagnostic)
         source_quality["sequoia"] = _source_quality("failed", error=message)
 
-    # --- Source 5: low-base structure seeds from shared daily DB ---
-    try:
-        structure_candidates = _build_low_base_structure_seeds(limit=limit_per_source)
-        for seed in structure_candidates:
-            _collect(seed)
-        diagnostic = _source_diagnostic("low_base_structure", "ok" if structure_candidates else "empty", count=len(structure_candidates))
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["low_base_structure"] = _source_quality("ok" if structure_candidates else "empty", freshness="latest_local")
-    except Exception as exc:
-        logger.debug("seed pool: low_base_structure failed: %s", exc)
-        message = f"{type(exc).__name__}: {exc}"
-        diagnostic = _source_diagnostic("low_base_structure", "failed", error=message)
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["low_base_structure"] = _source_quality("failed", error=message)
-
-    # --- Source 6: deterministic auto candidates as richness supplement ---
+    # --- Source 5: deterministic auto candidates as richness supplement ---
     # This reuses the broader existing L1 discovery stack as a best-effort sector
     # supplement, but event/news/fundamental buckets are intentionally not admitted
     # into this committee seed builder because their historical precision was low.
@@ -3267,7 +3273,7 @@ def run_thesis_desk_committee(
     seed_symbols: Sequence[str],
     tool_registry: Any,
     llm_adapter: Any,
-    regime: str = "unknown",
+    regime: Any = "unknown",
     today: Optional[str] = None,
     tool_decls: Optional[Sequence[Dict[str, Any]]] = None,
     overall_timeout_s: float = CommitteeOverallTimeoutSeconds,
@@ -3295,6 +3301,7 @@ def run_thesis_desk_committee(
     from src.agent.candidate_experts_v2.aggregator import (
         aggregate_desk_picks,
         allocate_slots,
+        _parse_allocation,
     )
     from src.agent.candidate_experts_v2.experts.early_turn_desk import EarlyTurnDeskExpert
     from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
@@ -3309,6 +3316,7 @@ def run_thesis_desk_committee(
 
     started = time.time()
     market_value = (market or "cn").strip().lower() or "cn"
+    regime_key = _market_regime_key(regime)
     tdecls = list(tool_decls or [])
 
     payload: Dict[str, Any] = {
@@ -3460,43 +3468,71 @@ def run_thesis_desk_committee(
         3.0,
         min(180.0, (budget - 5.0) / max(1, len(rows))),
     )
+    active_allocation = _parse_allocation(allocation_json, regime_key)
+    if regime_key in {"risk_off", "panic", "trending_down"}:
+        active_allocation["momentum_desk"] = 0
 
     desk_tasks: Dict[str, Any] = {
         "early_turn_desk": lambda: early_turn_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=per_seed_timeout_s,
         ),
         "momentum_desk": lambda: momentum_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=per_seed_timeout_s,
         ),
         "quality_repair_desk": lambda: quality_repair_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=per_seed_timeout_s,
         ),
         "theme_catalyst_desk": lambda: theme_catalyst_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=per_seed_timeout_s,
         ),
     }
+    skipped_desk_packets: List[ExpertPacketV2] = []
+    for desk_key in list(desk_tasks.keys()):
+        if int(active_allocation.get(desk_key, 0)) > 0:
+            continue
+        del desk_tasks[desk_key]
+        skipped_desk_packets.append(
+            ExpertPacketV2(
+                expert=desk_key,
+                dimension=desk_key,
+                status="empty",
+                seed_summary=SeedSummaryV2(seed_count=0),
+                candidates=[],
+                rejected=[],
+                diagnostics=[
+                    {
+                        "source": "desk_allocation",
+                        "status": "skipped_zero_quota",
+                        "regime": regime_key,
+                    }
+                ],
+            )
+        )
 
-    desk_packets = run_experts_parallel(
-        desk_tasks,
-        per_expert_timeout_s=budget * 0.8,
-        overall_timeout_s=budget,
-    )
+    desk_packets = [
+        *skipped_desk_packets,
+        *run_experts_parallel(
+            desk_tasks,
+            per_expert_timeout_s=budget * 0.8,
+            overall_timeout_s=budget,
+        ),
+    ]
     payload["thesis_desk_packets"] = [
         _compact_desk_packet_for_trace(packet)
         for packet in desk_packets
@@ -3533,10 +3569,10 @@ def run_thesis_desk_committee(
     # ── Step 3: aggregate + allocate ─────────────────────────────────────
     try:
         agg_pool = aggregate_desk_picks(desk_packets, rows)
-        agg_pool.regime = regime
+        agg_pool.regime = regime_key
         final_candidates: List[AggregatedCandidate] = allocate_slots(
             agg_pool,
-            regime,
+            regime_key,
             total=total_slots,
             allocation_json=allocation_json,
             backfill_rules_json=backfill_rules_json,

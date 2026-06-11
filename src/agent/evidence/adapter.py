@@ -23,6 +23,9 @@ from src.agent.evidence.scoring import clamp_confidence, clamp_score_delta, stre
 _TOOL_DIMENSION = {
     "get_realtime_quote": "quote",
     "analyze_trend": "technical",
+    "calculate_ma": "technical",
+    "get_volume_analysis": "technical",
+    "analyze_pattern": "technical_pattern",
     "analyze_price_structure": "price_structure",
     "get_capital_flow": "capital_flow",
     "get_chip_distribution": "chip",
@@ -245,8 +248,11 @@ def _missing_fields_for(tool_name: str, raw: Dict[str, Any]) -> List[str]:
     required = {
         "get_realtime_quote": ["price"],
         "analyze_trend": ["trend_status"],
+        "calculate_ma": ["ma"],
+        "get_volume_analysis": ["pattern"],
+        "analyze_pattern": ["summary"],
         "analyze_price_structure": ["chan", "smc"],
-        "get_capital_flow": ["main_net_inflow", "inflow_5d"],
+        "get_capital_flow": ["main_net_inflow"],
         "get_chip_distribution": ["profit_ratio", "avg_cost"],
         "get_stock_info": ["name"],
         "search_comprehensive_intel": ["report"],
@@ -260,6 +266,12 @@ def _signals_for(tool_name: str, raw: Dict[str, Any]) -> List[EvidenceSignal]:
         return _quote_signals(raw)
     if tool_name == "analyze_trend":
         return _trend_signals(raw)
+    if tool_name == "calculate_ma":
+        return _ma_signals(raw)
+    if tool_name == "get_volume_analysis":
+        return _volume_signals(raw)
+    if tool_name == "analyze_pattern":
+        return _pattern_signals(raw)
     if tool_name == "analyze_price_structure":
         return _structure_signals(raw)
     if tool_name == "get_capital_flow":
@@ -301,6 +313,46 @@ def _trend_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
     return [_signal("trend_status", status, None, delta, f"趋势状态：{status or '未知'}。")]
 
 
+def _ma_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
+    alignment = str(raw.get("ma_alignment") or "")
+    above = _num(raw.get("above_ma_count"))
+    total = _num(raw.get("total_ma_count"))
+    delta = 0
+    if "多头" in alignment:
+        delta += 8
+    elif "空头" in alignment:
+        delta -= 8
+    elif above is not None and total:
+        delta += int((above / total - 0.5) * 10)
+    return [_signal("ma_alignment", alignment, None, delta, f"均线状态：{alignment or '未知'}。")]
+
+
+def _volume_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
+    pattern = str(raw.get("pattern") or "")
+    trend = str(raw.get("volume_trend") or "")
+    ratio = _num(raw.get("volume_ratio_vs_20d"))
+    delta = 0
+    if "放量" in trend or (ratio is not None and ratio >= 1.3):
+        delta += 5
+    if "缩量" in trend or (ratio is not None and ratio < 0.8):
+        delta -= 3
+    return [_signal("volume_pattern", ratio, None, delta, f"量价：{pattern or trend or '未知'}。")]
+
+
+def _pattern_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
+    summary = str(raw.get("summary") or "")
+    patterns = raw.get("patterns") if isinstance(raw.get("patterns"), list) else []
+    delta = 0
+    text = json.dumps(patterns, ensure_ascii=False, default=str)
+    if "bullish" in text or "看涨" in summary or "双底" in summary or "突破" in summary:
+        delta += 8
+    if "bearish" in text or "看跌" in summary or "黄昏" in summary or "流星" in summary:
+        delta -= 8
+    if not patterns:
+        delta = 0
+    return [_signal("kline_pattern", summary or None, None, delta, f"K线形态：{summary or '未发现明显形态'}。")]
+
+
 def _structure_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
     smc = raw.get("smc") if isinstance(raw.get("smc"), dict) else {}
     chan = raw.get("chan") if isinstance(raw.get("chan"), dict) else {}
@@ -315,14 +367,14 @@ def _structure_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
 
 def _capital_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
     latest = _num(raw.get("main_net_inflow"))
-    inflow_5d = _num(raw.get("inflow_5d"))
+    inflow_5d = _num(raw.get("main_inflow_5d") if raw.get("main_inflow_5d") is not None else raw.get("inflow_5d"))
     signals = []
     if latest is not None:
         delta = 8 if latest > 0 else -8
         signals.append(_signal("main_net_inflow", latest, "CNY", delta, "主力净流入为正。" if latest > 0 else "主力净流入为负。"))
     if inflow_5d is not None:
         delta = 6 if inflow_5d > 0 else -6
-        signals.append(_signal("inflow_5d", inflow_5d, "CNY", delta, "5日资金净流入为正。" if inflow_5d > 0 else "5日资金净流入为负。"))
+        signals.append(_signal("main_inflow_5d", inflow_5d, "CNY", delta, "5日主力净流入为正。" if inflow_5d > 0 else "5日主力净流入为负。"))
     return signals
 
 

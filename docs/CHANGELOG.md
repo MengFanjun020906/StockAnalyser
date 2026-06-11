@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [文档] 新增 `docs/openinvest-integration-assessment.md`，并补充 `docs/regime-state-machine.md` 的 Regime forward probability、路径画像与买回点参考方案，评估 openInvest 投资委员会、后处理、Dreaming 复盘、telemetry 和收益率展示页面等能力在当前仓库的可接入位置与迁移边界。
+- [改进] Agent 单股 ReAct 工具结果回灌改为工具级 ETL 事实卡，76 个注册工具均映射到明确 profile；模型只接收业务有效字段、错误状态和摘要，原始长度、hash 与预览留在 Trace，避免长 K 线、公告正文、新闻原文和 source/query 诊断字段污染上下文注意力。
+- [改进] Seed Pool 默认移除 `low_base_structure` 低位结构来源，不再调用低位结构扫描；AlphaSift 与 Sequoia 调整为加权主干来源，source cap 分别提升到 14/12，让实际效果更好的两个席位获得更多入池名额。
+- [修复] `scripts/update_sequoia_candidates.py` 识别 baostock 长批量更新中的“用户未登录”会话失效，自动重新登录并重试当前标的，避免日线刷新中途掉线后连续污染后续股票为失败。
+- [修复] Agent 单股 `fundamental_analysis` 不再只依赖易超时的 `get_stock_info` 聚合工具，Planner 默认追加 `get_tushare_daily_basic`、`get_tushare_financial_indicators` 和 `get_tushare_financial_statements` 做估值与财报兜底验证。
+- [修复] Agent Trace 单股问题在注入组合上下文时固定以用户明确股票代码作为 `primary_symbol/target_symbols`，避免被已有持仓标的污染为错误的持仓复盘。
+- [修复] Agent 最终报告新增事实校验门禁，缺少工具来源的资金流、筹码分布和均线精确值会被替换为 `N/A`，并拦截 A 股非法零散买入股数建议。
+- [修复] `get_capital_flow` 区分 Tushare `moneyflow` 全口径净流入与大单/特大单主力净流入，避免把 `net_mf_amount` 误标为主力资金。
+- [改进] `get_capital_flow` 的工具描述、模型压缩上下文和 Agent 提示词显式保留资金口径定义，防止模型把 `net_inflow*` 解读为主力资金。
+- [改进] Agent 新增高风险指标语义注册表，只向模型压缩上下文注入资金流、筹码分布等易误读字段的短说明，避免所有工具全量解释挤占上下文。
+- [修复] planning_execute 最终报告生成前会审计 Planner 核心工具是否已执行，防止 `calculate_ma`、`analyze_pattern` 等计划内技术工具未调用时提前收尾。
+- [改进] `analyze_trend` 单股技术工具新增布林带中轨/上下轨/带宽/位置输出，并让均线、量价和 K 线形态工具进入证据卡适配。
+- [改进] `scripts/daily_run.sh` 的 Sequoia 日线更新步骤同步写入上证指数 `000001.SH`，为 Seed Pool 质量评估的基准 Alpha 提供本地 OHLC。
+- [文档] 新增 `docs/seed-pool-quality-monitor-plan.md`，规划按日期长期记录 seed pool 快照、次日收盘表现评估、四席位支持/拒绝理由追溯和前端质量监控页。
+- [文档] 完善 Seed Pool 质量监控计划，将上证指数 Alpha、MFE/MAE、一字涨停不可买入过滤、催化剂字段、K 线 price lines 和归因分析面板纳入第一版验收范围。
+- [新功能] 新增 Seed Pool 质量监控 API 与 Web 页面，可按日期查看 seed 次日 Alpha、MFE/MAE、流动性状态、来源/席位/Catalyst 归因，并用 ECharts 展示 K 线、seed close 和 T+1 标记。
+- [改进] Seed Pool 质量页改为固定四席位理由矩阵展示，缺失席位也显示 `missing`；K 线参考线不再从四席位自然语言理由中正则抽取，避免把席位判断误读为交易点位。
+- [改进] Seed Pool 质量页展示快照生成时间、T+1 评估更新时间和缺价/未评估数量，并将评估按钮明确为“手动更新 T+1”。
+- [改进] 四席位候选发现将动量席升级为“趋势/形态延续席”并提高趋势市默认配额；`early_turn_desk` 业务语义降级为“结构反转席”，低位必须叠加明确转强证据才参与，防守 regime 会跳过零配额动量席以减少无效 LLM 超时。
+- [修复] Agent Runner 对 `discover_watchlist_candidates` 和 `detect_market_regime` 采用重工具外层等待预算，避免内部已有结构化诊断的候选发现/市场状态工具被统一 30 秒壳超时截断。
+- [修复] Agent Trace 在注入持仓账户上下文时，明确“选股/下周可入手股票/候选池”请求会覆盖组合上下文默认的 `position_review`，确保进入 `watchlist_scan` 五阶段候选池 + 四席位链路。
+- [修复] 修复 Agent Trace 跳转 Seed Pool 质量页时 `YYYYMMDD` 日期参数未规范化导致页面请求失败并显示空状态的问题。
+- [修复] 修复 Seed Pool 质量页直接渲染四席位 `risks` 对象导致 React 运行时崩溃、整页空白的问题。
+- [改进] Seed Pool 质量页手动更新 T+1 前改为先检查评估日是否应有行情，并优先使用本地数据库；缺少指数或 Seed 股票 OHLC 时返回结构化错误，不再静默写入空评估。
+- [修复] Seed Pool 质量 API 对上游只给代码或占位名称的 seed 自动从股票索引补齐中文名，避免页面显示 `000050 / 000050`。
+- [修复] Seed Pool 质量评估和 K 线复盘在主库缺少 OHLC 时读取 Sequoia `stock_daily(symbol, date, open, high, low, close, volume, turnover)`；上证基准仅使用 `000001.SH`，避免误用平安银行 `000001`。
+- [修复] Seed Pool 质量页将选择日期同步到 URL；周末 seed 的 K 线窗口按最近交易日锚定并保证包含 T+1，主库只有部分行情时会合并 Sequoia 历史 K 线，K 线 hover 精简为日期和开收高低。
+- [修复] Seed Pool 质量评估改为 Sequoia K 线窗口优先，避免主库 Tushare 原始价与 Sequoia 复权/策略价混用导致 Alpha 错算；手动更新 T+1 会刷新当天全部 seed，质量页不再展示 MFE/MAE 买卖点式口径。
+- [修复] Seed Pool 质量快照幂等键加入 `seed_date`，并为默认 `selection-run` 快照 ID 增加日期后缀，避免新一天 seed pool 覆盖前一天快照但页面仍显示旧日期。
+- [修复] Seed Pool 质量页改为 A 股红涨绿跌显示，并将同一 `seed_date` 的候选池保存语义改为最新池替换旧池，T+1 评估只针对当天最新池。
+- [改进] Seed Pool 质量快照的默认归属日改为北京时间 09:00 前归前一自然日，避免次日开盘前生成的候选池误计入新交易日。
+- [修复] `start_all.sh` 后端启动改用 `uvicorn server:app`，避免本地脚本报告 ready 后 `main.py --serve-only` 后台进程退出导致 8000 不可访问。
+- [新功能] 新增 `get_stock_disclosure_events` 底层工具，通过巨潮公开公告检索公司年报、投资者关系记录和公告标题，结构化返回文档类型、URL、命中词、source_chain 与失败诊断，为主题催化席后续做“行业主题 × 公司公开资料”匹配提供基础证据。
+- [新功能] 新增 `search_stock_prompt_intel` 单股用户问题检索工具，将股票代码/名称与用户原始 prompt 合成搜索查询，复用现有搜索引擎返回公告、消息、走势背景等结构化结果，支持 Agent 在单股问答中按用户问题主动查证。
+- [新功能] 持仓管理新增单账户“重设持仓基准”能力，可清空旧流水并按指定日期、本金/现金余额、持仓数量和成本价重建基准流水，方便补录或校准未及时更新的账户持仓。
+- [改进] 持仓基准重设从自由文本解析改为逐行字段录入，分别填写代码、数量、成本价、市场和币种，降低补录持仓时的格式误填风险。
+- [修复] 修复 DatabaseManager 半初始化单例被复用时导致持仓流水列表请求失败的问题。
+- [改进] 四席位 seed pool 默认上限从 20 扩到 32，提升 AlphaSift、Sequoia、资金、主题等多来源召回覆盖；逐股深挖上限仍保持默认 4。
 - [新功能] 四席位 seed pool 新增 `news_theme_daily` 盘前日报主题来源，接入东方财富财经早餐 `stock_info_cjzc_em`，按 `trade_date` 匹配当天 6 点日报，并通过本地概念字典、可选 `jieba` 分词和规则引擎映射主题成分股；日报直接点名公司仅做诊断与避雷，不直接生成 seed。
 - [文档] 重写根 README 为专业化项目首页，突出账户感知 AI 投资研究、四席位选股、Meta 约束、点位计算、组合配置、Judge 和 Trace 复盘；新增 `docs/stock-selection-pipeline.md` 专题文档说明选股链路输入输出、机会首选/执行首选双轴语义和 Trace artifact。
 - [文档] 在 README 与 `docs/stock-selection-pipeline.md` 的 L1 seed pool 说明中显式列出 `AlphaSift` 与 `Sequoia` 本地主干候选源，避免把两者泛化成“本地价量与形态”。

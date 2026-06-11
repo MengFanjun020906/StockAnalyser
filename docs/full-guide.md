@@ -313,7 +313,7 @@ daily_stock_analysis/
 | `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 Tushare `moneyflow` 个股历史资金流，失败时回退 StockAPI `codeFlow` | `15.0` | 可选 |
 | `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 在 Tushare `moneyflow` 不可用时回退调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
 | `STOCKAPI_URL` | StockAPI 历史资金流 `codeFlow` 接口地址；默认使用官方 `https://www.stockapi.com.cn/v1/base/codeFlow`，可在私有代理或测试环境覆盖 | 官方 codeFlow URL | 可选 |
-| `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace | `30.0` | 可选 |
+| `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace。`discover_watchlist_candidates` 与 `detect_market_regime` 属于多组件重工具，Runner 会给它们更高的外层等待下限，让工具内部先返回结构化诊断，而不是被 30 秒统一壳超时截断 | `30.0` | 可选 |
 | `AGENT_SELECTION_DEEP_DIVE_LIMIT` | `watchlist_scan` 最多对多少只 L1 候选做逐股深度分析；有效范围 1-5，默认深挖 4 只，在覆盖面和整轮耗时之间取平衡，调大可减少“候选观察”但会增加工具调用 | `4` | 可选 |
 | `AGENT_CANDIDATE_BLACKLIST_CODES` | L1 候选池硬排除黑名单，逗号分隔；命中后不会进入候选池 | - | 可选 |
 | `AGENT_CANDIDATE_MIN_AVG_AMOUNT` | 候选源提供均成交额/成交额字段时的最低流动性阈值；`0` 表示不启用 | `0` | 可选 |
@@ -326,10 +326,14 @@ daily_stock_analysis/
 | `FUNDAMENTAL_CACHE_MAX_ENTRIES` | 基本面缓存最大条目数（TTL 内按时间淘汰） | `256` | 可选 |
 
 > 行为说明：
+> - Agent 最终报告会执行事实校验门禁：资金流精确值必须来自 `get_capital_flow` 的成功来源链，筹码分布精确值必须来自 `get_chip_distribution`，均线精确值必须来自 `calculate_ma` 或 `analyze_trend`。缺少对应工具证据时，最终 dashboard 会将这些字段替换为 `N/A` 并写入 `data_quality_warnings`。A 股买入股数还会按 100 股整数倍校验，模型输出的零散买入股数会被替换为“按100股整数倍”。
 > - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
-> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
+> - 四席位候选发现中，`momentum_desk` 的业务语义是“趋势/形态延续席”，优先消费 Sequoia、AlphaSift、涨停池和资金异常召回；`early_turn_desk` 代码名保留，但业务上降级为“结构反转席”，必须同时满足 `range_pct_120` 低位和明确转强证据，低位本身不再天然加分。防守 regime（`risk_off`/`panic`/`trending_down`）会跳过零配额动量席，避免无效席位消耗 LLM 预算。
+> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并额外写入上证指数 `000001.SH` 作为 Seed Pool 质量评估基准。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
+> - Seed Pool 质量页按 `seed_date` 只保留最新一个池子；同一天多次生成候选池时，新池会替换旧池，T+1 评估和页面总览只针对最新池。北京时间 09:00 前生成的候选池归属到前一自然日，例如 6 月 10 日 09:00 前生成的池子计入 6 月 9 日。
 > - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
-> - `get_capital_flow` 默认优先使用 Tushare `moneyflow` 个股历史资金流，用最近可用交易日 `net_mf_amount` 生成 `main_net_inflow`、近 5 日和近 10 日累计主力净流入；当 Tushare 不可用时回退到 StockAPI 历史资金流 `codeFlow`。未配置 `STOCKAPI_TOKEN` 时，fallback 只能按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
+> - Agent 模型上下文使用压缩后的工具事实卡。资金流、筹码分布等容易被误读的高风险指标，会从 `src/agent/metric_semantics.py` 注入短 `field_semantics` 防误读说明；自解释字段不会重复解释，避免浪费上下文预算。
+> - `get_capital_flow` 默认优先使用 Tushare `moneyflow` 个股历史资金流。Tushare 原始金额单位是“万元”，工具统一输出为 `CNY`：`net_mf_amount` 映射为全口径 `net_inflow/net_inflow_5d/net_inflow_10d`，`buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount` 映射为主力口径 `main_net_inflow/main_inflow_5d/main_inflow_10d`，兼容字段 `inflow_5d/inflow_10d` 指向主力口径。当 Tushare 不可用时回退到 StockAPI 历史资金流 `codeFlow`。未配置 `STOCKAPI_TOKEN` 时，fallback 只能按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；
 > - ETF：返回可得项，缺失能力标记为 `not_supported`，整体不影响原流程；
 > - 美股/港股：返回 `not_supported` 兜底块；

@@ -12,6 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.evidence import build_evidence_cards_for_stock
@@ -1915,10 +1916,10 @@ def _run_candidate_discovery_tool(
             today_str = datetime.now().strftime("%Y%m%d")
             try:
                 seed_pool_total_limit = int(
-                    getattr(Config.get_instance(), "agent_seed_pool_total_limit", 20) or 20
+                    getattr(Config.get_instance(), "agent_seed_pool_total_limit", 32) or 32
                 )
             except Exception:
-                seed_pool_total_limit = 20
+                seed_pool_total_limit = 32
             seed_pool_result = _build_seed_pool_result(
                 market=ctx.market,
                 seed_symbols=target_symbols,
@@ -1969,6 +1970,7 @@ def _run_candidate_discovery_tool(
                         "packets": payload.get("seed_fact_packets") if isinstance(payload.get("seed_fact_packets"), list) else [],
                     },
                 )
+            _persist_seed_pool_quality_snapshot(ctx=ctx, payload=payload, today=today_str)
             _emit(
                 ctx.progress_callback,
                 "selection_seed_gate_done",
@@ -2454,10 +2456,16 @@ def _candidate_capital_schema(evidence: Dict[str, Any]) -> Dict[str, Any]:
         }
     return {
         "status": "ok",
-        "summary": f"主力净流入={flow.get('main_net_inflow')}",
+        "summary": f"主力净流入={flow.get('main_net_inflow')}；全口径净流入={flow.get('net_inflow')}",
         "main_net_inflow": flow.get("main_net_inflow"),
-        "inflow_5d": flow.get("inflow_5d"),
-        "inflow_10d": flow.get("inflow_10d"),
+        "main_inflow_5d": flow.get("main_inflow_5d", flow.get("inflow_5d")),
+        "main_inflow_10d": flow.get("main_inflow_10d", flow.get("inflow_10d")),
+        "net_inflow": flow.get("net_inflow"),
+        "net_inflow_5d": flow.get("net_inflow_5d"),
+        "net_inflow_10d": flow.get("net_inflow_10d"),
+        "amount_unit": flow.get("amount_unit", "CNY"),
+        "main_inflow_definition": flow.get("main_inflow_definition"),
+        "net_inflow_definition": flow.get("net_inflow_definition"),
         "latest_date": flow.get("latest_date"),
         "source_update": flow.get("source_update"),
     }
@@ -2778,6 +2786,39 @@ def _compact_seed_gate_result(seed_result: Dict[str, Any]) -> Dict[str, Any]:
         "candidate_count": seed_result.get("candidate_count"),
         "candidate_source": seed_result.get("candidate_source"),
     })
+
+
+def _persist_seed_pool_quality_snapshot(*, ctx: SelectionRunContext, payload: Dict[str, Any], today: str) -> None:
+    """Persist seed-pool quality snapshot without breaking the selection chain."""
+    try:
+        from src.services.seed_pool_quality_service import SeedPoolQualityService, effective_seed_pool_date
+
+        generated_at = datetime.now()
+        try:
+            seed_date = datetime.strptime(str(today), "%Y%m%d").date()
+        except Exception:
+            seed_date = effective_seed_pool_date(generated_at)
+        else:
+            effective_date = effective_seed_pool_date(generated_at)
+            if seed_date == generated_at.date() and effective_date < seed_date:
+                seed_date = effective_date
+        result = SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id=f"{ctx.run_id}:{seed_date.isoformat()}" if seed_date else ctx.run_id,
+            trace_id=f"{ctx.run_id}:{seed_date.isoformat()}" if seed_date else ctx.run_id,
+            seed_date=seed_date,
+            generated_at=generated_at,
+            market=ctx.market,
+            candidate_discovery_mode=ctx.candidate_discovery_mode,
+        )
+        _emit(ctx.progress_callback, "selection_seed_pool_quality_snapshot", payload=result)
+    except Exception as exc:
+        logger.warning("seed pool quality snapshot persistence failed: %s", exc)
+        _emit(
+            ctx.progress_callback,
+            "selection_seed_pool_quality_snapshot",
+            payload={"status": "failed", "error": str(exc)},
+        )
 
 
 def _summarize_seed_items(seeds: Sequence[Any], *, total_limit: int) -> Dict[str, Any]:

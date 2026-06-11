@@ -50,6 +50,12 @@ def test_capital_flow_tools_are_registered():
     assert "get_market_capital_flow" in registry
     assert "get_northbound_capital_flow" in registry
     assert "get_margin_trading_summary" in registry
+    tool = registry.get("get_capital_flow")
+    assert tool is not None
+    description = tool.description
+    assert "main_net_inflow" in description
+    assert "net_inflow" in description
+    assert "Do not describe `net_inflow*` as 主力资金" in description
 
 
 def test_stockapi_market_microstructure_tools_are_registered():

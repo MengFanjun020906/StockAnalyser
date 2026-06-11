@@ -1512,36 +1512,59 @@ class AkshareFundamentalAdapter:
         if df is None or df.empty:
             return {}, None, ["tushare_moneyflow:empty_data"]
 
-        normalized_by_date: Dict[str, float] = {}
+        net_by_date: Dict[str, float] = {}
+        main_by_date: Dict[str, float] = {}
+        raw_by_date: Dict[str, Dict[str, Any]] = {}
         for _, row in df.iterrows():
             trade_date = _safe_str(row.get("trade_date")).replace("-", "")[:8]
             if len(trade_date) != 8:
                 continue
-            amount = _safe_float(row.get("net_mf_amount"))
-            if amount is None:
-                buy_lg = _safe_float(row.get("buy_lg_amount")) or 0.0
-                sell_lg = _safe_float(row.get("sell_lg_amount")) or 0.0
-                buy_elg = _safe_float(row.get("buy_elg_amount")) or 0.0
-                sell_elg = _safe_float(row.get("sell_elg_amount")) or 0.0
-                amount = (buy_lg + buy_elg) - (sell_lg + sell_elg)
-            if amount is None:
-                continue
-            normalized_by_date[
-                f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-            ] = float(amount) * 10000.0
+            date_key = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+            net_amount = _safe_float(row.get("net_mf_amount"))
+            buy_lg = _safe_float(row.get("buy_lg_amount"))
+            sell_lg = _safe_float(row.get("sell_lg_amount"))
+            buy_elg = _safe_float(row.get("buy_elg_amount"))
+            sell_elg = _safe_float(row.get("sell_elg_amount"))
+            if net_amount is not None:
+                net_by_date[date_key] = float(net_amount) * 10000.0
+            if any(value is not None for value in (buy_lg, sell_lg, buy_elg, sell_elg)):
+                main_amount = (buy_lg or 0.0) + (buy_elg or 0.0) - (sell_lg or 0.0) - (sell_elg or 0.0)
+                main_by_date[date_key] = float(main_amount) * 10000.0
+            raw_by_date[date_key] = {
+                "net_mf_amount_10k_cny": net_amount,
+                "buy_lg_amount_10k_cny": buy_lg,
+                "sell_lg_amount_10k_cny": sell_lg,
+                "buy_elg_amount_10k_cny": buy_elg,
+                "sell_elg_amount_10k_cny": sell_elg,
+            }
 
-        normalized_rows = sorted(normalized_by_date.items(), key=lambda item: item[0])
-        if not normalized_rows:
+        net_rows = sorted(net_by_date.items(), key=lambda item: item[0])
+        main_rows = sorted(main_by_date.items(), key=lambda item: item[0])
+        if not net_rows and not main_rows:
             return {}, None, ["tushare_moneyflow:no_main_amount"]
 
-        amounts = [item[1] for item in normalized_rows]
-        latest_date, latest_main = normalized_rows[-1]
+        latest_date = (main_rows or net_rows)[-1][0]
+        latest_main = main_by_date.get(latest_date)
+        latest_net = net_by_date.get(latest_date)
+        main_amounts = [item[1] for item in main_rows]
+        net_amounts = [item[1] for item in net_rows]
         return {
             "main_net_inflow": latest_main,
-            "inflow_5d": float(sum(amounts[-5:])),
-            "inflow_10d": float(sum(amounts[-10:])),
+            "main_inflow_5d": float(sum(main_amounts[-5:])) if main_amounts else None,
+            "main_inflow_10d": float(sum(main_amounts[-10:])) if main_amounts else None,
+            "net_inflow": latest_net,
+            "net_inflow_5d": float(sum(net_amounts[-5:])) if net_amounts else None,
+            "net_inflow_10d": float(sum(net_amounts[-10:])) if net_amounts else None,
+            # Backward-compatible aliases now point to the main-force口径.
+            "inflow_5d": float(sum(main_amounts[-5:])) if main_amounts else None,
+            "inflow_10d": float(sum(main_amounts[-10:])) if main_amounts else None,
             "latest_date": latest_date,
             "source_update": "tushare_moneyflow_after_market_close",
+            "amount_unit": "CNY",
+            "raw_amount_unit": "10k CNY",
+            "main_inflow_definition": "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000",
+            "net_inflow_definition": "net_mf_amount * 10000",
+            "latest_raw": raw_by_date.get(latest_date, {}),
         }, "tushare_moneyflow", []
 
     def _get_stockapi_capital_flow(

@@ -396,6 +396,114 @@ class BacktestSummary(Base):
     )
 
 
+class SelectionSeedPoolSnapshot(Base):
+    """One persisted seed-pool generation event."""
+
+    __tablename__ = 'selection_seed_pool_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    trace_id = Column(String(128), nullable=False, index=True)
+    seed_date = Column(Date, nullable=False, index=True)
+    generated_at = Column(DateTime, default=datetime.now, index=True)
+    market = Column(String(16), nullable=False, default='cn', index=True)
+    candidate_discovery_mode = Column(String(64), index=True)
+    seed_count = Column(Integer, default=0)
+    status = Column(String(16), default='ok', index=True)
+    error = Column(Text)
+    source_summary_json = Column(Text)
+    diagnostics_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'trace_id', 'seed_date', name='uix_seed_pool_snapshot_run_trace_date'),
+        Index('ix_seed_pool_snapshot_seed_date', 'seed_date', 'generated_at'),
+    )
+
+
+class SelectionSeedPoolItem(Base):
+    """One stock in a persisted seed-pool snapshot."""
+
+    __tablename__ = 'selection_seed_pool_items'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(Integer, ForeignKey('selection_seed_pool_snapshots.id'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    name = Column(String(64))
+    market = Column(String(16), nullable=False, default='cn', index=True)
+    source = Column(String(64), index=True)
+    source_diagnostics_json = Column(Text)
+    trigger_signals_json = Column(Text)
+    catalyst_tags_json = Column(Text)
+    catalyst_tier = Column(Integer, default=0, index=True)
+    entry_reason = Column(Text)
+    freshness = Column(String(64))
+    seed_order = Column(Integer, default=0)
+    entered_deep_dive = Column(Boolean, default=False, index=True)
+    entered_final_report = Column(Boolean, default=False, index=True)
+    raw_payload_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('snapshot_id', 'code', name='uix_seed_pool_item_snapshot_code'),
+        Index('ix_seed_pool_item_snapshot_order', 'snapshot_id', 'seed_order'),
+    )
+
+
+class SelectionSeedPoolDeskOutcome(Base):
+    """Per-seed thesis-desk processing result."""
+
+    __tablename__ = 'selection_seed_pool_desk_outcomes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(Integer, ForeignKey('selection_seed_pool_items.id'), nullable=False, index=True)
+    desk = Column(String(64), nullable=False, index=True)
+    status = Column(String(24), default='missing', index=True)
+    stance = Column(String(24), default='missing', index=True)
+    decision = Column(String(24), default='not_evaluated', index=True)
+    reason = Column(Text)
+    risks_json = Column(Text)
+    evidence_json = Column(Text)
+    metrics_json = Column(Text)
+    errors_json = Column(Text)
+    elapsed_ms = Column(Integer)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('item_id', 'desk', name='uix_seed_pool_outcome_item_desk'),
+    )
+
+
+class SelectionSeedPoolEvaluation(Base):
+    """Post-hoc T+1 performance evaluation for a seed item."""
+
+    __tablename__ = 'selection_seed_pool_evaluations'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    item_id = Column(Integer, ForeignKey('selection_seed_pool_items.id'), nullable=False, index=True)
+    evaluation_date = Column(Date, nullable=False, index=True)
+    seed_close = Column(Float)
+    evaluation_open = Column(Float)
+    evaluation_high = Column(Float)
+    evaluation_low = Column(Float)
+    evaluation_close = Column(Float)
+    next_close_return_pct = Column(Float)
+    benchmark_code = Column(String(16), default='000001.SH')
+    benchmark_return_pct = Column(Float)
+    alpha_return_pct = Column(Float)
+    mfe_pct = Column(Float)
+    mae_pct = Column(Float)
+    liquidity_status = Column(String(32), default='UNKNOWN', index=True)
+    data_status = Column(String(24), default='pending', index=True)
+    error = Column(Text)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('item_id', 'evaluation_date', name='uix_seed_pool_eval_item_date'),
+        Index('ix_seed_pool_eval_status_liquidity', 'data_status', 'liquidity_status'),
+    )
+
+
 class PortfolioAccount(Base):
     """Portfolio account metadata."""
 
@@ -732,6 +840,7 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._run_schema_migrations()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
@@ -742,7 +851,7 @@ class DatabaseManager:
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
         """获取单例实例"""
-        if cls._instance is None:
+        if cls._instance is None or not getattr(cls._instance, '_initialized', False):
             cls._instance = cls()
         return cls._instance
     
@@ -792,6 +901,71 @@ class DatabaseManager:
     def _is_file_sqlite_database(self) -> bool:
         database = (self._engine.url.database or "").strip()
         return bool(database) and database.lower() != ":memory:"
+
+    def _run_schema_migrations(self) -> None:
+        if not self._is_sqlite_engine:
+            return
+        self._migrate_seed_pool_snapshot_unique_key()
+
+    def _migrate_seed_pool_snapshot_unique_key(self) -> None:
+        with self._engine.begin() as conn:
+            leftover = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='selection_seed_pool_snapshots_old'"
+            ).fetchone()
+            if leftover is not None:
+                new_count = conn.exec_driver_sql("SELECT COUNT(*) FROM selection_seed_pool_snapshots").scalar() or 0
+                if int(new_count) == 0:
+                    conn.exec_driver_sql(
+                        """INSERT INTO selection_seed_pool_snapshots (
+                            id, run_id, trace_id, seed_date, generated_at, market,
+                            candidate_discovery_mode, seed_count, status, error,
+                            source_summary_json, diagnostics_json, created_at
+                        )
+                        SELECT
+                            id, run_id, trace_id, seed_date, generated_at, market,
+                            candidate_discovery_mode, seed_count, status, error,
+                            source_summary_json, diagnostics_json, created_at
+                        FROM selection_seed_pool_snapshots_old"""
+                    )
+                conn.exec_driver_sql("DROP TABLE selection_seed_pool_snapshots_old")
+
+            rows = conn.exec_driver_sql("PRAGMA index_list('selection_seed_pool_snapshots')").fetchall()
+            unique_indexes = {str(row[1]) for row in rows if int(row[2] or 0) == 1}
+            if "sqlite_autoindex_selection_seed_pool_snapshots_1" not in unique_indexes:
+                return
+            columns = conn.exec_driver_sql(
+                "PRAGMA index_info('sqlite_autoindex_selection_seed_pool_snapshots_1')"
+            ).fetchall()
+            column_names = [str(row[2]) for row in columns]
+            if column_names != ["run_id", "trace_id"]:
+                return
+            conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            try:
+                conn.exec_driver_sql("ALTER TABLE selection_seed_pool_snapshots RENAME TO selection_seed_pool_snapshots_old")
+                old_indexes = conn.exec_driver_sql(
+                    "PRAGMA index_list('selection_seed_pool_snapshots_old')"
+                ).fetchall()
+                for row in old_indexes:
+                    index_name = str(row[1])
+                    if index_name.startswith("sqlite_autoindex_"):
+                        continue
+                    conn.exec_driver_sql(f'DROP INDEX IF EXISTS "{index_name}"')
+                SelectionSeedPoolSnapshot.__table__.create(conn)
+                conn.exec_driver_sql(
+                    """INSERT INTO selection_seed_pool_snapshots (
+                        id, run_id, trace_id, seed_date, generated_at, market,
+                        candidate_discovery_mode, seed_count, status, error,
+                        source_summary_json, diagnostics_json, created_at
+                    )
+                    SELECT
+                        id, run_id, trace_id, seed_date, generated_at, market,
+                        candidate_discovery_mode, seed_count, status, error,
+                        source_summary_json, diagnostics_json, created_at
+                    FROM selection_seed_pool_snapshots_old"""
+                )
+                conn.exec_driver_sql("DROP TABLE selection_seed_pool_snapshots_old")
+            finally:
+                conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
     def _run_write_transaction(
         self,

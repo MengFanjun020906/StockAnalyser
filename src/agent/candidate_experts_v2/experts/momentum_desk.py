@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Momentum thesis desk expert (动量席 — trend continuation + limit-up)."""
+"""Trend-continuation thesis desk expert (趋势/形态延续席)."""
 
 from __future__ import annotations
 
@@ -31,12 +31,13 @@ MOMENTUM_DESK_TOOLS: tuple[str, ...] = (
     "get_stock_info",
 )
 
-# FeatureFlag kinds that signal momentum eligibility
+# FeatureFlag/source kinds that signal trend-continuation eligibility.
 _ELIGIBLE_KINDS = {"limit", "capital", "pattern"}
+_ELIGIBLE_SOURCES = {"sequoia", "alphasift", "limit_up_pool", "capital_flow_anomaly"}
 
 
 class MomentumDeskExpert(BaseDeskExpert):
-    """动量席 — trend continuation and real capital-momentum (limit-up) plays."""
+    """趋势/形态延续席 — trend continuation and real capital-momentum plays."""
 
     expert_name = "momentum_desk"
     dimension = "momentum"
@@ -71,25 +72,31 @@ class MomentumDeskExpert(BaseDeskExpert):
         )
 
     def _filter_eligible_rows(self, rows: List[FeatureRow]) -> List[FeatureRow]:
-        """Eligibility: limit/capital/pattern flag OR bullish trend OR high volume."""
+        """Eligibility: strategy/limit/capital source OR bullish trend OR high volume."""
         primary: List[FeatureRow] = []
         fallback_candidates: List[FeatureRow] = []
 
         for row in rows:
             fs = row.fact_sheet
             flag_kinds = {f.kind for f in row.flags}
+            sources = set(row.recall_sources)
 
-            # Criterion 1: has limit/capital/pattern flag
+            # Criterion 1: main momentum recall sources.
+            if sources & _ELIGIBLE_SOURCES:
+                primary.append(row)
+                continue
+
+            # Criterion 2: has limit/capital/pattern flag.
             if flag_kinds & _ELIGIBLE_KINDS:
                 primary.append(row)
                 continue
 
-            # Criterion 2: FactSheet shows bullish trend
+            # Criterion 3: FactSheet shows bullish trend.
             if fs is not None and fs.trend_state == "bullish":
                 primary.append(row)
                 continue
 
-            # Criterion 3: high volume ratio or strong 5d gain
+            # Criterion 4: high volume ratio or strong 5d gain.
             if fs is not None:
                 vr = fs.volume_ratio
                 gain = fs.gain_5d

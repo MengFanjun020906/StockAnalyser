@@ -1018,6 +1018,58 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(summary["position_count"], 1)
         self.assertEqual(context["agent_user_context"].report.intent, "position_review")
 
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": ""}, clear=False)
+    @patch("src.services.portfolio_service.PortfolioService")
+    def test_trace_context_keeps_explicit_stock_code_ahead_of_portfolio_positions(self, mock_service_cls) -> None:
+        mock_portfolio_service = MagicMock()
+        mock_portfolio_service.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-06-09",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 3,
+                    "account_name": "5w账户",
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 61276.95,
+                    "total_market_value": 32575.0,
+                    "total_equity": 93851.95,
+                    "positions": [
+                        {
+                            "symbol": "002617",
+                            "quantity": 2500,
+                            "avg_cost": 8.96,
+                            "last_price": 8.29,
+                            "market_value_base": 20725.0,
+                            "unrealized_pnl_base": -1675.0,
+                            "unrealized_pnl_pct": -7.48,
+                        }
+                    ],
+                }
+            ],
+        }
+        mock_service_cls.return_value = mock_portfolio_service
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="002156可以吗",
+                account_id=3,
+                inject_portfolio_context=True,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        report = context["agent_user_context"].report
+        self.assertEqual(context["stock_code"], "002156")
+        self.assertEqual(report.primary_symbol, "002156")
+        self.assertEqual(report.target_symbols, ["002156"])
+        self.assertEqual(report.intent, "entry_analysis")
+        planner = agent._build_planner_trace(context)
+        self.assertIsNotNone(planner)
+        self.assertEqual(planner["primary_symbol"], "002156")
+        self.assertEqual(planner["intent"], "entry_analysis")
+
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
     @patch("litellm.completion")
     def test_trace_context_forces_watchlist_scan_when_portfolio_context_is_injected(self, mock_completion) -> None:
@@ -1075,6 +1127,50 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
 
         self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
         self.assertTrue(context["agent_user_context"].report.include_watchlist_ranking)
+
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": ""}, clear=False)
+    @patch("src.services.portfolio_service.PortfolioService")
+    def test_explicit_stock_selection_overrides_injected_position_review_context(self, mock_portfolio_service_cls) -> None:
+        mock_portfolio_service = MagicMock()
+        mock_portfolio_service_cls.return_value = mock_portfolio_service
+        mock_portfolio_service.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-06-09",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 3,
+                    "account_name": "5w账户",
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 61276.95,
+                    "total_market_value": 33175.0,
+                    "total_equity": 94451.95,
+                    "positions": [
+                        {"symbol": "002617", "market": "cn", "quantity": 2500, "avg_cost": 8.96},
+                        {"symbol": "300628", "market": "cn", "quantity": 300, "avg_cost": 39.017},
+                    ],
+                }
+            ],
+        }
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="帮我选一下下周可以入手的股票，并说明候选池来源、入池理由、主要风险和等待确认条件。",
+                account_id=3,
+                stock_code=None,
+                inject_portfolio_context=True,
+                report_intent=None,
+                candidate_discovery_mode="thesis_desk_committee",
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        self.assertEqual(context["_trace_intent_resolution"]["intent"], "watchlist_scan")
+        self.assertTrue(context["_trace_intent_resolution"]["explicit_watchlist_request"])
+        self.assertEqual(context["agent_user_context"].report.intent, "watchlist_scan")
+        self.assertTrue(context["agent_user_context"].report.include_watchlist_ranking)
+        self.assertEqual(context["candidate_discovery_mode"], "thesis_desk_committee")
 
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": ""}, clear=False)
     def test_trace_context_does_not_default_to_watchlist_without_explicit_selection_request(self) -> None:

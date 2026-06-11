@@ -66,6 +66,33 @@ class PortfolioCashLedgerCreateRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=255)
 
 
+class PortfolioBaselinePositionInput(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=16)
+    quantity: float = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    market: Optional[Literal["cn", "hk", "us"]] = None
+    currency: Optional[str] = Field(None, min_length=3, max_length=8)
+
+
+class PortfolioBaselineResetRequest(BaseModel):
+    as_of: date
+    cash_amount: float = Field(0.0, ge=0)
+    positions: List[PortfolioBaselinePositionInput] = Field(default_factory=list)
+    note: Optional[str] = Field(None, max_length=255)
+
+
+class PortfolioBaselineResetResponse(BaseModel):
+    account_id: int
+    as_of: str
+    cash_amount: float
+    position_count: int
+    cash_ledger_count: int
+    trade_count: int
+    deleted_trades: int
+    deleted_cash_ledger: int
+    deleted_corporate_actions: int
+
+
 class PortfolioCorporateActionCreateRequest(BaseModel):
     account_id: int
     symbol: str = Field(..., min_length=1, max_length=16)
