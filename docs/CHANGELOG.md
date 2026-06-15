@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [改进] `get_sector_rankings` 优先使用 Tushare `ths_hot(market=行业板块)` 获取同花顺行业板块热榜，保留 Eastmoney 与 StockAPI 作为降级来源，并在 `source_chain` 暴露热榜口径。
 - [文档] 新增 `docs/openinvest-integration-assessment.md`，并补充 `docs/regime-state-machine.md` 的 Regime forward probability、路径画像与买回点参考方案，评估 openInvest 投资委员会、后处理、Dreaming 复盘、telemetry 和收益率展示页面等能力在当前仓库的可接入位置与迁移边界。
 - [改进] Agent 单股 ReAct 工具结果回灌改为工具级 ETL 事实卡，76 个注册工具均映射到明确 profile；模型只接收业务有效字段、错误状态和摘要，原始长度、hash 与预览留在 Trace，避免长 K 线、公告正文、新闻原文和 source/query 诊断字段污染上下文注意力。
 - [改进] Seed Pool 默认移除 `low_base_structure` 低位结构来源，不再调用低位结构扫描；AlphaSift 与 Sequoia 调整为加权主干来源，source cap 分别提升到 14/12，让实际效果更好的两个席位获得更多入池名额。

@@ -15,6 +15,7 @@ import concurrent.futures
 import time
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Thread
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -145,107 +146,160 @@ def _get_sector_rankings_agent_probe(manager: Any, top_n: int, timeout: float) -
 
 
 def _get_tushare_sector_rankings_fast(top_n: int, timeout: float) -> Optional[tuple]:
-    """Fast-path sector rankings via Tushare moneyflow industry endpoints."""
+    """Fast-path sector rankings via Tushare THS hot industry-board rankings."""
     try:
-        from data_provider.tushare_client import get_tushare_token, query_tushare_api
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=Path(__file__).resolve().parents[3] / ".env", override=False)
+    except Exception:
+        pass
+    try:
+        from data_provider.tushare_client import build_tushare_http_client, get_tushare_token
     except Exception:
         return None
     if not get_tushare_token():
         return None
 
     started_at = time.time()
-    now = datetime.now()
-    cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    end_day = now.date() if now >= cutoff else (now.date() - timedelta(days=1))
-    start_day = end_day - timedelta(days=20)
     source_chain: List[Dict[str, Any]] = []
     errors: List[str] = []
+    client = build_tushare_http_client(timeout=max(1, int(timeout)))
 
-    def remaining(default: float = 1.5) -> float:
+    def remaining(default: float = 4.0) -> float:
         return max(1.0, min(default, float(timeout) - (time.time() - started_at)))
 
-    try:
-        cal_df = query_tushare_api(
-            "trade_cal",
-            params={
-                "exchange": "SSE",
-                "start_date": start_day.strftime("%Y%m%d"),
-                "end_date": end_day.strftime("%Y%m%d"),
-            },
-            fields="cal_date,is_open",
-            timeout=int(remaining(2.0)),
-        )
-        dates = [
-            str(row.get("cal_date") or "")
-            for row in cal_df.to_dict(orient="records")
-            if str(row.get("is_open")) in {"1", "1.0", "True", "true"}
-        ]
-        dates = list(reversed([item for item in dates if item]))[:4]
-    except Exception as exc:
-        dates = [end_day.strftime("%Y%m%d")]
-        errors.append(f"tushare:trade_cal:{exc}")
+    def _to_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            number = float(value)
+        except Exception:
+            return None
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
 
-    def rank_rows(rows: List[Dict[str, Any]], name_key: str) -> tuple:
-        scored: List[Dict[str, Any]] = []
+    def _to_int(value: Any) -> Optional[int]:
+        number = _to_float(value)
+        if number is None:
+            return None
+        return int(number)
+
+    def normalize_rows(rows: List[Dict[str, Any]], trade_date: str) -> tuple:
+        latest_trade_date = trade_date
+        if not latest_trade_date:
+            trade_dates = sorted({str(row.get("trade_date") or "").strip() for row in rows if row.get("trade_date")})
+            latest_trade_date = trade_dates[-1] if trade_dates else ""
+        ranked: List[Dict[str, Any]] = []
         for row in rows:
-            try:
-                change = float(row.get("pct_change"))
-            except Exception:
+            row_trade_date = str(row.get("trade_date") or trade_date).strip()
+            if latest_trade_date and row_trade_date and row_trade_date != latest_trade_date:
                 continue
-            name = str(row.get(name_key) or "").strip()
-            if name:
-                scored.append({"name": name, "change_pct": change})
-        scored.sort(key=lambda item: item["change_pct"], reverse=True)
-        top = scored[:top_n]
-        bottom = list(reversed(scored[-top_n:])) if scored else []
+            data_type = str(row.get("data_type") or "").strip()
+            if data_type and data_type != "行业板块":
+                continue
+            name = str(row.get("ts_name") or row.get("name") or "").strip()
+            code = str(row.get("ts_code") or "").strip()
+            if not name and not code:
+                continue
+            rank = _to_int(row.get("rank"))
+            item: Dict[str, Any] = {
+                "name": name or code,
+                "code": code,
+                "rank": rank,
+                "change_pct": _to_float(row.get("pct_change")),
+                "current_price": _to_float(row.get("current_price")),
+                "hot": _to_float(row.get("hot")),
+                "trade_date": row_trade_date or latest_trade_date,
+                "data_type": data_type or "行业板块",
+                "rank_time": str(row.get("rank_time") or "").strip(),
+                "rank_reason": str(row.get("rank_reason") or "").strip(),
+                "source": "tushare:ths_hot",
+                "ranking_basis": "THS热榜:market=行业板块",
+            }
+            ranked.append(item)
+        ranked.sort(key=lambda item: item["rank"] if item.get("rank") is not None else 10**9)
+        top = ranked[:top_n]
+        bottom_candidates = [item for item in ranked if item.get("change_pct") is not None]
+        bottom_candidates.sort(key=lambda item: item["change_pct"])
+        bottom = bottom_candidates[:top_n]
         return top, bottom
 
-    for trade_date in dates:
+    def _previous_weekday(day):
+        day = day - timedelta(days=1)
+        while day.weekday() >= 5:
+            day = day - timedelta(days=1)
+        return day
+
+    now = datetime.now()
+    candidate_days = []
+    today = now.date()
+    if today.weekday() < 5 and now.time() >= datetime.strptime("22:30", "%H:%M").time():
+        candidate_days.append(today)
+        day = today
+    else:
+        day = _previous_weekday(today)
+        candidate_days.append(day)
+    while len(candidate_days) < 5:
+        day = _previous_weekday(day)
+        candidate_days.append(day)
+    candidate_dates = [day.strftime("%Y%m%d") for day in candidate_days]
+
+    for trade_date in candidate_dates:
         if time.time() - started_at >= timeout:
             break
-        for api_name, fields, name_key, filter_industry in (
-            ("moneyflow_ind_ths", "trade_date,industry,pct_change", "industry", False),
-            ("moneyflow_ind_dc", "trade_date,name,pct_change,content_type", "name", True),
-        ):
+        for is_new in ("Y", "N"):
             call_start = time.time()
             try:
-                df = query_tushare_api(
-                    api_name,
-                    params={"trade_date": trade_date},
-                    fields=fields,
-                    timeout=int(remaining(1.5)),
+                params = {"market": "行业板块", "is_new": is_new}
+                if trade_date:
+                    params["trade_date"] = trade_date
+                client._timeout = remaining(4.0)
+                df = client.query(
+                    "ths_hot",
+                    **params,
+                    fields=(
+                        "trade_date,data_type,ts_code,ts_name,rank,pct_change,"
+                        "current_price,hot,concept,rank_reason,rank_time"
+                    ),
                 )
             except Exception as exc:
-                errors.append(f"tushare:{api_name}:{exc}")
+                errors.append(f"tushare:ths_hot:{exc}")
                 source_chain.append({
-                    "provider": f"tushare:{api_name}",
+                    "provider": "tushare:ths_hot",
                     "result": "failed",
                     "duration_ms": int((time.time() - call_start) * 1000),
+                    "trade_date": trade_date,
+                    "market": "行业板块",
+                    "is_new": is_new,
                     "error": str(exc),
                 })
                 continue
-            if filter_industry and "content_type" in df.columns:
-                df = df[df["content_type"] == "行业"]
             if df is None or df.empty:
                 source_chain.append({
-                    "provider": f"tushare:{api_name}",
+                    "provider": "tushare:ths_hot",
                     "result": "empty",
                     "duration_ms": int((time.time() - call_start) * 1000),
                     "trade_date": trade_date,
+                    "market": "行业板块",
+                    "is_new": is_new,
                 })
                 continue
-            top, bottom = rank_rows(df.to_dict(orient="records"), name_key)
+            top, bottom = normalize_rows(df.to_dict(orient="records"), trade_date)
             if top or bottom:
                 source_chain.append({
-                    "provider": f"tushare:{api_name}",
+                    "provider": "tushare:ths_hot",
                     "result": "ok",
                     "duration_ms": int((time.time() - call_start) * 1000),
                     "trade_date": trade_date,
+                    "market": "行业板块",
+                    "is_new": is_new,
+                    "ranking_basis": "THS热榜:market=行业板块",
                 })
                 return top, bottom, source_chain, ""
 
     if source_chain or errors:
-        return [], [], source_chain, " | ".join(errors) or "Tushare sector rankings empty"
+        return [], [], source_chain, " | ".join(errors) or "Tushare ths_hot industry rankings empty"
     return None
 
 
@@ -1838,9 +1892,31 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
-    timeout = min(_get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0), 6.0)
+    timeout = min(_get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 5.0), 6.0)
     started_at = time.time()
-    eastmoney_timeout = min(timeout, 3.0)
+    tushare_timeout = min(timeout, 4.5)
+    tushare_result, tushare_err, tushare_ms = _run_with_timeout(
+        lambda: _get_tushare_sector_rankings_fast(top_n, tushare_timeout),
+        tushare_timeout,
+        "tushare_ths_hot_industry_rankings",
+    )
+    if isinstance(tushare_result, tuple) and len(tushare_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = tushare_result
+        if top_sectors or bottom_sectors:
+            return {
+                "status": "ok",
+                "top_sectors": top_sectors or [],
+                "bottom_sectors": bottom_sectors or [],
+                "source_chain": source_chain,
+                "data_source": "tushare:ths_hot",
+                "ranking_market": "行业板块",
+                "ranking_basis": "THS热榜:market=行业板块",
+                "bottom_basis": "lowest pct_change within returned THS hot industry-board rows",
+                "errors": [chain_error] if chain_error else [],
+            }
+
+    remaining_timeout = max(0.0, timeout - (time.time() - started_at))
+    eastmoney_timeout = min(remaining_timeout, 3.0)
     eastmoney_result, eastmoney_err, eastmoney_ms = _run_with_timeout(
         lambda: _get_eastmoney_industry_rankings_fast(top_n),
         eastmoney_timeout,
@@ -1877,6 +1953,28 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
 
     source_chain: List[Dict[str, Any]] = []
     errors: List[str] = []
+    if tushare_err:
+        source_chain.append({
+            "provider": "tushare:ths_hot",
+            "result": "timeout" if "timeout" in str(tushare_err).lower() else "failed",
+            "duration_ms": tushare_ms,
+            "market": "行业板块",
+            "error": tushare_err,
+        })
+        errors.append(str(tushare_err))
+    elif isinstance(tushare_result, tuple) and len(tushare_result) == 4:
+        _, _, tushare_chain, tushare_chain_error = tushare_result
+        source_chain.extend(tushare_chain or [])
+        if tushare_chain_error:
+            errors.append(str(tushare_chain_error))
+    else:
+        source_chain.append({
+            "provider": "tushare:ths_hot",
+            "result": "empty",
+            "duration_ms": tushare_ms,
+            "market": "行业板块",
+        })
+
     if eastmoney_err:
         source_chain.append({
             "provider": "eastmoney:stock_board_industry_name_em",
@@ -1960,8 +2058,9 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
 get_sector_rankings_tool = ToolDefinition(
     name="get_sector_rankings",
     description=(
-        "Get sector rankings. Prefer Eastmoney industry-board realtime quotes "
-        "(stock_board_industry_name_em / quote.eastmoney boardlist page); fall back to "
+        "Get industry-board hot rankings. Prefer Tushare THS hot rank "
+        "`ths_hot(market=行业板块)`; fall back to Eastmoney industry-board realtime "
+        "quotes (stock_board_industry_name_em / quote.eastmoney boardlist page), then "
         "StockAPI /v1/hotBkJlrDr when available. Permission, quota, network and remote "
         "disconnect failures are returned as structured failed/timeout diagnostics "
         "without slow fetcher probing."
