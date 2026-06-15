@@ -259,6 +259,63 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.assertEqual(june_7["items"][0]["code"], "600001")
         self.assertEqual(june_8["items"][0]["code"], "600002")
 
+    def test_snapshot_deduplicates_packet_and_final_candidate_desk_outcomes(self) -> None:
+        payload = {
+            "status": "ok",
+            "market": "cn",
+            "seed_pool_summary": {
+                "seed_count": 1,
+                "preview": [
+                    {
+                        "code": "002718",
+                        "name": "友邦吊顶",
+                        "source": "daily_screener",
+                        "freshness": "20260611",
+                    }
+                ],
+            },
+            "thesis_desk_packets": [
+                {
+                    "expert": "momentum_desk",
+                    "status": "ok",
+                    "candidates": [
+                        {
+                            "code": "002718",
+                            "stance": "watch",
+                            "reason": "动量席已看过，等待回踩确认。",
+                        }
+                    ],
+                }
+            ],
+            "candidates": [
+                {
+                    "code": "002718",
+                    "name": "友邦吊顶",
+                    "stance_by_desk": {"momentum_desk": "watch"},
+                    "reason": "最终候选聚合理由。",
+                }
+            ],
+        }
+
+        saved = SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id="trace-case:2026-06-11",
+            trace_id="trace-case",
+            generated_at=datetime(2026, 6, 12, 14, 20),
+            market="cn",
+            candidate_discovery_mode="thesis_desk_committee",
+        )
+        self.assertEqual(saved["status"], "ok")
+
+        quality = self.client.get("/api/v1/seed-pool-quality", params={"seed_date": "2026-06-11"}).json()
+        self.assertEqual(quality["snapshot"]["trace_id"], "trace-case")
+        item = quality["items"][0]
+        self.assertEqual(item["code"], "002718")
+        momentum = [outcome for outcome in item["desk_outcomes"] if outcome["desk"] == "momentum_desk"]
+        self.assertEqual(len(momentum), 1)
+        self.assertEqual(momentum[0]["stance"], "watch")
+        self.assertEqual(momentum[0]["reason"], "动量席已看过，等待回踩确认。")
+
     def test_default_seed_date_before_open_belongs_to_previous_day(self) -> None:
         self.assertEqual(
             effective_seed_pool_date(datetime(2026, 6, 10, 8, 59)),

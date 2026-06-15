@@ -2508,6 +2508,8 @@ class DataFetcherManager:
             {
                 "stock_flow": payload.get("stock_flow", {}),
                 "sector_rankings": payload.get("sector_rankings", {}),
+                "flow_sources": (payload.get("stock_flow") or {}).get("flow_sources", {}),
+                "selected_flow_source": (payload.get("stock_flow") or {}).get("selected_flow_source"),
             },
             self._normalize_source_chain(
                 payload.get("source_chain", []),

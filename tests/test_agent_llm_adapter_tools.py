@@ -136,3 +136,31 @@ def test_call_completion_passes_response_format_to_litellm(monkeypatch):
 
     assert response.provider == "unit"
     assert seen["response_format"] == {"type": "json_object"}
+
+
+def test_call_completion_injects_json_prompt_for_json_response_format(monkeypatch):
+    """DeepSeek JSON Output requires prompts to mention JSON."""
+    from src.agent import llm_adapter as module
+    from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
+
+    monkeypatch.setattr(module, "get_effective_agent_models_to_try", lambda _config: ["unit/model"])
+
+    adapter = LLMToolAdapter()
+    seen = {}
+
+    def fake_call(messages, *_args, **kwargs):
+        seen["messages"] = messages
+        seen["response_format"] = kwargs.get("response_format")
+        return LLMResponse(content='{"ok":true}', provider="unit", model="unit/model")
+
+    monkeypatch.setattr(adapter, "_call_litellm_model", fake_call)
+
+    response = adapter.call_completion(
+        [{"role": "user", "content": "只输出对象"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert response.provider == "unit"
+    assert seen["response_format"] == {"type": "json_object"}
+    assert seen["messages"][0]["role"] == "system"
+    assert "JSON" in seen["messages"][0]["content"]

@@ -19,6 +19,8 @@ from __future__ import annotations
 import pytest
 
 from src.agent.candidate_experts_v2.experts.early_turn_desk import EARLY_TURN_DESK_TOOLS
+from src.agent.candidate_experts_v2.experts.momentum_desk import MOMENTUM_DESK_TOOLS
+from src.agent.candidate_experts_v2.experts.quality_repair_desk import QUALITY_REPAIR_DESK_TOOLS
 from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import THEME_CATALYST_DESK_TOOLS
 from src.agent.candidate_experts_v2.prompts._renderer import render_manifest_block
 from src.agent.candidate_experts_v2.prompts.early_turn_desk import (
@@ -56,6 +58,22 @@ def test_load_theme_catalyst_desk_manifest_returns_validated_dimension_manifest(
     assert m.dimension == "theme_catalyst_desk"
     names = {e.tool for e in m.tools}
     assert names == set(THEME_CATALYST_DESK_TOOLS)
+
+
+def test_load_momentum_desk_manifest_returns_validated_dimension_manifest():
+    m = load_manifest("momentum_desk")
+    assert isinstance(m, DimensionManifest)
+    assert m.dimension == "momentum_desk"
+    names = {e.tool for e in m.tools}
+    assert names == set(MOMENTUM_DESK_TOOLS)
+
+
+def test_load_quality_repair_desk_manifest_returns_validated_dimension_manifest():
+    m = load_manifest("quality_repair_desk")
+    assert isinstance(m, DimensionManifest)
+    assert m.dimension == "quality_repair_desk"
+    names = {e.tool for e in m.tools}
+    assert names == set(QUALITY_REPAIR_DESK_TOOLS)
 
 
 def test_load_early_turn_desk_manifest_all_priorities_in_range():
@@ -154,10 +172,11 @@ def test_validate_full_early_turn_desk_manifest_against_real_registry():
     """The shipped early_turn_desk.yaml must validate against the real ToolRegistry."""
     from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
     from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.registry import ToolRegistry
 
     reg = ToolRegistry()
-    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS:
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_MARKET_TOOLS:
         reg.register(t)
 
     m = load_manifest("early_turn_desk")
@@ -177,6 +196,35 @@ def test_validate_full_theme_catalyst_desk_manifest_against_real_registry():
 
     m = load_manifest("theme_catalyst_desk")
     validate_manifest(m, whitelist=THEME_CATALYST_DESK_TOOLS, tool_registry=reg)
+
+
+def test_validate_full_momentum_desk_manifest_against_real_registry():
+    """The shipped momentum_desk.yaml must validate against the real ToolRegistry."""
+    from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
+    from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.market_tools import ALL_MARKET_TOOLS
+    from src.agent.tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_MARKET_TOOLS:
+        reg.register(t)
+
+    m = load_manifest("momentum_desk")
+    validate_manifest(m, whitelist=MOMENTUM_DESK_TOOLS, tool_registry=reg)
+
+
+def test_validate_full_quality_repair_desk_manifest_against_real_registry():
+    """The shipped quality_repair_desk.yaml must validate against the real ToolRegistry."""
+    from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
+    from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS:
+        reg.register(t)
+
+    m = load_manifest("quality_repair_desk")
+    validate_manifest(m, whitelist=QUALITY_REPAIR_DESK_TOOLS, tool_registry=reg)
 
 
 # ---------------------------------------------------------------------------

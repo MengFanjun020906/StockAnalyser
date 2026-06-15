@@ -298,7 +298,7 @@ daily_stock_analysis/
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
 | `AGENT_SEED_FACT_MAX_WORKERS` | 三席位选股前 `SeedFactPacket` 取数层的 `(seed,tool)` 并发 worker 上限 | `12` | 可选 |
-| `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | `SeedFactPacket` 单个工具调用预算；失败会写入 trace，不会伪造成成功 facts | `12.0` | 可选 |
+| `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | `SeedFactPacket` 单个工具调用预算；失败会写入 trace，不会伪造成成功 facts | `30.0` | 可选 |
 | `AGENT_SEED_FACT_TOOLS` | 三席位共享的预取工具列表，逗号分隔；默认覆盖趋势、结构、均线、量能、资金与轻量业务归属 | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context` | 可选 |
 | `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
@@ -310,7 +310,11 @@ daily_stock_analysis/
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `8.0` | 可选 |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `3.0` | 可选 |
-| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前默认使用 Tushare `moneyflow` 个股历史资金流，失败时回退 StockAPI `codeFlow` | `15.0` | 可选 |
+| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；当前会合成 Tushare `moneyflow_dc`、`moneyflow_ths` 和 legacy `moneyflow` 个股历史资金流，失败时回退 StockAPI `codeFlow` | `15.0` | 可选 |
+| `get_board_capital_flow` | Agent 工具：合成 Tushare `moneyflow_ind_dc`、`moneyflow_ind_ths`、`moneyflow_cnt_ths` 的行业/概念/地域板块资金流，统一输出 CNY，并保留 `flow_sources/source_definitions` 防止 DC/THS 口径混读 | - | 工具 |
+| `get_tushare_stk_factor` | Agent 工具：Tushare 股票技术因子（`stk_factor`），输出 MACD、KDJ、RSI、BOLL、CCI 等基于前复权价格计算的技术指标；已纳入 planning 技术分析能力和结构反转、动量、质量修复、主题催化席工具 YAML | - | 工具 |
+| `get_tushare_moneyflow_ind_ths` | Agent 工具：同花顺行业资金流向（`moneyflow_ind_ths`），支持 `trade_date` 或 `start_date/end_date`，将原始亿元字段转换为 CNY；已纳入主题催化席和动量席工具 YAML | - | 工具 |
+| `get_tushare_moneyflow_mkt_dc` | Agent 工具：东方财富大盘资金流向（`moneyflow_mkt_dc`），支持 `trade_date` 或 `start_date/end_date`，输出上证/深证涨跌和全市场主力/超大单/大单资金；已纳入结构反转、动量、主题催化席工具 YAML | - | 工具 |
 | `STOCKAPI_TOKEN` | StockAPI 历史资金流 Token；`get_capital_flow` 在 Tushare `moneyflow` 不可用时回退调用 `stockapi.com.cn/v1/base/codeFlow`，不配置时使用免费额度（只能查滞后历史窗口且每日请求次数很少） | - | 可选 |
 | `STOCKAPI_URL` | StockAPI 历史资金流 `codeFlow` 接口地址；默认使用官方 `https://www.stockapi.com.cn/v1/base/codeFlow`，可在私有代理或测试环境覆盖 | 官方 codeFlow URL | 可选 |
 | `AGENT_TOOL_CALL_TIMEOUT_SECONDS` | Agent 单批工具调用超时；慢接口会按工具失败降级，不拖垮整轮 Trace。`discover_watchlist_candidates` 与 `detect_market_regime` 属于多组件重工具，Runner 会给它们更高的外层等待下限，让工具内部先返回结构化诊断，而不是被 30 秒统一壳超时截断 | `30.0` | 可选 |
@@ -330,10 +334,13 @@ daily_stock_analysis/
 > - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
 > - 四席位候选发现中，`momentum_desk` 的业务语义是“趋势/形态延续席”，优先消费 Sequoia、AlphaSift、涨停池和资金异常召回；`early_turn_desk` 代码名保留，但业务上降级为“结构反转席”，必须同时满足 `range_pct_120` 低位和明确转强证据，低位本身不再天然加分。防守 regime（`risk_off`/`panic`/`trending_down`）会跳过零配额动量席，避免无效席位消耗 LLM 预算。
 > - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并额外写入上证指数 `000001.SH` 作为 Seed Pool 质量评估基准。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
-> - Seed Pool 质量页按 `seed_date` 只保留最新一个池子；同一天多次生成候选池时，新池会替换旧池，T+1 评估和页面总览只针对最新池。北京时间 09:00 前生成的候选池归属到前一自然日，例如 6 月 10 日 09:00 前生成的池子计入 6 月 9 日。
+> - Seed Pool 质量页按 `seed_date` 只保留最新一个池子；同一天多次生成候选池时，新池会替换旧池，T+1 评估和页面总览只针对最新池。候选池会优先使用 seed 自身的 `freshness`/`as_of`/`trade_date` 归属日期；缺少这些字段时，北京时间 09:00 前生成的候选池归属到前一自然日，例如 6 月 10 日 09:00 前生成的池子计入 6 月 9 日。
 > - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
 > - Agent 模型上下文使用压缩后的工具事实卡。资金流、筹码分布等容易被误读的高风险指标，会从 `src/agent/metric_semantics.py` 注入短 `field_semantics` 防误读说明；自解释字段不会重复解释，避免浪费上下文预算。
-> - `get_capital_flow` 默认优先使用 Tushare `moneyflow` 个股历史资金流。Tushare 原始金额单位是“万元”，工具统一输出为 `CNY`：`net_mf_amount` 映射为全口径 `net_inflow/net_inflow_5d/net_inflow_10d`，`buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount` 映射为主力口径 `main_net_inflow/main_inflow_5d/main_inflow_10d`，兼容字段 `inflow_5d/inflow_10d` 指向主力口径。当 Tushare 不可用时回退到 StockAPI 历史资金流 `codeFlow`。未配置 `STOCKAPI_TOKEN` 时，fallback 只能按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
+> - `get_tushare_stk_factor` 返回的 MACD/KDJ/RSI/BOLL/CCI 基于 Tushare `stk_factor` 的前复权价格计算；该接口的前复权行情是历史当日快照，可能与 `pro_bar` 动态前复权或本地行情重新计算结果不完全一致。报告引用时必须带日期和来源。
+> - `get_capital_flow` 会把 Tushare `moneyflow_dc`（东方财富口径）、`moneyflow_ths`（同花顺口径）和 legacy `moneyflow` 合成到同一个工具返回。金额原始单位均为“万元”，工具统一输出为 `CNY`；`selected_flow_source` 标明顶层字段采用哪套来源，`flow_sources` 保留每个成功来源的独立口径。顶层 `main_net_inflow/main_inflow_5d/main_inflow_10d` 始终采用选中来源自己的主力/大单定义，`net_inflow*` 采用选中来源自己的净流入定义，`inflow_5d/inflow_10d` 为主力口径兼容别名。不要把 DC、THS、legacy moneyflow 的数值混成同一统计定义；需要比较时先看 `selected_flow_source`、`main_inflow_definition` 和 `net_inflow_definition`。当 Tushare 三套来源都不可用时回退到 StockAPI 历史资金流 `codeFlow`。未配置 `STOCKAPI_TOKEN` 时，fallback 只能按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
+> - `get_tushare_moneyflow_mkt_dc` 是东财大盘资金流向底层工具，用于判断全市场主力资金水位；这是市场背景，不替代个股 `get_capital_flow` 或板块 `get_board_capital_flow`，也不能和个股/板块资金金额直接相加。
+> - `get_board_capital_flow` 是板块资金统一入口，会把东财 `moneyflow_ind_dc`（行业/概念/地域）、同花顺 `moneyflow_ind_ths`（行业）和 `moneyflow_cnt_ths`（概念）放到同一个返回结构。工具只统一单位和字段，不把三套统计方法相加；比较板块资金时必须查看 `selected_flow_source`、`source_definitions` 和 `flow_sources`。需要单独查看 THS 行业口径时，可直接调用 `get_tushare_moneyflow_ind_ths`，它已经进入主题催化席与动量席的 `tools_manifest`。
 > - A 股：按 `valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards` 聚合能力返回；
 > - ETF：返回可得项，缺失能力标记为 `not_supported`，整体不影响原流程；
 > - 美股/港股：返回 `not_supported` 兜底块；
@@ -1172,10 +1179,10 @@ python main.py --serve-only --host 0.0.0.0 --port 8888
 ### 注意事项
 
 - 浏览器访问：`http://127.0.0.1:8000`（或您配置的端口）
-- 在云服务器上部署后，不知道浏览器该输入什么地址？请看 [云服务器 Web 界面访问指南](deploy-webui-cloud.md)
+- 在云服务器上部署后，不知道浏览器该输入什么地址？请看 [云服务器 Web 界面访问指南](deployment/deploy-webui-cloud.md)
 - 分析完成后自动推送通知到配置的渠道
 - 此功能在 GitHub Actions 环境中会自动禁用
-- 另见 [openclaw Skill 集成指南](openclaw-skill-integration.md)
+- 另见 [openclaw Skill 集成指南](integrations/openclaw-skill-integration.md)
 
 ---
 
@@ -1203,6 +1210,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 当 Agent 请求的天数多于本地缓存记录数时，工具会返回实际可用记录，并通过 `partial_cache=true`、`requested_days`、`actual_records` 标明这是部分缓存命中。
 - 缓存缺失或过期时，工具仍会按原逻辑从数据源获取日线数据；获取成功后会 best-effort 写回 `stock_daily`，保存失败不会阻断 Agent 回复。
 - `search_stock_news` 与 `search_comprehensive_intel` 成功返回后会 best-effort 写入 `news_intel`，复用现有 URL / fallback key 去重逻辑。
+- `search_openinvest_news` 接入 `openInvest/services/news_sources` 的多源新闻适配，默认走 `yfinance.Ticker.news` 做 ticker 关联新闻补充；RSS / DDGS 为可选源，其中 DDGS 需要额外安装 `ddgs` 等依赖，缺依赖或单源失败会在 `source_chain` 中说明，不阻断工具返回。
 - `get_realtime_quote` 不复用 `stock_daily` 作为实时行情缓存，也不会把盘中实时行情写入日线表；如需实时行情缓存，应单独设计实时行情存储。
 
 ## 持仓管理说明

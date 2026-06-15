@@ -1231,11 +1231,11 @@ def _handle_get_capital_flow(
             error_summary = "capital-flow endpoint timeout"
         elif "tushare_moneyflow" in joined_errors:
             if "empty_data" in joined_errors:
-                error_summary = "Tushare moneyflow returned no capital-flow rows for the queried window"
+                error_summary = "Tushare moneyflow endpoints returned no capital-flow rows for the queried window"
             elif "invalid_date" in joined_errors:
                 error_summary = "Tushare moneyflow query window is invalid"
             else:
-                error_summary = "Tushare moneyflow capital-flow endpoint failed"
+                error_summary = "Tushare moneyflow capital-flow endpoints failed"
         elif "stockapi_codeFlow" in joined_errors:
             if "empty_data" in joined_errors:
                 error_summary = "StockAPI codeFlow returned no capital-flow rows for the queried window"
@@ -1269,6 +1269,19 @@ def _handle_get_capital_flow(
         "source_update": stock_flow.get("source_update"),
         "amount_unit": stock_flow.get("amount_unit", "CNY"),
         "raw_amount_unit": stock_flow.get("raw_amount_unit"),
+        "selected_flow_source": stock_flow.get("selected_flow_source"),
+        "flow_sources": stock_flow.get("flow_sources"),
+        "latest_price": stock_flow.get("latest_price"),
+        "pct_change": stock_flow.get("pct_change"),
+        "net_inflow_rate": stock_flow.get("net_inflow_rate"),
+        "extra_large_net_inflow": stock_flow.get("extra_large_net_inflow"),
+        "extra_large_net_inflow_rate": stock_flow.get("extra_large_net_inflow_rate"),
+        "large_net_inflow": stock_flow.get("large_net_inflow"),
+        "large_net_inflow_rate": stock_flow.get("large_net_inflow_rate"),
+        "medium_net_inflow": stock_flow.get("medium_net_inflow"),
+        "medium_net_inflow_rate": stock_flow.get("medium_net_inflow_rate"),
+        "small_net_inflow": stock_flow.get("small_net_inflow"),
+        "small_net_inflow_rate": stock_flow.get("small_net_inflow_rate"),
         "main_inflow_definition": stock_flow.get("main_inflow_definition"),
         "net_inflow_definition": stock_flow.get("net_inflow_definition"),
         "latest_raw": stock_flow.get("latest_raw"),
@@ -1285,12 +1298,16 @@ def _handle_get_capital_flow(
 get_capital_flow_tool = ToolDefinition(
     name="get_capital_flow",
     description=(
-        "Get A-share stock capital flow with explicit semantics and units. "
-        "`main_net_inflow`, `main_inflow_5d`, and `main_inflow_10d` are the main-force口径: "
-        "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000, in CNY. "
-        "`net_inflow`, `net_inflow_5d`, and `net_inflow_10d` are Tushare all-order net_mf_amount * 10000, in CNY. "
-        "`inflow_5d`/`inflow_10d` are backward-compatible aliases for the main-force口径. "
-        "Do not describe `net_inflow*` as 主力资金. "
+        "Get A-share stock capital flow with explicit semantics and units. The tool normalizes "
+        "three different per-stock sources into one contract: Tushare Eastmoney `moneyflow_dc`, "
+        "Tushare THS `moneyflow_ths`, and legacy Tushare `moneyflow`; StockAPI codeFlow is still "
+        "a fallback. `selected_flow_source` tells which source populates the top-level fields, and "
+        "`flow_sources` retains each successful source so their different statistics are auditable. "
+        "`main_net_inflow`, `main_inflow_5d`, and `main_inflow_10d` always follow the selected source's "
+        "documented main/large-order definition and are in CNY. `net_inflow*` keeps the selected "
+        "source's own net-flow definition. `inflow_5d`/`inflow_10d` remain backward-compatible aliases "
+        "for the selected main-flow口径. Do not mix DC, THS, and legacy moneyflow values as if they "
+        "were the same statistical definition; inspect `selected_flow_source` and definitions first. "
         "Only supported for A-share individual stocks (not ETFs, indices, HK, or US stocks)."
     ),
     parameters=[
@@ -2777,28 +2794,54 @@ def _to_yuan_from_100m(value: Any) -> Optional[float]:
 def _handle_get_tushare_moneyflow_ind_ths(
     trade_date: str = "",
     ts_code: str = "",
+    start_date: str = "",
+    end_date: str = "",
     limit: int = 30,
 ) -> dict:
     """Get Tushare THS industry money-flow ranking without fallback."""
     requested_date = _normalize_tushare_date(trade_date)
+    requested_start_date = _normalize_tushare_date(start_date)
+    requested_end_date = _normalize_tushare_date(end_date)
     effective_limit = max(1, min(int(limit or 30), 200))
     target_code = _clean_text(ts_code).upper()
     fields = (
         "trade_date,ts_code,industry,lead_stock,close,pct_change,company_num,"
         "pct_change_stock,close_price,net_buy_amount,net_sell_amount,net_amount"
     )
-    selected_date, result, source_chain, errors = _tushare_recent_date_query(
-        "moneyflow_ind_ths",
-        requested_date=requested_date,
-        fields=fields,
-        param_builder=lambda _date: {"ts_code": target_code},
-    )
+    params: Dict[str, Any] = {
+        "ts_code": target_code,
+        "trade_date": requested_date,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
+    }
+    params = {k: v for k, v in params.items() if v}
+    source_chain: List[Dict[str, Any]]
+    errors: List[str]
+    if requested_start_date or requested_end_date:
+        result = _tushare_query_all_rows(
+            "moneyflow_ind_ths",
+            params,
+            fields,
+            timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
+        )
+        selected_date = requested_date or requested_end_date or requested_start_date
+        source_chain = list(result.get("source_chain") or [])
+        errors = list(result.get("errors") or [])
+    else:
+        selected_date, result, source_chain, errors = _tushare_recent_date_query(
+            "moneyflow_ind_ths",
+            requested_date=requested_date,
+            fields=fields,
+            param_builder=lambda _date: {"ts_code": target_code},
+        )
     if result.get("status") != "ok":
         return {
             "status": result.get("status") or "failed",
             "api_name": "moneyflow_ind_ths",
             "trade_date": selected_date,
             "ts_code": target_code,
+            "start_date": requested_start_date,
+            "end_date": requested_end_date,
             "items": [],
             "source_chain": source_chain,
             "errors": errors or [f"tushare:moneyflow_ind_ths unavailable for {selected_date}"],
@@ -2843,6 +2886,8 @@ def _handle_get_tushare_moneyflow_ind_ths(
         "api_name": "moneyflow_ind_ths",
         "trade_date": selected_date,
         "ts_code": target_code,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
         "items": items,
         "total_rows": int(result.get("total_rows") or len(raw_items)),
         "source_chain": source_chain,
@@ -2859,6 +2904,8 @@ get_tushare_moneyflow_ind_ths_tool = ToolDefinition(
     parameters=[
         ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
         ToolParameter(name="ts_code", type="string", description="Optional THS board code, e.g. 881267.TI.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
         ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
     ],
     handler=_handle_get_tushare_moneyflow_ind_ths,
@@ -3060,6 +3107,200 @@ get_tushare_moneyflow_cnt_ths_tool = ToolDefinition(
         ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
     ],
     handler=_handle_get_tushare_moneyflow_cnt_ths,
+    category="data",
+)
+
+
+def _normalize_board_capital_item(item: Dict[str, Any], *, source_key: str) -> Dict[str, Any]:
+    row = dict(item)
+    row["source_key"] = source_key
+    row["amount_unit"] = "CNY"
+    if source_key == "tushare_moneyflow_ind_dc":
+        row["board_type"] = _clean_text(row.get("content_type")) or "unknown"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "moneyflow_ind_dc.net_amount (CNY, Eastmoney board main-force net inflow)"
+        row["net_inflow_definition"] = "same as main_net_inflow for moneyflow_ind_dc"
+    elif source_key == "tushare_moneyflow_ind_ths":
+        row["board_type"] = "行业"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "moneyflow_ind_ths.net_amount * 100000000 (THS industry net amount)"
+        row["net_inflow_definition"] = "moneyflow_ind_ths.net_amount * 100000000"
+    elif source_key == "tushare_moneyflow_cnt_ths":
+        row["board_type"] = "概念"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "moneyflow_cnt_ths.net_amount * 100000000 (THS concept net amount)"
+        row["net_inflow_definition"] = "moneyflow_cnt_ths.net_amount * 100000000"
+    else:
+        row["board_type"] = _clean_text(row.get("content_type")) or "unknown"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "unknown board capital-flow source"
+        row["net_inflow_definition"] = "unknown board capital-flow source"
+    return row
+
+
+def _top_bottom_board_items(items: List[Dict[str, Any]], limit: int) -> Dict[str, List[Dict[str, Any]]]:
+    ranked = sorted(
+        [item for item in items if isinstance(item, dict)],
+        key=lambda item: (
+            float(item.get("main_net_inflow") or item.get("net_inflow") or 0.0),
+            float(item.get("pct_change") or item.get("change_ratio") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+        reverse=True,
+    )
+    bottom = sorted(
+        [item for item in items if isinstance(item, dict)],
+        key=lambda item: (
+            float(item.get("main_net_inflow") or item.get("net_inflow") or 0.0),
+            float(item.get("pct_change") or item.get("change_ratio") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+    )
+    return {
+        "top": ranked[:limit],
+        "bottom": bottom[:limit],
+    }
+
+
+def _handle_get_board_capital_flow(
+    trade_date: str = "",
+    ts_code: str = "",
+    content_type: str = "",
+    limit: int = 20,
+) -> dict:
+    """Get board-level capital flow through a unified THS/DC contract."""
+    effective_limit = max(1, min(int(limit or 20), 100))
+    requested_type = _clean_text(content_type)
+    source_results: Dict[str, Any] = {}
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    dc_types = [requested_type] if requested_type in {"行业", "概念", "地域"} else ["行业", "概念", "地域"]
+    dc_items: List[Dict[str, Any]] = []
+    for dc_type in dc_types:
+        dc_result = _handle_get_tushare_moneyflow_ind_dc(
+            trade_date=trade_date,
+            ts_code=ts_code,
+            content_type=dc_type,
+            limit=max(effective_limit, 30),
+        )
+        key = f"tushare_moneyflow_ind_dc:{dc_type}"
+        source_results[key] = dc_result
+        source_chain.extend(dc_result.get("source_chain") or [])
+        errors.extend(dc_result.get("errors") or [])
+        for item in dc_result.get("items") or []:
+            if isinstance(item, dict):
+                dc_items.append(_normalize_board_capital_item(item, source_key="tushare_moneyflow_ind_dc"))
+
+    ths_ind_result: Optional[Dict[str, Any]] = None
+    ths_ind_items: List[Dict[str, Any]] = []
+    if requested_type in {"", "行业"}:
+        ths_ind_result = _handle_get_tushare_moneyflow_ind_ths(
+            trade_date=trade_date,
+            ts_code=ts_code,
+            limit=max(effective_limit, 30),
+        )
+        source_results["tushare_moneyflow_ind_ths"] = ths_ind_result
+        source_chain.extend(ths_ind_result.get("source_chain") or [])
+        errors.extend(ths_ind_result.get("errors") or [])
+        for item in ths_ind_result.get("items") or []:
+            if isinstance(item, dict):
+                ths_ind_items.append(_normalize_board_capital_item(item, source_key="tushare_moneyflow_ind_ths"))
+
+    ths_cnt_result: Optional[Dict[str, Any]] = None
+    ths_cnt_items: List[Dict[str, Any]] = []
+    if requested_type in {"", "概念"}:
+        ths_cnt_result = _handle_get_tushare_moneyflow_cnt_ths(
+            trade_date=trade_date,
+            ts_code=ts_code,
+            limit=max(effective_limit, 30),
+        )
+        source_results["tushare_moneyflow_cnt_ths"] = ths_cnt_result
+        source_chain.extend(ths_cnt_result.get("source_chain") or [])
+        errors.extend(ths_cnt_result.get("errors") or [])
+        for item in ths_cnt_result.get("items") or []:
+            if isinstance(item, dict):
+                ths_cnt_items.append(_normalize_board_capital_item(item, source_key="tushare_moneyflow_cnt_ths"))
+
+    all_items = dc_items + ths_ind_items + ths_cnt_items
+    selected_source = "tushare_moneyflow_ind_dc" if dc_items else (
+        "tushare_moneyflow_cnt_ths" if ths_cnt_items else (
+            "tushare_moneyflow_ind_ths" if ths_ind_items else ""
+        )
+    )
+    ranking = _top_bottom_board_items(all_items, effective_limit)
+    selected_ranking = _top_bottom_board_items(
+        dc_items or ths_cnt_items or ths_ind_items,
+        effective_limit,
+    )
+    statuses = [
+        str(payload.get("status") or "empty")
+        for payload in source_results.values()
+        if isinstance(payload, dict)
+    ]
+    status = "ok" if all_items else ("failed" if any(value in {"failed", "timeout", "error"} for value in statuses) else "empty")
+    trade_dates = [
+        str(payload.get("trade_date") or "")
+        for payload in source_results.values()
+        if isinstance(payload, dict) and payload.get("trade_date")
+    ]
+    return {
+        "status": status,
+        "api_name": "board_capital_flow",
+        "trade_date": trade_dates[0] if trade_dates else _normalize_tushare_date(trade_date),
+        "ts_code": _clean_text(ts_code).upper(),
+        "content_type": requested_type or "all",
+        "selected_flow_source": selected_source,
+        "amount_unit": "CNY",
+        "source_definitions": {
+            "tushare_moneyflow_ind_dc": "Eastmoney 行业/概念/地域板块资金流；net_amount/buy_* 字段已是 CNY。",
+            "tushare_moneyflow_ind_ths": "THS 行业资金流；net_buy_amount/net_sell_amount/net_amount 原始单位为亿元，工具转为 CNY。",
+            "tushare_moneyflow_cnt_ths": "THS 概念资金流；net_buy_amount/net_sell_amount/net_amount 原始单位为亿元，工具转为 CNY。",
+        },
+        "top_boards": ranking["top"],
+        "bottom_boards": ranking["bottom"],
+        "selected_top_boards": selected_ranking["top"],
+        "selected_bottom_boards": selected_ranking["bottom"],
+        "flow_sources": {
+            "tushare_moneyflow_ind_dc": _top_bottom_board_items(dc_items, effective_limit),
+            "tushare_moneyflow_ind_ths": _top_bottom_board_items(ths_ind_items, effective_limit),
+            "tushare_moneyflow_cnt_ths": _top_bottom_board_items(ths_cnt_items, effective_limit),
+        },
+        "source_status": {
+            key: {
+                "status": value.get("status"),
+                "count": len(value.get("items") or []),
+                "trade_date": value.get("trade_date"),
+                "errors": value.get("errors") or [],
+            }
+            for key, value in source_results.items()
+            if isinstance(value, dict)
+        },
+        "source_chain": source_chain,
+        "errors": errors,
+        "notes": [
+            "DC, THS industry, and THS concept board flows use different statistics; compare values only with source_definitions.",
+            "selected_flow_source identifies the preferred top-level ranking source; flow_sources keeps each source separate.",
+        ],
+    }
+
+
+get_board_capital_flow_tool = ToolDefinition(
+    name="get_board_capital_flow",
+    description=(
+        "Get unified A-share board/sector capital flow by combining Tushare Eastmoney "
+        "`moneyflow_ind_dc`, THS industry `moneyflow_ind_ths`, and THS concept "
+        "`moneyflow_cnt_ths`. Amounts are normalized to CNY, while source_definitions and "
+        "flow_sources preserve the different DC/THS statistical definitions. Use this instead "
+        "of asking the model to manually compare separate board-moneyflow tools."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional board code, e.g. BK0477 or 885748.TI.", required=False, default=""),
+        ToolParameter(name="content_type", type="string", description="Optional DC board type: 行业/概念/地域. Blank queries all supported board types plus THS industry/concept.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max top/bottom rows per ranking (default: 20, max: 100).", required=False, default=20),
+    ],
+    handler=_handle_get_board_capital_flow,
     category="data",
 )
 
@@ -4721,6 +4962,119 @@ get_tushare_adj_factor_tool = ToolDefinition(
 )
 
 
+def _handle_get_tushare_stk_factor(
+    stock_code: str = "",
+    ts_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare daily technical factors (stk_factor) without fallback."""
+    raw_code = _clean_text(ts_code) or _clean_text(stock_code)
+    tushare_code = _to_tushare_ts_code(raw_code) if raw_code else ""
+    effective_limit = max(1, min(int(limit or 30), 200))
+    fields = (
+        "ts_code,trade_date,close,open,high,low,pre_close,change,pct_change,"
+        "vol,amount,adj_factor,open_hfq,open_qfq,close_hfq,close_qfq,"
+        "high_hfq,high_qfq,low_hfq,low_qfq,pre_close_hfq,pre_close_qfq,"
+        "macd_dif,macd_dea,macd,kdj_k,kdj_d,kdj_j,rsi_6,rsi_12,rsi_24,"
+        "boll_upper,boll_mid,boll_lower,cci"
+    )
+    result = _tushare_query(
+        "stk_factor",
+        {
+            "ts_code": tushare_code,
+            "trade_date": _normalize_tushare_date(trade_date),
+            "start_date": _normalize_tushare_date(start_date),
+            "end_date": _normalize_tushare_date(end_date),
+        },
+        fields,
+        effective_limit,
+    )
+
+    items: List[Dict[str, Any]] = []
+    for row in result.get("items") or []:
+        if not isinstance(row, dict):
+            continue
+        row_ts_code = _clean_text(row.get("ts_code")).upper()
+        items.append({
+            "ts_code": row_ts_code,
+            "code": _normalize_ts_code_to_symbol(row_ts_code),
+            "trade_date": str(row.get("trade_date") or "").replace("-", "")[:8],
+            "open": _safe_number(row.get("open")),
+            "high": _safe_number(row.get("high")),
+            "low": _safe_number(row.get("low")),
+            "close": _safe_number(row.get("close")),
+            "pre_close": _safe_number(row.get("pre_close")),
+            "change": _safe_number(row.get("change")),
+            "pct_change": _safe_number(row.get("pct_change")),
+            "vol": _safe_number(row.get("vol")),
+            "volume": _safe_number(row.get("vol")),
+            "amount": _safe_number(row.get("amount")),
+            "adj_factor": _safe_number(row.get("adj_factor")),
+            "open_hfq": _safe_number(row.get("open_hfq")),
+            "open_qfq": _safe_number(row.get("open_qfq")),
+            "close_hfq": _safe_number(row.get("close_hfq")),
+            "close_qfq": _safe_number(row.get("close_qfq")),
+            "high_hfq": _safe_number(row.get("high_hfq")),
+            "high_qfq": _safe_number(row.get("high_qfq")),
+            "low_hfq": _safe_number(row.get("low_hfq")),
+            "low_qfq": _safe_number(row.get("low_qfq")),
+            "pre_close_hfq": _safe_number(row.get("pre_close_hfq")),
+            "pre_close_qfq": _safe_number(row.get("pre_close_qfq")),
+            "macd_dif": _safe_number(row.get("macd_dif")),
+            "macd_dea": _safe_number(row.get("macd_dea")),
+            "macd": _safe_number(row.get("macd")),
+            "kdj_k": _safe_number(row.get("kdj_k")),
+            "kdj_d": _safe_number(row.get("kdj_d")),
+            "kdj_j": _safe_number(row.get("kdj_j")),
+            "rsi_6": _safe_number(row.get("rsi_6")),
+            "rsi_12": _safe_number(row.get("rsi_12")),
+            "rsi_24": _safe_number(row.get("rsi_24")),
+            "boll_upper": _safe_number(row.get("boll_upper")),
+            "boll_mid": _safe_number(row.get("boll_mid")),
+            "boll_lower": _safe_number(row.get("boll_lower")),
+            "cci": _safe_number(row.get("cci")),
+            "source": "tushare:stk_factor",
+        })
+    items.sort(key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+    result.update({
+        "api_name": "stk_factor",
+        "stock_code": _normalize_ts_code_to_symbol(tushare_code or raw_code),
+        "ts_code": tushare_code,
+        "trade_date": _normalize_tushare_date(trade_date),
+        "start_date": _normalize_tushare_date(start_date),
+        "end_date": _normalize_tushare_date(end_date),
+        "items": items[:effective_limit],
+        "latest": items[0] if items else {},
+        "notes": [
+            "Tushare stk_factor indicators are calculated from front-adjusted prices.",
+            "The front-adjusted price series is a historical daily snapshot and may differ from dynamic pro_bar qfq output.",
+        ],
+    })
+    return result
+
+
+get_tushare_stk_factor_tool = ToolDefinition(
+    name="get_tushare_stk_factor",
+    description=(
+        "Get Tushare stock daily technical factors (stk_factor) without fallback. "
+        "Returns front-adjusted technical indicators such as MACD, KDJ, RSI, BOLL, and CCI."
+    ),
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 600519 or 600519.SH.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional Tushare stock code alias, e.g. 600519.SH.", required=False, default=""),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_stk_factor,
+    category="data",
+)
+
+
 def _to_tushare_index_code(index_code: str) -> str:
     raw = str(index_code or "").strip().upper()
     if "." in raw:
@@ -4955,9 +5309,16 @@ get_tushare_moneyflow_hsgt_tool = ToolDefinition(
 )
 
 
-def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) -> dict:
+def _handle_get_tushare_moneyflow_mkt_dc(
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 10,
+) -> dict:
     """Get Tushare DC broad-market money flow without fallback."""
     requested_date = _normalize_tushare_date(trade_date)
+    requested_start_date = _normalize_tushare_date(start_date)
+    requested_end_date = _normalize_tushare_date(end_date)
     effective_limit = max(1, min(int(limit or 10), 60))
     fields = (
         "trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,"
@@ -4969,6 +5330,13 @@ def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) 
         result = _tushare_query(
             "moneyflow_mkt_dc",
             {"trade_date": requested_date},
+            fields,
+            limit=effective_limit,
+        )
+    elif requested_start_date or requested_end_date:
+        result = _tushare_query(
+            "moneyflow_mkt_dc",
+            {"start_date": requested_start_date, "end_date": requested_end_date},
             fields,
             limit=effective_limit,
         )
@@ -5014,6 +5382,8 @@ def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) 
     result.update({
         "api_name": "moneyflow_mkt_dc",
         "trade_date": requested_date,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
         "items": items[:effective_limit],
     })
     return result
@@ -5027,6 +5397,8 @@ get_tushare_moneyflow_mkt_dc_tool = ToolDefinition(
     ),
     parameters=[
         ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
         ToolParameter(name="limit", type="integer", description="Recent rows to return when trade_date is omitted (default: 10, max: 60).", required=False, default=10),
     ],
     handler=_handle_get_tushare_moneyflow_mkt_dc,
@@ -5455,6 +5827,7 @@ ALL_DATA_TOOLS.extend([
     get_tushare_moneyflow_ind_ths_tool,
     get_tushare_moneyflow_ind_dc_tool,
     get_tushare_moneyflow_cnt_ths_tool,
+    get_board_capital_flow_tool,
     get_tushare_ths_member_tool,
     get_tushare_today_news_tool,
     get_eastmoney_cjzc_daily_tool,
@@ -5473,6 +5846,7 @@ ALL_DATA_TOOLS.extend([
     get_tushare_express_tool,
     get_tushare_dividend_tool,
     get_tushare_adj_factor_tool,
+    get_tushare_stk_factor_tool,
     get_tushare_index_daily_tool,
     get_tushare_trade_calendar_tool,
     get_tushare_moneyflow_ths_tool,

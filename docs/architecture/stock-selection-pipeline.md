@@ -1,6 +1,6 @@
 # 选股链路说明
 
-本文说明 `watchlist_scan` 选股链路的当前实现语义。更底层的实施细节、类名和历史迁移记录见 [选股链路重构实施方案](选股链路重构-实施方案.md)。
+本文说明 `watchlist_scan` 选股链路的当前实现语义。更底层的实施细节、类名和历史迁移记录见 [选股链路重构实施方案](./选股链路重构-实施方案.md)。
 
 ## 1. 设计目标
 
@@ -147,8 +147,10 @@ Meta-Agent 的重点是把“股票机会”翻译成“下游可计算的约束
 | `stop_loss` | 止损位 |
 | `failure_condition` | 论点失效条件 |
 | `risk_reward_comment` | 风险收益说明 |
+| `regime_probability` | 市场代理指数在当前 Regime 下的 forward return 概率摘要 |
+| `reentry_reference` | 基于悲观分位的买回/回踩参考；`low_confidence=true` 时只能作弱证据 |
 
-点位计算层不重新判断股票好坏，也不能覆盖 Meta 的硬约束。
+点位计算层不重新判断股票好坏，也不能覆盖 Meta 的硬约束。`market_context.forward_probability` 只作为后验证据进入 prompt 和 fallback：`low_confidence=true` 时不得作为主要开仓理由；`reentry_reference` 只用于等待回踩、分批入场或 TRIM 后买回解释，不能被写成保证成交价。最终报告会在 Meta/点位计算链路中展示 `Regime 概率证据`，便于复盘它到底是强证据还是弱证据。
 
 ## 10. 组合配置排序
 
@@ -171,7 +173,41 @@ Meta-Agent 的重点是把“股票机会”翻译成“下游可计算的约束
 
 注意：执行排序不等于机会排序。账户过于谨慎、现金缺失或市场高波动会影响 `执行首选`，但不应该把高质量机会从 `机会首选` 中抹掉。
 
-## 11. 反方审查与 Judge
+## 11. 后验复盘数据集
+
+Agent Trace 完成后，离线脚本可以把 Judge 裁决和后续行情转成 verdict review JSONL：
+
+```bash
+python scripts/build_agent_verdict_reviews.py --windows 7,30
+```
+
+第一版只读本地 Trace 和 `StockDaily`，默认输出 `data/agent_reviews/verdict_review.jsonl`。它会记录 `chain_type`、`trace_id`、`decision_date`、`symbol`、`final_action`、`symbol_action`、7/30 日后验收益和保守标签，例如 `hit`、`missed_up`、`avoided_down`、`wrong_direction`、`insufficient_data`。这些 review 行只用于后续校准和复盘，不会自动注入 Agent、Meta-Agent 或 Judge。
+
+Web 工作台提供只读复盘页：
+
+- API：`GET /api/v1/agent-verdict-reviews`
+- 样本刷新 API：`POST /api/v1/agent-verdict-reviews/rebuild?windows=7,30&limit=300`
+- 页面：`/agent-verdict-reviews`
+- 筛选：`chain_type`、`review_label`、`symbol`
+
+页面可点击“重建样本”刷新 `verdict_review.jsonl`，默认只扫描最近 300 个本地 Trace，并只读取本地 `StockDaily`。它不会重跑历史 Agent Trace、不会拉取外部行情，也不会把复盘标签自动注入实时决策。
+
+当 review 样本积累后，可以离线生成稳定 insight Markdown：
+
+```bash
+python scripts/build_agent_verdict_insights.py --min-samples 20
+```
+
+默认输出 `data/agent_reviews/insights/agent_verdict_insights.md`。该文件只从本地 `verdict_review.jsonl` 聚合分组样本，默认同一分组至少 20 条 completed 样本才形成稳定洞察；样本不足时只展示概览，不沉淀为长期提示。当前版本仍只作为人工复盘产物，不会自动注入 Agent、Meta-Agent 或 Judge。
+
+使用场景边界：
+
+- 选股链路：适用于 `planning_execute + watchlist_scan` 的选股 Agent Trace，输出 `chain_type=stock_selection`。脚本读取 `candidate_discovery`、`portfolio_allocation.positions_plan`、`judge_decision` 和 `market_regime`，复盘“本轮候选/计划/裁决后来表现如何”。
+- 单股链路：适用于单股 ReAct 决策仪表盘 Trace，输出 `chain_type=single_stock_analysis`。脚本读取 `risk_gate.trade_plan`、`risk_gate.allowed_action`、`operation_advice`、`decision_type`、`confidence_level` 和单股报告日期，复盘“这次单股操作建议后来表现如何”。
+
+两条链路共用后续行情评估和标签体系，但输入 schema 分开；单股链路不会伪造 `candidate_discovery`、`portfolio_allocation` 或 `judge_decision`。
+
+## 12. 反方审查与 Judge
 
 `adversarial_review` 负责挑战组合计划：
 
@@ -189,7 +225,16 @@ Meta-Agent 的重点是把“股票机会”翻译成“下游可计算的约束
 
 Judge 不补新证据，只基于已有主方案、反方审查和共享证据裁决。
 
-## 12. 最终报告
+Judge 输出后会经过确定性 sanity check：
+
+- worker 或工具阶段出现不可用标记时，主动交易裁决降级为等待确认。
+- Judge 给出 `open`，但组合配置没有可执行开仓仓位时，降级为 `wait`。
+- 市场处于 `risk_off` / `panic` / `extreme` 防御状态时，主动开仓裁决降级为 `wait`。
+- 单票首仓比例超过投资者上限时，截断仓位并同步组合摘要。
+
+sanity check 不会把 `wait` / `monitor` / `reject` 升级成 `open`。审计结果写入 `judge_decision.full.sanity_checks`。
+
+## 13. 最终报告
 
 最终报告是确定性渲染，不是新的 LLM stage。
 
@@ -207,7 +252,7 @@ Judge 不补新证据，只基于已有主方案、反方审查和共享证据�
 
 报告中的 Meta 链路章节只做链路对齐说明，不是另一套推荐排序。标题使用“链路对齐（非推荐排序）”，避免用户误读为独立顺位。
 
-## 13. Trace artifact
+## 14. Trace artifact
 
 每次选股运行会落盘到：
 
@@ -232,5 +277,8 @@ data/agent_traces/<timestamp>-trace-<id>/
 | `final_report.json` | 最终报告结构化输入 |
 | `final.md` | 最终 Markdown 报告 |
 | `events.ndjson` | 前端 Trace 流事件 |
+| `llm_usage.jsonl` | 阶段 LLM 调用 telemetry，包含 trace_id、stage、agent_role、symbol、provider、model、token、latency、tool_calls、ok/error |
+| `llm_telemetry.json` | API / Trace UI 使用的 LLM 调用汇总，包含总调用、成功/失败、token、latency、estimated_cost 和按 stage 聚合 |
+| `judge_sanity.json` | API / Trace UI 使用的 Judge sanity 汇总，包含最终动作、原方案裁决、sanity_checks 和 required_plan_changes |
 
-排障时优先从 `final_report.json`、`portfolio_allocation.json` 和 `events.ndjson` 看报告结构、执行排序和阶段失败。
+排障时优先从 `final_report.json`、`portfolio_allocation.json`、`events.ndjson`、`llm_usage.jsonl`、`llm_telemetry.json` 和 `judge_sanity.json` 看报告结构、执行排序、阶段失败、LLM 成本/耗时和 Judge 修正原因。

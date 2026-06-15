@@ -11,7 +11,7 @@ API v1 路由聚合
 
 from fastapi import APIRouter
 
-from api.v1.endpoints import analysis, auth, history, stocks, backtest, system_config, agent, usage, portfolio, candidate_pool, seed_pool_quality
+from api.v1.endpoints import analysis, auth, history, stocks, backtest, system_config, agent, usage, portfolio, candidate_pool, seed_pool_quality, agent_verdict_reviews
 
 # 创建 v1 版本主路由
 router = APIRouter(prefix="/api/v1")
@@ -38,6 +38,12 @@ router.include_router(
     seed_pool_quality.router,
     prefix="/seed-pool-quality",
     tags=["SeedPoolQuality"]
+)
+
+router.include_router(
+    agent_verdict_reviews.router,
+    prefix="/agent-verdict-reviews",
+    tags=["AgentVerdictReviews"]
 )
 
 router.include_router(

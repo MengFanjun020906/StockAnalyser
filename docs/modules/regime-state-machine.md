@@ -221,9 +221,15 @@ Regime 切换需要连续确认，默认 `confirmation_bars=3`。
 - 缺少路径形状信息：同样 30 日收益为正，可能是先跌后涨，也可能是直接上涨无回踩；这对等待、分批入场和 TRIM 完全不同。
 - 缺少 `n / effective_n / low_confidence`，模型和 Judge 无法判断 regime 统计是否可靠。
 
-## 12. 下一版：Regime forward probability
+## 12. Regime forward probability
 
-下一版不应继续只调阈值或 prompt，而应在当前状态机之上新增概率层。
+当前已在状态机之上新增第一版概率层，用于回答“当前 regime 在历史上未来窗口通常怎么走”。这层只提供后验证据，不直接输出 `BUY / SELL`；最终动作仍由 Meta-Agent、点位计算层、Judge 和 Risk Gate 决定。
+
+实现入口：
+
+- `src/agent/regime_probability.py`：纯函数概率层，复用 `src/agent/regime.py` 的分类逻辑。
+- `src/agent/tools/market_tools.py`：Agent 工具 `get_regime_forward_probability`。
+- `src/agent/stock_selection.py`：`watchlist_scan` 在 `detect_market_regime` 后调用概率工具，并把摘要写入 `market_regime.forward_probability`；点位 prompt、fallback 和报告会消费 `regime_probability` / `reentry_reference`，但只把它作为后验证据和买回参考。
 
 ### 12.1 设计目标
 
@@ -247,7 +253,7 @@ Regime 概率层回答：
 
 ### 12.2 建议输出字段
 
-建议新增独立工具 `get_regime_forward_probability`，第一版不强行塞进 `detect_market_regime`，避免市场状态识别工具变得过重。
+工具 `get_regime_forward_probability` 独立于 `detect_market_regime`，避免市场状态识别工具变得过重。第一版默认使用市场代理指数，输出 7 / 30 / 60 / 90 个交易日 forward probability。
 
 ```json
 {
@@ -305,16 +311,18 @@ Regime 概率层回答：
 6. 显著回踩和显著冲高用当日 ATR 自校准，例如 `min_return <= -1 * atr_pct` 才算给过明显低吸点。
 7. 尾部 lookahead 不足、停牌、涨跌停不可成交、除权复权口径异常的样本必须标记或剔除。
 
-### 12.4 接入路径
+### 12.4 当前接入路径
 
-第一阶段只做市场代理指数：
+第一阶段已接入市场代理指数：
 
 - 默认 `index_code=000300`。
 - 支持 `000001 / 000016 / 000300 / 000852 / 000905 / 399006`。
 - 输出当前市场 regime 对应的 forward probability。
-- Trace 中展示概率摘要和 `low_confidence`。
+- `market_regime.forward_probability` 中保留概率摘要、`low_confidence`、路径画像和买回参考。
+- `pricing_agent` prompt 明确禁止把概率层当成买卖信号；fallback 只会在 `Mean_Reversion_Pullback` 中把 `reentry_price` 写成“参考回踩/买回价”，并保留“仍需量价确认”。
+- 最终报告的 Meta/点位计算链路会展示 `Regime 概率证据`；当样本或有效样本不足时，会明确标记“仅作弱证据，不能单独支持开仓”。
 
-第二阶段做单股级概率：
+下一阶段做单股级概率：
 
 - 只对持仓、用户指定单股或 deep dive 候选计算。
 - 输出 `symbol_regime_probability` 和 `reentry_reference`。
@@ -339,7 +347,7 @@ Regime 概率层回答：
 建议优先级：
 
 1. 用 `TUSHARE_TOKEN` 接入 `index_daily`，稳定指数历史数据。
-2. 新增 `get_regime_forward_probability`，先对市场代理指数输出 7d / 30d / 60d / 90d forward probability。
+2. 扩展 `get_regime_forward_probability` 的本地指数缓存和复权/不可成交样本标记。
 3. 新增单股级 `symbol_regime_probability` 和 `reentry_reference`，只对 deep dive 标的和持仓标的计算。
 4. 将概率摘要接入 Meta-Agent、点位计算层和 Judge，不直接接入 Risk Gate。
 5. 接入 `fut_daily` / `fut_holding`，加入股指期货持仓和基差信号。

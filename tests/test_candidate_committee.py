@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 try:
@@ -27,15 +28,21 @@ from src.agent.candidate_experts_v2.committee import (
     run_committee_discovery,
     run_thesis_desk_committee,
 )
+from src.agent.candidate_experts_v2.runtime import run_experts_parallel
 from src.agent.candidate_experts_v2.experts.base import LLMTurn
 from src.agent.candidate_experts_v2.experts.desk_base import BaseDeskExpert
 from src.agent.candidate_experts_v2.schemas import (
+    EvidenceItem,
+    ExpertCandidateV2,
+    ExpertPacketV2,
     FactSheet,
     FeatureFlag,
     FeatureRow,
+    RecallResult,
     SeedFactDataQuality,
     SeedFactPacket,
     SeedFactToolResult,
+    SeedSummaryV2,
 )
 from src.agent.candidate_experts_v2.seed_facts import (
     build_seed_fact_packets_parallel,
@@ -77,6 +84,23 @@ def test_market_regime_key_accepts_market_regime_payload_dict():
     assert _market_regime_key({"regime": "risk_off", "volatility": "high"}) == "risk_off"
     assert _market_regime_key({"market_regime": "TRENDING_UP"}) == "trending_up"
     assert _market_regime_key({}) == "unknown"
+
+
+def test_parallel_expert_timeout_records_budget_reason():
+    def slow_task():
+        time.sleep(0.05)
+        return ExpertPacketV2(expert="slow_desk", dimension="desk", status="empty")
+
+    packets = run_experts_parallel(
+        {"slow_desk": slow_task},
+        per_expert_timeout_s=120.0,
+        overall_timeout_s=0.01,
+    )
+
+    assert packets[0].status == "timeout"
+    assert "overall timeout" in packets[0].errors[0]
+    assert packets[0].diagnostics[0]["reason"] == "overall_timeout_exhausted_before_expert_returned"
+    assert packets[0].diagnostics[0]["configured_per_expert_timeout_s"] == 120.0
 
 
 def test_seed_pool_assembly_allocates_total_limit_evenly_across_live_sources():
@@ -380,6 +404,176 @@ def test_thesis_desk_init_failure_preserves_seed_fact_payload():
     assert result["discovery_steps"][-1]["dimension"] == "desk_init"
 
 
+def test_thesis_desk_committee_degrades_failed_desk_but_keeps_candidates():
+    row = FeatureRow(
+        code="301161",
+        name="唯万密封",
+        flags=[FeatureFlag(detector="alphasift", kind="pattern", summary="趋势候选")],
+        fact_sheet=FactSheet(code="301161", trend_state="bullish"),
+    )
+    momentum_packet = ExpertPacketV2(
+        expert="momentum_desk",
+        dimension="momentum",
+        status="ok",
+        seed_summary=SeedSummaryV2(seed_count=1, accepted_count=1),
+        candidates=[
+            ExpertCandidateV2(
+                code="301161",
+                name="唯万密封",
+                stance="watch",
+                setup_type="trend_continuation",
+                reason="趋势结构健康但追高风险明确，等待回踩确认。",
+                evidence=[EvidenceItem(tool="analyze_trend", summary="均线多头")],
+            )
+        ],
+    )
+    quality_packet = ExpertPacketV2(
+        expert="quality_repair_desk",
+        dimension="quality",
+        status="failed",
+        seed_summary=SeedSummaryV2(seed_count=1),
+        candidates=[],
+        errors=["quality_repair_desk seed 688721 timeout after 106.7s"],
+    )
+
+    with patch(
+        "src.agent.candidate_experts_v2.recall.build_recall_pool",
+        return_value=RecallResult(rows=[row], all_rows=[row], total_in=1, total_kept=1),
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.build_seed_fact_packets_parallel",
+        return_value=[],
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.summarize_seed_fact_packets",
+        return_value={"total": 1, "ok": 0, "partial": 0, "failed": 0, "elapsed_ms": 0},
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.compact_seed_fact_packets_for_model",
+        return_value=[],
+    ), patch.object(
+        committee_module,
+        "run_experts_parallel",
+        return_value=[
+            ExpertPacketV2(expert="early_turn_desk", dimension="early_turn", status="empty"),
+            momentum_packet,
+            quality_packet,
+            ExpertPacketV2(expert="theme_catalyst_desk", dimension="theme_catalyst", status="empty"),
+        ],
+    ):
+        result = run_thesis_desk_committee(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            overall_timeout_s=30.0,
+        )
+
+    assert result["status"] == "partial"
+    assert result["degraded"] is True
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["code"] == "301161"
+    assert result["candidates"][0]["stance"] == "watch"
+    assert result["candidates"][0]["primary_desk"] == "momentum_desk"
+    assert "quality_repair_desk seed 688721 timeout" in result["partial_errors"][0]
+    assert result["negative_conclusion_reasons"]
+    assert any(item["conclusion"] == "desk_packet_failed" for item in result["negative_conclusion_reasons"])
+    assert any(step.get("status") == "partial" and step.get("degraded") is True for step in result["discovery_steps"])
+
+
+def test_thesis_desk_committee_records_rejection_reason_when_no_final_candidate():
+    row = FeatureRow(
+        code="600123",
+        name="拒绝样本",
+        flags=[FeatureFlag(detector="daily_screener", kind="pattern", summary="放量但位置高")],
+        fact_sheet=FactSheet(code="600123", trend_state="neutral"),
+        recall_sources=["daily_screener"],
+    )
+    rejected_packet = ExpertPacketV2(
+        expert="momentum_desk",
+        dimension="momentum",
+        status="empty",
+        seed_summary=SeedSummaryV2(seed_count=1, rejected_count=1),
+        rejected=[
+            {
+                "code": "600123",
+                "name": "拒绝样本",
+                "stance": "oppose",
+                "reason": "量能放大但趋势未确认，不符合动量席打法。",
+            }
+        ],
+    )
+
+    with patch(
+        "src.agent.candidate_experts_v2.recall.build_recall_pool",
+        return_value=RecallResult(rows=[row], all_rows=[row], total_in=1, total_kept=1),
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.build_seed_fact_packets_parallel",
+        return_value=[],
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.summarize_seed_fact_packets",
+        return_value={"total": 1, "ok": 0, "partial": 0, "failed": 0, "elapsed_ms": 0},
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.compact_seed_fact_packets_for_model",
+        return_value=[],
+    ), patch.object(
+        committee_module,
+        "run_experts_parallel",
+        return_value=[
+            ExpertPacketV2(expert="early_turn_desk", dimension="early_turn", status="empty"),
+            rejected_packet,
+            ExpertPacketV2(expert="quality_repair_desk", dimension="quality", status="empty"),
+            ExpertPacketV2(expert="theme_catalyst_desk", dimension="theme_catalyst", status="empty"),
+        ],
+    ):
+        result = run_thesis_desk_committee(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            overall_timeout_s=30.0,
+        )
+
+    reasons = result["negative_conclusion_reasons"]
+    assert result["candidate_count"] == 0
+    assert any(item["conclusion"] == "rejected_by_desk" for item in reasons)
+    assert any("不符合动量席打法" in item["reason"] for item in reasons)
+    assert any(item["conclusion"] == "not_promoted_to_final_candidates" for item in reasons)
+
+
+def test_desk_filter_explains_why_seed_did_not_enter_desk():
+    rows = [
+        FeatureRow(
+            code="600123",
+            name="高位样本",
+            flags=[FeatureFlag(detector="daily_screener", kind="unknown", summary="普通异动")],
+            fact_sheet=FactSheet(code="600123", range_pct_120=0.80),
+            recall_sources=["daily_screener"],
+        )
+    ]
+    desk = BaseDeskExpert(
+        allowed_tools=[],
+        tool_registry={},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+        system_prompt="test",
+    )
+    desk.expert_name = "test_filter_desk"
+
+    def no_rows(_rows):
+        return []
+
+    desk._filter_eligible_rows = no_rows
+    desk._ineligible_row_reason = lambda row: "测试席位未入席：缺少本席位需要的触发条件。"
+
+    packet = desk.run_desk(rows)
+
+    assert packet.status == "empty"
+    assert any(
+        diag.get("source") == "desk_filter_excluded_seed"
+        and diag.get("code") == "600123"
+        and "缺少本席位需要的触发条件" in diag.get("reason", "")
+        for diag in packet.diagnostics
+    )
+
+
 def _deterministic_stub(*, market: str, seed_symbols, limit: int):
     return {
         "status": "ok",
@@ -472,6 +666,60 @@ def test_run_committee_discovery_fails_without_seed_fallback_when_thesis_desk_is
         {"desk": "early_turn_desk", "status": "empty", "picks": 0},
     ]
     assert any(step.get("source") == "thesis_desk_committee" for step in result["discovery_steps"])
+
+
+def test_run_committee_discovery_propagates_partial_thesis_desk_candidates():
+    seed_result = committee_module.SeedPoolBuildResult(
+        seeds=[committee_module.SeedItem(code="301161", name="唯万密封", source="alphasift", priority_score=88)],
+        total_limit=1,
+    )
+
+    with patch.object(
+        committee_module,
+        "run_thesis_desk_committee",
+        return_value={
+            "status": "partial",
+            "degraded": True,
+            "partial_errors": ["quality_repair_desk seed 688721 timeout after 106.7s"],
+            "candidate_source": "thesis_desk_committee",
+            "candidates": [
+                {
+                    "code": "301161",
+                    "name": "唯万密封",
+                    "stance": "watch",
+                    "primary_desk": "momentum_desk",
+                    "candidate_source": "thesis_desk_committee",
+                }
+            ],
+            "candidate_count": 1,
+            "recall_total_in": 1,
+            "recall_total_kept": 1,
+            "thesis_desk_diagnostics": [
+                {"desk": "quality_repair_desk", "status": "failed", "errors": ["timeout"]},
+            ],
+            "thesis_desk_committee_elapsed_ms": 123,
+        },
+    ):
+        result = run_committee_discovery(
+            market="cn",
+            seed_symbols=[],
+            limit=8,
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            today="20260523",
+            seed_pool_result=seed_result,
+        )
+
+    assert result["status"] == "partial"
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["code"] == "301161"
+    assert result["llm_expert_committee"]["status"] == "partial"
+    assert result["llm_expert_committee"]["degraded"] is True
+    assert result["thesis_desk_committee"]["status"] == "partial"
+    assert result["thesis_desk_committee"]["degraded"] is True
+    assert result["thesis_desk_committee"]["partial_errors"] == [
+        "quality_repair_desk seed 688721 timeout after 106.7s",
+    ]
 
 
 def test_run_committee_discovery_coerces_non_dict_deterministic_payload():

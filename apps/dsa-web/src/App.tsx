@@ -9,6 +9,7 @@ import NotFoundPage from './pages/NotFoundPage';
 import ChatPage from './pages/ChatPage';
 import PortfolioPage from './pages/PortfolioPage';
 import AgentTracePage from './pages/AgentTracePage';
+import AgentVerdictReviewsPage from './pages/AgentVerdictReviewsPage';
 import CandidatePoolPage from './pages/CandidatePoolPage';
 import SeedPoolQualityPage from './pages/SeedPoolQualityPage';
 import { ApiErrorAlert, Shell } from './components/common';
@@ -68,6 +69,7 @@ const AppContent: React.FC = () => {
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/agent-trace" element={<AgentTracePage />} />
         <Route path="/agent-trace/:sessionId" element={<AgentTracePage />} />
+        <Route path="/agent-verdict-reviews" element={<AgentVerdictReviewsPage />} />
         <Route path="/candidate-pool" element={<CandidatePoolPage />} />
         <Route path="/seed-pool-quality" element={<SeedPoolQualityPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />

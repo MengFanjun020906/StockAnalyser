@@ -14,7 +14,7 @@
 | --- | --- | --- |
 | 策略多因子专家 | AlphaSift YAML 策略召回 | `AlphaSiftCandidateProvider` |
 | 技术形态专家 | 突破、RPS、形态、动量 | `SequoiaCandidateProvider` |
-| 板块主题专家 | 强势板块扩散到个股 | `get_sector_rankings`、AkShare 板块成分 |
+| 板块主题专家 | 强势板块扩散到个股 | `get_sector_rankings`（Tushare `ths_hot(market=行业板块)` 优先）、`get_board_capital_flow`、AkShare 板块成分 |
 | 资金面专家 | 涨停池、人气、游资、资金承接 | `get_tushare_moneyflow_ths`、`get_tushare_moneyflow_dc`、`get_tushare_dragon_tiger_list`、`get_tushare_dragon_tiger_inst`、`get_tushare_limit_list_ths`、`get_tushare_limit_list_d`、`get_tushare_limit_step`、`get_tushare_hot_rank`、`get_capital_flow`、`get_market_capital_flow`、StockAPI 资金相关工具 |
 | 消息事件专家 | 公司级新闻、公告、硬事件 | `search_stock_news`、`search_comprehensive_intel`、`get_tushare_reference_events` |
 | 情绪/宏观事件专家 | 宏观、地缘、主题扩散 | `event_impact`、`news_momentum` |
@@ -26,9 +26,12 @@
 | --- | --- | --- |
 | `moneyflow` | 个股主力资金流 | 已接到 `get_capital_flow` 主链路 |
 | `moneyflow_ths` | 个股资金流向（THS） | 已接到资金面候选专家首位工具 |
-| `moneyflow_ind_ths` | 行业资金流向（THS） | 已接到 `get_tushare_moneyflow_ind_ths`，并用于板块主题专家快路径 |
-| `moneyflow_ind_dc` | 行业资金流向（东财） | 已接到 `get_tushare_moneyflow_ind_dc`，并用于板块主题专家快路径 |
+| `moneyflow_ind_ths` | 行业资金流向（THS） | 已接到 `get_tushare_moneyflow_ind_ths`，支持 `trade_date/start_date/end_date`，并纳入 `get_board_capital_flow` 统一板块资金入口与主题催化/动量席工具 YAML |
+| `moneyflow_ind_dc` | 行业/概念/地域资金流向（东财） | 已接到 `get_tushare_moneyflow_ind_dc`，并纳入 `get_board_capital_flow` 统一板块资金入口 |
+| `moneyflow_cnt_ths` | 概念板块资金流向（THS） | 已接到 `get_tushare_moneyflow_cnt_ths`，并纳入 `get_board_capital_flow` 统一板块资金入口 |
 | `moneyflow_dc` | 个股资金流向（东财） | 已接到 `get_tushare_moneyflow_dc` |
+| `moneyflow_mkt_dc` | 大盘资金流向（东财） | 已接到 `get_tushare_moneyflow_mkt_dc`，支持 `trade_date/start_date/end_date`，并纳入 planning `capital_flow` 与结构反转/动量/主题催化席工具 YAML |
+| `stk_factor` | 股票技术因子 | 已接到 `get_tushare_stk_factor`，支持 `ts_code/stock_code/trade_date/start_date/end_date`，并纳入 planning `technical_analysis` 与结构反转/动量/质量修复/主题催化席工具 YAML |
 | `cyq_chips` | 筹码分布 | 已接到 `get_chip_distribution` |
 | `margin` | 融资融券汇总 | 已接到 `get_margin_trading_summary` |
 | `top_list` | 龙虎榜每日明细 | 已接到 `get_tushare_dragon_tiger_list`，也保留在参考事件工具中 |
@@ -98,7 +101,7 @@
 - `moneyflow_cnt_ths`
 - `ths_member`
 
-这层现在可以直接输出“板块为什么热”，不只是“板块涨了多少”。
+这层现在可以通过 `get_board_capital_flow` 统一输出“板块为什么热”，不只是“板块涨了多少”。统一入口只做单位和字段归一，不把 DC 行业/概念/地域、THS 行业、THS 概念三套统计方法相加；需要比较时看 `source_definitions` 和 `flow_sources`。如果只需要同花顺行业口径，主题催化席和动量席也可以直接调用 `get_tushare_moneyflow_ind_ths`。
 
 ### 4.3 消息事件专家
 
@@ -146,7 +149,7 @@
 
 1. 已补 `moneyflow_ths`，接到资金面专家首位候选源。
 2. 已补 `moneyflow_dc`、`top_list`、`top_inst`、`limit_list_ths`、`limit_list_d`、`limit_step`、`ths_hot`、`dc_hot`，把资金候选做成可交叉验证。
-3. 已补 `moneyflow_ind_ths`、`moneyflow_ind_dc`、`moneyflow_cnt_ths`、`ths_member`，板块主题专家可以直接做主题归因。
+3. 已补 `moneyflow_ind_ths`、`moneyflow_ind_dc`、`moneyflow_cnt_ths`、`ths_member`，并新增 `get_board_capital_flow` 合成入口，板块主题专家可以直接做主题归因。
 4. 已补 `anns_d`、`stk_alert`、`stk_shock`、`share_float`、`stk_holdertrade`、`pledge_stat`、`pledge_detail`、`repurchase`，消息事件已经变成结构化硬事件。
 
 ## 6. 代码落点

@@ -24,6 +24,7 @@ QUALITY_REPAIR_DESK_TOOLS: tuple[str, ...] = (
     "get_tushare_express",
     "get_tushare_dividend",
     "analyze_trend",
+    "get_tushare_stk_factor",
     "analyze_price_structure",
 )
 
@@ -93,3 +94,14 @@ class QualityRepairDeskExpert(BaseDeskExpert):
             return primary
 
         return fallback_candidates[: self._fallback_supplement_n]
+
+    def _ineligible_row_reason(self, row: FeatureRow) -> str:
+        fs = row.fact_sheet
+        flag_kinds = {f.kind for f in row.flags}
+        if flag_kinds & _ELIGIBLE_KINDS:
+            return "质量修复席过滤条件未命中，但 fundamental flag 存在；请检查席位过滤实现。"
+        if fs is None:
+            return "质量修复席要求 fundamental flag 或低估值/低位置事实，当前缺少 FactSheet。"
+        if fs.range_pct_120 is None:
+            return "质量修复席要求 fundamental flag 或 range_pct_120<=0.35，当前缺少 range_pct_120。"
+        return f"质量修复席要求 fundamental flag 或 range_pct_120<=0.35，当前 range_pct_120={fs.range_pct_120:.3f}。"

@@ -107,6 +107,7 @@ function stanceLabel(value?: string): string {
     oppose: '反对',
     invalid: '无效',
     missing: '缺失',
+    not_in_scope: '未入席',
   };
   return labels[String(value || '')] || String(value || 'missing');
 }
@@ -120,9 +121,26 @@ function stanceVariant(value?: string): React.ComponentProps<typeof Badge>['vari
 
 function orderedDeskOutcomes(outcomes?: SeedPoolDeskOutcome[]): SeedPoolDeskOutcome[] {
   const byDesk = new Map((outcomes || []).map((item) => [String(item.desk || ''), item]));
-  const ordered = DESK_ORDER.map((desk) => byDesk.get(desk) || { desk, status: 'missing', stance: 'missing', decision: 'not_evaluated' });
+  const ordered = DESK_ORDER.map((desk) => byDesk.get(desk) || {
+    desk,
+    status: 'not_in_scope',
+    stance: 'not_in_scope',
+    decision: 'not_evaluated',
+    reason: '未进入该席位评估范围。',
+  });
   const extras = (outcomes || []).filter((item) => !DESK_ORDER.includes(String(item.desk || '')));
   return [...ordered, ...extras];
+}
+
+function deskOutcomeReason(outcome: SeedPoolDeskOutcome): string {
+  if (outcome.reason) return outcome.reason;
+  if (outcome.stance === 'not_in_scope' || outcome.status === 'not_in_scope') {
+    return '未进入该席位评估范围。';
+  }
+  if (outcome.stance === 'missing' || outcome.status === 'missing') {
+    return '该席位未返回结构化理由。';
+  }
+  return '该席位未提供文本理由。';
 }
 
 const MetricTile: React.FC<{ label: string; value: string; hint?: string; tone?: 'good' | 'bad' | 'warn' | 'neutral'; icon: React.ReactNode }> = ({ label, value, hint, tone = 'neutral', icon }) => {
@@ -538,7 +556,7 @@ const SeedPoolQualityPage: React.FC = () => {
                     </div>
                     <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-1">
                       {orderedDeskOutcomes(selectedItem.deskOutcomes).map((outcome) => (
-                      <div key={`${selectedItem.id}-${outcome.desk}-${outcome.stance}`} className={cn('border p-3', outcome.stance === 'missing' ? 'border-border/40 bg-elevated/30 opacity-80' : 'border-border/60')}>
+                      <div key={`${selectedItem.id}-${outcome.desk}-${outcome.stance}`} className={cn('border p-3', outcome.stance === 'missing' || outcome.stance === 'not_in_scope' ? 'border-border/40 bg-elevated/30 opacity-80' : 'border-border/60')}>
                         <div className="flex items-center justify-between gap-2">
                           <span className="font-medium text-foreground">{deskLabel(outcome.desk)}</span>
                           <Badge variant={stanceVariant(outcome.stance)}>
@@ -549,7 +567,7 @@ const SeedPoolQualityPage: React.FC = () => {
                           <Badge variant="default">status: {outcome.status || 'missing'}</Badge>
                           <Badge variant="default">decision: {outcome.decision || 'not_evaluated'}</Badge>
                         </div>
-                        <p className="mt-2 text-sm leading-6 text-secondary-text">{outcome.reason || '未落盘该席位理由'}</p>
+                        <p className="mt-2 text-sm leading-6 text-secondary-text">{deskOutcomeReason(outcome)}</p>
                         {(outcome.risks || []).length ? (
                           <div className="mt-2">
                             <div className="text-xs font-medium text-muted-text">风险</div>

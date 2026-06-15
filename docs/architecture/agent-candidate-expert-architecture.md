@@ -290,7 +290,7 @@ evaluate：针对已入池股票做深度验证，负责输出证据和反证
 - `valid_until`：候选有效期，不同专家可以不同。
 - `refresh_policy`：刷新策略，例如盘中、收盘后、下个交易日、周度。
 
-候选进入深度分析后，各专家输出从 `ExpertCandidatePacket` 切换为 `EvidenceCard` 和 `ExpertEvidencePacket`。字段语义应与 [agent-evidence-card-protocol.md](agent-evidence-card-protocol.md) 保持一致，尤其是 `confidence`、`stance`、`data_quality`、`counter_evidence` 和有效期语义。
+候选进入深度分析后，各专家输出从 `ExpertCandidatePacket` 切换为 `EvidenceCard` 和 `ExpertEvidencePacket`。字段语义应与 [agent-evidence-card-protocol.md](./agent-evidence-card-protocol.md) 保持一致，尤其是 `confidence`、`stance`、`data_quality`、`counter_evidence` 和有效期语义。
 
 ## 6. 合并与裁决规则
 
@@ -454,7 +454,7 @@ join
 
 ### 8.3 输出协议
 
-深度分析阶段输出对齐 `agent-evidence-card-protocol.md`：
+深度分析阶段输出对齐 `./agent-evidence-card-protocol.md`：
 
 - 单工具/单信号输出 `EvidenceCard`。
 - 单专家聚合输出 `ExpertEvidencePacket`。

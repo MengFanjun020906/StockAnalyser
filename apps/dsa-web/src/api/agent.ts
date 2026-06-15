@@ -87,6 +87,8 @@ export interface AgentTraceRunResponse {
   debate?: Record<string, unknown> | null;
   stock_selection?: Record<string, unknown> | null;
   risk_gate?: Record<string, unknown> | null;
+  llm_telemetry?: Record<string, unknown> | null;
+  judge_sanity?: Record<string, unknown> | null;
   artifact_dir?: string | null;
   runtime_config?: Record<string, unknown> | null;
 }

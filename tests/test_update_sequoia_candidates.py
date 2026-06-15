@@ -1,4 +1,8 @@
 import sqlite3
+from datetime import date, datetime
+from types import SimpleNamespace
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -12,6 +16,7 @@ from scripts.update_sequoia_candidates import (
     init_db,
     prune_symbol_row_limit,
     prune_to_latest_trading_days,
+    resolve_cn_resume_target_date,
     upsert_rows,
 )
 
@@ -137,6 +142,26 @@ def test_update_sequoia_candidates_resume_filters_completed_symbols(tmp_path):
 
     assert skipped == 1
     assert pending == ["600002", "600003"]
+
+
+def test_update_sequoia_candidates_resume_target_uses_effective_cn_trading_date():
+    class _FakeCalendar:
+        def is_session(self, check_date):
+            return check_date == date(2026, 6, 12)
+
+        def date_to_session(self, check_date, direction="previous"):
+            assert check_date == date(2026, 6, 13)
+            assert direction == "previous"
+            return pd.Timestamp(date(2026, 6, 12))
+
+    current_time = datetime(2026, 6, 13, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with patch("src.core.trading_calendar._XCALS_AVAILABLE", True), patch(
+        "src.core.trading_calendar.xcals",
+        SimpleNamespace(get_calendar=lambda _ex: _FakeCalendar()),
+        create=True,
+    ):
+        assert resolve_cn_resume_target_date(current_time) == date(2026, 6, 12)
 
 
 def test_update_sequoia_candidates_detects_baostock_session_expired_errors():

@@ -20,6 +20,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
+from src.agent.llm_telemetry import llm_telemetry_scope
 from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
 from src.schemas.agent_signal import TradeAction, TradePlan
 from src.services.agent_model_service import list_agent_model_deployments
@@ -133,6 +134,8 @@ class AgentTraceRunResponse(BaseModel):
     debate: Optional[Dict[str, Any]] = None
     stock_selection: Optional[Dict[str, Any]] = None
     risk_gate: Optional[Dict[str, Any]] = None
+    llm_telemetry: Optional[Dict[str, Any]] = None
+    judge_sanity: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
     runtime_config: Optional[Dict[str, Any]] = None
 
@@ -931,6 +934,8 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
     stock_selection = _read_trace_json_file(path / "stock_selection.json", None)
     risk_gate = _read_trace_json_file(path / "risk_gate.json", summary.get("risk_gate"))
     debate = _read_trace_json_file(path / "debate.json", None)
+    llm_telemetry = _read_trace_json_file(path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(path)
+    judge_sanity = _read_trace_json_file(path / "judge_sanity.json", None) or _build_judge_sanity_summary(stock_selection)
     events = _read_trace_events(path / "events.ndjson")
     agent_user_context = context_payload.get("agent_user_context") if isinstance(context_payload, dict) else None
     context_summary = (
@@ -955,6 +960,8 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
         "debate": debate,
         "stock_selection": stock_selection,
         "risk_gate": risk_gate,
+        "llm_telemetry": llm_telemetry,
+        "judge_sanity": judge_sanity,
         "artifact_dir": str(path),
         "runtime_config": None,
     }
@@ -1746,10 +1753,126 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "是", "涨停", "跌停"}
+
+
+def _read_llm_telemetry_events(path: Path, *, limit: int = 500) -> List[Dict[str, Any]]:
+    return _read_trace_events(path / "llm_usage.jsonl", limit=limit)
+
+
+def _build_llm_telemetry_summary(path: Path) -> Dict[str, Any]:
+    events = _read_llm_telemetry_events(path)
+    by_stage: Dict[str, Dict[str, Any]] = {}
+    ok_calls = 0
+    failed_calls = 0
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    total_latency_ms = 0.0
+    estimated_cost = 0.0
+
+    for event in events:
+        ok = event.get("ok") is True
+        ok_calls += 1 if ok else 0
+        failed_calls += 0 if ok else 1
+        stage = str(event.get("stage") or "unknown")
+        input_value = _to_int(event.get("input_tokens"))
+        output_value = _to_int(event.get("output_tokens"))
+        total_value = _to_int(event.get("total_tokens")) or input_value + output_value
+        latency_value = _to_float(event.get("latency_ms")) or 0.0
+        cost_value = _to_float(event.get("estimated_cost")) or 0.0
+        input_tokens += input_value
+        output_tokens += output_value
+        total_tokens += total_value
+        total_latency_ms += latency_value
+        estimated_cost += cost_value
+        stage_summary = by_stage.setdefault(stage, {
+            "stage": stage,
+            "calls": 0,
+            "ok_calls": 0,
+            "failed_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "latency_ms": 0.0,
+            "estimated_cost": 0.0,
+        })
+        stage_summary["calls"] += 1
+        stage_summary["ok_calls"] += 1 if ok else 0
+        stage_summary["failed_calls"] += 0 if ok else 1
+        stage_summary["input_tokens"] += input_value
+        stage_summary["output_tokens"] += output_value
+        stage_summary["total_tokens"] += total_value
+        stage_summary["latency_ms"] = round(float(stage_summary["latency_ms"]) + latency_value, 2)
+        stage_summary["estimated_cost"] = round(float(stage_summary["estimated_cost"]) + cost_value, 8)
+
+    total_calls = len(events)
+    return {
+        "schema_version": 1,
+        "events": events[-200:],
+        "total_calls": total_calls,
+        "ok_calls": ok_calls,
+        "failed_calls": failed_calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "total_latency_ms": round(total_latency_ms, 2),
+        "avg_latency_ms": round(total_latency_ms / total_calls, 2) if total_calls else 0.0,
+        "estimated_cost": round(estimated_cost, 8),
+        "by_stage": sorted(by_stage.values(), key=lambda item: str(item.get("stage") or "")),
+    }
+
+
+def _build_judge_sanity_summary(stock_selection: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(stock_selection, dict):
+        return None
+    final_report_json = stock_selection.get("final_report_json") if isinstance(stock_selection.get("final_report_json"), dict) else {}
+    selection_context = stock_selection.get("selection_context") if isinstance(stock_selection.get("selection_context"), dict) else {}
+    stages = selection_context.get("stages") if isinstance(selection_context.get("stages"), dict) else {}
+    judge_stage = (
+        final_report_json.get("judge_decision")
+        if isinstance(final_report_json.get("judge_decision"), dict)
+        else stages.get("judge_decision") if isinstance(stages.get("judge_decision"), dict) else {}
+    )
+    if not isinstance(judge_stage, dict) or not judge_stage:
+        return None
+    full = judge_stage.get("full") if isinstance(judge_stage.get("full"), dict) else {}
+    summary = judge_stage.get("summary") if isinstance(judge_stage.get("summary"), dict) else {}
+    sanity_checks = full.get("sanity_checks") if isinstance(full.get("sanity_checks"), list) else []
+    required_plan_changes = (
+        full.get("required_plan_changes")
+        if isinstance(full.get("required_plan_changes"), list)
+        else []
+    )
+    final_action = (
+        summary.get("final_action")
+        or full.get("final_action")
+        or full.get("action")
+        or ""
+    )
+    primary_plan_verdict = full.get("primary_plan_verdict") or summary.get("primary_plan_verdict") or ""
+    return {
+        "schema_version": 1,
+        "final_action": final_action,
+        "primary_plan_verdict": primary_plan_verdict,
+        "decision_summary": summary.get("decision_summary") or full.get("decision_summary") or "",
+        "reason": full.get("reason") or summary.get("reason") or "",
+        "check_count": len(sanity_checks),
+        "required_change_count": len(required_plan_changes),
+        "sanity_checks": sanity_checks,
+        "required_plan_changes": required_plan_changes,
+        "summary": summary,
+    }
 
 
 class TraceArtifactWriter:
@@ -1898,6 +2021,12 @@ class TraceArtifactWriter:
                     continue
                 safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(stage_name)).strip("._") or "stage"
                 _write_trace_json(self.path / f"{safe_name}.json", stage_payload)
+        llm_telemetry = _build_llm_telemetry_summary(self.path)
+        judge_sanity = _build_judge_sanity_summary(stock_selection)
+        _write_trace_json(self.path / "llm_telemetry.json", llm_telemetry)
+        _write_trace_json(self.path / "judge_sanity.json", judge_sanity)
+        payload["llm_telemetry"] = llm_telemetry
+        payload["judge_sanity"] = judge_sanity
         _write_trace_json(self.path / "summary.json", payload)
         (self.path / "final.md").write_text(final_content or "", encoding="utf-8")
         if context is not None:
@@ -2093,6 +2222,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
     )
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
+    context["session_id"] = session_id
+    context["trace_id"] = session_id
     if skills is not None:
         context["skills"] = skills
     events: List[Dict[str, Any]] = []
@@ -2110,12 +2241,13 @@ async def run_agent_trace(request: AgentTraceRunRequest):
 
     def run_sync():
         executor = _build_executor(config, skills or None)
-        return executor.chat(
-            message=request.message,
-            session_id=session_id,
-            progress_callback=progress_callback,
-            context=context,
-        )
+        with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+            return executor.chat(
+                message=request.message,
+                session_id=session_id,
+                progress_callback=progress_callback,
+                context=context,
+            )
 
     try:
         loop = asyncio.get_running_loop()
@@ -2141,6 +2273,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         context=context,
         tool_calls=normalized_tool_calls,
     )
+    llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
+    judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
 
     return AgentTraceRunResponse(
         success=result.success,
@@ -2160,6 +2294,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         debate=result.debate,
         stock_selection=getattr(result, "stock_selection", None),
         risk_gate=risk_gate,
+        llm_telemetry=llm_telemetry,
+        judge_sanity=judge_sanity,
         artifact_dir=str(artifact_writer.path),
         runtime_config=_build_agent_runtime_config(config),
     )
@@ -2184,6 +2320,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
     queue: asyncio.Queue = asyncio.Queue()
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
+    context["session_id"] = session_id
+    context["trace_id"] = session_id
     if skills is not None:
         context["skills"] = skills
     artifact_writer = TraceArtifactWriter(session_id)
@@ -2228,12 +2366,13 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "runtime_config": _build_agent_runtime_config(config),
             })
             executor = _build_executor(config, skills or None)
-            result = executor.chat(
-                message=request.message,
-                session_id=session_id,
-                progress_callback=progress_callback,
-                context=context,
-            )
+            with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+                result = executor.chat(
+                    message=request.message,
+                    session_id=session_id,
+                    progress_callback=progress_callback,
+                    context=context,
+                )
             _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
             normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
             risk_gate = _build_trace_risk_gate_payload(
@@ -2241,6 +2380,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 context=context,
                 tool_calls=normalized_tool_calls,
             )
+            llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
+            judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
             put_event({
                 "type": "done",
                 "success": result.success,
@@ -2260,6 +2401,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "debate": result.debate,
                 "stock_selection": getattr(result, "stock_selection", None),
                 "risk_gate": risk_gate,
+                "llm_telemetry": llm_telemetry,
+                "judge_sanity": judge_sanity,
                 "artifact_dir": str(artifact_writer.path),
                 "runtime_config": _build_agent_runtime_config(config),
             })

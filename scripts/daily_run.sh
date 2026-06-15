@@ -152,7 +152,7 @@ else
             info "更新后: $(db_stat "$SEQUOIA_DB")"
             mark_done "$STEP1_KEY"
         else
-            warn "更新失败（baostock 不可用），已有 $(db_stat "$SEQUOIA_DB") 仍可用"
+            warn "stock_daily 更新脚本失败，已有 $(db_stat "$SEQUOIA_DB") 仍可用"
             warn "step1 未标记完成，下次续跑会重试"
         fi
     fi

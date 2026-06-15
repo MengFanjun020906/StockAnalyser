@@ -2,7 +2,7 @@
 
 > All English-language documentation for the AI Stock Analysis System.
 > 
-> For Chinese docs, see the [main README](../README.md).
+> For Chinese docs, see the [main README](../../README.md).
 
 ---
 
@@ -11,33 +11,33 @@
 | Document | Description |
 |----------|-------------|
 | [README (EN)](README_EN.md) | Project overview, quick start, features, sample output |
-| [Full Guide (EN)](full-guide_EN.md) | Complete setup and usage walkthrough |
-| [Deploy Guide (EN)](DEPLOY_EN.md) | Server deployment (Docker, systemd, Supervisor) |
-| [LLM Config Guide (EN)](LLM_CONFIG_GUIDE_EN.md) | AI model configuration (Gemini, OpenAI-compatible, DeepSeek, Ollama, etc.) |
+| [Full Guide (EN)](../full-guide_EN.md) | Complete setup and usage walkthrough |
+| [Deploy Guide (EN)](../deployment/DEPLOY_EN.md) | Server deployment (Docker, systemd, Supervisor) |
+| [LLM Config Guide (EN)](../LLM_CONFIG_GUIDE_EN.md) | AI model configuration (Gemini, OpenAI-compatible, DeepSeek, Ollama, etc.) |
 
 ## ❓ Help & Troubleshooting
 
 | Document | Description |
 |----------|-------------|
-| [FAQ (EN)](FAQ_EN.md) | Frequently asked questions and common errors |
+| [FAQ (EN)](../FAQ_EN.md) | Frequently asked questions and common errors |
 
 ## 🤖 Bot Integration
 
 | Document | Description |
 |----------|-------------|
-| [Bot Commands (EN)](bot-command_EN.md) | Bot architecture, commands, webhook routes, Feishu / DingTalk integration |
+| [Bot Commands (EN)](../bot-command_EN.md) | Bot architecture, commands, webhook routes, Feishu / DingTalk integration |
 
 ## 🤝 Contributing
 
 | Document | Description |
 |----------|-------------|
-| [Contributing Guide (EN)](CONTRIBUTING_EN.md) | How to report bugs, request features, and submit pull requests |
+| [Contributing Guide (EN)](../CONTRIBUTING_EN.md) | How to report bugs, request features, and submit pull requests |
 
 ## 📋 Reference
 
 | Document | Description |
 |----------|-------------|
-| [Changelog](CHANGELOG.md) | Version history and release notes (maintained in Chinese with English summaries) |
+| [Changelog](../CHANGELOG.md) | Version history and release notes (maintained in Chinese with English summaries) |
 
 ---
 
@@ -61,4 +61,4 @@ Some terms in this project are specific to Chinese financial markets. Here is a 
 
 ---
 
-*Last updated: see [CHANGELOG.md](CHANGELOG.md)*
+*Last updated: see [CHANGELOG.md](../CHANGELOG.md)*

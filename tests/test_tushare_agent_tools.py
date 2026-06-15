@@ -8,6 +8,7 @@ import pandas as pd
 
 from src.agent.tools.data_tools import (
     ALL_DATA_TOOLS,
+    _handle_get_board_capital_flow,
     _handle_get_margin_trading_summary,
     _handle_get_tushare_block_trade,
     _handle_get_tushare_dragon_tiger_inst,
@@ -38,6 +39,7 @@ from src.agent.tools.data_tools import (
     _handle_get_tushare_pledge_stat,
     _handle_get_tushare_repurchase,
     _handle_get_tushare_share_float,
+    _handle_get_tushare_stk_factor,
     _handle_get_tushare_stock_alerts,
     _handle_get_tushare_stock_shock,
     _handle_get_tushare_ths_member,
@@ -464,6 +466,44 @@ def _fake_query(api_name, params=None, fields="", timeout=30):
         return pd.DataFrame([{"ts_code": "600519.SH", "ann_date": "20260508", "cash_div": 30.0, "record_date": "20260601", "ex_date": "20260602"}])
     if api_name == "adj_factor":
         return pd.DataFrame([{"ts_code": "600519.SH", "trade_date": "20260508", "adj_factor": 12.34}])
+    if api_name == "stk_factor":
+        return pd.DataFrame([{
+            "ts_code": (params or {}).get("ts_code", "600519.SH"),
+            "trade_date": "20260508",
+            "close": 1688.0,
+            "open": 1660.0,
+            "high": 1699.0,
+            "low": 1650.0,
+            "pre_close": 1658.0,
+            "change": 30.0,
+            "pct_change": 1.81,
+            "vol": 10000.0,
+            "amount": 1688000.0,
+            "adj_factor": 12.34,
+            "open_hfq": 20000.0,
+            "open_qfq": 1660.0,
+            "close_hfq": 20200.0,
+            "close_qfq": 1688.0,
+            "high_hfq": 20300.0,
+            "high_qfq": 1699.0,
+            "low_hfq": 19800.0,
+            "low_qfq": 1650.0,
+            "pre_close_hfq": 19900.0,
+            "pre_close_qfq": 1658.0,
+            "macd_dif": 1.2,
+            "macd_dea": 0.8,
+            "macd": 0.4,
+            "kdj_k": 72.0,
+            "kdj_d": 64.0,
+            "kdj_j": 88.0,
+            "rsi_6": 61.0,
+            "rsi_12": 58.0,
+            "rsi_24": 55.0,
+            "boll_upper": 1710.0,
+            "boll_mid": 1600.0,
+            "boll_lower": 1490.0,
+            "cci": 120.0,
+        }])
     if api_name == "index_daily":
         return pd.DataFrame([{"ts_code": "000300.SH", "trade_date": "20260508", "close": 4000.0, "pct_chg": 1.0}])
     if api_name == "margin":
@@ -602,6 +642,7 @@ def test_get_tushare_sector_moneyflow_tools_normalize_board_rows():
         ths = _handle_get_tushare_moneyflow_ind_ths(limit=2)
         dc = _handle_get_tushare_moneyflow_ind_dc(limit=2)
         cnt = _handle_get_tushare_moneyflow_cnt_ths(limit=2)
+        unified = _handle_get_board_capital_flow(limit=2)
         members = _handle_get_tushare_ths_member(ts_code="885001.TI", limit=2)
 
     assert ths["status"] == "ok"
@@ -613,8 +654,51 @@ def test_get_tushare_sector_moneyflow_tools_normalize_board_rows():
     assert cnt["api_name"] == "moneyflow_cnt_ths"
     assert cnt["items"][0]["name"] == "人工智能"
     assert cnt["items"][0]["net_inflow"] == 300000000.0
+    assert unified["api_name"] == "board_capital_flow"
+    assert unified["status"] == "ok"
+    assert unified["selected_flow_source"] == "tushare_moneyflow_ind_dc"
+    assert unified["amount_unit"] == "CNY"
+    assert "tushare_moneyflow_ind_dc" in unified["flow_sources"]
+    assert "tushare_moneyflow_ind_ths" in unified["flow_sources"]
+    assert "tushare_moneyflow_cnt_ths" in unified["flow_sources"]
+    assert unified["selected_top_boards"][0]["name"] == "白酒"
+    assert unified["selected_top_boards"][0]["main_net_inflow"] == 300000000.0
+    assert "DC, THS industry, and THS concept" in unified["notes"][0]
     assert members["api_name"] == "ths_member"
     assert [item["code"] for item in members["items"]] == ["600519", "600000"]
+
+
+def test_get_tushare_moneyflow_ind_ths_accepts_date_range_params():
+    seen = []
+
+    def capture(api_name, params=None, fields="", timeout=30):
+        seen.append((api_name, dict(params or {}), fields))
+        return _fake_query(api_name, params=params, fields=fields, timeout=timeout)
+
+    with patch("data_provider.tushare_client.query_tushare_api", side_effect=capture), \
+            patch("data_provider.tushare_client.get_tushare_http_url", return_value="http://unit/"):
+        result = _handle_get_tushare_moneyflow_ind_ths(
+            ts_code="881273.TI",
+            start_date="2024-09-01",
+            end_date="2024-09-27",
+            limit=5,
+        )
+
+    assert [call[0] for call in seen] == ["moneyflow_ind_ths"]
+    assert seen[0][1]["ts_code"] == "881273.TI"
+    assert seen[0][1]["start_date"] == "20240901"
+    assert seen[0][1]["end_date"] == "20240927"
+    assert result["api_name"] == "moneyflow_ind_ths"
+    assert result["start_date"] == "20240901"
+    assert result["end_date"] == "20240927"
+
+
+def test_tushare_board_capital_flow_tools_are_registered():
+    names = {tool.name for tool in ALL_DATA_TOOLS}
+    assert "get_tushare_moneyflow_ind_ths" in names
+    assert "get_tushare_moneyflow_ind_dc" in names
+    assert "get_tushare_moneyflow_cnt_ths" in names
+    assert "get_board_capital_flow" in names
 
 
 def test_get_tushare_dragon_tiger_list_normalizes_rows():
@@ -696,6 +780,7 @@ def test_get_tushare_event_fundamental_and_technical_tools_query_expected_apis()
         dividend = _handle_get_tushare_dividend(stock_code="600519", limit=1)
         dividend_missing = _handle_get_tushare_dividend(limit=1)
         adj = _handle_get_tushare_adj_factor(stock_code="600519", trade_date="20260508", limit=1)
+        factors = _handle_get_tushare_stk_factor(stock_code="600519", start_date="20260501", end_date="20260508", limit=5)
         index_daily = _handle_get_tushare_index_daily(index_code="000300", trade_date="20260508", limit=1)
         index_daily_alias = _handle_get_tushare_index_daily(ts_code="000300.SH", trade_date="20260508", limit=1)
         trade_cal = _handle_get_tushare_trade_calendar(start_date="20260501", end_date="20260508", limit=2)
@@ -722,6 +807,14 @@ def test_get_tushare_event_fundamental_and_technical_tools_query_expected_apis()
     assert dividend["api_name"] == "dividend"
     assert dividend_missing["status"] == "failed"
     assert adj["api_name"] == "adj_factor"
+    assert factors["api_name"] == "stk_factor"
+    assert factors["stock_code"] == "600519"
+    assert factors["ts_code"] == "600519.SH"
+    assert factors["latest"]["macd"] == 0.4
+    assert factors["latest"]["kdj_j"] == 88.0
+    assert factors["latest"]["rsi_6"] == 61.0
+    assert factors["latest"]["boll_upper"] == 1710.0
+    assert "front-adjusted prices" in factors["notes"][0]
     assert index_daily["api_name"] == "index_daily"
     assert index_daily_alias["index_code"] == "000300.SH"
     assert trade_cal["api_name"] == "trade_cal"
@@ -816,3 +909,27 @@ def test_get_tushare_stock_connect_margin_and_block_tools_normalize_rows():
     assert block["api_name"] == "block_trade"
     assert block["items"][0]["code"] == "600519"
     assert block["items"][0]["amount"] == 16800000.0
+
+
+def test_get_tushare_moneyflow_mkt_dc_accepts_date_range_params():
+    seen = []
+
+    def capture(api_name, params=None, fields="", timeout=30):
+        seen.append((api_name, dict(params or {}), fields))
+        return _fake_query(api_name, params=params, fields=fields, timeout=timeout)
+
+    with patch("data_provider.tushare_client.query_tushare_api", side_effect=capture), \
+            patch("data_provider.tushare_client.get_tushare_http_url", return_value="http://unit/"):
+        result = _handle_get_tushare_moneyflow_mkt_dc(
+            start_date="2024-09-01",
+            end_date="2024-09-30",
+            limit=10,
+        )
+
+    assert [call[0] for call in seen] == ["moneyflow_mkt_dc"]
+    assert seen[0][1]["start_date"] == "20240901"
+    assert seen[0][1]["end_date"] == "20240930"
+    assert result["api_name"] == "moneyflow_mkt_dc"
+    assert result["start_date"] == "20240901"
+    assert result["end_date"] == "20240930"
+    assert result["items"][0]["net_amount"] == 200000000.0

@@ -411,14 +411,15 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 
 - `portfolio_context` -> `get_portfolio_snapshot`
 - `realtime_quote` -> `get_realtime_quote`
-- `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure`
+- `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_tushare_stk_factor`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure`
 - `news_event` -> `search_comprehensive_intel`, `search_stock_news`, `score_stock_news_sentiment`
-- `capital_flow` -> `get_capital_flow`, `get_market_capital_flow`, `get_northbound_capital_flow`, `get_margin_trading_summary`
-- `get_capital_flow` 字段语义必须保留：`main_net_inflow/main_inflow_5d/main_inflow_10d` 是大单+特大单主力口径；`net_inflow/net_inflow_5d/net_inflow_10d` 是 Tushare `net_mf_amount` 全口径主动净流入，不能写成主力资金。
+- `capital_flow` -> `get_capital_flow`, `get_board_capital_flow`, `get_market_capital_flow`, `get_tushare_moneyflow_mkt_dc`, `get_northbound_capital_flow`, `get_margin_trading_summary`
+- `get_capital_flow` 字段语义必须保留：先看 `selected_flow_source`、`main_inflow_definition`、`net_inflow_definition`，不能把 DC、THS、legacy moneyflow 数值当同一统计定义混写。
+- `get_board_capital_flow` 是板块资金统一入口：`flow_sources` 保留 DC 行业/概念/地域、THS 行业、THS 概念的不同统计口径，不能把三套来源的排名和金额当同一来源直接相加。
 - StockAPI 增强工具按需调用，不属于资金面默认全量必查：`get_stockapi_hot_sectors` 用于热点板块/概念资金确认；`get_stockapi_sector_constituents` 和 `get_stockapi_sector_flow_history` 仅在已有 `bkCode` 后展开；`get_stockapi_limit_up_pool` 用于涨停/短线情绪；`get_stockapi_popularity_rank` 用于人气/关注度；`get_stockapi_hot_money_activity` 用于游资或龙虎榜验证。
 - `chip_distribution` -> `get_chip_distribution`
 - `fundamental_analysis` -> `get_stock_info`, `get_tushare_daily_basic`, `get_tushare_financial_indicators`, `get_tushare_financial_statements`
-- `sector_industry` -> `get_market_indices`, `get_sector_rankings`
+- `sector_industry` -> `get_market_indices`, `get_sector_rankings`, `get_board_capital_flow`
 - `regime_detection` -> `detect_market_regime`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`
 - `backtest_memory` -> `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary`
 

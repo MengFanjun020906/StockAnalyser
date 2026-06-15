@@ -171,6 +171,34 @@ tools:
     failure_modes:
       - 历史数据不足时结论弱化。
 
+  - tool: get_tushare_stk_factor
+    priority: 28
+    when_to_use: >-
+      在基本面修复候选上补充技术面确认，核实 MACD/KDJ/RSI/BOLL/CCI 是否支持价格结构从弱转稳。
+      用于避免基本面改善但价格仍处下跌加速。
+    typical_args:
+      stock_code: "{code}"
+      limit: 20
+    returns_summary: >-
+      返回最近交易日技术因子 latest 和历史 items；指标基于前复权价格计算。
+    key_fields:
+      - latest
+      - macd_dif
+      - macd_dea
+      - macd
+      - kdj_k
+      - kdj_d
+      - rsi_6
+      - boll_mid
+      - cci
+    combo_hints:
+      - 基本面改善 + MACD/KDJ 从弱转强 + 价格不在高位 = 修复逻辑更完整。
+      - 基本面好但 RSI/KDJ 过热或 BOLL 上轨透支 = 不追高，改 watch。
+    cost: medium
+    failure_modes:
+      - Tushare stk_factor 基于前复权价格，可能与 pro_bar 动态前复权或本地行情计算不完全一致。
+      - 技术因子只能辅助质量修复，不替代财务改善证据。
+
   - tool: analyze_price_structure
     priority: 30
     when_to_use: >-

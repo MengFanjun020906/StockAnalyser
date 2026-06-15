@@ -451,11 +451,11 @@ def test_stock_selection_report_does_not_promote_weak_wait_or_candidate_score_to
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 三、关键风险与等待确认", 1)[0]
 
     assert "| 机会首选 | 暂无高质量机会标的 |" in markdown
     assert "| 执行首选 | 暂无可执行标的 |" in markdown
-    assert "## 三、深挖结果与等待/排除决策" in recommendation_section
+    assert "## 二、深挖结果与等待/排除决策" in recommendation_section
     assert "### ⏳ 等待确认 1：000568 泸州老窖" in recommendation_section
     assert "### 🥇 首选：000568 泸州老窖" not in recommendation_section
     assert "| 理想入场区间 | 当前不形成可执行买点，仅保留观察条件 |" not in recommendation_section
@@ -525,10 +525,10 @@ def test_stock_selection_final_markdown_keeps_debate_auxiliary():
 
     markdown = render_stock_selection_markdown(report)
 
-    conclusion_block = markdown.split("## 七、辅助审查摘要", 1)[0]
+    conclusion_block = markdown.split("## 五、风控复查摘要", 1)[0]
     assert "组合主结论：候选质量尚可但等待回踩确认。" in conclusion_block
     assert "如果它进入核心原因" not in conclusion_block
-    assert "## 七、辅助审查摘要" in markdown
+    assert "## 五、风控复查摘要" in markdown
     assert "反方审查与 Judge 裁决" not in markdown
     assert "风险三" in markdown
     assert "风险四" not in markdown
@@ -768,7 +768,7 @@ def test_stock_selection_candidate_appendix_sorts_by_entry_score_and_marks_deep_
     }
 
     markdown = render_stock_selection_markdown(report)
-    candidate_section = markdown.split("## 附录一、候选池来源与入池理由", 1)[1].split("## 附录二", 1)[0]
+    candidate_section = markdown.split("## 附录二、候选池来源与入池理由", 1)[1].split("## 附录三", 1)[0]
 
     assert "| 排名 | 股票 | 入池通道 | 入池分 | 深度分析 | 入池理由 | 关注点 |" in candidate_section
     assert candidate_section.index("| 1 | 301183 东田微") < candidate_section.index("| 2 | 000568 泸州老窖")
@@ -865,13 +865,14 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert "选股分析报告：下周可关注候选" in result.final_markdown
     assert "核心推荐结论" in result.final_markdown
     assert "深挖结果与等待/排除决策" in result.final_markdown
-    assert "Execute 证据摘要" in result.final_markdown
+    assert "Execute 证据摘要" not in result.final_markdown
     assert "候选池来源与入池理由" in result.final_markdown or "候选池来源与入池理由" in result.appendix_markdown
     assert "逐股维度证据展开" in result.final_markdown or "逐股维度证据展开" in result.appendix_markdown
     assert "600001 测试一" in result.final_markdown
-    assert "MA5/MA20 多头" in result.final_markdown
-    assert "跌破 9 元支撑" in result.final_markdown
-    assert "capital_flow" in result.final_markdown
+    combined_markdown = result.final_markdown + "\n" + result.appendix_markdown
+    assert "MA5/MA20 多头" in combined_markdown
+    assert "跌破 9 元支撑" in combined_markdown
+    assert "capital_flow" in combined_markdown
     assert result.context.stage_summary("judge_decision")["final_action"] == "wait"
     assert result.context.stages["candidate_discovery"].full_ref == "candidate_discovery.json"
     assert adapter.call_text.call_count == 8
@@ -988,12 +989,12 @@ def test_stock_selection_runs_meta_and_pricing_stages_before_allocation():
     assert any("Meta-Agent / Orchestrator" in prompt for prompt in prompts)
     assert any("点位计算 Agent / 条件单计算层" in prompt for prompt in prompts)
     assert any("Meta/点位计算字段语义" in prompt for prompt in prompts)
-    assert "## 二、Meta-Agent 链路对齐（非推荐排序）" in result.final_markdown
-    assert "字段说明" in result.final_markdown
-    assert "Right_Side_Momentum_High_Exhaustion_Risk" in result.final_markdown
-    assert "点位计算 If-Then 条件单" in result.final_markdown
-    assert "Meta 场景约束" in result.final_markdown
-    assert "点位计算条件单" in result.final_markdown
+    assert "## 附录一、系统推理链路（调试用）" in result.appendix_markdown
+    assert "字段说明" not in result.final_markdown
+    assert "右侧动量，但短线过热" in result.appendix_markdown
+    assert "点位条件单" in result.appendix_markdown
+    assert "Meta 场景约束" not in result.final_markdown
+    assert "点位计算条件单" not in result.final_markdown
     assert "Pricing If-Then" not in result.final_markdown
 
 
@@ -1349,9 +1350,9 @@ def test_stock_selection_recommendation_section_always_shows_deep_dived_candidat
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 三、关键风险与等待确认", 1)[0]
 
-    assert "## 三、深挖结果与等待/排除决策" in recommendation_section
+    assert "## 二、深挖结果与等待/排除决策" in recommendation_section
     assert "### 👀 强观察 1：688127 蓝特光学（候选分 100）" in recommendation_section
     assert "### 👀 强观察 2：603629 利通电子（候选分 100）" in recommendation_section
     assert "### 👀 强观察 3：603256 宏和科技（候选分 100）" in recommendation_section
@@ -1429,17 +1430,96 @@ def test_stock_selection_wait_with_conditions_renders_conditional_entry():
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 三、关键风险与等待确认", 1)[0]
 
-    assert "## 三、推荐排序与入场决策" in recommendation_section
+    assert "## 二、推荐排序与入场决策" in recommendation_section
     assert "| 机会首选 | 688266 泽璟制药-U |" in markdown
     assert "| 执行首选 | 688266 泽璟制药-U（条件触发） |" in markdown
     assert "### ⚡ 条件入场 1：688266 泽璟制药-U（候选分 96）" in recommendation_section
     assert "| 看盘动作 | 条件入场，不是无条件追买 |" in recommendation_section
-    assert "| 明日触发条件 | 竞价强承接且开盘 15 分钟不破分时均线" in recommendation_section
+    assert "| 必要条件 |" in recommendation_section
+    assert "竞价强承接且开盘 15 分钟不破分时均线" in recommendation_section
+    assert "| 加分条件 | 竞价强承接且开盘 15 分钟不破分时均线 |" in recommendation_section
+    assert "| 加分条件 | 满足其一即可：竞价强承接且开盘 15 分钟不破分时均线 |" not in recommendation_section
     assert "| 可试探仓位 | 5%-10% 试探仓" in recommendation_section
     assert "| 禁止追高 | 高开超过 6% 且无回踩不追 |" in recommendation_section
     assert "| 失效条件 | 跌破前一日低点或板块退潮；跌破前一日低点 |" in recommendation_section
+
+
+def test_stock_selection_report_uses_chinese_labels_and_split_entry_conditions():
+    report = {
+        "candidate_discovery": {
+            "summary": {"source_count": 1},
+            "full": {"candidates": [{"code": "603260", "name": "合盛硅业", "source": "alphasift", "signal_score": 96}]},
+        },
+        "candidate_screening": {"summary": {}, "full": {}},
+        "single_stock_deep_dive": {
+            "summary": {},
+            "full": {
+                "results": [
+                    {
+                        "summary": {
+                            "code": "603260",
+                            "name": "合盛硅业",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下；乖离修复至8%以下；MACD金叉；主力资金净流入",
+                            "no_chase_line": "43.50",
+                            "stop_loss": "跌破41.50",
+                            "main_supporting_evidence": ["资金承接持续"],
+                        },
+                        "full": {
+                            "stock": {"code": "603260", "name": "合盛硅业"},
+                            "entry_quality": {
+                                "ideal_entry_zone": "价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下；乖离修复至8%以下；MACD金叉；主力资金净流入",
+                                "failure_condition": "跌破41.50",
+                            },
+                            "key_evidence": ["资金承接持续"],
+                            "missing_evidence": [],
+                        },
+                    }
+                ]
+            },
+        },
+        "portfolio_allocation": {
+            "summary": {"portfolio_action": "wait", "core_reason": "等待条件触发"},
+            "full": {
+                "positions_plan": [
+                    {
+                        "rank": 1,
+                        "code": "603260",
+                        "name": "合盛硅业",
+                        "action": "wait",
+                        "action_strength": "medium",
+                        "execution_mode": "conditional_open",
+                        "initial_position_pct": 0,
+                        "entry_condition": "价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下；乖离修复至8%以下；MACD金叉；主力资金净流入",
+                        "stop_loss_condition": "跌破41.50",
+                    }
+                ]
+            },
+        },
+        "adversarial_review": {"summary": {}, "full": {}},
+        "judge_decision": {
+            "summary": {
+                "primary_plan_verdict": "accept_with_changes",
+                "final_action": "wait",
+                "decision_summary": "条件触发后再执行",
+            },
+            "full": {},
+        },
+    }
+
+    markdown = render_stock_selection_markdown(report)
+    main_report = markdown.split("<!-- APPENDIX_SEPARATOR -->", 1)[0]
+
+    assert "| 最终动作 | 等待 |" in main_report
+    assert "| 裁决 | 有条件采纳 |" in main_report
+    assert "### 字段说明" not in main_report
+    assert "Meta-Agent 链路对齐" not in main_report
+    assert "Execute 证据摘要" not in main_report
+    assert "| 必要条件 | 价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下 |" in main_report
+    assert "| 加分条件 | 满足其一即可：MACD金叉 / 主力资金净流入 |" in main_report
 
 
 def test_stock_selection_headline_and_meta_chain_align_with_deep_dive_body():
@@ -1533,17 +1613,17 @@ def test_stock_selection_headline_and_meta_chain_align_with_deep_dive_body():
     }
 
     markdown = render_stock_selection_markdown(report)
-    observation_pool = markdown.split("### 观察池", 1)[1].split("## 四、Execute 证据摘要", 1)[0]
+    observation_pool = markdown.split("### 观察池", 1)[1].split("## 三、关键风险与等待确认", 1)[0]
 
     assert "| 机会首选 | 300308 中际旭创 |" in markdown
     assert "| 执行首选 | 300308 中际旭创（条件触发） |" in markdown
     assert "| 可观察标的 | 600487 亨通光电 |" in markdown
     assert "| 可观察标的 | 300628 亿联网络 |" not in markdown
     assert "300628 亿联网络" in observation_pool
-    assert "## 二、Meta-Agent 链路对齐（非推荐排序）" in markdown
-    assert "### 链路对齐：300308 中际旭创" in markdown
-    assert "### 链路对齐：600487 亨通光电" in markdown
-    assert "### 链路对齐：603341 龙旗科技" not in markdown
+    assert "## 附录一、系统推理链路（调试用）" in markdown
+    assert "### 300308 中际旭创" in markdown
+    assert "### 600487 亨通光电" in markdown
+    assert "### 603341 龙旗科技" not in markdown
     assert "### 1. 300308 中际旭创" not in markdown
 
 
@@ -2429,8 +2509,12 @@ def test_run_candidate_discovery_tool_uses_committee_when_mode_is_thesis_desk():
     assert event_types[:3] == [
         "selection_candidate_discovery_mode",
         "selection_seed_pool_built",
-        "selection_seed_gate_done",
+        "selection_seed_pool_quality_snapshot",
     ]
+    assert "selection_seed_gate_done" in event_types
+    assert event_types.index("selection_seed_pool_quality_snapshot") < event_types.index(
+        "selection_seed_gate_done",
+    )
     seed_event = next(e for e in events if e.get("type") == "selection_seed_pool_built")
     assert seed_event["payload"]["seed_pool_summary"]["seed_count"] >= 1
     assert seed_event["payload"]["seed_pool_diagnostics"]
@@ -2509,6 +2593,43 @@ def test_seed_pool_quality_snapshot_before_open_uses_previous_seed_date():
     assert kwargs["seed_date"].isoformat() == "2026-06-09"
     assert kwargs["run_id"] == "selection-run:2026-06-09"
     assert kwargs["trace_id"] == "selection-run:2026-06-09"
+    assert kwargs["generated_at"] == fixed_now
+
+
+def test_seed_pool_quality_snapshot_uses_seed_freshness_and_trace_id():
+    ctx = SelectionRunContext(run_id="trace-abc123", user_message="m", candidate_discovery_mode="thesis_desk_committee")
+    payload = {
+        "status": "ok",
+        "seed_pool_summary": {
+            "seed_count": 1,
+            "preview": [
+                {
+                    "code": "002718",
+                    "name": "友邦吊顶",
+                    "source": "daily_screener",
+                    "freshness": "20260611",
+                }
+            ],
+        },
+    }
+
+    service_instance = MagicMock()
+    service_instance.persist_candidate_discovery_snapshot.return_value = {"status": "ok", "snapshot_id": 1}
+    fixed_now = datetime(2026, 6, 12, 14, 20)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is None else fixed_now.replace(tzinfo=tz)
+
+    with patch("src.services.seed_pool_quality_service.SeedPoolQualityService", return_value=service_instance), \
+            patch("src.agent.stock_selection.datetime", FixedDateTime):
+        _persist_seed_pool_quality_snapshot(ctx=ctx, payload=payload, today="20260612")
+
+    kwargs = service_instance.persist_candidate_discovery_snapshot.call_args.kwargs
+    assert kwargs["seed_date"].isoformat() == "2026-06-11"
+    assert kwargs["run_id"] == "trace-abc123:2026-06-11"
+    assert kwargs["trace_id"] == "trace-abc123"
     assert kwargs["generated_at"] == fixed_now
 
 

@@ -581,7 +581,9 @@ def build_pricing_agent_prompt(payload: Dict[str, Any]) -> str:
 2. 如果缺少实时价/ATR/盘口，只能输出 conditional/monitor 计划，并把 data_status 写为 partial。
 3. A 股场景下 Fakeout_Exhaustion 不生成真实做空执行单；只生成退出、回避或风险提示。
 4. 如果 market_regime 为 risk_off / panic / trending_down，Breakout_Continuation 最高只能是 watch/conditional，不得生成 immediate_open。
-5. 每个 scenario 必须包含 condition、action、entry_zone、stop_loss、failure_condition、risk_reward_comment。
+5. 输入中的 market_context.forward_probability 只是后验概率证据，不是买卖信号；low_confidence=true 时只能作为弱证据，不得作为主要开仓理由。
+6. reentry_reference 只能用于解释等待回踩、分批入场或 TRIM 后买回参考；不得把 reentry_price 当作保证成交价或必然到达价。
+7. 每个 scenario 必须包含 condition、action、entry_zone、stop_loss、failure_condition、risk_reward_comment。
 
 {JSON_RULES}
 {COMMON_ENUMS}
@@ -603,6 +605,8 @@ def build_pricing_agent_prompt(payload: Dict[str, Any]) -> str:
         "name": "股票名称",
         "asset_regime": "",
         "data_status": "ok | partial | insufficient_data",
+        "regime_probability": {{"status": "", "brief": "", "windows": {{}}, "reentry_reference": {{}}}},
+        "reentry_reference": {{"reentry_price": null, "low_confidence": true}},
         "scenarios": [
           {{
             "scenario_name": "Breakout_Continuation",

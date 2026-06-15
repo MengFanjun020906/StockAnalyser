@@ -17,6 +17,7 @@ def test_capital_flow_tools_are_registered():
     assert "get_tushare_moneyflow_ind_ths" in registry
     assert "get_tushare_moneyflow_ind_dc" in registry
     assert "get_tushare_moneyflow_cnt_ths" in registry
+    assert "get_board_capital_flow" in registry
     assert "get_tushare_ths_member" in registry
     assert "get_tushare_announcements" in registry
     assert "get_tushare_stock_alerts" in registry
@@ -32,6 +33,7 @@ def test_capital_flow_tools_are_registered():
     assert "get_tushare_express" in registry
     assert "get_tushare_dividend" in registry
     assert "get_tushare_adj_factor" in registry
+    assert "get_tushare_stk_factor" in registry
     assert "get_tushare_index_daily" in registry
     assert "get_tushare_trade_calendar" in registry
     assert "get_tushare_moneyflow_ths" in registry
@@ -55,7 +57,8 @@ def test_capital_flow_tools_are_registered():
     description = tool.description
     assert "main_net_inflow" in description
     assert "net_inflow" in description
-    assert "Do not describe `net_inflow*` as 主力资金" in description
+    assert "selected_flow_source" in description
+    assert "Do not mix DC, THS, and legacy moneyflow values" in description
 
 
 def test_stockapi_market_microstructure_tools_are_registered():

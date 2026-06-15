@@ -21,8 +21,10 @@ EARLY_TURN_DESK_TOOLS: tuple[str, ...] = (
     "analyze_price_structure",
     "analyze_pattern",
     "calculate_ma",
+    "get_tushare_stk_factor",
     "get_volume_analysis",
     "get_capital_flow",
+    "get_tushare_moneyflow_mkt_dc",
     "get_chip_distribution",
     "get_stock_info",
 )
@@ -97,3 +99,18 @@ class EarlyTurnDeskExpert(BaseDeskExpert):
                 primary.append(row)
 
         return primary
+
+    def _ineligible_row_reason(self, row: FeatureRow) -> str:
+        fs = row.fact_sheet
+        if fs is None or fs.range_pct_120 is None:
+            return "低位启动席需要 range_pct_120 位置分位，当前事实包缺少该字段。"
+        if fs.range_pct_120 > self._low_base_range_pct_max:
+            return (
+                "低位启动席只看低位反转，当前 range_pct_120="
+                f"{fs.range_pct_120:.3f} 高于阈值 {self._low_base_range_pct_max:.3f}。"
+            )
+        sources = set(row.recall_sources)
+        flag_kinds = {f.kind for f in row.flags}
+        if not (sources & _TURN_EVIDENCE_SOURCES or flag_kinds & _TURN_EVIDENCE_KINDS):
+            return "低位启动席要求低位且有反转证据，当前缺少 pattern/capital 或 low_base_structure 证据。"
+        return "低位启动席过滤条件未命中。"

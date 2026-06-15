@@ -757,7 +757,7 @@ class Config:
     agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
-    agent_candidate_expert_timeout_seconds: float = 60.0  # Max seconds for one L1 candidate expert discovery packet
+    agent_candidate_expert_timeout_seconds: float = 300.0  # Max seconds for one L1 candidate expert seed packet in development traces
     agent_seed_pool_total_limit: int = 32  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
     agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
     agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
@@ -776,7 +776,7 @@ class Config:
     agent_regime_component_timeout_seconds: float = 25.0  # Max seconds for one market-regime auxiliary component
     agent_tushare_tool_timeout_seconds: float = 20.0  # Max seconds for one Tushare Agent tool request
     agent_seed_fact_max_workers: int = 12  # Max concurrent (seed, tool) workers before thesis desks
-    agent_seed_fact_tool_timeout_seconds: float = 12.0  # Max seconds for one SeedFactPacket tool call
+    agent_seed_fact_tool_timeout_seconds: float = 30.0  # Max seconds for one SeedFactPacket tool call
     agent_seed_fact_tools: List[str] = field(
         default_factory=lambda: [
             "analyze_price_structure",
@@ -1507,7 +1507,7 @@ class Config:
             ),
             agent_candidate_expert_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS'),
-                60.0,
+                300.0,
                 field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
@@ -1602,7 +1602,7 @@ class Config:
             ),
             agent_seed_fact_tool_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS'),
-                12.0,
+                30.0,
                 field_name='AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),

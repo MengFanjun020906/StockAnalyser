@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import concurrent.futures
+import contextvars
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ from src.agent.candidate_experts_v2.schemas import (
     SeedItem,
     SeedSummaryV2,
 )
+from src.agent.llm_telemetry import llm_telemetry_scope
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,17 @@ class BaseDeskExpert(BaseExpert):
         started = time.time()
 
         eligible = self._filter_eligible_rows(rows)
+        eligible_codes = {str(row.code) for row in eligible}
+        filter_diagnostics = [
+            {
+                "source": "desk_filter_excluded_seed",
+                "status": "not_in_scope",
+                "code": row.code,
+                "reason": self._ineligible_row_reason(row),
+            }
+            for row in rows
+            if str(row.code) not in eligible_codes
+        ]
         if not eligible:
             logger.debug("%s: no eligible rows after filtering", self.expert_name)
             packet = ExpertPacketV2(
@@ -106,7 +119,10 @@ class BaseDeskExpert(BaseExpert):
                 seed_summary=SeedSummaryV2(seed_count=0),
                 candidates=[],
                 rejected=[],
-                diagnostics=[{"source": "desk_filter", "status": "no_eligible_rows"}],
+                diagnostics=[
+                    {"source": "desk_filter", "status": "no_eligible_rows"},
+                    *filter_diagnostics,
+                ],
             )
             packet.elapsed_ms = int((time.time() - started) * 1000)
             return packet
@@ -171,6 +187,7 @@ class BaseDeskExpert(BaseExpert):
             row_packets,
             elapsed_ms=int((time.time() - started) * 1000),
             stop_reason=stop_reason,
+            initial_diagnostics=filter_diagnostics,
         )
 
     def _run_one_row_with_timeout(
@@ -185,8 +202,19 @@ class BaseDeskExpert(BaseExpert):
 
         started = time.time()
         worker = copy.copy(self)
+        progress_events: List[Dict[str, Any]] = []
+        worker._progress_events = progress_events
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(worker._run_one_row, row, market=market, regime=regime)
+
+        def _run_worker() -> ExpertPacketV2:
+            with llm_telemetry_scope(
+                stage=f"candidate_discovery:{self.expert_name}",
+                agent_role=self.expert_name,
+                symbol=row.code,
+            ):
+                return worker._run_one_row(row, market=market, regime=regime)
+
+        future = executor.submit(contextvars.copy_context().run, _run_worker)
         try:
             packet = future.result(timeout=max(1.0, timeout_s))
             executor.shutdown(wait=False, cancel_futures=True)
@@ -197,6 +225,7 @@ class BaseDeskExpert(BaseExpert):
                 row,
                 timeout_s=timeout_s,
                 elapsed_ms=int((time.time() - started) * 1000),
+                progress_events=progress_events,
             )
             self._persist_single_row_packet(packet, row=row, market=market, regime=regime)
             return packet
@@ -210,8 +239,46 @@ class BaseDeskExpert(BaseExpert):
         *,
         timeout_s: float,
         elapsed_ms: int,
+        progress_events: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> ExpertPacketV2:
         seed = _seed_from_row(row)
+        progress = [dict(item) for item in (progress_events or []) if isinstance(item, dict)]
+        requested_tools = [
+            str(tool)
+            for item in progress
+            if item.get("phase") == "llm_turn"
+            for tool in (item.get("tools") if isinstance(item.get("tools"), list) else [])
+            if str(tool)
+        ]
+        started_tools = [
+            str(item.get("tool"))
+            for item in progress
+            if item.get("phase") == "tool_call_start" and str(item.get("tool") or "")
+        ]
+        completed_tools = [
+            str(item.get("tool"))
+            for item in progress
+            if item.get("phase") == "tool_call_end" and str(item.get("tool") or "")
+        ]
+        pending_tools = [
+            tool for tool in started_tools if started_tools.count(tool) > completed_tools.count(tool)
+        ]
+        latest_progress = progress[-1] if progress else {}
+        reason_detail = _timeout_reason_detail(
+            requested_tools=requested_tools,
+            started_tools=started_tools,
+            completed_tools=completed_tools,
+            pending_tools=pending_tools,
+            latest_progress=latest_progress,
+        )
+        tool_calls = [
+            {
+                "tool": tool,
+                "status": "requested_before_timeout",
+                "stock_code": row.code,
+            }
+            for tool in requested_tools
+        ]
         return ExpertPacketV2(
             expert=self.expert_name,
             dimension=self.dimension,
@@ -227,9 +294,20 @@ class BaseDeskExpert(BaseExpert):
                     "status": "timeout",
                     "code": row.code,
                     "timeout_s": round(float(timeout_s), 3),
+                    "reason": reason_detail,
+                    "llm_turn_count": sum(1 for item in progress if item.get("phase") == "llm_turn"),
+                    "requested_tools": requested_tools,
+                    "started_tools": started_tools,
+                    "completed_tools": completed_tools,
+                    "pending_tools": pending_tools,
+                    "latest_progress": latest_progress,
                 }
+            ]
+            + progress[-8:],
+            errors=[
+                f"{self.expert_name} seed {row.code} timeout after {timeout_s:.1f}s: {reason_detail}"
             ],
-            errors=[f"{self.expert_name} seed {row.code} timeout after {timeout_s:.1f}s"],
+            tool_calls=tool_calls,
             elapsed_ms=max(0, int(elapsed_ms)),
         )
 
@@ -359,6 +437,7 @@ class BaseDeskExpert(BaseExpert):
         *,
         elapsed_ms: int,
         stop_reason: str = "",
+        initial_diagnostics: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> ExpertPacketV2:
         candidates = []
         rejected: List[Dict[str, Any]] = []
@@ -372,6 +451,7 @@ class BaseDeskExpert(BaseExpert):
                 "stop_reason": stop_reason,
             }
         ]
+        diagnostics.extend(dict(item) for item in (initial_diagnostics or []) if isinstance(item, dict))
         errors: List[str] = []
         source_counts: Dict[str, int] = {}
         source_chain: List[str] = []
@@ -449,6 +529,11 @@ class BaseDeskExpert(BaseExpert):
         apply cheap eligibility criteria with mandatory OR fallback.
         """
         return rows
+
+    def _ineligible_row_reason(self, row: FeatureRow) -> str:
+        """Explain why a row did not enter this desk after local filtering."""
+
+        return f"{self.expert_name} eligibility filter did not match this seed."
 
     # ------------------------------------------------------------------
     # Override: build user message from FeatureRows + FactSheets
@@ -559,6 +644,31 @@ def _seed_from_row(row: FeatureRow) -> SeedItem:
         return SeedItem(source=source, **kwargs)
     except Exception:
         return SeedItem(source="fallback", **kwargs)
+
+
+def _timeout_reason_detail(
+    *,
+    requested_tools: Sequence[str],
+    started_tools: Sequence[str],
+    completed_tools: Sequence[str],
+    pending_tools: Sequence[str],
+    latest_progress: Mapping[str, Any],
+) -> str:
+    if pending_tools:
+        return (
+            "LLM 已返回工具调用，但工具执行未在行级超时前完成；"
+            f"pending_tools={list(dict.fromkeys(pending_tools))}"
+        )
+    if started_tools and len(completed_tools) < len(started_tools):
+        return "LLM 已返回工具调用，部分工具执行未在行级超时前完成。"
+    if requested_tools and not started_tools:
+        return (
+            "LLM 已返回工具调用，但 worker 在线程调度/工具启动前触发行级超时；"
+            f"requested_tools={list(dict.fromkeys(requested_tools))}"
+        )
+    if latest_progress.get("phase") == "llm_turn":
+        return "LLM 已返回但未能在行级超时前完成最终 JSON 闭环。"
+    return "行级超时前没有捕获到 LLM/tool 进度，可能卡在首次 LLM 请求或线程调度。"
 
 
 def _row_packet_hash(row: FeatureRow, *, regime: str) -> str:

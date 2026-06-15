@@ -694,7 +694,7 @@ event_key = lowercase(event_type) + "_" + lowercase(core_subject) + "_" + date_b
 
 ## 22. 补充：与 Evidence Card Protocol 对接
 
-消息面 EvidenceCard 示例（对齐 `agent-evidence-card-protocol.md`）：
+消息面 EvidenceCard 示例（对齐 `architecture/agent-evidence-card-protocol.md`）：
 
 ```json
 {

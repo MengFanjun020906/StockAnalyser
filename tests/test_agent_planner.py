@@ -24,6 +24,7 @@ def test_get_tools_for_capability_filters_missing_registry_tools():
     )
 
     assert plan.tools == ["analyze_trend", "calculate_ma"]
+    assert "get_tushare_stk_factor" in plan.missing_tools
     assert "get_volume_analysis" in plan.missing_tools
     assert "analyze_price_structure" in plan.missing_tools
     assert plan.capability == "technical_analysis"
@@ -34,7 +35,9 @@ def test_get_tools_for_capability_includes_extended_capital_flow_tools():
         "capital_flow",
         tool_registry=_registry(
             "get_capital_flow",
+            "get_board_capital_flow",
             "get_market_capital_flow",
+            "get_tushare_moneyflow_mkt_dc",
             "get_northbound_capital_flow",
             "get_margin_trading_summary",
         ),
@@ -42,7 +45,9 @@ def test_get_tools_for_capability_includes_extended_capital_flow_tools():
 
     assert plan.tools == [
         "get_capital_flow",
+        "get_board_capital_flow",
         "get_market_capital_flow",
+        "get_tushare_moneyflow_mkt_dc",
         "get_northbound_capital_flow",
         "get_margin_trading_summary",
     ]
@@ -102,6 +107,7 @@ def test_build_planning_result_selects_position_review_capabilities():
             "analyze_trend",
             "analyze_price_structure",
             "get_capital_flow",
+            "get_board_capital_flow",
             "get_market_capital_flow",
             "get_northbound_capital_flow",
             "get_margin_trading_summary",
@@ -119,6 +125,7 @@ def test_build_planning_result_selects_position_review_capabilities():
     assert "get_portfolio_snapshot" in result.required_tools
     assert "margin_pressure" in result.risk_checks
     assert "get_market_capital_flow" in result.required_tools
+    assert "get_board_capital_flow" in result.required_tools
     assert "detect_market_regime" in result.required_tools
     assert "analyze_price_structure" in result.required_tools
 

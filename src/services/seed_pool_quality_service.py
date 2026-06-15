@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -140,7 +141,11 @@ class SeedPoolQualityService:
         if not items:
             return {"status": "skipped", "reason": "empty_seed_pool"}
         effective_generated_at = generated_at or datetime.now(CN_TZ)
-        effective_seed_date = seed_date or _parse_seed_date(candidate_discovery) or effective_seed_pool_date(effective_generated_at)
+        effective_seed_date = (
+            seed_date
+            or infer_seed_pool_snapshot_date(candidate_discovery)
+            or effective_seed_pool_date(effective_generated_at)
+        )
         outcomes = _extract_desk_outcomes_by_code(candidate_discovery)
         summary = candidate_discovery.get("seed_pool_summary") if isinstance(candidate_discovery.get("seed_pool_summary"), dict) else {}
         diagnostics = candidate_discovery.get("seed_pool_diagnostics") if isinstance(candidate_discovery.get("seed_pool_diagnostics"), list) else []
@@ -444,7 +449,7 @@ def _resolve_seed_stock_name(code: str, item: Dict[str, Any]) -> str:
 
 
 def _extract_desk_outcomes_by_code(payload: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    result: Dict[str, List[Dict[str, Any]]] = {}
+    result: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for packet in payload.get("thesis_desk_packets") or []:
         if not isinstance(packet, dict):
             continue
@@ -461,7 +466,7 @@ def _extract_desk_outcomes_by_code(payload: Dict[str, Any]) -> Dict[str, List[Di
                 code = _normalize_code(row.get("code") or row.get("stock_code"))
                 if not code:
                     continue
-                result.setdefault(code, []).append({
+                _put_desk_outcome(result, code, {
                     "desk": desk,
                     "status": status,
                     "stance": row.get("stance") or stance_default,
@@ -472,21 +477,45 @@ def _extract_desk_outcomes_by_code(payload: Dict[str, Any]) -> Dict[str, List[Di
                     "metrics": row.get("metrics") or {},
                     "errors": row.get("errors") or packet.get("errors") or [],
                     "elapsed_ms": elapsed_ms,
-                })
+                }, priority=30)
         for row in packet.get("per_seed_packets") or []:
             if not isinstance(row, dict):
                 continue
-            if row.get("candidates") or row.get("rejected"):
-                continue
             code = _normalize_code(_per_seed_packet_code(row))
+            emitted_nested = False
+            for key, stance_default, decision_default in (
+                ("candidates", "support", "accepted"),
+                ("rejected", "oppose", "rejected"),
+            ):
+                for nested in row.get(key) or []:
+                    if not isinstance(nested, dict):
+                        continue
+                    nested_code = _normalize_code(nested.get("code") or nested.get("stock_code") or code)
+                    if not nested_code:
+                        continue
+                    emitted_nested = True
+                    _put_desk_outcome(result, nested_code, {
+                        "desk": desk,
+                        "status": str(row.get("status") or status or "unknown"),
+                        "stance": nested.get("stance") or stance_default,
+                        "decision": nested.get("decision") or decision_default,
+                        "reason": nested.get("reason") or nested.get("summary") or nested.get("reject_reason") or "",
+                        "risks": nested.get("risks") or nested.get("risk_factors") or [],
+                        "evidence": nested.get("evidence") or [],
+                        "metrics": nested.get("metrics") or {},
+                        "errors": nested.get("errors") or row.get("errors") or packet.get("errors") or [],
+                        "elapsed_ms": row.get("elapsed_ms") or elapsed_ms,
+                    }, priority=25)
+            if emitted_nested:
+                continue
             if not code:
                 continue
             status_text = str(row.get("status") or status or "unknown")
             diagnostics = [item for item in row.get("diagnostics") or [] if isinstance(item, dict)]
             errors = [str(item) for item in row.get("errors") or [] if str(item)]
-            if code in result and any(str(item.get("desk") or "") == desk for item in result.get(code, [])):
+            if desk in result.get(code, {}):
                 continue
-            result.setdefault(code, []).append({
+            _put_desk_outcome(result, code, {
                 "desk": desk,
                 "status": status_text,
                 "stance": "missing",
@@ -497,7 +526,7 @@ def _extract_desk_outcomes_by_code(payload: Dict[str, Any]) -> Dict[str, List[Di
                 "metrics": {},
                 "errors": errors or packet.get("errors") or [],
                 "elapsed_ms": row.get("elapsed_ms") or elapsed_ms,
-            })
+            }, priority=10)
     candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
     for cand in candidates:
         if not isinstance(cand, dict):
@@ -505,7 +534,7 @@ def _extract_desk_outcomes_by_code(payload: Dict[str, Any]) -> Dict[str, List[Di
         code = _normalize_code(cand.get("code") or cand.get("stock_code"))
         stance_items = (cand.get("stance_by_desk") or {}).items() if isinstance(cand.get("stance_by_desk"), dict) else []
         for desk, stance in stance_items:
-            result.setdefault(code, []).append({
+            _put_desk_outcome(result, code, {
                 "desk": str(desk),
                 "status": "ok",
                 "stance": str(stance),
@@ -515,8 +544,53 @@ def _extract_desk_outcomes_by_code(payload: Dict[str, Any]) -> Dict[str, List[Di
                 "evidence": cand.get("evidence") or [],
                 "metrics": cand.get("metrics") or {},
                 "errors": [],
-            })
-    return result
+            }, priority=20)
+    return {
+        code: [_strip_internal_outcome_fields(outcome) for outcome in outcomes.values()]
+        for code, outcomes in result.items()
+    }
+
+
+def _put_desk_outcome(
+    result: Dict[str, Dict[str, Dict[str, Any]]],
+    code: str,
+    outcome: Dict[str, Any],
+    *,
+    priority: int,
+) -> None:
+    desk = str(outcome.get("desk") or outcome.get("expert") or "unknown")
+    if not code or not desk:
+        return
+    normalized = dict(outcome)
+    normalized["desk"] = desk
+    normalized["_source_priority"] = priority
+    by_desk = result.setdefault(code, {})
+    existing = by_desk.get(desk)
+    if existing is None or _desk_outcome_score(normalized) > _desk_outcome_score(existing):
+        by_desk[desk] = normalized
+
+
+def _desk_outcome_score(outcome: Dict[str, Any]) -> int:
+    stance = str(outcome.get("stance") or "")
+    decision = str(outcome.get("decision") or "")
+    score = int(outcome.get("_source_priority") or 0)
+    if stance and stance not in {"missing", "not_in_scope"}:
+        score += 20
+    if decision and decision not in {"missing", "not_evaluated"}:
+        score += 10
+    if str(outcome.get("reason") or "").strip():
+        score += 15
+    if outcome.get("evidence"):
+        score += 5
+    if outcome.get("risks"):
+        score += 3
+    if outcome.get("errors"):
+        score += 1
+    return score
+
+
+def _strip_internal_outcome_fields(outcome: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in outcome.items() if not str(key).startswith("_")}
 
 
 def _per_seed_packet_code(row: Dict[str, Any]) -> str:
@@ -548,7 +622,9 @@ def _per_seed_packet_reason(row: Dict[str, Any], *, code: str, desk: str) -> str
     return f"{desk} 对 {code} 未产出 candidates/rejected 结构化结论，状态 {status}。"
 
 
-def _parse_seed_date(payload: Dict[str, Any]) -> Optional[date]:
+def infer_seed_pool_snapshot_date(payload: Dict[str, Any]) -> Optional[date]:
+    """Infer the trading date represented by a seed-pool payload."""
+
     for value in (
         payload.get("seed_date"),
         payload.get("trade_date"),
@@ -557,6 +633,29 @@ def _parse_seed_date(payload: Dict[str, Any]) -> Optional[date]:
         parsed = _parse_date(value)
         if parsed:
             return parsed
+    seed_dates: List[date] = []
+    for item in _extract_seed_items(payload):
+        parsed = _infer_seed_date_from_item(item)
+        if parsed:
+            seed_dates.append(parsed)
+    if not seed_dates:
+        return None
+    counts = Counter(seed_dates)
+    return sorted(counts.items(), key=lambda pair: (pair[1], pair[0]), reverse=True)[0][0]
+
+
+def _infer_seed_date_from_item(item: Dict[str, Any]) -> Optional[date]:
+    for key in ("seed_date", "trade_date", "as_of", "freshness", "date", "target_date"):
+        parsed = _parse_date(item.get(key))
+        if parsed:
+            return parsed
+    for signal in item.get("trigger_signals") or []:
+        if not isinstance(signal, dict):
+            continue
+        for key in ("seed_date", "trade_date", "as_of", "freshness", "date", "target_date"):
+            parsed = _parse_date(signal.get(key))
+            if parsed:
+                return parsed
     return None
 
 

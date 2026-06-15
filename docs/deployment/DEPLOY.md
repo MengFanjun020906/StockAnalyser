@@ -57,7 +57,7 @@ docker-compose -f ./docker/docker-compose.yml ps
 
 启动成功后，在浏览器输入 `http://服务器公网IP:8000` 即可打开 Web 管理界面。如果打不开，记得先在云服务器控制台的「安全组」里放行 8000 端口。
 
-> 不知道怎么访问？→ [云服务器 Web 界面访问指南](deploy-webui-cloud.md)
+> 不知道怎么访问？→ [云服务器 Web 界面访问指南](./deploy-webui-cloud.md)
 
 ### 4. 常用管理命令
 
@@ -136,7 +136,7 @@ python main.py --webui-only
 python main.py --webui
 ```
 
-> 不知道怎么访问？→ [云服务器 Web 界面访问指南](deploy-webui-cloud.md)
+> 不知道怎么访问？→ [云服务器 Web 界面访问指南](./deploy-webui-cloud.md)
 
 ---
 
@@ -484,7 +484,7 @@ A: 每次运行约 2-5 分钟，一个月 22 个工作日 = 44-110 分钟，远�
 
 ## 🌐 云服务器上部署了，但不知道怎么用浏览器访问？
 
-详见 → [云服务器 Web 界面访问指南](deploy-webui-cloud.md)
+详见 → [云服务器 Web 界面访问指南](./deploy-webui-cloud.md)
 
 涵盖：直接部署和 Docker 两种方式的启动与访问、安全组/防火墙配置、常见问题排查、Nginx 反向代理（可选）。
 

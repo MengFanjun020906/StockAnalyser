@@ -58,20 +58,33 @@ class TestFundamentalAdapter(unittest.TestCase):
     def test_capital_flow_fails_when_tushare_and_stockapi_both_fail(self) -> None:
         adapter = AkshareFundamentalAdapter()
 
-        with patch.object(adapter, "_get_tushare_capital_flow", return_value=({}, None, ["tushare_moneyflow:failed"])), \
+        with patch.object(adapter, "_get_tushare_moneyflow_dc_capital_flow", return_value=({}, None, ["tushare_moneyflow_dc:failed"])), \
+                patch.object(adapter, "_get_tushare_moneyflow_ths_capital_flow", return_value=({}, None, ["tushare_moneyflow_ths:failed"])), \
+                patch.object(adapter, "_get_tushare_capital_flow", return_value=({}, None, ["tushare_moneyflow:failed"])), \
                 patch.object(adapter, "_get_stockapi_capital_flow", return_value=({}, None, ["stockapi_codeFlow:failed"])), \
                 patch.object(adapter, "_call_df_candidates") as mock_akshare:
             result = adapter.get_capital_flow("300456")
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["stock_flow"], {})
-        self.assertEqual(result["errors"], ["tushare_moneyflow:failed", "stockapi_codeFlow:failed"])
+        self.assertEqual(
+            result["errors"],
+            ["tushare_moneyflow_dc:failed", "tushare_moneyflow_ths:failed", "tushare_moneyflow:failed", "stockapi_codeFlow:failed"],
+        )
         mock_akshare.assert_not_called()
 
     def test_capital_flow_not_supported_for_non_a_share_without_eastmoney(self) -> None:
         adapter = AkshareFundamentalAdapter()
 
         with patch.object(
+            adapter,
+            "_get_tushare_moneyflow_dc_capital_flow",
+            return_value=({}, None, ["tushare_moneyflow_dc:not_supported:HK.00700"]),
+        ), patch.object(
+            adapter,
+            "_get_tushare_moneyflow_ths_capital_flow",
+            return_value=({}, None, ["tushare_moneyflow_ths:not_supported:HK.00700"]),
+        ), patch.object(
             adapter,
             "_get_tushare_capital_flow",
             return_value=({}, None, ["tushare_moneyflow:not_supported:HK.00700"]),
@@ -86,13 +99,71 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["stock_flow"], {})
         self.assertEqual(
             result["errors"],
-            ["tushare_moneyflow:not_supported:HK.00700", "stockapi_codeFlow:not_supported:HK.00700"],
+            [
+                "tushare_moneyflow_dc:not_supported:HK.00700",
+                "tushare_moneyflow_ths:not_supported:HK.00700",
+                "tushare_moneyflow:not_supported:HK.00700",
+                "stockapi_codeFlow:not_supported:HK.00700",
+            ],
         )
         mock_akshare.assert_not_called()
 
-    def test_capital_flow_prefers_tushare_moneyflow(self) -> None:
+    def test_capital_flow_prefers_tushare_moneyflow_dc_and_keeps_sources(self) -> None:
         adapter = AkshareFundamentalAdapter()
-        tushare_df = pd.DataFrame([
+        dc_df = pd.DataFrame([
+            {
+                "trade_date": "20260507",
+                "ts_code": "600004.SH",
+                "name": "样例股份",
+                "pct_change": 1.2,
+                "close": 10.5,
+                "net_amount": 200.0,
+                "net_amount_rate": 3.5,
+                "buy_elg_amount": 80.0,
+                "buy_elg_amount_rate": 1.4,
+                "buy_lg_amount": 60.0,
+                "buy_lg_amount_rate": 1.1,
+                "buy_md_amount": 20.0,
+                "buy_md_amount_rate": 0.3,
+                "buy_sm_amount": -10.0,
+                "buy_sm_amount_rate": -0.2,
+            },
+            {
+                "trade_date": "20260508",
+                "ts_code": "600004.SH",
+                "name": "样例股份",
+                "pct_change": 2.0,
+                "close": 10.8,
+                "net_amount": 300.0,
+                "net_amount_rate": 4.5,
+                "buy_elg_amount": 100.0,
+                "buy_elg_amount_rate": 1.7,
+                "buy_lg_amount": 50.0,
+                "buy_lg_amount_rate": 0.9,
+                "buy_md_amount": 30.0,
+                "buy_md_amount_rate": 0.5,
+                "buy_sm_amount": -20.0,
+                "buy_sm_amount_rate": -0.4,
+            },
+        ])
+        ths_df = pd.DataFrame([
+            {
+                "trade_date": "20260508",
+                "ts_code": "600004.SH",
+                "name": "样例股份",
+                "pct_change": 2.0,
+                "latest": 10.8,
+                "net_amount": 88.0,
+                "net_d5_amount": 288.0,
+                "buy_lg_amount": 66.0,
+                "buy_lg_amount_rate": 1.0,
+                "buy_md_amount": 11.0,
+                "buy_md_amount_rate": 0.2,
+                "buy_sm_amount": -3.0,
+                "buy_sm_amount_rate": -0.1,
+            }
+        ])
+        legacy_df = pd.DataFrame([
             {
                 "trade_date": "20260506",
                 "net_mf_amount": 100.0,
@@ -119,12 +190,131 @@ class TestFundamentalAdapter(unittest.TestCase):
             },
         ])
 
-        with patch("data_provider.fundamental_adapter.query_tushare_api", return_value=tushare_df), \
+        def _query(api_name, **_kwargs):
+            if api_name == "moneyflow_dc":
+                return dc_df
+            if api_name == "moneyflow_ths":
+                return ths_df
+            if api_name == "moneyflow":
+                return legacy_df
+            raise AssertionError(api_name)
+
+        with patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=_query), \
                 patch.object(adapter, "_get_stockapi_capital_flow") as stockapi_mock, \
                 patch.object(adapter, "_call_df_candidates") as mock_akshare:
             result = adapter.get_capital_flow("600004")
 
         self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"]["selected_flow_source"], "tushare_moneyflow_dc")
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 3000000.0)
+        self.assertEqual(result["stock_flow"]["main_inflow_5d"], 5000000.0)
+        self.assertEqual(result["stock_flow"]["main_inflow_10d"], 5000000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow"], 1500000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow_5d"], 2900000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow_10d"], 2900000.0)
+        self.assertEqual(result["stock_flow"]["inflow_5d"], 5000000.0)
+        self.assertEqual(result["stock_flow"]["inflow_10d"], 5000000.0)
+        self.assertEqual(result["stock_flow"]["extra_large_net_inflow"], 1000000.0)
+        self.assertEqual(result["stock_flow"]["large_net_inflow"], 500000.0)
+        self.assertEqual(result["stock_flow"]["amount_unit"], "CNY")
+        self.assertEqual(result["stock_flow"]["raw_amount_unit"], "10k CNY")
+        self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
+        self.assertEqual(result["stock_flow"]["source_update"], "tushare_moneyflow_dc_after_market_close")
+        self.assertIn("moneyflow_dc.net_amount", result["stock_flow"]["main_inflow_definition"])
+        self.assertIn("tushare_moneyflow_dc", result["stock_flow"]["flow_sources"])
+        self.assertIn("tushare_moneyflow_ths", result["stock_flow"]["flow_sources"])
+        self.assertIn("tushare_moneyflow", result["stock_flow"]["flow_sources"])
+        self.assertIn("capital_stock:tushare_moneyflow_dc", result["source_chain"])
+        self.assertEqual(result["errors"], [])
+        stockapi_mock.assert_not_called()
+        mock_akshare.assert_not_called()
+
+    def test_capital_flow_uses_ths_when_dc_is_unavailable(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        ths_df = pd.DataFrame([
+            {
+                "trade_date": "20260508",
+                "ts_code": "600004.SH",
+                "name": "样例股份",
+                "pct_change": 2.0,
+                "latest": 10.8,
+                "net_amount": 88.0,
+                "net_d5_amount": 288.0,
+                "buy_lg_amount": 66.0,
+                "buy_lg_amount_rate": 1.0,
+                "buy_md_amount": 11.0,
+                "buy_md_amount_rate": 0.2,
+                "buy_sm_amount": -3.0,
+                "buy_sm_amount_rate": -0.1,
+            }
+        ])
+
+        def _query(api_name, **_kwargs):
+            if api_name == "moneyflow_dc":
+                raise RuntimeError("no dc permission")
+            if api_name == "moneyflow_ths":
+                return ths_df
+            if api_name == "moneyflow":
+                raise RuntimeError("legacy unavailable")
+            raise AssertionError(api_name)
+
+        with patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=_query), \
+                patch.object(adapter, "_get_stockapi_capital_flow") as stockapi_mock:
+            result = adapter.get_capital_flow("600004")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"]["selected_flow_source"], "tushare_moneyflow_ths")
+        self.assertEqual(result["stock_flow"]["main_net_inflow"], 660000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow"], 880000.0)
+        self.assertEqual(result["stock_flow"]["net_inflow_5d"], 2880000.0)
+        self.assertIn("moneyflow_ths.buy_lg_amount", result["stock_flow"]["main_inflow_definition"])
+        self.assertIn("tushare_moneyflow_dc:RuntimeError:no dc permission", result["errors"])
+        stockapi_mock.assert_not_called()
+
+    def test_capital_flow_uses_legacy_moneyflow_when_dc_and_ths_unavailable(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        legacy_df = pd.DataFrame([
+            {
+                "trade_date": "20260506",
+                "net_mf_amount": 100.0,
+                "buy_lg_amount": 20.0,
+                "sell_lg_amount": 15.0,
+                "buy_elg_amount": 8.0,
+                "sell_elg_amount": 3.0,
+            },
+            {
+                "trade_date": "20260507",
+                "net_mf_amount": -20.0,
+                "buy_lg_amount": 10.0,
+                "sell_lg_amount": 12.0,
+                "buy_elg_amount": 1.0,
+                "sell_elg_amount": 4.0,
+            },
+            {
+                "trade_date": "20260508",
+                "net_mf_amount": 30.0,
+                "buy_lg_amount": 7.0,
+                "sell_lg_amount": 8.0,
+                "buy_elg_amount": 5.0,
+                "sell_elg_amount": 1.0,
+            },
+        ])
+
+        def _query(api_name, **_kwargs):
+            if api_name == "moneyflow_dc":
+                raise RuntimeError("no dc permission")
+            if api_name == "moneyflow_ths":
+                raise RuntimeError("no ths permission")
+            if api_name == "moneyflow":
+                return legacy_df
+            raise AssertionError(api_name)
+
+        with patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=_query), \
+                patch.object(adapter, "_get_stockapi_capital_flow") as stockapi_mock:
+            result = adapter.get_capital_flow("600004")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["stock_flow"]["selected_flow_source"], "tushare_moneyflow")
         self.assertEqual(result["stock_flow"]["net_inflow"], 300000.0)
         self.assertEqual(result["stock_flow"]["net_inflow_5d"], 1100000.0)
         self.assertEqual(result["stock_flow"]["net_inflow_10d"], 1100000.0)
@@ -138,9 +328,7 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
         self.assertEqual(result["stock_flow"]["source_update"], "tushare_moneyflow_after_market_close")
         self.assertIn("capital_stock:tushare_moneyflow", result["source_chain"])
-        self.assertEqual(result["errors"], [])
         stockapi_mock.assert_not_called()
-        mock_akshare.assert_not_called()
 
     def test_capital_flow_falls_back_to_stockapi_when_tushare_fails(self) -> None:
         adapter = AkshareFundamentalAdapter()
@@ -172,7 +360,9 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["stock_flow"]["inflow_10d"], 110.0)
         self.assertEqual(result["stock_flow"]["latest_date"], "2026-05-08")
         self.assertIn("capital_stock:stockapi_codeFlow", result["source_chain"])
-        self.assertEqual(result["errors"], ["tushare_moneyflow:RuntimeError:sdk timeout"])
+        self.assertIn("tushare_moneyflow_dc:RuntimeError:sdk timeout", result["errors"])
+        self.assertIn("tushare_moneyflow_ths:RuntimeError:sdk timeout", result["errors"])
+        self.assertIn("tushare_moneyflow:RuntimeError:sdk timeout", result["errors"])
         mock_akshare.assert_not_called()
         params = mock_get.call_args.kwargs["params"]
         self.assertEqual(params["code"], "600004")
@@ -221,7 +411,15 @@ class TestFundamentalAdapter(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["errors"], ["tushare_moneyflow:invalid_date:start_date_after_end_date", "stockapi_codeFlow:invalid_date:start_date_after_end_date"])
+        self.assertEqual(
+            result["errors"],
+            [
+                "tushare_moneyflow_dc:invalid_date:start_date_after_end_date",
+                "tushare_moneyflow_ths:invalid_date:start_date_after_end_date",
+                "tushare_moneyflow:invalid_date:start_date_after_end_date",
+                "stockapi_codeFlow:invalid_date:start_date_after_end_date",
+            ],
+        )
         mock_get.assert_not_called()
 
     def test_stockapi_code_flow_completed_date_uses_previous_day_before_1530(self) -> None:
@@ -358,7 +556,12 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(
             result["errors"],
-            ["tushare_moneyflow:RuntimeError:sdk timeout", "stockapi_codeFlow:empty_data"],
+            [
+                "tushare_moneyflow_dc:RuntimeError:sdk timeout",
+                "tushare_moneyflow_ths:RuntimeError:sdk timeout",
+                "tushare_moneyflow:RuntimeError:sdk timeout",
+                "stockapi_codeFlow:empty_data",
+            ],
         )
         self.assertEqual(mock_get.call_count, 3)
         windows = [

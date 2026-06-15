@@ -50,6 +50,8 @@ class _DummyManagerOk:
                     "raw_amount_unit": "10k CNY",
                     "latest_date": "2026-05-08",
                     "source_update": "after_market_close",
+                    "selected_flow_source": "tushare_moneyflow_dc",
+                    "flow_sources": {"tushare_moneyflow_dc": {"main_net_inflow": 1500000.0}},
                 },
                 "sector_rankings": {
                     "top": [{"name": "白酒", "inflow": 5e8}, {"name": "半导体", "inflow": 3e8}],
@@ -131,6 +133,8 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertEqual(result["raw_amount_unit"], "10k CNY")
         self.assertEqual(result["latest_date"], "2026-05-08")
         self.assertEqual(result["source_update"], "after_market_close")
+        self.assertEqual(result["selected_flow_source"], "tushare_moneyflow_dc")
+        self.assertIn("tushare_moneyflow_dc", result["flow_sources"])
         self.assertEqual(
             result["query"],
             {"start_date": None, "end_date": None, "page_no": 1, "page_size": 50},
@@ -211,7 +215,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
 
         self.assertEqual(result["stock_code"], "688469")
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_summary"], "Tushare moneyflow capital-flow endpoint failed")
+        self.assertEqual(result["error_summary"], "Tushare moneyflow capital-flow endpoints failed")
         self.assertIn("tushare_moneyflow", result["errors"][0])
 
     def test_tushare_empty_has_clear_error_summary(self) -> None:
@@ -222,7 +226,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
             result = _handle_get_capital_flow("301028")
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_summary"], "Tushare moneyflow returned no capital-flow rows for the queried window")
+        self.assertEqual(result["error_summary"], "Tushare moneyflow endpoints returned no capital-flow rows for the queried window")
         self.assertEqual(result["errors"], ["tushare_moneyflow:empty_data"])
 
     def test_stockapi_empty_is_reported_when_fallback_also_has_no_rows(self) -> None:

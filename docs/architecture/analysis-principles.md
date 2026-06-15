@@ -377,7 +377,7 @@ Agent 模式会注册工具，供 LLM 按阶段调用。主要工具包括：
 | `search_stock_news` | search | 搜索单维最新新闻 |
 | `search_comprehensive_intel` | search | 多维情报搜索 |
 | `get_market_indices` | market | 获取主要指数 |
-| `get_sector_rankings` | market | 获取板块涨跌排行 |
+| `get_sector_rankings` | market | 获取同花顺行业板块热榜，优先 Tushare `ths_hot(market=行业板块)` |
 | `get_skill_backtest_summary` | backtest | 获取策略/技能回测摘要 |
 | `get_strategy_backtest_summary` | backtest | 获取策略回测摘要 |
 | `get_stock_backtest_summary` | backtest | 获取个股历史信号验证摘要 |

@@ -211,6 +211,199 @@ def _compact_desk_packet_for_trace(packet: ExpertPacketV2) -> Dict[str, Any]:
     return payload
 
 
+def _first_diag_code(diagnostics: Sequence[Dict[str, Any]]) -> str:
+    for item in diagnostics or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("code", "stock_code", "symbol", "expected_code"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _packet_reason(packet: Dict[str, Any], *, fallback: str) -> str:
+    for error in packet.get("errors") or []:
+        text = str(error or "").strip()
+        if text:
+            return text
+    for diag in packet.get("diagnostics") or []:
+        if not isinstance(diag, dict):
+            continue
+        parts = [
+            str(diag.get(key) or "").strip()
+            for key in ("reason", "error", "note", "source", "status")
+            if str(diag.get(key) or "").strip()
+        ]
+        if parts:
+            return " · ".join(parts)
+    return fallback
+
+
+def _build_negative_conclusion_reasons(
+    *,
+    rows: Sequence[FeatureRow],
+    desk_packets: Sequence[ExpertPacketV2],
+    final_candidates: Optional[Sequence[AggregatedCandidate]] = None,
+) -> List[Dict[str, Any]]:
+    """Explain trace-negative outcomes instead of only recording the outcome.
+
+    The list is intentionally trace-facing: it says why a seed did not become a
+    final candidate, why a desk did not produce a row, and why a desk packet
+    timed out or failed.
+    """
+
+    row_by_code = {str(row.code): row for row in rows or [] if str(row.code or "").strip()}
+    final_codes = {
+        str(candidate.code)
+        for candidate in (final_candidates or [])
+        if str(getattr(candidate, "code", "") or "").strip()
+    }
+    reasons_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def _add(
+        *,
+        code: str,
+        name: str = "",
+        desk: str = "",
+        conclusion: str,
+        reason: str,
+        status: str = "",
+        stage: str = "thesis_desk_committee",
+        evidence: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        code_text = str(code or "").strip()
+        if not code_text:
+            return
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            reason_text = "未记录具体原因。"
+        key = (code_text, str(desk or ""), str(conclusion or ""))
+        row = row_by_code.get(code_text)
+        reasons_by_key[key] = {
+            "code": code_text,
+            "name": name or (row.name if row is not None else ""),
+            "desk": desk,
+            "stage": stage,
+            "status": status,
+            "conclusion": conclusion,
+            "reason": reason_text,
+            "evidence": evidence or [],
+        }
+
+    for packet_model in desk_packets or []:
+        packet = _compact_desk_packet_for_trace(packet_model)
+        desk = str(packet.get("expert") or packet.get("desk") or "unknown")
+        packet_status = str(packet.get("status") or "unknown")
+        packet_errors = [str(item) for item in (packet.get("errors") or []) if str(item)]
+        if packet_status in {"failed", "timeout", "unavailable"}:
+            packet_reason = _packet_reason(packet, fallback=f"{desk} 未返回可用席位结论。")
+            _add(
+                code=_first_diag_code(packet.get("diagnostics") or []) or "__committee__",
+                desk=desk,
+                conclusion="desk_packet_failed",
+                status=packet_status,
+                reason=packet_reason,
+                evidence=packet.get("diagnostics") or [],
+            )
+
+        for diag in packet.get("diagnostics") or []:
+            if not isinstance(diag, dict):
+                continue
+            if str(diag.get("source") or "") != "desk_filter_excluded_seed":
+                continue
+            code = str(diag.get("code") or "").strip()
+            _add(
+                code=code,
+                desk=desk,
+                conclusion="not_entered_desk",
+                status=str(diag.get("status") or "not_in_scope"),
+                reason=str(diag.get("reason") or "").strip()
+                or f"{desk} 过滤后未进入本席位评估范围。",
+                evidence=[diag],
+            )
+
+        for row in packet.get("rejected") or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code") or row.get("stock_code") or "").strip()
+            _add(
+                code=code,
+                name=str(row.get("name") or ""),
+                desk=desk,
+                conclusion="rejected_by_desk",
+                status=packet_status,
+                reason=str(row.get("reason") or row.get("summary") or row.get("reject_reason") or "").strip()
+                or f"{desk} 明确拒绝但未写 reason。",
+                evidence=row.get("evidence") if isinstance(row.get("evidence"), list) else [],
+            )
+
+        for seed_packet in packet.get("per_seed_packets") or []:
+            if not isinstance(seed_packet, dict):
+                continue
+            nested_codes = {
+                str(item.get("code") or item.get("stock_code") or "").strip()
+                for bucket in ("candidates", "rejected")
+                for item in (seed_packet.get(bucket) or [])
+                if isinstance(item, dict)
+            }
+            code = _first_diag_code(seed_packet.get("diagnostics") or [])
+            if not code:
+                code = next((item for item in nested_codes if item), "")
+            if not code:
+                continue
+            seed_status = str(seed_packet.get("status") or packet_status or "unknown")
+            if seed_status in {"timeout", "failed", "unavailable"}:
+                _add(
+                    code=code,
+                    desk=desk,
+                    conclusion="desk_seed_no_structured_output",
+                    status=seed_status,
+                    reason=_packet_reason(
+                        seed_packet,
+                        fallback=f"{desk} 对 {code} 未产出 candidates/rejected 结构化结论。",
+                    ),
+                    evidence=seed_packet.get("diagnostics") or [],
+                )
+            elif seed_status == "empty" and code not in nested_codes:
+                _add(
+                    code=code,
+                    desk=desk,
+                    conclusion="desk_seed_empty",
+                    status=seed_status,
+                    reason=f"{desk} 对 {code} 运行完成，但没有输出候选或拒绝明细。",
+                    evidence=seed_packet.get("diagnostics") or [],
+                )
+            if seed_status in {"timeout", "failed", "unavailable"} and packet_errors:
+                _add(
+                    code=code,
+                    desk=desk,
+                    conclusion="desk_seed_error",
+                    status=seed_status,
+                    reason=packet_errors[0],
+                    evidence=seed_packet.get("diagnostics") or [],
+                )
+
+    for code, row in row_by_code.items():
+        if final_codes and code in final_codes:
+            continue
+        existing = [item for item in reasons_by_key.values() if item.get("code") == code]
+        if existing:
+            reason = "；".join(str(item.get("reason") or "") for item in existing[:3] if item.get("reason"))
+        else:
+            sources = ", ".join(row.recall_sources or []) or "unknown"
+            reason = f"召回层进入种子池但四席位未给出支持票，recall_sources={sources}。"
+        _add(
+            code=code,
+            name=row.name,
+            conclusion="not_promoted_to_final_candidates",
+            status="not_selected",
+            reason=reason,
+        )
+
+    return list(reasons_by_key.values())
+
+
 def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
     """Wrap ``llm_adapter`` into the ``LLMCallable`` signature.
 
@@ -231,8 +424,12 @@ def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
             "llm_adapter must be callable or expose a .chat(messages, tools=...) method"
         )
 
-    def _call(messages: List[Dict[str, Any]], tool_decls: List[Dict[str, Any]]) -> LLMTurn:
-        raw = chat(messages, tools=tool_decls)
+    def _call(
+        messages: List[Dict[str, Any]],
+        tool_decls: List[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> LLMTurn:
+        raw = chat(messages, tools=tool_decls, **kwargs)
         if isinstance(raw, LLMTurn):
             return raw
         if isinstance(raw, dict):
@@ -3061,7 +3258,8 @@ def run_committee_discovery(
     enable_seed_gate: bool = True,
     seed_fact_tools: Optional[Sequence[str]] = None,
     seed_fact_max_workers: int = 12,
-    seed_fact_tool_timeout_seconds: float = 12.0,
+    seed_fact_tool_timeout_seconds: float = 30.0,
+    per_seed_timeout_budget_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run the LLM expert committee and return a discover-compatible payload.
 
@@ -3155,6 +3353,7 @@ def run_committee_discovery(
             seed_fact_tools=seed_fact_tools,
             seed_fact_max_workers=seed_fact_max_workers,
             seed_fact_tool_timeout_seconds=seed_fact_tool_timeout_seconds,
+            per_seed_timeout_budget_s=per_seed_timeout_budget_s,
         )
         # Merge thesis result into payload while preserving seed-pool diagnostics.
         # Empty desk output is a hard candidate-discovery failure, not permission
@@ -3169,6 +3368,8 @@ def run_committee_discovery(
         if thesis_candidates:
             deterministic_payload["candidates"] = thesis_candidates
             deterministic_payload["candidate_count"] = len(thesis_candidates)
+            if thesis_result.get("status") in {"partial", "failed"}:
+                deterministic_payload["status"] = str(thesis_result.get("status"))
         else:
             deterministic_payload["candidates"] = []
             deterministic_payload["candidate_count"] = 0
@@ -3212,7 +3413,7 @@ def run_committee_discovery(
             "status": thesis_result.get("status", "ok"),
             "seed_count": len(seeds),
             "candidate_count": len(thesis_candidates),
-            "degraded": not bool(thesis_candidates),
+            "degraded": bool(thesis_result.get("degraded")) or thesis_result.get("status") == "partial",
             "dimensions_covered": [
                 "early_turn_desk",
                 "momentum_desk",
@@ -3220,15 +3421,17 @@ def run_committee_discovery(
                 "theme_catalyst_desk",
             ],
             "delegate": "thesis_desk_committee",
+            "partial_errors": thesis_result.get("partial_errors") or [],
         }
         deterministic_payload["thesis_desk_committee"] = {
             "status": thesis_result.get("status", "ok"),
             "candidate_count": len(thesis_candidates),
-            "degraded": not bool(thesis_candidates),
+            "degraded": bool(thesis_result.get("degraded")) or thesis_result.get("status") == "partial",
             "diagnostics": thesis_result.get("thesis_desk_diagnostics") or [],
             "recall_total_in": thesis_result.get("recall_total_in"),
             "recall_total_kept": thesis_result.get("recall_total_kept"),
             "elapsed_ms": thesis_result.get("thesis_desk_committee_elapsed_ms"),
+            "partial_errors": thesis_result.get("partial_errors") or [],
         }
         deterministic_payload["candidate_source"] = "llm_expert_committee"
     except Exception as exc:
@@ -3288,7 +3491,8 @@ def run_thesis_desk_committee(
     backfill_max: int = 3,
     seed_fact_tools: Optional[Sequence[str]] = None,
     seed_fact_max_workers: int = 12,
-    seed_fact_tool_timeout_seconds: float = 12.0,
+    seed_fact_tool_timeout_seconds: float = 30.0,
+    per_seed_timeout_budget_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
 
@@ -3464,9 +3668,15 @@ def run_thesis_desk_committee(
 
     budget = max(10.0, overall_timeout_s - (time.time() - started))
     desk_deadline_s = time.time() + max(1.0, budget - 1.0)
-    per_seed_timeout_s = max(
-        3.0,
-        min(180.0, (budget - 5.0) / max(1, len(rows))),
+    # Each row can require: first LLM turn -> several data tools -> final JSON
+    # turn.  Dividing the shared desk budget by the full recall pool made small
+    # desks inherit the 32-row pool size and produced opaque ~100s single-row
+    # timeouts even in development traces.  Keep a generous per-row ceiling while
+    # the shared desk_deadline_s still bounds the whole committee run.
+    configured_per_seed_timeout = float(per_seed_timeout_budget_s or 300.0)
+    effective_per_seed_timeout_s = max(
+        60.0,
+        min(configured_per_seed_timeout, max(240.0, (budget - 5.0) / max(1, len(rows)))),
     )
     active_allocation = _parse_allocation(allocation_json, regime_key)
     if regime_key in {"risk_off", "panic", "trending_down"}:
@@ -3478,28 +3688,28 @@ def run_thesis_desk_committee(
             market=market_value,
             regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
         "momentum_desk": lambda: momentum_desk.run_desk(
             rows,
             market=market_value,
             regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
         "quality_repair_desk": lambda: quality_repair_desk.run_desk(
             rows,
             market=market_value,
             regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
         "theme_catalyst_desk": lambda: theme_catalyst_desk.run_desk(
             rows,
             market=market_value,
             regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
     }
     skipped_desk_packets: List[ExpertPacketV2] = []
@@ -3541,17 +3751,25 @@ def run_thesis_desk_committee(
         packet for packet in desk_packets
         if packet.status in {"failed", "timeout", "unavailable"}
     ]
-    if failed_packets:
-        errors = []
-        for packet in failed_packets:
-            errors.extend([str(err) for err in (packet.errors or []) if err])
+    failed_packet_errors: List[str] = []
+    for packet in failed_packets:
+        failed_packet_errors.extend([str(err) for err in (packet.errors or []) if err])
+    has_candidate_outputs = any(packet.candidates for packet in desk_packets)
+    if failed_packets and not has_candidate_outputs:
+        negative_reasons = _build_negative_conclusion_reasons(
+            rows=rows,
+            desk_packets=desk_packets,
+        )
         payload["status"] = "failed"
         payload["error"] = "thesis desk timeout or failure"
+        payload["negative_conclusion_reasons"] = negative_reasons
         payload["thesis_desk_diagnostics"] = [
             {
                 "desk": packet.expert,
                 "status": packet.status,
                 "errors": list(packet.errors or []),
+                "warnings": list(packet.data_quality.warnings or []),
+                "diagnostics": list(packet.diagnostics or []),
             }
             for packet in desk_packets
         ]
@@ -3561,10 +3779,30 @@ def run_thesis_desk_committee(
                 "source": "thesis_desk_committee",
                 "status": "failed",
                 "dimension": "committee",
-                "error": "; ".join(errors) or "thesis desk timeout or failure",
+                "error": "; ".join(failed_packet_errors) or "thesis desk timeout or failure",
+                "negative_reason_count": len(negative_reasons),
             }
         )
         return payload
+    if failed_packets:
+        negative_reasons = _build_negative_conclusion_reasons(
+            rows=rows,
+            desk_packets=desk_packets,
+        )
+        payload["status"] = "partial"
+        payload["degraded"] = True
+        payload["partial_errors"] = failed_packet_errors
+        payload["negative_conclusion_reasons"] = negative_reasons
+        payload["discovery_steps"].append(
+            {
+                "source": "thesis_desk_committee",
+                "status": "partial",
+                "dimension": "committee",
+                "error": "; ".join(failed_packet_errors) or "one or more thesis desks failed",
+                "degraded": True,
+                "negative_reason_count": len(negative_reasons),
+            }
+        )
 
     # ── Step 3: aggregate + allocate ─────────────────────────────────────
     try:
@@ -3639,9 +3877,28 @@ def run_thesis_desk_committee(
 
     payload["candidates"] = candidate_dicts
     payload["candidate_count"] = len(candidate_dicts)
+    negative_reasons = _build_negative_conclusion_reasons(
+        rows=rows,
+        desk_packets=desk_packets,
+        final_candidates=final_candidates,
+    )
+    payload["negative_conclusion_reasons"] = negative_reasons
+    payload["status"] = "partial" if failed_packets else payload.get("status", "ok")
+    payload["degraded"] = bool(failed_packets)
+    if failed_packets:
+        payload["error"] = "partial thesis desk failure"
+        payload["partial_errors"] = failed_packet_errors
     payload["regime"] = regime
     payload["thesis_desk_diagnostics"] = agg_pool.diagnostics
     payload["thesis_desk_committee_elapsed_ms"] = int((time.time() - started) * 1000)
+    payload["discovery_steps"].append(
+        {
+            "source": "thesis_desk_committee",
+            "status": payload.get("status") or "ok",
+            "dimension": "negative_reason_summary",
+            "negative_reason_count": len(negative_reasons),
+        }
+    )
     return payload
 
 

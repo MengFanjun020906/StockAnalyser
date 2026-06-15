@@ -3,10 +3,13 @@
 
 import unittest
 from types import SimpleNamespace
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 from src.agent.tools.search_tools import (
     _handle_search_comprehensive_intel,
+    _handle_search_openinvest_news,
     _handle_score_stock_news_sentiment,
     _handle_search_stock_prompt_intel,
     _handle_search_stock_news,
@@ -55,6 +58,65 @@ class SearchToolsPersistenceTest(unittest.TestCase):
             query=response.query,
             response=response,
             query_context=None,
+        )
+
+    def test_search_openinvest_news_normalizes_yfinance_items(self) -> None:
+        item = SimpleNamespace(
+            title="Apple supplier news",
+            snippet="Ticker-linked Yahoo item",
+            url="https://finance.yahoo.com/news/apple",
+            src_name="yfinance:Yahoo Finance",
+            published_at="2026-06-12T01:00:00Z",
+            fetched_at="2026-06-12T01:00:01Z",
+            raw_meta={"symbol": "AAPL"},
+        )
+
+        fetch_all = MagicMock(return_value=[item])
+        news_sources = types.ModuleType("services.news_sources")
+        news_sources.fetch_all = fetch_all
+        rss_feed = types.ModuleType("services.news_sources.rss_feed")
+        rss_feed.load_default_feeds = MagicMock(return_value=[])
+        with patch.dict(sys.modules, {
+            "services": types.ModuleType("services"),
+            "services.news_sources": news_sources,
+            "services.news_sources.rss_feed": rss_feed,
+        }), patch("src.agent.tools.search_tools._ensure_openinvest_import_path", return_value=object()):
+            result = _handle_search_openinvest_news(
+                stock_code="AAPL",
+                stock_name="Apple",
+                max_results=5,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["symbol"], "AAPL")
+        self.assertEqual(result["results_count"], 1)
+        self.assertEqual(result["results"][0]["source"], "yfinance:Yahoo Finance")
+        self.assertEqual(fetch_all.call_args.kwargs["symbols"], ["AAPL"])
+
+    def test_search_openinvest_news_reports_missing_ddgs_dependency_without_failing(self) -> None:
+        fetch_all = MagicMock(return_value=[])
+        news_sources = types.ModuleType("services.news_sources")
+        news_sources.fetch_all = fetch_all
+        rss_feed = types.ModuleType("services.news_sources.rss_feed")
+        rss_feed.load_default_feeds = MagicMock(return_value=[])
+        with patch.dict(sys.modules, {
+            "services": types.ModuleType("services"),
+            "services.news_sources": news_sources,
+            "services.news_sources.rss_feed": rss_feed,
+        }), patch("src.agent.tools.search_tools._ensure_openinvest_import_path", return_value=object()):
+            result = _handle_search_openinvest_news(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                include_ddgs=True,
+                include_yfinance=False,
+                max_results=3,
+            )
+
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["symbol"], "600519.SS")
+        self.assertEqual(fetch_all.call_args.kwargs["queries"], [])
+        self.assertTrue(
+            any(item.get("result") == "missing_dependency" for item in result["source_chain"])
         )
 
     def test_search_stock_prompt_intel_searches_user_prompt_with_stock_anchor(self) -> None:

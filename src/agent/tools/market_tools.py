@@ -23,6 +23,13 @@ from src.agent.candidate_experts import CandidateExpertOrchestrator, apply_hard_
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 from src.agent.regime import SentimentComponents, coerce_bars, detect_market_regime
+from src.agent.regime_probability import (
+    build_path_profile,
+    build_regime_probability,
+    build_reentry_reference,
+    compute_regime_return_frame,
+    format_regime_probability_brief,
+)
 from src.agent.sentiment.news_events import score_news_items
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 from src.data.stock_index_loader import get_index_stock_name, get_stock_name_index_map
@@ -2561,6 +2568,153 @@ detect_market_regime_tool = ToolDefinition(
 )
 
 
+def _handle_get_regime_forward_probability(
+    market: str = "cn",
+    index_code: str = "000300",
+    regime: Optional[str] = None,
+    current_price: Optional[float] = None,
+    lookback_days: int = 900,
+    windows: Optional[List[int]] = None,
+) -> dict:
+    """Compute forward-return probabilities for the current or requested regime."""
+    market_key = (market or "cn").strip().lower()
+    if market_key != "cn":
+        return {
+            "status": "not_supported",
+            "market": market_key,
+            "error": "get_regime_forward_probability currently supports China A-share market only.",
+        }
+
+    normalized_windows = [
+        int(value)
+        for value in (windows or [7, 30, 60, 90])
+        if str(value).strip().isdigit() and int(value) > 0
+    ] or [7, 30, 60, 90]
+    max_window = max(normalized_windows)
+    lookback = max(260, min(int(lookback_days or 900), 1600))
+    history_result, history_err, history_ms = _run_with_timeout(
+        lambda: _load_market_history(index_code or "000300", lookback + max_window + 100),
+        _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 25.0),
+        "regime_forward_history",
+    )
+    if isinstance(history_result, tuple) and len(history_result) == 2:
+        history_rows, history_source = history_result
+    else:
+        history_rows, history_source = [], "timeout" if history_err else "none"
+    bars = coerce_bars(history_rows)
+    if len(bars) < 140 + max_window:
+        return {
+            "status": "insufficient_data",
+            "market": market_key,
+            "index_code": index_code,
+            "history_source": history_source,
+            "history_records": len(bars),
+            "duration_ms": history_ms,
+            "error": history_err or "not enough historical OHLC bars for forward probability.",
+            "note": "样本不足，不生成强概率结论。",
+        }
+
+    current_state = detect_market_regime(bars, market=market_key, confirmation_bars=1).to_dict()
+    target_regime = str(regime or current_state.get("regime") or "unknown").strip().lower()
+    frame = compute_regime_return_frame(
+        bars,
+        windows=normalized_windows,
+        market=market_key,
+    )
+    probability = build_regime_probability(frame, regime=target_regime, windows=normalized_windows)
+    profile_window = 90 if 90 in normalized_windows else max_window
+    path_profile = build_path_profile(frame, regime=target_regime, window=profile_window)
+    price = current_price
+    if price is None and bars:
+        price = bars[-1].close
+    reentry = build_reentry_reference(
+        probability,
+        current_price=price,
+        window=30 if 30 in normalized_windows else min(normalized_windows),
+    )
+    status = "ok" if probability.get("sample_count", 0) else "insufficient_data"
+    payload = {
+        "status": status,
+        "market": market_key,
+        "index_code": index_code,
+        "symbol": _normalize_index_ts_code(index_code),
+        "as_of": current_state.get("as_of"),
+        "regime": target_regime,
+        "current_regime": current_state,
+        "source": "ohlc_forward_return",
+        "history_source": history_source,
+        "history_records": len(bars),
+        "duration_ms": history_ms,
+        "windows": probability.get("windows", {}),
+        "sample_count": probability.get("sample_count", 0),
+        "path_profile": path_profile,
+        "reentry_reference": reentry,
+        "brief": "",
+        "guardrails": [
+            "Regime probability is evidence only and must not directly override Judge or Risk Gate.",
+            "low_confidence=true means the probability layer cannot be a primary decision reason.",
+        ],
+    }
+    payload["brief"] = format_regime_probability_brief(payload)
+    if history_err:
+        payload.setdefault("data_errors", []).append(f"history: {history_err}")
+    return payload
+
+
+get_regime_forward_probability_tool = ToolDefinition(
+    name="get_regime_forward_probability",
+    description=(
+        "Compute historical forward-return probabilities for the current China A-share market regime. "
+        "Use this as evidence for reentry/downside reference, not as a direct buy/sell signal."
+    ),
+    parameters=[
+        ToolParameter(
+            name="market",
+            type="string",
+            description="Market code. Currently only 'cn' is supported.",
+            required=False,
+            default="cn",
+            enum=["cn"],
+        ),
+        ToolParameter(
+            name="index_code",
+            type="string",
+            description="A-share index proxy, default CSI 300 '000300'.",
+            required=False,
+            default="000300",
+        ),
+        ToolParameter(
+            name="regime",
+            type="string",
+            description="Optional target regime. If omitted, the tool detects the latest regime from history.",
+            required=False,
+        ),
+        ToolParameter(
+            name="current_price",
+            type="number",
+            description="Optional current index price used to compute reentry_price. Defaults to latest close.",
+            required=False,
+        ),
+        ToolParameter(
+            name="lookback_days",
+            type="integer",
+            description="Trading days for historical sampling, default 900, capped at 1600.",
+            required=False,
+            default=900,
+        ),
+        ToolParameter(
+            name="windows",
+            type="array",
+            description="Forward windows in trading days, default [7,30,60,90].",
+            required=False,
+            default=[7, 30, 60, 90],
+        ),
+    ],
+    handler=_handle_get_regime_forward_probability,
+    category="market",
+)
+
+
 # ============================================================
 # discover_watchlist_candidates
 # ============================================================
@@ -3026,6 +3180,7 @@ discover_watchlist_candidates_tool = ToolDefinition(
 
 ALL_MARKET_TOOLS = [
     detect_market_regime_tool,
+    get_regime_forward_probability_tool,
     get_market_indices_tool,
     get_sector_rankings_tool,
     discover_watchlist_candidates_tool,

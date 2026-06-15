@@ -70,8 +70,60 @@ tools:
     failure_modes:
       - StockAPI 网络失败或当天无数据时返回 empty/failed。
 
-  - tool: get_stockapi_hot_sector_leaders
+  - tool: get_board_capital_flow
+    priority: 11
+    when_to_use: >-
+      统一查看行业、概念、地域板块资金流向，交叉观察 DC 与 THS 板块资金是否支持主题。
+      这是板块资金的优先入口，避免模型自行混读不同来源字段。
+    typical_args:
+      trade_date: "{today}"
+      content_type: "行业"
+      limit: 20
+    returns_summary: >-
+      返回 selected_flow_source、source_definitions、flow_sources，以及板块净流入前后排名。
+      金额统一为 CNY，但 DC/THS 口径分别保留。
+    key_fields:
+      - selected_flow_source
+      - source_definitions
+      - selected_top_boards
+      - flow_sources
+      - main_net_inflow
+    combo_hints:
+      - 日报主题 + 统一板块资金前排 = 主题被资金验证。
+      - 必须查看 source_definitions，不能把 DC 行业/概念/地域与 THS 行业/概念金额相加。
+    cost: medium
+    failure_modes:
+      - 单个来源失败时 flow_sources 中会缺失该来源；不能据此判断板块无资金。
+      - 不同来源统计方法不同，排名方向比绝对金额更适合交叉验证。
+
+  - tool: get_tushare_moneyflow_ind_ths
     priority: 12
+    when_to_use: >-
+      需要单独核查同花顺行业资金流向时调用，读取行业板块净额、流入/流出资金、领涨股和行业涨跌幅。
+      当候选来自行业主题而非概念主题时，用它验证行业层面的资金承接。
+    typical_args:
+      trade_date: "{today}"
+      limit: 20
+    returns_summary: >-
+      返回 THS 行业资金流向列表；net_buy_amount/net_sell_amount/net_inflow 已从亿元转为 CNY。
+    key_fields:
+      - ts_code
+      - industry
+      - lead_stock
+      - pct_change
+      - net_inflow
+      - net_buy_amount
+      - net_sell_amount
+    combo_hints:
+      - 行业净流入前排 + 候选业务归属匹配 = 主题资金支持增强。
+      - 行业净流出但个股上涨，需警惕孤立拉升或补涨兑现。
+    cost: medium
+    failure_modes:
+      - 每日盘后更新，盘中可能没有当日完整数据。
+      - 与 DC 行业资金统计口径不同，只能并列比较，不能相加。
+
+  - tool: get_stockapi_hot_sector_leaders
+    priority: 14
     when_to_use: >-
       查看热点板块龙头股，判断候选是龙头、跟随补涨还是弱相关边缘票。
     typical_args:
@@ -93,7 +145,7 @@ tools:
       - 板块代码缺失时只能看全量龙头列表。
 
   - tool: get_stockapi_hot_money_activity
-    priority: 14
+    priority: 16
     when_to_use: >-
       补充个股或全市场热门资金活跃数据，观察主题票是否已有资金关注。
     typical_args:
@@ -113,6 +165,33 @@ tools:
     cost: medium
     failure_modes:
       - 部分日期或个股可能无活跃记录。
+
+  - tool: get_tushare_moneyflow_mkt_dc
+    priority: 17
+    when_to_use: >-
+      查看东财大盘主力资金流向，判断主题扩散是否处在市场资金支持环境中。
+      用于大盘水位背景，不替代板块或个股资金验证。
+    typical_args:
+      trade_date: "{today}"
+      limit: 5
+    returns_summary: >-
+      返回上证/深证涨跌、全市场主力净流入和超大单/大单/中单/小单净流入。
+      金额为 CNY。
+    key_fields:
+      - trade_date
+      - pct_change_sh
+      - pct_change_sz
+      - net_amount
+      - net_amount_rate
+      - extra_large_net_inflow
+      - large_net_inflow
+    combo_hints:
+      - 大盘主力净流入 + 主题板块资金前排 = 主题扩散环境较好。
+      - 大盘资金净流出时，主题票即使上涨也要降低追高结论强度。
+    cost: medium
+    failure_modes:
+      - 每日盘后更新，盘中不能当实时资金。
+      - 大盘口径不能和个股或板块资金直接相加。
 
   - tool: get_capital_flow
     priority: 18
@@ -171,6 +250,34 @@ tools:
     cost: cheap
     failure_modes:
       - 停牌或历史数据不足时结论弱化。
+
+  - tool: get_tushare_stk_factor
+    priority: 26
+    when_to_use: >-
+      主题票已经异动时，用 Tushare 技术因子检查是否过热或仍有趋势延续空间。
+      重点看 MACD、KDJ、RSI、BOLL、CCI 与量能是否一致。
+    typical_args:
+      stock_code: "{code}"
+      limit: 20
+    returns_summary: >-
+      返回最近交易日技术因子 latest 和历史 items；指标基于前复权价格计算。
+    key_fields:
+      - latest
+      - macd_dif
+      - macd_dea
+      - macd
+      - kdj_j
+      - rsi_6
+      - rsi_12
+      - boll_upper
+      - cci
+    combo_hints:
+      - 主题强 + 技术因子温和转强 = 可继续跟踪。
+      - 主题强但 RSI/KDJ 极端过热且贴近 BOLL 上轨 = 追高风险，最多 watch。
+    cost: medium
+    failure_modes:
+      - Tushare stk_factor 基于前复权价格，可能与 pro_bar 动态前复权或本地行情计算不完全一致。
+      - 技术因子不能替代主题真实性和业务匹配验证。
 
   - tool: analyze_price_structure
     priority: 28

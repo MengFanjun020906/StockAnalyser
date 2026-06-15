@@ -99,9 +99,9 @@ openInvest 的 `parse_cio_memo()` 把 LLM 输出后的关键安全约束放进�
 
 **建议落点**
 
-- 在 `src/agent/llm_adapter.py` 的统一调用出口记录。
-- 每个 trace 下写入 `llm_usage.jsonl`，并可汇总进阶段 JSON。
-- Web 端 Agent Trace 页面后续展示“本次 token / 费用 / LLM 耗时 / 工具耗时”。
+- 在 `src/agent/llm_adapter.py` 的统一调用出口记录。（已接入：`src/agent/llm_telemetry.py` 通过 trace scope 写入成功/失败调用，`src/agent/stock_selection.py` 为阶段 LLM 调用补充 `stage/agent_role/symbol`。）
+- 每个 trace 下写入 `llm_usage.jsonl`，并可汇总进阶段 JSON。（已接入：`api/v1/endpoints/agent.py` 的 Trace run/stream 会设置 artifact scope。）
+- Web 端 Agent Trace 页面展示“本次 token / 费用 / LLM 耗时 / Judge sanity 修正”。（已接入：`AgentTraceRunResponse.llm_telemetry/judge_sanity`、Trace UI “可观测性”层。）
 
 **测试**
 
@@ -250,7 +250,7 @@ src/agent/tools/market_tools.py:get_regime_forward_probability
 - 在 `src/agent/tools/market_tools.py` 注册 `get_regime_forward_probability` 工具。
 - 在 `src/agent/stock_selection.py` 的 `_summarize_market_regime()` 中保留概率摘要字段，供 Trace 和后续阶段读取。
 - 点位计算层在生成 `TRIM`、回撤买点、分批入场区间时读取该参考。
-- 文档同步 `docs/regime-state-machine.md`，把当前状态机定位为“识别层”，新增概率层说明。
+- 文档同步 `docs/modules/regime-state-machine.md`，把当前状态机定位为“识别层”，新增概率层说明。
 
 **测试**
 
@@ -296,7 +296,9 @@ data/agent_reviews/insights/*.md
 
 - 先做离线脚本：`scripts/build_agent_verdict_reviews.py`。
 - 再做 service：`src/services/agent_verdict_review_service.py`。
-- 最后把稳定 insight 作为“历史复盘提示”注入 Meta-Agent 或 Judge，而不是所有阶段。
+- Web / API 闭环只做本地样本刷新：`POST /api/v1/agent-verdict-reviews/rebuild?windows=7,30&limit=300` 会扫描本地 Trace 和本地 `StockDaily` 后重写 `data/agent_reviews/verdict_review.jsonl`。
+- 离线 insight 先写 Markdown：`scripts/build_agent_verdict_insights.py --min-samples 20` 会从本地 `verdict_review.jsonl` 生成 `data/agent_reviews/insights/agent_verdict_insights.md`，默认只把同分组 20 条以上 completed 样本沉淀为稳定洞察。
+- 未来如需把稳定 insight 作为“历史复盘提示”注入 Meta-Agent 或 Judge，必须另设阈值门、灰度开关和 trace_id 追溯；当前版本不注入线上决策。
 
 **防过拟合规则**
 
@@ -321,7 +323,7 @@ data/agent_reviews/insights/*.md
 **建议落点**
 
 - `src/agent/debate.py`：从当前“共享 evidence bundle 的正反方”扩展出可选的分视角 bundle。
-- `docs/agent-multi-expert-refactor-plan.md` 后续可引用本协议。
+- `docs/plans/agent-multi-expert-refactor-plan.md` 后续可引用本协议。
 - `data/agent_traces/` 中保留每个角色实际输入摘要，便于审计信息隔离是否生效。
 
 ### 4.6 策略级回测与 reward
@@ -450,9 +452,9 @@ POST /api/v1/performance/snapshot
 
 ### Phase 1：安全与可观测性
 
-1. 新增 Judge sanity check 纯函数。
-2. 接入 LLM telemetry 到 Agent Trace。
-3. 在最终报告或 Trace 中展示“LLM 修正前后裁决”和“token / cost / latency”。
+1. 新增 Judge sanity check 纯函数。（已接入：`src/agent/judge_sanity.py`，在 `judge_decision` 后处理阶段执行，只降级或截断不合规裁决，并在 `full.sanity_checks` 留审计。）
+2. 接入 LLM telemetry 到 Agent Trace。（已接入：`src/agent/llm_telemetry.py`、`src/agent/llm_adapter.py`、Trace artifact `llm_usage.jsonl`。）
+3. 在最终报告或 Trace 中展示“LLM 修正前后裁决”和“token / cost / latency”。（已接入：Trace artifact 固化 `llm_telemetry.json` / `judge_sanity.json`，API run/stream/history 返回 `llm_telemetry` / `judge_sanity`，Web Trace “可观测性”层展示调用次数、Token、延迟、估算成本、阶段统计和 sanity 规则修正。）
 
 验收：
 
@@ -461,25 +463,29 @@ POST /api/v1/performance/snapshot
 
 ### Phase 2：Regime 概率与点位增强
 
-1. 基于现有 regime 和历史行情构建 forward return 统计。
-2. 给 pricing agent 提供 reentry / downside reference。
-3. 对 `TRIM`、分批入场、等待回踩计划增加历史概率说明。
+1. 基于现有 regime 和历史行情构建 forward return 统计。（已接入第一版：`src/agent/regime_probability.py` 复用 `detect_market_regime` 分类历史切片，`get_regime_forward_probability` 输出 7/30/60/90 日 forward probability。）
+2. 给 pricing agent 提供 reentry / downside reference。（已接入第一版：`stock_selection` 在 market regime 后挂载 `forward_probability`，pricing fallback 输出 `regime_probability` / `reentry_reference`。）
+3. 对 `TRIM`、分批入场、等待回踩计划增加历史概率说明。（已接入第一版：pricing prompt 约束 `low_confidence` 只能作弱证据，fallback 将 `reentry_price` 写成参考回踩/买回价，最终报告展示 `Regime 概率证据`。）
 
 验收：
 
 - 样本不足不会生成强结论。
 - Regime 概率不直接覆盖 Judge，只作为证据。
+- 第一版仍是市场代理指数概率，单股级概率和历史回测校准留到后续阶段。
 
 ### Phase 3：后验复盘与长期 insight
 
-1. 从 Agent Trace 构建 verdict review jsonl。
-2. 生成稳定 insight markdown。
-3. 只向 Meta-Agent / Judge 注入经过阈值门的 insight。
+1. 从 Agent Trace 构建 verdict review jsonl。（已接入第一版：`src/services/agent_verdict_review_service.py` 和 `scripts/build_agent_verdict_reviews.py` 只读 Trace 与本地 `StockDaily`，选股链路写入 `chain_type=stock_selection`，单股链路写入 `chain_type=single_stock_analysis`。）
+2. Web/API 样本刷新闭环。（已接入：`POST /api/v1/agent-verdict-reviews/rebuild` 和 Web `/agent-verdict-reviews` 的“重建样本”按钮可从本地 Trace 刷新 `verdict_review.jsonl`，默认只扫最近 300 个 Trace，不重跑 Agent、不拉外部行情、不注入线上决策。）
+3. 生成稳定 insight markdown。（已接入离线第一版：`scripts/build_agent_verdict_insights.py` 从本地 `verdict_review.jsonl` 聚合分组样本，默认至少 20 条 completed 样本才形成稳定洞察，并写入 `data/agent_reviews/insights/agent_verdict_insights.md`；当前只供人工复盘，不注入线上决策。）
+4. 只向 Meta-Agent / Judge 注入经过阈值门的 insight。（未接入；第一版明确不影响线上决策。）
 
 验收：
 
 - insight 都能追溯到 trace_id 和行情窗口。
 - 能区分模型错误、数据缺失、不可成交和黑天鹅事件。
+- 样本不足、缺少起始价或未来行情不足时只输出 `insufficient_data` / `partial`，不强行归因。
+- 第一版同时覆盖两条主链路，但 schema 分开：选股链路读取 `candidate_discovery -> portfolio_allocation -> judge_decision`，单股链路读取 `risk_gate`、`operation_advice`、`decision_type` 和 `confidence_level`；单股不会伪造选股链路字段。
 
 ### Phase 3.5：收益率展示页面
 
@@ -527,7 +533,7 @@ POST /api/v1/performance/snapshot
 
 ## 9. 与现有文档关系
 
-- 多专家角色边界可后续同步到 `docs/agent-multi-expert-refactor-plan.md`。
-- Regime 概率接入后需同步 `docs/regime-state-machine.md`。
-- 若影响最终报告结构或 Trace 展示，需要同步 `docs/stock-selection-pipeline.md` 和 `docs/CHANGELOG.md`。
+- 多专家角色边界可后续同步到 `docs/plans/agent-multi-expert-refactor-plan.md`。
+- Regime 概率接入后需同步 `docs/modules/regime-state-machine.md`。
+- 若影响最终报告结构或 Trace 展示，需要同步 `docs/architecture/stock-selection-pipeline.md` 和 `docs/CHANGELOG.md`。
 - 本文只记录迁移评估和实施建议，不代表功能已实现。

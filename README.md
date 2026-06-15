@@ -59,7 +59,7 @@ Daily Stock Analysis 不是“输入股票代码后生成一篇看似完整报�
 - `可观察标的`：已经进入主线深挖、但执行优先级低于首选的候选。
 - `观察池`：未进入本轮深挖或证据不足的候选，只用于后续跟踪。
 
-完整链路、输入输出和字段契约见 [选股链路说明](docs/stock-selection-pipeline.md)。
+完整链路、输入输出和字段契约见 [选股链路说明](docs/architecture/stock-selection-pipeline.md)。
 
 ## 主要使用场景
 
@@ -159,13 +159,13 @@ data/agent_traces/                 本地 Trace artifact，默认不提交
 
 ## 相关文档
 
-- [选股链路说明](docs/stock-selection-pipeline.md)
-- [选股链路重构实施方案](docs/选股链路重构-实施方案.md)
-- [候选池路线图](docs/agent-candidate-pool-roadmap.md)
-- [阶段化选股 Prompt 设计](docs/agent-stock-selection-prompts.md)
-- [A 股 Regime 状态机](docs/regime-state-machine.md)
-- [价格结构分析引擎](docs/price-structure-engine.md)
-- [Agent 工具能力缺口分析](docs/agent-tool-gap-analysis.md)
+- [选股链路说明](docs/architecture/stock-selection-pipeline.md)
+- [选股链路重构实施方案](docs/architecture/选股链路重构-实施方案.md)
+- [候选池路线图](docs/plans/agent-candidate-pool-roadmap.md)
+- [阶段化选股 Prompt 设计](docs/plans/agent-stock-selection-prompts.md)
+- [A 股 Regime 状态机](docs/modules/regime-state-machine.md)
+- [价格结构分析引擎](docs/modules/price-structure-engine.md)
+- [Agent 工具能力缺口分析](docs/plans/agent-tool-gap-analysis.md)
 - [完整指南](docs/full-guide.md)
 - [更新日志](docs/CHANGELOG.md)
 

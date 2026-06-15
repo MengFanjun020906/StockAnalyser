@@ -59,6 +59,9 @@ describe('SeedPoolQualityPage', () => {
     expect(within(upRow as HTMLElement).getByText('+4.00%')).toHaveClass('text-danger');
     expect(within(downRow as HTMLElement).getByText('-2.50%')).toHaveClass('text-success');
     expect(within(downRow as HTMLElement).getByText('-1.00%')).toHaveClass('text-success');
+    expect(await screen.findAllByText('未入席')).toHaveLength(4);
+    expect(screen.getAllByText('未进入该席位评估范围。')).toHaveLength(4);
+    expect(screen.queryByText('未落盘该席位理由')).not.toBeInTheDocument();
   });
 });
 

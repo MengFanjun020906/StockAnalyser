@@ -1007,7 +1007,6 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('测试一').length).toBeGreaterThan(0);
     expect(screen.getAllByText('301183').length).toBeGreaterThan(0);
     expect(screen.getAllByText('东田微').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('92.5').length).toBeGreaterThan(0);
     expect(screen.getAllByText('共振 +7.05').length).toBeGreaterThan(0);
     expect(screen.getAllByText('新进入').length).toBeGreaterThan(0);
     expect(screen.getAllByText('存在反证').length).toBeGreaterThan(0);
@@ -1659,9 +1658,18 @@ describe('AgentTracePage', () => {
                         elapsed_ms: 1000,
                         candidates: [],
                         rejected: [],
-                        tool_calls: [],
-                        diagnostics: [{ source: 'desk_single_seed_timeout', status: 'timeout', code: '600003' }],
-                        errors: ['momentum_desk seed 600003 timeout after 1.0s'],
+                        tool_calls: [{ tool: 'analyze_trend', status: 'requested_before_timeout', stock_code: '600003' }],
+                        diagnostics: [
+                          {
+                            source: 'desk_single_seed_timeout',
+                            status: 'timeout',
+                            code: '600003',
+                            reason: 'LLM 已返回工具调用，但工具执行未在行级超时前完成；pending_tools=["analyze_trend"]',
+                          },
+                        ],
+                        errors: [
+                          'momentum_desk seed 600003 timeout after 1.0s: LLM 已返回工具调用，但工具执行未在行级超时前完成；pending_tools=["analyze_trend"]',
+                        ],
                       },
                     ],
                     diagnostics: [],
@@ -1694,7 +1702,7 @@ describe('AgentTracePage', () => {
     fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
-    expect(await screen.findByText('P4 三席位可观察性')).toBeInTheDocument();
+    expect(await screen.findByText('P4 四席位可观察性')).toBeInTheDocument();
     expect(screen.getByText('Seed 20 / 20')).toBeInTheDocument();
     expect(screen.getByText('Seed Preview (2)')).toBeInTheDocument();
     expect(screen.getByText('低位启动席')).toBeInTheDocument();
@@ -1703,7 +1711,8 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('低位启动确认')).toBeInTheDocument();
     expect(screen.getByText('动量仍在')).toBeInTheDocument();
     expect(screen.getByText('600003')).toBeInTheDocument();
-    expect(screen.getByText('momentum_desk seed 600003 timeout after 1.0s')).toBeInTheDocument();
+    expect(document.body.textContent).toContain('seed 600003 timeout after 1.0s');
+    expect(document.body.textContent).toContain('LLM 已返回工具调用');
     expect(screen.getByText('本席位未输出候选。')).toBeInTheDocument();
   });
 
@@ -1743,6 +1752,67 @@ describe('AgentTracePage', () => {
         candidate_discovery_mode: 'thesis_desk_committee',
       }));
     });
+  });
+
+  it('renders LLM telemetry and judge sanity observability from trace result', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-observability',
+        content: '选股结论',
+        error: null,
+        total_steps: 0,
+        total_tokens: 0,
+        provider: 'agent',
+        model: 'mimo-v2.5',
+        mode: 'planning_execute',
+        tool_calls: [],
+        agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+        context_summary: { account_count: 0, position_count: 0, accounts: [], investor: null },
+        llm_telemetry: {
+          total_calls: 7,
+          total_tokens: 12345,
+          failed_calls: 0,
+          total_latency_ms: 2450,
+          estimated_cost: 0.012345,
+          by_stage: [
+            { stage: 'candidate_screening', calls: 1, total_tokens: 1200, failed_calls: 0 },
+            { stage: 'judge_decision', calls: 1, total_tokens: 1800, failed_calls: 0 },
+          ],
+        },
+        judge_sanity: {
+          final_action: 'watch',
+          primary_plan_verdict: 'downgraded',
+          decision_summary: '等待回踩确认。',
+          check_count: 1,
+          required_change_count: 1,
+          sanity_checks: [
+            {
+              rule_id: 'open_without_position_plan',
+              action: 'downgrade',
+              from_action: 'open',
+              to_action: 'watch',
+              reason: '缺少明确入场条件。',
+            },
+          ],
+        },
+        artifact_dir: '/tmp/trace-observability',
+      },
+    ]));
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('可观测性')).toBeInTheDocument();
+    expect(screen.getByText('LLM 调用')).toBeInTheDocument();
+    expect(screen.getByText('12,345')).toBeInTheDocument();
+    expect(screen.getByText('candidate_screening')).toBeInTheDocument();
+    expect(screen.getByText('judge_decision')).toBeInTheDocument();
+    expect(screen.getByText('Judge Sanity')).toBeInTheDocument();
+    expect(screen.getByText('open_without_position_plan')).toBeInTheDocument();
+    expect(screen.getByText('等待回踩确认。')).toBeInTheDocument();
   });
 });
 

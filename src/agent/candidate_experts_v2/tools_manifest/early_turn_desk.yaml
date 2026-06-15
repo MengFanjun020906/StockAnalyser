@@ -46,6 +46,35 @@ tools:
     failure_modes:
       - 历史数据不足 20 日时 ma20 为空。
 
+  - tool: get_tushare_stk_factor
+    priority: 9
+    when_to_use: >-
+      用 Tushare 社区自产技术因子核实低位拐点：MACD、KDJ、RSI、BOLL、CCI 是否同步转强。
+      适合在本地趋势/均线结论需要外部数据交叉验证时调用。
+    typical_args:
+      stock_code: "{code}"
+      limit: 20
+    returns_summary: >-
+      返回最近交易日技术因子 latest 和历史 items；指标基于前复权价格计算。
+    key_fields:
+      - latest
+      - macd_dif
+      - macd_dea
+      - macd
+      - kdj_k
+      - kdj_d
+      - kdj_j
+      - rsi_6
+      - boll_mid
+      - cci
+    combo_hints:
+      - MACD 低位改善 + KDJ 金叉 + RSI 回升 = 转强拐点证据增强。
+      - 技术因子与本地 analyze_trend 冲突时，必须写明数据源与日期。
+    cost: medium
+    failure_modes:
+      - Tushare stk_factor 基于前复权价格，可能与 pro_bar 动态前复权或本地行情计算不完全一致。
+      - 停牌或新股历史较短时部分指标可能为空。
+
   - tool: get_volume_analysis
     priority: 10
     when_to_use: >-
@@ -104,6 +133,33 @@ tools:
     cost: medium
     failure_modes:
       - 非交易日无数据；Tushare 免费额度耗尽时返回空。
+
+  - tool: get_tushare_moneyflow_mkt_dc
+    priority: 19
+    when_to_use: >-
+      查看东财大盘主力资金流向，判断当前市场水位是否支持低位结构反转。
+      这是市场背景工具，不替代个股资金流。
+    typical_args:
+      trade_date: "{today}"
+      limit: 5
+    returns_summary: >-
+      返回上证/深证收盘与涨跌幅、全市场主力净流入、超大单/大单/中单/小单净流入。
+      金额为 CNY。
+    key_fields:
+      - trade_date
+      - pct_change_sh
+      - pct_change_sz
+      - net_amount
+      - net_amount_rate
+      - extra_large_net_inflow
+      - large_net_inflow
+    combo_hints:
+      - 大盘主力净流入转正 + 个股低位放量 = 反转环境更友好。
+      - 大盘主力持续净流出时，低位启动只能降低仓位或放 watch。
+    cost: medium
+    failure_modes:
+      - 每日盘后更新，不能当盘中实时资金。
+      - 这是东财大盘口径，不能和个股/板块资金直接相加。
 
   - tool: get_chip_distribution
     priority: 20

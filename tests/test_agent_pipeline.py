@@ -1212,7 +1212,8 @@ class TestAgentConstructionChain(unittest.TestCase):
 
         adapter._call_litellm_model = MagicMock(side_effect=fake_call)
 
-        with patch("src.agent.llm_adapter.time.time", side_effect=[0.0, 0.0, 7.0, 7.0]):
+        time_values = iter([0.0, 0.0, 0.0, 7.0, 7.0, 7.0])
+        with patch("src.agent.llm_adapter.time.time", side_effect=lambda: next(time_values, 7.0)):
             result = adapter.call_completion(
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[],

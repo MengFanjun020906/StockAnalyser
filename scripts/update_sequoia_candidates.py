@@ -33,9 +33,15 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.core.trading_calendar import get_effective_trading_date
 
 DEFAULT_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
 DEFAULT_TRADING_DAYS = 260
@@ -91,6 +97,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-only", action="store_true",
                         help="Only fetch the benchmark index, without updating stock symbols")
     return parser.parse_args()
+
+
+def resolve_cn_resume_target_date(current_time: Optional[datetime] = None) -> date:
+    """Return the latest reusable A-share daily-bar date."""
+    return get_effective_trading_date("cn", current_time=current_time)
 
 
 def init_db(db_path: str) -> None:
@@ -371,7 +382,7 @@ def main() -> int:
     args = parse_args()
     db_path = str(Path(args.db_path).expanduser())
     trading_days = max(1, args.trading_days)
-    end = date.today()
+    end = resolve_cn_resume_target_date()
     end_text = end.strftime("%Y-%m-%d")
 
     init_db(db_path)
@@ -389,9 +400,11 @@ def main() -> int:
         start_text = start.strftime("%Y-%m-%d")
         mode = f"full ({start_text}..{end_text})"
 
-    # Resume target is today's fetch end date, not the DB's current max date.
-    # Using the DB max date caused all symbols to be skipped on re-runs of the
-    # same day because every symbol already has max_date == DB max date.
+    # Resume target is the latest completed A-share session, not the natural
+    # date. Weekend/holiday runs cannot write bars for "today" and must still
+    # be considered complete once symbols reach the previous trading day.
+    # It is also not the DB's current max date, because that caused all symbols
+    # to be skipped on re-runs of the same day.
     resume_target_date = end_text
 
     import baostock as bs

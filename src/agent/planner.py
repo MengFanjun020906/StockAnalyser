@@ -23,6 +23,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
     "technical_analysis": [
         "analyze_trend",
         "calculate_ma",
+        "get_tushare_stk_factor",
         "get_volume_analysis",
         "analyze_pattern",
         "analyze_price_structure",
@@ -32,7 +33,9 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
     "news_event": ["search_comprehensive_intel", "search_stock_news"],
     "capital_flow": [
         "get_capital_flow",
+        "get_board_capital_flow",
         "get_market_capital_flow",
+        "get_tushare_moneyflow_mkt_dc",
         "get_northbound_capital_flow",
         "get_margin_trading_summary",
     ],
@@ -49,7 +52,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
         "get_sector_rankings",
         "get_volume_analysis",
     ],
-    "market_context": ["get_market_indices", "get_sector_rankings"],
+    "market_context": ["get_market_indices", "get_sector_rankings", "get_board_capital_flow"],
     "backtest_memory": [
         "get_skill_backtest_summary",
         "get_strategy_backtest_summary",

@@ -7,5 +7,5 @@ contact_links:
     url: https://github.com/ZhuLinsen/daily_stock_analysis#-快速开始
     about: 查看中文 README 获取使用帮助 / View the Chinese README for setup help
   - name: 📋 English Docs Index
-    url: https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/INDEX_EN.md
+    url: https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/i18n/INDEX_EN.md
     about: All English-language documentation in one place

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Candidate expert committee v2.
 
-LLM-driven multi-expert candidate discovery. See docs/选股池多专家设计.md.
+LLM-driven multi-expert candidate discovery. See docs/plans/选股池多专家设计.md.
 
 This package is opt-in via AGENT_CANDIDATE_DISCOVERY_MODE=llm_expert_committee
 and does NOT replace the deterministic v1 in src.agent.candidate_experts.

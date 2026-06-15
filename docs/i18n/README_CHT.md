@@ -18,9 +18,9 @@
 
 每日自動分析自選股 -> 生成決策儀表盤 -> 推送到 Telegram / Discord / Slack / 郵件 / 企業微信 / 飛書。
 
-[**功能特性**](#-功能特性) · [**快速開始**](#-快速開始) · [**推送效果**](#-推送效果) · [**完整指南**](./full-guide.md) · [**常見問題**](./FAQ.md) · [**更新日誌**](./CHANGELOG.md)
+[**功能特性**](#-功能特性) · [**快速開始**](#-快速開始) · [**推送效果**](#-推送效果) · [**完整指南**](../full-guide.md) · [**常見問題**](../FAQ.md) · [**更新日誌**](../CHANGELOG.md)
 
-繁體中文 | [English](README_EN.md) | [简体中文](../README.md)
+繁體中文 | [English](README_EN.md) | [简体中文](../../README.md)
 
 </div>
 
@@ -28,7 +28,7 @@
 
 <div align="center">
   <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
-    <img src="../sources/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
+    <img src="../../sources/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
   </a>
 </div>
 <br>
@@ -50,7 +50,7 @@
 | 推送 | 多渠道通知 | 支援企業微信、飛書、Telegram、Discord、Slack、郵件等主流渠道 |
 | 自動化 | 定時運行 | 支援 GitHub Actions、Docker、本地定時任務和 FastAPI 服務模式 |
 
-> 功能細節、欄位契約、基本面 P0 超時語義、交易紀律、數據源優先級、Web/API 行為請看 [完整配置與部署指南](./full-guide.md)。
+> 功能細節、欄位契約、基本面 P0 超時語義、交易紀律、數據源優先級、Web/API 行為請看 [完整配置與部署指南](../full-guide.md)。
 
 ### 技術棧與數據來源
 
@@ -61,7 +61,7 @@
 | 新聞搜尋 | [Anspire](https://aisearch.anspire.cn/)、[SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)、[Tavily](https://tavily.com/)、[Bocha](https://open.bocha.cn/)、[Brave](https://brave.com/search/api/)、[MiniMax](https://platform.minimaxi.com/)、SearXNG |
 | 社交輿情 | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit / X / Polymarket，僅美股，可選） |
 
-> 完整規則見 [數據源配置](./full-guide.md#数据源配置)。
+> 完整規則見 [數據源配置](../full-guide.md#数据源配置)。
 
 ## 🚀 快速開始
 
@@ -79,7 +79,7 @@
 
 **AI 模型配置（至少配置一個）**
 
-預設先選一個模型服務商並填寫 API Key；需要多模型、圖片識別、本地模型或高級路由時，再參考 [LLM 配置指南](./LLM_CONFIG_GUIDE.md)。
+預設先選一個模型服務商並填寫 API Key；需要多模型、圖片識別、本地模型或高級路由時，再參考 [LLM 配置指南](../LLM_CONFIG_GUIDE.md)。
 
 > 推薦 [AIHubMix](https://aihubmix.com/?aff=CfMq)：一個 Key 即可使用 Gemini、GPT、Claude、DeepSeek 等全球主流模型，無需科學上網，含免費模型，付費模型高穩定性無限併發。本項目可享 10% 充值優惠。
 
@@ -104,7 +104,7 @@
 | `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` | Slack Bot |
 | `EMAIL_SENDER` + `EMAIL_PASSWORD` | 郵件推送 |
 
-更多渠道、簽名校驗、分組郵件、Markdown 轉圖片等配置見 [通知渠道詳細配置](./full-guide.md#通知渠道详细配置)。
+更多渠道、簽名校驗、分組郵件、Markdown 轉圖片等配置見 [通知渠道詳細配置](../full-guide.md#通知渠道详细配置)。
 
 **自選股配置（必填）**
 
@@ -126,7 +126,7 @@
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/)：結構化搜尋結果 | 可選 |
 | `SEARXNG_BASE_URLS` | SearXNG 自建實例：無配額兜底，適合私有部署 | 可選 |
 
-更多搜尋源、社交輿情和降級規則見 [搜尋服務配置](./full-guide.md#搜索服务配置)。
+更多搜尋源、社交輿情和降級規則見 [搜尋服務配置](../full-guide.md#搜索服务配置)。
 
 #### 3. 啟用 Actions
 
@@ -138,7 +138,7 @@
 
 #### 完成
 
-預設每個工作日 18:00（北京時間）自動執行，也可手動觸發。預設非交易日（含 A/H/US 節假日）不執行；強制運行、交易日檢查、斷點續傳等規則見 [完整指南](./full-guide.md#定时任务配置)。
+預設每個工作日 18:00（北京時間）自動執行，也可手動觸發。預設非交易日（含 A/H/US 節假日）不執行；強制運行、交易日檢查、斷點續傳等規則見 [完整指南](../full-guide.md#定时任务配置)。
 
 ### 方式二：本地運行 / Docker 部署
 
@@ -167,7 +167,7 @@ python main.py --schedule
 python main.py --serve-only
 ```
 
-> Docker 部署、定時任務、雲端伺服器訪問請參考 [完整指南](./full-guide.md)；桌面客戶端打包請參考 [桌面端打包說明](./desktop-package.md)。
+> Docker 部署、定時任務、雲端伺服器訪問請參考 [完整指南](../full-guide.md)；桌面客戶端打包請參考 [桌面端打包說明](../deployment/desktop-package.md)。
 
 ## 📱 推送效果
 
@@ -207,11 +207,11 @@ python main.py --serve-only
 
 ## ⚙️ 配置說明
 
-完整環境變數、模型渠道、通知渠道、數據源優先級、交易紀律、基本面 P0 語義和部署說明請參考 [完整配置指南](./full-guide.md)。
+完整環境變數、模型渠道、通知渠道、數據源優先級、交易紀律、基本面 P0 語義和部署說明請參考 [完整配置指南](../full-guide.md)。
 
 ## 🖥️ Web 介面
 
-![FastAPI Web UI](../sources/fastapi_server.png)
+![FastAPI Web UI](../../sources/fastapi_server.png)
 
 Web 工作台提供配置管理、任務監控、手動分析、歷史報告、回測、持倉管理、智能匯入和淺色 / 深色主題。啟動方式：
 
@@ -220,7 +220,7 @@ python main.py --webui
 python main.py --webui-only
 ```
 
-訪問 `http://127.0.0.1:8000` 即可使用。認證、智能匯入、搜尋補全、歷史報告複製、雲端伺服器訪問等細節見 [本地 WebUI 管理介面](./full-guide.md#本地-webui-管理界面)。
+訪問 `http://127.0.0.1:8000` 即可使用。認證、智能匯入、搜尋補全、歷史報告複製、雲端伺服器訪問等細節見 [本地 WebUI 管理介面](../full-guide.md#本地-webui-管理界面)。
 
 ## 🤖 Agent 策略問股
 
@@ -231,7 +231,7 @@ python main.py --webui-only
 - 支援多輪追問、會話匯出、發送到通知渠道和後台執行
 - 支援自訂策略文件與多 Agent 編排（實驗性）
 
-> Agent 具體參數、`skill` 命名兼容、多 Agent 模式和預算護欄見 [完整指南](./full-guide.md#本地-webui-管理界面) 與 [LLM 配置指南](./LLM_CONFIG_GUIDE.md)。
+> Agent 具體參數、`skill` 命名兼容、多 Agent 模式和預算護欄見 [完整指南](../full-guide.md#本地-webui-管理界面) 與 [LLM 配置指南](../LLM_CONFIG_GUIDE.md)。
 
 ## 相關項目 (Related Projects)
 
@@ -242,7 +242,7 @@ DSA 聚焦日常分析報告；以下兩個同系列項目分別覆蓋選股、�
 
 ## 🗺️ Roadmap
 
-查看已支援的功能和未來規劃：[更新日誌](./CHANGELOG.md)
+查看已支援的功能和未來規劃：[更新日誌](../CHANGELOG.md)
 
 > 有建議？歡迎 [提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
 
@@ -254,7 +254,7 @@ DSA 聚焦日常分析報告；以下兩個同系列項目分別覆蓋選股、�
 
 | 支付寶 (Alipay) | 微信支付 (WeChat) | 小紅書 |
 | :---: | :---: | :---: |
-| <img src="../sources/alipay.jpg" width="200" alt="Alipay"> | <img src="../sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../sources/xiaohongshu.png" width="200" alt="小紅書"> |
+| <img src="../../sources/alipay.jpg" width="200" alt="Alipay"> | <img src="../../sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../../sources/xiaohongshu.png" width="200" alt="小紅書"> |
 
 ## 🤝 貢獻
 
@@ -271,11 +271,11 @@ npm run lint
 npm run build
 ```
 
-詳見 [貢獻指南](CONTRIBUTING.md)。
+詳見 [貢獻指南](../CONTRIBUTING.md)。
 
 ## 📄 License
 
-[MIT License](../LICENSE) © 2026 ZhuLinsen
+[MIT License](../../LICENSE) © 2026 ZhuLinsen
 
 如果你在項目中使用或基於本項目進行二次開發，非常歡迎在 README 或文檔中註明來源並附上本倉庫鏈接。
 

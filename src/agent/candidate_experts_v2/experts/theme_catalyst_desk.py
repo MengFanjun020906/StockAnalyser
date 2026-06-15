@@ -18,11 +18,15 @@ THEME_CATALYST_DESK_TOOLS: tuple[str, ...] = (
     "get_eastmoney_cjzc_daily",
     "get_stock_business_context",
     "get_stockapi_hot_sectors",
+    "get_board_capital_flow",
+    "get_tushare_moneyflow_ind_ths",
     "get_stockapi_hot_sector_leaders",
     "get_stockapi_hot_money_activity",
+    "get_tushare_moneyflow_mkt_dc",
     "get_capital_flow",
     "get_realtime_quote",
     "get_volume_analysis",
+    "get_tushare_stk_factor",
     "analyze_price_structure",
     "search_stock_news",
     "score_stock_news_sentiment",
@@ -100,3 +104,24 @@ class ThemeCatalystDeskExpert(BaseDeskExpert):
         if primary:
             return primary
         return fallback_candidates[: self._fallback_supplement_n]
+
+    def _ineligible_row_reason(self, row: FeatureRow) -> str:
+        sources = set(str(item) for item in (row.recall_sources or []) if item)
+        flag_kinds = {flag.kind for flag in row.flags}
+        flag_detectors = " ".join(str(flag.detector or "") for flag in row.flags)
+        flag_summaries = " ".join(str(flag.summary or "") for flag in row.flags)
+        source_note = "" if sources & _ELIGIBLE_SOURCES else "召回来源未命中 news_theme_daily/sector_theme/hot_rank/limit_up_pool"
+        flag_note = "" if flag_kinds & _ELIGIBLE_KINDS else "flags 未命中 news/sector/capital/limit"
+        clue_note = (
+            ""
+            if ("news_theme_daily" in flag_detectors or "主题" in flag_summaries or "催化" in flag_summaries)
+            else "detector/summary 未出现主题或催化线索"
+        )
+        fs = row.fact_sheet
+        sector_note = ""
+        if fs is None:
+            sector_note = "缺少 FactSheet，无法用强板块作为 fallback"
+        elif fs.sector_strength != "strong":
+            sector_note = f"板块强度为 {fs.sector_strength or 'unknown'}，不是 strong"
+        parts = [item for item in (source_note, flag_note, clue_note, sector_note) if item]
+        return "主题催化席未入席：" + "；".join(parts) + "。"
