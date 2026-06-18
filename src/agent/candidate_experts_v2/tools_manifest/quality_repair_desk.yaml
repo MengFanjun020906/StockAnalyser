@@ -25,6 +25,26 @@ tools:
     failure_modes:
       - 少数标的信息缺失。
 
+  - tool: get_stock_business_context
+    priority: 6
+    when_to_use: >-
+      核实公司主营、所属行业、概念板块和业务线索，避免把低估值公司误判成相关产业链修复。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回公司名称、行业、所属板块、业务摘要、来源和日期。
+    key_fields:
+      - industry
+      - boards
+      - business_summary
+      - source
+    combo_hints:
+      - 业务线索与财务改善方向一致 = 修复逻辑更完整。
+      - 行业/业务不匹配时，不能仅靠低估值 support。
+    cost: cheap
+    failure_modes:
+      - 所属板块或业务摘要缺失时只能标记业务不明，不得臆测主营。
+
   - tool: get_tushare_daily_basic
     priority: 8
     when_to_use: >-
@@ -151,6 +171,49 @@ tools:
     failure_modes:
       - 上市未满3年无完整分红记录。
 
+  - tool: get_tushare_announcements
+    priority: 24
+    when_to_use: >-
+      核查近期公告、业绩相关披露、分红和重大事项，验证质量修复是否有公司级触发。
+    typical_args:
+      stock_code: "{code}"
+      limit: 20
+    returns_summary: >-
+      返回 Tushare 公告列表、公告日期、标题、链接和来源链路。
+    key_fields:
+      - ann_date
+      - title
+      - url
+      - errors
+    combo_hints:
+      - 业绩预告/快报/分红公告与财务指标一致 = 修复证据增强。
+      - 减持、处罚、诉讼等负面公告优先降级或剔除。
+    cost: medium
+    failure_modes:
+      - 公告列表为空不代表公司无公告，需结合披露事件工具或新闻降级判断。
+
+  - tool: get_stock_disclosure_events
+    priority: 25
+    when_to_use: >-
+      从公开公告源核查年报、季报、投资者关系和关键词披露，验证基本面改善是否有原始披露依据。
+    typical_args:
+      stock_code: "{code}"
+      stock_name: "{name}"
+      limit: 20
+    returns_summary: >-
+      返回公告/IR 条目、事件候选、匹配词、摘要和 source_chain。
+    key_fields:
+      - events
+      - event_count
+      - matched_terms
+      - evidence_summary
+    combo_hints:
+      - 财务改善 + 披露事件支持 = 质量修复证据更硬。
+      - 披露中出现减持、处罚、诉讼、监管问询 = 风险优先。
+    cost: expensive
+    failure_modes:
+      - PDF 正文可能跳过；标题和元数据仍可用，但结论要降级。
+
   - tool: analyze_trend
     priority: 26
     when_to_use: >-
@@ -218,3 +281,69 @@ tools:
     cost: cheap
     failure_modes:
       - 新股历史不足，position_zone 可能返回 unknown。
+
+  - tool: get_capital_flow
+    priority: 32
+    when_to_use: >-
+      质量修复候选需要确认资金没有持续撤离。它不是质量席主证据，但可用于排除价值陷阱和出货风险。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回个股主力/净流入口径、近 5/10 日累计资金方向、source_definitions 和 source_chain。
+    key_fields:
+      - selected_flow_source
+      - main_net_inflow
+      - net_5d_inflow
+      - net_10d_inflow
+      - warnings
+    combo_hints:
+      - 基本面改善 + 资金由负转正 = 修复启动概率提高。
+      - 财务改善但资金连续流出 = 降级为 watch，等待资金确认。
+    cost: medium
+    failure_modes:
+      - 不同资金源口径不同，必须查看 source_definitions，不能混加金额。
+
+  - tool: get_chip_distribution
+    priority: 34
+    when_to_use: >-
+      检查筹码集中度、获利盘和上方套牢压力，避免质量修复候选在高位筹码拥挤时追买。
+    typical_args:
+      stock_code: "{code}"
+    returns_summary: >-
+      返回筹码成本、获利比例、集中度和套牢压力。
+    key_fields:
+      - chip_concentration
+      - profit_ratio
+      - average_cost
+      - cost_distribution
+    combo_hints:
+      - 低位筹码集中 + 基本面改善 = 修复逻辑更完整。
+      - 获利盘过高或上方套牢重 = 需要等待回踩或放弃追高。
+    cost: medium
+    failure_modes:
+      - 部分数据源不提供实时筹码，缺失时不能编造成本结构。
+
+  - tool: get_symbol_regime_probability
+    priority: 36
+    when_to_use: >-
+      对质量修复候选补充当前市场 regime 下的单股历史路径画像和 reentry_reference。
+      只用于校准等待回踩/买回参考，不能替代基本面改善证据。
+    typical_args:
+      stock_code: "{code}"
+      market: "cn"
+      lookback_days: 900
+      windows: [7, 30, 60, 90]
+    returns_summary: >-
+      返回 forward-return 概率、路径画像、样本质量和买回参考。
+    key_fields:
+      - status
+      - regime
+      - windows
+      - reentry_reference
+      - low_confidence
+    combo_hints:
+      - 基本面改善但点位不舒服时，用 reentry_reference 写等待条件。
+      - low_confidence=true 时只能作为弱证据，不得提高 stance。
+    cost: medium
+    failure_modes:
+      - 仅支持 A 股；样本不足、本地 K 线不足时会低置信返回。

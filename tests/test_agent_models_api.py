@@ -472,7 +472,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(payload["runtime_config"]["agent_orchestration_mode"], "expert_graph")
         self.assertEqual(payload["runtime_config"]["agent_tool_call_timeout_seconds"], 30)
 
-    def test_trace_tool_status_marks_preview_errors_failed(self) -> None:
+    def test_trace_tool_status_keeps_preview_errors_successful_when_data_exists(self) -> None:
         call = {
             "step": 1,
             "tool": "get_capital_flow",
@@ -482,6 +482,30 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             "result_preview": json.dumps({
                 "status": "ok",
                 "main_net_inflow": 123.4,
+                "errors": ["capital flow fetch failed"],
+            }, ensure_ascii=False),
+        }
+
+        normalized = agent._normalize_tool_calls_status([call])
+        ledger = agent._build_evidence_ledger(normalized)
+        event = agent._normalize_tool_event_status({"type": "tool_done", **call})
+
+        self.assertTrue(normalized[0]["success"])
+        self.assertEqual(ledger["entries"][0]["status"], "success")
+        self.assertTrue(event["success"])
+
+    def test_trace_tool_status_marks_preview_errors_failed_without_data(self) -> None:
+        call = {
+            "step": 1,
+            "tool": "get_capital_flow",
+            "arguments": {"stock_code": "600519"},
+            "success": True,
+            "duration": 15.0,
+            "result_preview": json.dumps({
+                "status": "partial",
+                "query": {"page_no": 1, "page_size": 50},
+                "main_net_inflow": None,
+                "sector_rankings": {"top_inflow_sectors": [], "top_outflow_sectors": []},
                 "errors": ["capital flow fetch failed"],
             }, ensure_ascii=False),
         }

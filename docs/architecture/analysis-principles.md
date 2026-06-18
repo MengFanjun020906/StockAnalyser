@@ -357,7 +357,7 @@ Agent 模式会注册工具，供 LLM 按阶段调用。主要工具包括：
 | `get_chip_distribution` | data | 获取筹码分布；默认优先使用 Tushare `cyq_chips`，失败时返回 `status/errors/source_chain/error_summary`，区分禁用、不支持、熔断和数据源异常 |
 | `get_analysis_context` | data | 获取数据库中的技术上下文 |
 | `get_stock_info` | data | 获取估值、基本面、板块等压缩上下文 |
-| `get_capital_flow` | data | 获取 A 股个股主力资金流；默认使用 Tushare `moneyflow`，失败时回退 StockAPI 历史资金流 `codeFlow`，显式工具使用 `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` 预算 |
+| `get_capital_flow` | data | 获取 A 股个股主力资金流；按 Tushare `moneyflow_dc`、`moneyflow_ths`、legacy `moneyflow` 顺序 failover，首个可用来源成功即返回，全部失败时回退 StockAPI `codeFlow`；未选中的 Tushare 来源后台 best-effort 审计，冲突仅写入 `warnings/source_conflicts` |
 | `discover_watchlist_candidates` | market | 生成选股候选池；默认使用 AlphaSift YAML 多因子策略、Sequoia 量化策略、强势板块成分股等多路召回并统一评分，仅在无候选时使用固定种子池兜底 |
 | `get_market_capital_flow` | data | 获取 A 股市场资金快照、个股/行业/概念资金流排名 |
 | `get_northbound_capital_flow` | data | 获取北向资金摘要和近期历史 |

@@ -11,11 +11,12 @@ from __future__ import annotations
 import logging
 import os
 import copy
+import concurrent.futures
 import re
 import threading
 import time
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -31,6 +32,19 @@ _STOCKAPI_CACHE_TTL_SECONDS = 15.0
 _STOCKAPI_REQUEST_LOCK = threading.Lock()
 _STOCKAPI_RESPONSE_CACHE: Dict[Tuple[str, Tuple[Tuple[str, str], ...], bool], Tuple[float, Dict[str, Any]]] = {}
 _stockapi_last_request_at = 0.0
+_CAPITAL_FLOW_AUDIT_SOURCES = (
+    "tushare_moneyflow_dc",
+    "tushare_moneyflow_ths",
+    "tushare_moneyflow",
+)
+_CAPITAL_FLOW_AUDIT_FIELDS = (
+    "main_net_inflow",
+    "net_inflow",
+    "main_inflow_5d",
+    "net_inflow_5d",
+)
+_CAPITAL_FLOW_CONFLICT_MIN_ABS_CNY = 1_000_000.0
+_CAPITAL_FLOW_CONFLICT_RELATIVE_DELTA = 0.5
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "per_share": [
@@ -225,6 +239,93 @@ def _has_capital_flow_value(payload: Dict[str, Any]) -> bool:
         "net_inflow_5d",
     )
     return any(payload.get(key) is not None for key in keys)
+
+
+def _capital_flow_direction(value: Any) -> int:
+    amount = _safe_float(value)
+    if amount is None or abs(amount) < 1e-6:
+        return 0
+    return 1 if amount > 0 else -1
+
+
+def _capital_flow_relative_delta(left: float, right: float) -> float:
+    denominator = max(abs(left), abs(right), 1.0)
+    return abs(left - right) / denominator
+
+
+def _capital_flow_source_summary(flow: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "latest_date": flow.get("latest_date"),
+        "main_net_inflow": flow.get("main_net_inflow"),
+        "net_inflow": flow.get("net_inflow"),
+        "main_inflow_definition": flow.get("main_inflow_definition"),
+        "net_inflow_definition": flow.get("net_inflow_definition"),
+    }
+
+
+def _compare_capital_flow_sources(
+    selected_source: str,
+    selected_flow: Dict[str, Any],
+    other_source: str,
+    other_flow: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    conflicts: List[Dict[str, Any]] = []
+    selected_date = selected_flow.get("latest_date")
+    other_date = other_flow.get("latest_date")
+    if selected_date and other_date and selected_date != other_date:
+        conflicts.append({
+            "type": "stale_source",
+            "severity": "medium",
+            "selected_source": selected_source,
+            "other_source": other_source,
+            "selected_date": selected_date,
+            "other_date": other_date,
+            "message": "Capital-flow sources use different latest trade dates; keep selected_flow_source authoritative.",
+        })
+
+    for field in _CAPITAL_FLOW_AUDIT_FIELDS:
+        selected_value = _safe_float(selected_flow.get(field))
+        other_value = _safe_float(other_flow.get(field))
+        if selected_value is None or other_value is None:
+            continue
+        selected_direction = _capital_flow_direction(selected_value)
+        other_direction = _capital_flow_direction(other_value)
+        if selected_direction and other_direction and selected_direction != other_direction:
+            conflicts.append({
+                "type": "direction_conflict",
+                "severity": "high",
+                "field": field,
+                "selected_source": selected_source,
+                "other_source": other_source,
+                "selected_value": selected_value,
+                "other_value": other_value,
+                "selected_date": selected_date,
+                "other_date": other_date,
+                "message": "Capital-flow source directions disagree; keep selected_flow_source authoritative.",
+            })
+            continue
+
+        abs_delta = abs(selected_value - other_value)
+        relative_delta = _capital_flow_relative_delta(selected_value, other_value)
+        if (
+            abs_delta >= _CAPITAL_FLOW_CONFLICT_MIN_ABS_CNY
+            and relative_delta >= _CAPITAL_FLOW_CONFLICT_RELATIVE_DELTA
+        ):
+            conflicts.append({
+                "type": "magnitude_divergence",
+                "severity": "medium",
+                "field": field,
+                "selected_source": selected_source,
+                "other_source": other_source,
+                "selected_value": selected_value,
+                "other_value": other_value,
+                "absolute_delta": abs_delta,
+                "relative_delta": round(relative_delta, 4),
+                "selected_date": selected_date,
+                "other_date": other_date,
+                "message": "Capital-flow source magnitudes diverge; keep selected_flow_source authoritative.",
+            })
+    return conflicts
 
 
 def _stockapi_endpoint_url(path: str) -> str:
@@ -1449,6 +1550,7 @@ class AkshareFundamentalAdapter:
         end_date: Optional[str] = None,
         page_no: int = 1,
         page_size: int = 50,
+        budget_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Return stock capital flow.
@@ -1461,36 +1563,37 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        source_attempts: List[Tuple[str, Dict[str, Any], Optional[str], List[str]]] = []
-        for label, getter in (
+        source_getters: Tuple[
+            Tuple[str, Callable[..., Tuple[Dict[str, Any], Optional[str], List[str]]]],
+            ...,
+        ] = (
             ("tushare_moneyflow_dc", self._get_tushare_moneyflow_dc_capital_flow),
             ("tushare_moneyflow_ths", self._get_tushare_moneyflow_ths_capital_flow),
             ("tushare_moneyflow", self._get_tushare_capital_flow),
-        ):
-            flow, source, errors = getter(
+        )
+        if budget_seconds is None:
+            tushare_hit = self._get_capital_flow_tushare_serial(
+                source_getters,
                 stock_code,
                 start_date=start_date,
                 end_date=end_date,
             )
-            if flow:
-                source_attempts.append((label, flow, source, []))
-                result["source_chain"].append(f"capital_stock:{source or label}")
-            else:
-                source_attempts.append((label, {}, source, errors))
-                result["errors"].extend(errors)
-                if errors:
-                    result["source_chain"].append(f"capital_stock:{label}")
-
-        flow_sources = {
-            label: flow
-            for label, flow, _, _ in source_attempts
-            if flow
-        }
-        selected_flow = self._select_capital_flow(flow_sources)
-        if selected_flow:
-            selected_source, stock_flow = selected_flow
-            stock_flow["selected_flow_source"] = selected_source
-            stock_flow["flow_sources"] = flow_sources
+        else:
+            tushare_hit = self._get_capital_flow_tushare_budgeted(
+                source_getters,
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                budget_seconds=budget_seconds,
+            )
+        result["errors"].extend(tushare_hit.get("errors", []))
+        result["source_chain"].extend(tushare_hit.get("source_chain", []))
+        selected_label = tushare_hit.get("selected_label")
+        flow = tushare_hit.get("flow")
+        if selected_label and isinstance(flow, dict) and flow:
+            stock_flow = dict(flow)
+            stock_flow["selected_flow_source"] = selected_label
+            stock_flow["flow_sources"] = {selected_label: flow}
             result["stock_flow"] = stock_flow
             result["status"] = "partial"
             return result
@@ -1515,6 +1618,237 @@ class AkshareFundamentalAdapter:
             result["status"] = "not_supported"
         elif result["errors"]:
             result["status"] = "failed"
+        return result
+
+    def _get_capital_flow_tushare_serial(
+        self,
+        source_getters: Tuple[
+            Tuple[str, Callable[..., Tuple[Dict[str, Any], Optional[str], List[str]]]],
+            ...,
+        ],
+        stock_code: str,
+        *,
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "selected_label": None,
+            "flow": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        for label, getter in source_getters:
+            flow, source, errors = getter(
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if flow:
+                result["selected_label"] = label
+                result["flow"] = flow
+                result["source_chain"].append(f"capital_stock:{source or label}")
+                return result
+            result["errors"].extend(errors)
+            if errors:
+                result["source_chain"].append(f"capital_stock:{label}")
+        return result
+
+    def _get_capital_flow_tushare_budgeted(
+        self,
+        source_getters: Tuple[
+            Tuple[str, Callable[..., Tuple[Dict[str, Any], Optional[str], List[str]]]],
+            ...,
+        ],
+        stock_code: str,
+        *,
+        start_date: Optional[str],
+        end_date: Optional[str],
+        budget_seconds: float,
+    ) -> Dict[str, Any]:
+        total_budget = max(1.0, float(budget_seconds or 0.0))
+        stockapi_reserve = 3.0 if total_budget >= 6.0 else 0.0
+        tushare_budget = max(0.75, min(8.0, total_budget - stockapi_reserve))
+        query_timeout = max(1.0, min(8.0, tushare_budget))
+        started_at = time.monotonic()
+        completed: Dict[str, Tuple[Dict[str, Any], Optional[str], List[str]]] = {}
+        result: Dict[str, Any] = {
+            "selected_label": None,
+            "flow": {},
+            "source_chain": [],
+            "errors": [],
+        }
+        futures: Dict[concurrent.futures.Future, str] = {}
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(source_getters),
+            thread_name_prefix="capital-flow-tushare",
+        )
+        try:
+            for label, getter in source_getters:
+                futures[
+                    executor.submit(
+                        getter,
+                        stock_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                        query_timeout=query_timeout,
+                    )
+                ] = label
+
+            pending = set(futures.keys())
+            deadline = started_at + tushare_budget
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=min(0.1, max(0.01, remaining)),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    label = futures[future]
+                    try:
+                        flow, source, errors = future.result()
+                    except Exception as exc:
+                        flow, source, errors = {}, None, [f"{label}:{type(exc).__name__}:{exc}"]
+                    completed[label] = (flow or {}, source, list(errors or []))
+
+                selected = self._select_completed_capital_flow(source_getters, completed)
+                if selected:
+                    selected_label, selected_flow, selected_source = selected
+                    result["selected_label"] = selected_label
+                    result["flow"] = selected_flow
+                    for label, _getter in source_getters:
+                        if label == selected_label:
+                            break
+                        _flow, _source, errors = completed.get(label, ({}, None, []))
+                        result["errors"].extend(errors)
+                        if errors:
+                            result["source_chain"].append(f"capital_stock:{label}")
+                    result["source_chain"].append(f"capital_stock:{selected_source or selected_label}")
+                    return result
+
+            for future in list(pending):
+                label = futures[future]
+                future.cancel()
+                completed.setdefault(label, ({}, None, [f"{label}:timeout:{tushare_budget:.1f}s"]))
+
+            selected = self._select_completed_capital_flow(
+                source_getters,
+                completed,
+                allow_pending_predecessors=True,
+            )
+            if selected:
+                selected_label, selected_flow, selected_source = selected
+                result["selected_label"] = selected_label
+                result["flow"] = selected_flow
+                for label, _getter in source_getters:
+                    if label == selected_label:
+                        break
+                    _flow, _source, errors = completed.get(label, ({}, None, []))
+                    result["errors"].extend(errors)
+                    if errors:
+                        result["source_chain"].append(f"capital_stock:{label}")
+                result["source_chain"].append(f"capital_stock:{selected_source or selected_label}")
+                return result
+
+            for label, _getter in source_getters:
+                _flow, _source, errors = completed.get(label, ({}, None, [f"{label}:timeout:{tushare_budget:.1f}s"]))
+                result["errors"].extend(errors)
+                if errors:
+                    result["source_chain"].append(f"capital_stock:{label}")
+            return result
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _select_completed_capital_flow(
+        source_getters: Tuple[
+            Tuple[str, Callable[..., Tuple[Dict[str, Any], Optional[str], List[str]]]],
+            ...,
+        ],
+        completed: Dict[str, Tuple[Dict[str, Any], Optional[str], List[str]]],
+        *,
+        allow_pending_predecessors: bool = False,
+    ) -> Optional[Tuple[str, Dict[str, Any], Optional[str]]]:
+        for label, _getter in source_getters:
+            if label not in completed:
+                if allow_pending_predecessors:
+                    continue
+                return None
+            flow, source, _errors = completed[label]
+            if flow:
+                return label, flow, source
+        return None
+
+    def audit_capital_flow_sources(
+        self,
+        stock_code: str,
+        selected_source: Optional[str],
+        selected_flow: Dict[str, Any],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Best-effort compare non-selected Tushare capital-flow sources."""
+        selected_label = _safe_str(selected_source) or "unknown"
+        result: Dict[str, Any] = {
+            "status": "no_comparison",
+            "selected_flow_source": selected_label,
+            "checked_sources": [],
+            "source_summaries": {
+                selected_label: _capital_flow_source_summary(selected_flow)
+                if isinstance(selected_flow, dict) else {}
+            },
+            "source_conflicts": [],
+            "warnings": [],
+            "source_chain": [],
+            "errors": [],
+        }
+        if not isinstance(selected_flow, dict) or not _has_capital_flow_value(selected_flow):
+            result["status"] = "not_applicable"
+            result["errors"].append("capital_flow_audit:no_selected_flow")
+            return result
+
+        getter_by_source = {
+            "tushare_moneyflow_dc": self._get_tushare_moneyflow_dc_capital_flow,
+            "tushare_moneyflow_ths": self._get_tushare_moneyflow_ths_capital_flow,
+            "tushare_moneyflow": self._get_tushare_capital_flow,
+        }
+        for label in _CAPITAL_FLOW_AUDIT_SOURCES:
+            if label == selected_label:
+                continue
+            getter = getter_by_source[label]
+            flow, source, errors = getter(
+                stock_code,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if flow:
+                result["checked_sources"].append(label)
+                result["source_chain"].append(f"capital_flow_audit:{source or label}")
+                result["source_summaries"][label] = _capital_flow_source_summary(flow)
+                result["source_conflicts"].extend(
+                    _compare_capital_flow_sources(
+                        selected_label,
+                        selected_flow,
+                        label,
+                        flow,
+                    )
+                )
+            else:
+                result["errors"].extend(errors)
+                if errors:
+                    result["source_chain"].append(f"capital_flow_audit:{label}")
+
+        if result["source_conflicts"]:
+            result["status"] = "conflict"
+            result["warnings"].append(
+                "capital_flow_source_conflict:"
+                f"{len(result['source_conflicts'])} conflict(s); "
+                f"keep selected_flow_source={selected_label} authoritative"
+            )
+        elif result["checked_sources"]:
+            result["status"] = "ok"
         return result
 
     def _select_capital_flow(self, flow_sources: Dict[str, Dict[str, Any]]) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -1564,6 +1898,7 @@ class AkshareFundamentalAdapter:
         fields: str,
         *,
         source_label: str,
+        query_timeout: float = 10.0,
     ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
         code, window_start, window_end, errors = self._tushare_capital_window(
             stock_code,
@@ -1580,7 +1915,12 @@ class AkshareFundamentalAdapter:
             "end_date": window_end.strftime("%Y%m%d"),
         }
         try:
-            df = query_tushare_api(api_name, params=params, fields=fields, timeout=10)
+            df = query_tushare_api(
+                api_name,
+                params=params,
+                fields=fields,
+                timeout=max(1, int(query_timeout)),
+            )
         except Exception as exc:
             return None, code, [f"{source_label}:{type(exc).__name__}:{exc}"]
         if df is None or df.empty:
@@ -1592,6 +1932,7 @@ class AkshareFundamentalAdapter:
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        query_timeout: float = 10.0,
     ) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
         source = "tushare_moneyflow_dc"
         fields = (
@@ -1606,6 +1947,7 @@ class AkshareFundamentalAdapter:
             end_date,
             fields,
             source_label=source,
+            query_timeout=query_timeout,
         )
         if errors:
             return {}, None, errors
@@ -1695,6 +2037,7 @@ class AkshareFundamentalAdapter:
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        query_timeout: float = 10.0,
     ) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
         source = "tushare_moneyflow_ths"
         fields = (
@@ -1709,6 +2052,7 @@ class AkshareFundamentalAdapter:
             end_date,
             fields,
             source_label=source,
+            query_timeout=query_timeout,
         )
         if errors:
             return {}, None, errors
@@ -1791,6 +2135,7 @@ class AkshareFundamentalAdapter:
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        query_timeout: float = 10.0,
     ) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
         code = _normalize_code(stock_code)
         if not re.fullmatch(r"\d{6}", code or ""):
@@ -1823,7 +2168,12 @@ class AkshareFundamentalAdapter:
             "buy_elg_amount,sell_elg_amount,net_mf_amount"
         )
         try:
-            df = query_tushare_api("moneyflow", params=params, fields=fields, timeout=10)
+            df = query_tushare_api(
+                "moneyflow",
+                params=params,
+                fields=fields,
+                timeout=max(1, int(query_timeout)),
+            )
         except Exception as exc:
             return {}, None, [f"tushare_moneyflow:{type(exc).__name__}:{exc}"]
 

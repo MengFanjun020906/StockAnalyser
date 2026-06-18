@@ -46,6 +46,7 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
         "get_tushare_financial_statements",
     ],
     "chip_distribution": ["get_chip_distribution"],
+    "symbol_regime_probability": ["get_symbol_regime_probability"],
     "regime_detection": [
         "detect_market_regime",
         "get_market_indices",
@@ -70,6 +71,7 @@ CAPABILITY_PURPOSES: Dict[CapabilityName, str] = {
     "capital_flow": "观察个股主力、市场资金、北向资金和两融环境是否支持当前信号。",
     "fundamental_analysis": "补充公司基本面和估值背景。",
     "chip_distribution": "评估筹码成本、集中度和获利盘压力。",
+    "symbol_regime_probability": "补充单股在当前市场 regime 下的历史 forward-return、路径画像和买回参考弱证据。",
     "regime_detection": "用指数、板块和量价数据判断市场环境对动作的约束。",
     "market_context": "补充指数和板块轮动背景。",
     "backtest_memory": "参考策略或股票历史表现，校准信号可靠性。",
@@ -228,6 +230,8 @@ def _select_capabilities(intent: str, has_position: bool, primary_symbol: Option
     ]
     if has_position or intent == "position_review":
         capabilities.insert(0, "portfolio_context")
+    if primary_symbol and intent in {"position_review", "entry_analysis"}:
+        capabilities.append("symbol_regime_probability")
     if intent in {"position_review", "entry_analysis"}:
         capabilities.append("regime_detection")
     if intent == "entry_analysis":

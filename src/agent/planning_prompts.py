@@ -155,6 +155,7 @@ ANALYSIS_DIMENSIONS = """\
 2. 市场状态识别（regime_detection）
    - 判断趋势、震荡、突破、回调、风险释放、情绪过热等状态。
    - 可结合波动率、趋势强度、板块轮动、资金行为和消息催化。
+   - 单股 `entry_analysis` / `position_review` 中，若系统提供 `symbol_regime_probability`，只能把它作为该股票在当前市场 regime 下的历史 forward-return / reentry_reference 弱证据，不得直接翻译成买卖动作。
 
 3. 信号生成（signal_generation）
    - 趋势突破信号
@@ -337,6 +338,7 @@ Planner 必须先选择主维度，再选择辅助维度。
 | `fundamental_analysis` | 中线持仓、估值、业绩逻辑 | 估值、盈利质量、现金流、成长性 |
 | `sector_industry` | 个股是否跟随主线或板块拖累 | 板块强弱、行业位置、主题共振 |
 | `backtest_memory` | 需要校准策略可靠性 | 历史信号表现，只能辅助权重 |
+| `symbol_regime_probability` | 单股入场分析、持仓复盘、TRIM 后买回参考 | 当前市场 regime 下该股票历史 forward-return、路径画像和 reentry_reference；只能辅助点位与风险权重 |
 
 ### watchlist_scan 规划规则
 
@@ -421,6 +423,7 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `fundamental_analysis` -> `get_stock_info`, `get_tushare_daily_basic`, `get_tushare_financial_indicators`, `get_tushare_financial_statements`
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`, `get_board_capital_flow`
 - `regime_detection` -> `detect_market_regime`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`
+- `symbol_regime_probability` -> `get_symbol_regime_probability`
 - `backtest_memory` -> `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary`
 
 ### 结构化执行计划
@@ -635,8 +638,8 @@ TOOL_USE_POLICY = """\
 
 - 先问“我缺什么证据”，再决定工具。
 - 不要为了显得全面而调用所有工具。
-- 对持仓诊断，优先需要 portfolio_snapshot、realtime_quote、trend_analysis、news_intel。
-- 对开仓分析，优先需要 realtime_quote、daily_history、trend_analysis、news_intel。
+- 对持仓诊断，优先需要 portfolio_snapshot、realtime_quote、trend_analysis、capital_flow、chip_distribution、news_intel、symbol_regime_probability 和市场 regime 约束。
+- 对开仓分析，优先需要 realtime_quote、trend_analysis、capital_flow、chip_distribution、fundamental_analysis、sector_industry、news_intel、symbol_regime_probability 和市场 regime 约束。
 - watchlist_scan 的候选池规则、触发边界、压缩注入格式和逐股取证要求见 `Watchlist Candidate Pool Protocol`；本节不重复展开。
 - 对事件影响，优先需要 news_intel，并结合持仓成本、仓位和关键技术位。
 - 对融资融券账户，必须检查 margin_debt、maintenance_ratio、risk_line_ratio 或等价风险字段。

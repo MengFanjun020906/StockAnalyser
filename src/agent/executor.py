@@ -17,6 +17,7 @@ same implementation.
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -543,10 +544,12 @@ class AgentExecutor:
         # Build tool declarations in OpenAI format (litellm handles all providers)
         tool_decls = self.tool_registry.to_openai_tools()
 
+        prefetch_context = self._prefetch_single_symbol_regime_context(context)
+
         # Initialize conversation
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self._build_user_message(task, context)},
+            {"role": "user", "content": self._build_user_message(task, context, prefetch_context=prefetch_context)},
         ]
 
         return self._run_loop(
@@ -555,6 +558,7 @@ class AgentExecutor:
             parse_dashboard=True,
             original_task=task,
             context=context,
+            pre_tool_calls_log=prefetch_context.get("tool_calls_log") if prefetch_context else None,
         )
 
     def chat(self, message: str, session_id: str, progress_callback: Optional[Callable] = None, context: Optional[Dict[str, Any]] = None) -> AgentResult:
@@ -611,10 +615,11 @@ class AgentExecutor:
                 messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
 
         agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        prefetch_context = self._prefetch_single_symbol_regime_context(context)
         if _is_planning_execute_context(agent_user_context):
-            messages.append({"role": "user", "content": self._build_user_message(message, context)})
+            messages.append({"role": "user", "content": self._build_user_message(message, context, prefetch_context=prefetch_context)})
         else:
-            messages.append({"role": "user", "content": message})
+            messages.append({"role": "user", "content": self._build_user_message(message, context, prefetch_context=prefetch_context) if prefetch_context else message})
 
         # Persist the user turn immediately so the session appears in history during processing
         conversation_manager.add_message(session_id, "user", message)
@@ -626,6 +631,7 @@ class AgentExecutor:
             progress_callback=progress_callback,
             original_task=message,
             context=context,
+            pre_tool_calls_log=prefetch_context.get("tool_calls_log") if prefetch_context else None,
         )
 
         # Persist assistant reply (or error note) for context continuity
@@ -646,6 +652,7 @@ class AgentExecutor:
         *,
         original_task: str = "",
         context: Optional[Dict[str, Any]] = None,
+        pre_tool_calls_log: Optional[List[Dict[str, Any]]] = None,
     ) -> AgentResult:
         """Delegate to the shared runner and adapt the result.
 
@@ -683,6 +690,9 @@ class AgentExecutor:
             tool_call_timeout_seconds=self.tool_call_timeout_seconds,
             tool_argument_guard=_build_context_tool_argument_guard(context),
         )
+        if pre_tool_calls_log:
+            loop_result.tool_calls_log = list(pre_tool_calls_log) + list(loop_result.tool_calls_log or [])
+            loop_result.total_steps = len(loop_result.tool_calls_log)
 
         model_str = loop_result.model
 
@@ -757,6 +767,8 @@ class AgentExecutor:
             run_id=context.get("session_id") or "selection-run",
             orchestration_mode=self.orchestration_mode,
             candidate_discovery_mode=context.get("candidate_discovery_mode"),
+            resume_artifact_dir=context.get("stock_selection_resume_artifact_dir"),
+            resume_from_run_id=context.get("resume_from_session_id"),
         )
 
     def _maybe_run_debate(
@@ -788,7 +800,13 @@ class AgentExecutor:
             progress_callback=progress_callback,
         )
 
-    def _build_user_message(self, task: str, context: Optional[Dict[str, Any]] = None) -> str:
+    def _build_user_message(
+        self,
+        task: str,
+        context: Optional[Dict[str, Any]] = None,
+        *,
+        prefetch_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Build the initial user message."""
         parts = [task]
         if context:
@@ -821,9 +839,43 @@ class AgentExecutor:
                 parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)}")
             if context.get("news_context"):
                 parts.append(f"\n[系统已获取的新闻与舆情情报]\n{context['news_context']}")
+            if prefetch_context and prefetch_context.get("symbol_regime_probability"):
+                parts.append(
+                    "\n[系统已获取的单股 Regime 概率证据]\n"
+                    + json.dumps(prefetch_context["symbol_regime_probability"], ensure_ascii=False, default=str)
+                )
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)
+
+    def _prefetch_single_symbol_regime_context(self, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        symbol = _single_symbol_for_regime_prefetch(context)
+        if not symbol or self.tool_registry.get("get_symbol_regime_probability") is None:
+            return {}
+        started = time.time()
+        arguments = {"stock_code": symbol, "market": "cn", "lookback_days": 900, "windows": [7, 30, 60, 90]}
+        try:
+            result = self.tool_registry.execute("get_symbol_regime_probability", **arguments)
+            success = not (isinstance(result, dict) and str(result.get("status") or "").lower() in {"failed", "error", "tool_failed", "timeout"})
+        except Exception as exc:
+            result = {"status": "tool_failed", "tool": "get_symbol_regime_probability", "error": str(exc)}
+            success = False
+        result_text = json.dumps(result, ensure_ascii=False, default=str)
+        return {
+            "symbol_regime_probability": result if isinstance(result, dict) else {"status": "unknown", "raw": result},
+            "tool_calls_log": [{
+                "step": 0,
+                "tool": "get_symbol_regime_probability",
+                "arguments": arguments,
+                "success": success,
+                "result_json": result,
+                "result_preview": result_text[:1200],
+                "result_length": len(result_text),
+                "duration": round(time.time() - started, 3),
+                "prefetch": True,
+                "selection_stage": False,
+            }],
+        }
 
 
 def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
@@ -868,6 +920,25 @@ def _build_context_tool_argument_guard(
         return guarded
 
     return guard
+
+
+def _single_symbol_for_regime_prefetch(context: Optional[Dict[str, Any]]) -> str:
+    context = context or {}
+    agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+    if agent_user_context is not None:
+        report = agent_user_context.report
+        if report.analysis_mode == "planning_execute" and report.intent == "watchlist_scan":
+            return ""
+        candidates: List[str] = []
+        if report.primary_symbol:
+            candidates.append(report.primary_symbol)
+        candidates.extend(report.target_symbols or [])
+        if len({str(item).strip() for item in candidates if str(item).strip()}) == 1:
+            return str(next(item for item in candidates if str(item).strip())).strip()
+        if not candidates and len(agent_user_context.positions) == 1:
+            return str(agent_user_context.positions[0].symbol or "").strip()
+        return ""
+    return str(context.get("stock_code") or "").strip()
 
 
 def _position_name_lookup(agent_user_context: AgentUserContext) -> Dict[str, str]:

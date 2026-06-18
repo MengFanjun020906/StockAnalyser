@@ -109,6 +109,11 @@ class _DummyManagerEmptyTushare:
 
 class TestGetCapitalFlowContract(unittest.TestCase):
 
+    def setUp(self) -> None:
+        with data_tools._capital_flow_audit_lock:
+            data_tools._capital_flow_audit_cache.clear()
+            data_tools._capital_flow_audit_inflight.clear()
+
     def test_ok_response_shape(self) -> None:
         """Happy path: key fields are present and values match the source data."""
         manager = _DummyManagerOk()
@@ -146,9 +151,74 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertIn("sector_rankings", result)
         self.assertIn("top_inflow_sectors", result["sector_rankings"])
         self.assertIn("top_outflow_sectors", result["sector_rankings"])
+        self.assertEqual(result["capital_flow_audit"]["status"], "unavailable")
         # At most 3 items are returned per ranking list
         self.assertLessEqual(len(result["sector_rankings"]["top_inflow_sectors"]), 3)
         self.assertEqual(result["errors"], [])
+
+    def test_background_audit_is_scheduled_without_waiting_for_result(self) -> None:
+        class _AuditAdapter:
+            def audit_capital_flow_sources(self, *_args, **_kwargs):
+                raise AssertionError("audit body should run in background, not inline")
+
+        manager = _DummyManagerOk()
+        manager._fundamental_adapter = _AuditAdapter()
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=manager,
+        ), patch.object(data_tools, "_ensure_capital_flow_audit_worker") as worker_mock, \
+                patch.object(data_tools._capital_flow_audit_queue, "put_nowait") as put_mock:
+            result = _handle_get_capital_flow("600519")
+
+        worker_mock.assert_called_once()
+        put_mock.assert_called_once()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["capital_flow_audit"]["status"], "pending")
+        self.assertEqual(result["capital_flow_audit"]["mode"], "background")
+        self.assertEqual(result["source_conflicts"], [])
+        self.assertEqual(result["warnings"], [])
+
+    def test_cached_audit_conflict_is_attached_to_capital_flow_response(self) -> None:
+        manager = _DummyManagerOk()
+        key = data_tools._capital_flow_audit_cache_key(
+            "600519",
+            None,
+            None,
+            "tushare_moneyflow_dc",
+            "2026-05-08",
+        )
+        data_tools._store_capital_flow_audit_cache(key, {
+            "status": "conflict",
+            "mode": "background",
+            "selected_flow_source": "tushare_moneyflow_dc",
+            "checked_sources": ["tushare_moneyflow_ths"],
+            "warnings": [
+                "capital_flow_source_conflict:1 conflict(s); keep selected_flow_source=tushare_moneyflow_dc authoritative",
+            ],
+            "source_conflicts": [{
+                "type": "direction_conflict",
+                "field": "main_net_inflow",
+                "selected_source": "tushare_moneyflow_dc",
+                "other_source": "tushare_moneyflow_ths",
+                "selected_value": 1500000.0,
+                "other_value": -800000.0,
+            }],
+            "source_summaries": {
+                "tushare_moneyflow_dc": {"latest_date": "2026-05-08", "main_net_inflow": 1500000.0},
+                "tushare_moneyflow_ths": {"latest_date": "2026-05-08", "main_net_inflow": -800000.0},
+            },
+        })
+
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=manager,
+        ):
+            result = _handle_get_capital_flow("600519")
+
+        self.assertEqual(result["capital_flow_audit"]["status"], "conflict")
+        self.assertEqual(result["capital_flow_audit"]["cache"], "hit")
+        self.assertEqual(result["source_conflicts"][0]["type"], "direction_conflict")
+        self.assertTrue(result["warnings"][0].startswith("capital_flow_source_conflict:1"))
 
     def test_not_supported_for_non_cn_or_etf(self) -> None:
         """ETF / non-CN stocks return status=not_supported with an explanatory note."""

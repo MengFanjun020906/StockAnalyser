@@ -148,6 +148,35 @@ def _registry():
         ],
         handler=lambda stock_code, stock_name: {"report": f"{stock_code} {stock_name} 无重大利空"},
     ))
+    registry.register(ToolDefinition(
+        name="get_regime_forward_probability",
+        description="market regime probability",
+        parameters=[],
+        handler=lambda **kwargs: {
+            "status": "ok",
+            "regime": kwargs.get("regime") or "trending_up",
+            "sample_count": 20,
+            "windows": {"30": {"n": 20, "effective_n": 2, "p_up": 0.55, "p_below_current": 0.4, "low_confidence": False}},
+            "reentry_reference": {"reentry_price": 9.6, "low_confidence": False},
+        },
+    ))
+    registry.register(ToolDefinition(
+        name="get_symbol_regime_probability",
+        description="symbol regime probability",
+        parameters=[],
+        handler=lambda stock_code, **kwargs: {
+            "status": "ok",
+            "stock_code": stock_code,
+            "regime": kwargs.get("regime") or "trending_up",
+            "source": "symbol_ohlc_forward_return_by_market_regime",
+            "sample_count": 18,
+            "matched_anchor_count": 18,
+            "symbol_history_records": 220,
+            "windows": {"30": {"n": 18, "effective_n": 2, "p_up": 0.61, "p_below_current": 0.44, "p20_min_return_pct": -4.2, "low_confidence": False}},
+            "path_profile": {"window": "90d", "n": 18},
+            "reentry_reference": {"current_price": kwargs.get("current_price"), "reentry_price": 9.58, "low_confidence": False},
+        },
+    ))
     return registry
 
 
@@ -190,6 +219,21 @@ def _context():
             include_watchlist_ranking=True,
         ),
     )
+
+
+def _context_with_position(symbol: str = "600002"):
+    ctx = _context()
+    ctx.positions = [
+        PositionContext(
+            symbol=symbol,
+            quantity=100,
+            avg_cost=9.5,
+            last_price=10.0,
+            market_value=1000.0,
+            position_pct=2.0,
+        )
+    ]
+    return ctx
 
 
 def _json_response(payload, tokens=1):
@@ -888,6 +932,65 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert "get_capital_flow" in result.context.evidence_ledger["summary"]["failed_tools"]
 
 
+def test_stock_selection_resume_reuses_complete_candidate_discovery_artifact(tmp_path):
+    resume_dir = tmp_path / "trace-old"
+    resume_dir.mkdir()
+    (resume_dir / "candidate_discovery.json").write_text(json.dumps({
+        "status": "ok",
+        "summary": {"candidate_codes": ["600001"], "main_limitations": []},
+        "full_ref": "candidate_discovery.json",
+        "full": {
+            "candidates": [{"code": "600001", "name": "测试一", "market": "cn", "source": "resume"}],
+            "missing_evidence": [],
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({
+            "stage": "candidate_screening",
+            "status": "ok",
+            "summary": {"deep_dive_targets": ["600001"], "monitor_targets": [], "rejected_targets": [], "main_limitations": []},
+            "full": {"shortlist": [{"code": "600001", "name": "测试一", "screening_result": "deep_dive", "score": 80}]},
+        }),
+        _json_response({
+            "stage": "single_stock_deep_dive",
+            "status": "ok",
+            "summary": {"code": "600001", "name": "测试一", "action_bias": "wait", "action_strength": "weak"},
+            "full": {"stock": {"code": "600001", "name": "测试一"}, "action_bias": "wait", "entry_quality": {}, "dimension_summary": {}, "missing_evidence": []},
+        }),
+        _json_response({"stage": "meta_orchestrator", "status": "ok", "summary": {"package_count": 1}, "full": {"packages": []}}),
+        _json_response({"stage": "pricing_agent", "status": "ok", "summary": {"priced_count": 0}, "full": {"if_then_order_matrix": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"final_action": "wait", "primary_plan_verdict": "accept_with_changes", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {}}),
+    ]
+    events = []
+
+    result = run_stock_selection_pipeline(
+        task="继续选股",
+        agent_user_context=_context(),
+        tool_registry=_registry_with_candidates([{"code": "999999", "name": "不应召回", "market": "cn"}]),
+        llm_adapter=adapter,
+        run_id="trace-new",
+        orchestration_mode="legacy",
+        candidate_discovery_mode="thesis_desk_committee",
+        resume_artifact_dir=str(resume_dir),
+        resume_from_run_id="trace-old",
+        progress_callback=events.append,
+    )
+
+    assert result.success is True
+    assert result.context.stage_full("candidate_discovery")["candidates"][0]["source"] == "resume"
+    assert not any(call["tool"] == "discover_watchlist_candidates" for call in result.tool_calls_log)
+    assert any(event["type"] == "selection_resume_loaded" for event in events)
+    assert any(
+        event["type"] == "selection_resume_reused_stage"
+        and event.get("payload", {}).get("stage") == "candidate_discovery"
+        for event in events
+    )
+
+
 def test_stock_selection_prompts_use_compact_evidence_cards_not_raw_previews():
     registry = _registry()
     huge_blob = "RAW_UNCOMPRESSED_PAYLOAD_" * 500
@@ -947,6 +1050,41 @@ def test_stock_selection_prompts_use_compact_evidence_cards_not_raw_previews():
     assert all('"preview"' not in prompt for prompt in prompts[1:])
     assert any('"evidence_cards"' in prompt for prompt in prompts)
     assert any('"raw_policy"' in prompt for prompt in prompts)
+
+
+def test_stock_selection_attaches_symbol_regime_probability_for_deep_dive_and_holdings():
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["600001"]}, "full": {"shortlist": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait"}, "full": {"stock": {"code": "600001", "name": "测试一"}}}),
+        _json_response({"stage": "meta_orchestrator", "status": "ok", "summary": {"package_count": 1}, "full": {"packages": []}}),
+        _json_response({"stage": "pricing_agent", "status": "ok", "summary": {"priced_count": 0}, "full": {"if_then_order_matrix": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="帮我选一下下周可以入手的股票",
+        agent_user_context=_context_with_position("600002"),
+        tool_registry=_registry(),
+        llm_adapter=adapter,
+        run_id="test-symbol-regime-probability",
+    )
+
+    assert result.success is True
+    stage = result.final_report_json["symbol_regime_probability"]
+    assert stage["summary"]["scope_counts"] == {"deep_dive": 1, "holding": 1}
+    codes = {item["stock_code"] for item in stage["summary"]["results_brief"]}
+    assert codes == {"600001", "600002"}
+    deep_full = result.final_report_json["single_stock_deep_dive"]["full"]["results"][0]["full"]
+    assert deep_full["symbol_regime_probability"]["stock_code"] == "600001"
+    prompts = [call.args[0][1]["content"] for call in adapter.call_text.call_args_list]
+    allocation_prompt = next(prompt for prompt in prompts if "组合配置 Agent" in prompt)
+    assert '"symbol_regime_probabilities"' in allocation_prompt
+    symbol_calls = [call for call in result.tool_calls_log if call["tool"] == "get_symbol_regime_probability"]
+    assert [call["arguments"]["stock_code"] for call in symbol_calls] == ["600001", "600002"]
 
 
 def test_stock_selection_runs_meta_and_pricing_stages_before_allocation():
@@ -2220,7 +2358,7 @@ def test_stock_selection_marks_partial_capital_flow_without_data_failed():
     assert all(call["success"] is False for call in capital_flow_calls)
 
 
-def test_stock_selection_marks_capital_flow_with_errors_failed_even_with_data():
+def test_stock_selection_keeps_capital_flow_with_data_successful_when_errors_are_diagnostics():
     registry = _registry()
     registry.register(ToolDefinition(
         name="get_capital_flow",
@@ -2257,7 +2395,7 @@ def test_stock_selection_marks_capital_flow_with_errors_failed_even_with_data():
     assert result.success is True
     capital_flow_calls = [call for call in result.tool_calls_log if call["tool"] == "get_capital_flow"]
     assert capital_flow_calls
-    assert all(call["success"] is False for call in capital_flow_calls)
+    assert all(call["success"] is True for call in capital_flow_calls)
 
 
 def test_stock_selection_overwrites_mismatched_stock_name_by_code():

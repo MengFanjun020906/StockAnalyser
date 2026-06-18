@@ -25,7 +25,11 @@ EARLY_TURN_DESK_TOOLS: tuple[str, ...] = (
     "get_volume_analysis",
     "get_capital_flow",
     "get_tushare_moneyflow_mkt_dc",
+    "get_market_capital_flow",
+    "get_northbound_capital_flow",
+    "get_margin_trading_summary",
     "get_chip_distribution",
+    "get_symbol_regime_probability",
     "get_stock_info",
 )
 

@@ -403,6 +403,8 @@ class AgentOrchestrator:
             run_id=context.get("session_id") or "selection-run",
             orchestration_mode=getattr(self.config, "agent_orchestration_mode", "legacy"),
             candidate_discovery_mode=context.get("candidate_discovery_mode"),
+            resume_artifact_dir=context.get("stock_selection_resume_artifact_dir"),
+            resume_from_run_id=context.get("resume_from_session_id"),
         )
         return AgentResult(
             success=selection.success,

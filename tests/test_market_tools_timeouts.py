@@ -93,6 +93,32 @@ def test_get_sector_rankings_does_not_call_manager_probe_after_fast_sources_fail
     assert mock_timeout.call_count == 3
 
 
+def test_get_sector_rankings_preserves_stockapi_budget_when_total_timeout_is_low():
+    calls = []
+    empty_payload = ([], [], [], "empty")
+
+    def fake_timeout(_task, timeout_seconds, task_name):
+        calls.append((task_name, timeout_seconds))
+        return empty_payload, None, 1
+
+    with patch(
+        "src.agent.tools.market_tools._get_agent_timeout_attr",
+        return_value=6.0,
+    ), patch(
+        "src.agent.tools.market_tools._run_with_timeout",
+        side_effect=fake_timeout,
+    ):
+        result = _handle_get_sector_rankings(top_n=10)
+
+    assert result["status"] == "failed"
+    assert [name for name, _timeout in calls] == [
+        "tushare_ths_hot_industry_rankings",
+        "eastmoney_industry_rankings",
+        "stockapi_hot_sectors",
+    ]
+    assert calls[2][1] >= 1.0
+
+
 def test_tushare_sector_rankings_uses_ths_hot_industry_market():
     seen = []
 

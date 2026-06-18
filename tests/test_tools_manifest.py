@@ -76,6 +76,55 @@ def test_load_quality_repair_desk_manifest_returns_validated_dimension_manifest(
     assert names == set(QUALITY_REPAIR_DESK_TOOLS)
 
 
+def test_shipped_desk_manifests_expose_high_value_context_tools():
+    expected = {
+        "early_turn_desk": {
+            "get_market_capital_flow",
+            "get_northbound_capital_flow",
+            "get_margin_trading_summary",
+            "get_symbol_regime_probability",
+        },
+        "momentum_desk": {
+            "get_market_capital_flow",
+            "get_northbound_capital_flow",
+            "get_margin_trading_summary",
+            "get_stockapi_limit_up_pool",
+            "get_stockapi_popularity_rank",
+            "get_symbol_regime_probability",
+        },
+        "quality_repair_desk": {
+            "get_stock_business_context",
+            "get_stock_disclosure_events",
+            "get_tushare_announcements",
+            "get_capital_flow",
+            "get_chip_distribution",
+            "get_symbol_regime_probability",
+        },
+        "theme_catalyst_desk": {
+            "get_stock_disclosure_events",
+            "get_tushare_announcements",
+            "get_stockapi_sector_constituents",
+            "get_stockapi_sector_flow_history",
+            "get_stockapi_limit_up_pool",
+            "get_stockapi_popularity_rank",
+            "search_openinvest_news",
+            "search_comprehensive_intel",
+            "get_symbol_regime_probability",
+        },
+    }
+
+    whitelists = {
+        "early_turn_desk": set(EARLY_TURN_DESK_TOOLS),
+        "momentum_desk": set(MOMENTUM_DESK_TOOLS),
+        "quality_repair_desk": set(QUALITY_REPAIR_DESK_TOOLS),
+        "theme_catalyst_desk": set(THEME_CATALYST_DESK_TOOLS),
+    }
+    for dimension, tools in expected.items():
+        manifest_tools = {entry.tool for entry in load_manifest(dimension).tools}
+        assert tools <= whitelists[dimension]
+        assert tools <= manifest_tools
+
+
 def test_load_early_turn_desk_manifest_all_priorities_in_range():
     m = load_manifest("early_turn_desk")
     priorities = [e.priority for e in m.tools]
@@ -187,11 +236,12 @@ def test_validate_full_theme_catalyst_desk_manifest_against_real_registry():
     """The shipped theme_catalyst_desk.yaml must validate against the real ToolRegistry."""
     from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
     from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.registry import ToolRegistry
     from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
 
     reg = ToolRegistry()
-    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS:
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_MARKET_TOOLS + ALL_SEARCH_TOOLS:
         reg.register(t)
 
     m = load_manifest("theme_catalyst_desk")
@@ -217,10 +267,11 @@ def test_validate_full_quality_repair_desk_manifest_against_real_registry():
     """The shipped quality_repair_desk.yaml must validate against the real ToolRegistry."""
     from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
     from src.agent.tools.data_tools import ALL_DATA_TOOLS
+    from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.registry import ToolRegistry
 
     reg = ToolRegistry()
-    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS:
+    for t in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_MARKET_TOOLS:
         reg.register(t)
 
     m = load_manifest("quality_repair_desk")

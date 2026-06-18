@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.evidence import build_evidence_cards_for_stock
@@ -257,6 +258,8 @@ def run_stock_selection_pipeline(
     run_id: str = "selection-run",
     orchestration_mode: Optional[str] = None,
     candidate_discovery_mode: Optional[str] = None,
+    resume_artifact_dir: Optional[str] = None,
+    resume_from_run_id: Optional[str] = None,
 ) -> StockSelectionResult:
     """Run the staged stock-selection pipeline.
 
@@ -281,8 +284,23 @@ def run_stock_selection_pipeline(
     )
     result = StockSelectionResult(enabled=True, context=ctx)
     base_evidence: Dict[str, Any] = {}
+    resume_state = _load_stock_selection_resume_state(resume_artifact_dir)
     try:
         _emit(progress_callback, "selection_start", message="开始五阶段选股流水线。")
+        if resume_state.get("requested"):
+            _emit(
+                progress_callback,
+                "selection_resume_loaded",
+                message=_selection_resume_message(resume_state),
+                payload={
+                    "source_run_id": resume_from_run_id,
+                    "artifact_dir": resume_state.get("artifact_dir"),
+                    "available_stages": resume_state.get("available_stages", []),
+                    "resumable_stages": resume_state.get("resumable_stages", []),
+                    "reused_stages": [],
+                    "warnings": resume_state.get("warnings", []),
+                },
+            )
 
         if ctx.candidate_discovery_mode != "thesis_desk_committee":
             ctx.next_step = "stop_non_thesis_desk_mode"
@@ -312,47 +330,70 @@ def run_stock_selection_pipeline(
             _finalize_result(result)
             return result
 
-        discovery_seed = _run_candidate_discovery_tool(
-            ctx=ctx,
-            tool_registry=tool_registry,
-            target_symbols=list(agent_user_context.report.target_symbols or []),
-            llm_adapter=llm_adapter,
-        )
-        if ctx.candidate_discovery_mode in {"llm_expert_committee", "thesis_desk_committee"}:
-            discovery_payload = discovery_seed
+        reused_stages: List[str] = []
+        resumed_candidate_discovery = _resume_stage_payload(resume_state, "candidate_discovery")
+        if resumed_candidate_discovery:
+            discovery_payload = resumed_candidate_discovery
+            reused_stages.append("candidate_discovery")
+            _emit_resumed_stage(progress_callback, "candidate_discovery", ctx, discovery_payload, reused_stages)
         else:
-            discovery_payload = _call_stage_json(
+            discovery_seed = _run_candidate_discovery_tool(
                 ctx=ctx,
+                tool_registry=tool_registry,
+                target_symbols=list(agent_user_context.report.target_symbols or []),
                 llm_adapter=llm_adapter,
-                stage_name="candidate_discovery",
-                prompt=build_candidate_discovery_prompt({
-                    "user_message": task,
-                    "market": ctx.market,
-                    "account_summary": ctx.account_summary,
-                    "investor_profile": ctx.investor_profile,
-                    "target_symbols": list(agent_user_context.report.target_symbols or []),
-                    "candidate_strategy": ctx.candidate_strategy,
-                    "strategy_thresholds": ctx.strategy_thresholds,
-                    "tool_seed_result": _compact_candidate_seed(discovery_seed),
-                    "available_tools": tool_registry.list_names(),
-                }),
-                fallback=_fallback_candidate_discovery(ctx, discovery_seed),
-                timeout_seconds=timeout_seconds,
             )
-            _merge_discovery_candidates(discovery_payload, discovery_seed)
-        _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
-        ctx.set_stage("candidate_discovery", discovery_payload)
-        _emit(progress_callback, "selection_candidate_discovery_done", payload=ctx.stages["candidate_discovery"].to_dict(include_full=False))
+            if ctx.candidate_discovery_mode in {"llm_expert_committee", "thesis_desk_committee"}:
+                discovery_payload = discovery_seed
+            else:
+                discovery_payload = _call_stage_json(
+                    ctx=ctx,
+                    llm_adapter=llm_adapter,
+                    stage_name="candidate_discovery",
+                    prompt=build_candidate_discovery_prompt({
+                        "user_message": task,
+                        "market": ctx.market,
+                        "account_summary": ctx.account_summary,
+                        "investor_profile": ctx.investor_profile,
+                        "target_symbols": list(agent_user_context.report.target_symbols or []),
+                        "candidate_strategy": ctx.candidate_strategy,
+                        "strategy_thresholds": ctx.strategy_thresholds,
+                        "tool_seed_result": _compact_candidate_seed(discovery_seed),
+                        "available_tools": tool_registry.list_names(),
+                    }),
+                    fallback=_fallback_candidate_discovery(ctx, discovery_seed),
+                    timeout_seconds=timeout_seconds,
+                )
+                _merge_discovery_candidates(discovery_payload, discovery_seed)
+            _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
+            ctx.set_stage("candidate_discovery", discovery_payload)
+            _emit_stage_done(progress_callback, "selection_candidate_discovery_done", ctx, "candidate_discovery")
         if ctx.stages["candidate_discovery"].status == "failed":
             error = _candidate_discovery_failure_message(ctx.stage_full("candidate_discovery"))
-            _complete_failed_candidate_discovery_result(ctx=ctx, result=result, error=error)
+            _complete_failed_candidate_discovery_result(
+                ctx=ctx,
+                result=result,
+                error=error,
+                progress_callback=progress_callback,
+            )
             _finalize_result(result)
             _emit(progress_callback, "selection_error", message=error, payload=result.final_report_json)
             return result
 
-        ctx.market_regime = _run_market_regime_tool(ctx=ctx, tool_registry=tool_registry)
-        _attach_regime_forward_probability(ctx=ctx, tool_registry=tool_registry)
-        _emit(progress_callback, "selection_market_regime_done", payload=_summarize_market_regime(ctx.market_regime))
+        resumed_market_regime = _resume_market_regime(resume_state)
+        if resumed_market_regime:
+            ctx.market_regime = resumed_market_regime
+            reused_stages.append("market_regime")
+            _emit(
+                progress_callback,
+                "selection_market_regime_done",
+                message="已复用历史 Trace 的市场环境识别结果。",
+                payload=_summarize_market_regime(ctx.market_regime),
+            )
+        else:
+            ctx.market_regime = _run_market_regime_tool(ctx=ctx, tool_registry=tool_registry)
+            _attach_regime_forward_probability(ctx=ctx, tool_registry=tool_registry)
+            _emit(progress_callback, "selection_market_regime_done", payload=_summarize_market_regime(ctx.market_regime))
 
         candidates = _candidate_codes(ctx.stage_full("candidate_discovery"), limit=DEFAULT_CANDIDATE_LIMIT)
         if not candidates:
@@ -371,234 +412,287 @@ def run_stock_selection_pipeline(
             _finalize_result(result)
             return result
 
-        balanced_payload = _build_balanced_candidate_evidence_stage(
-            ctx=ctx,
-            tool_registry=tool_registry,
-            discovery_full=ctx.stage_full("candidate_discovery"),
-            canonical_codes=candidates,
-        )
-        _enforce_stage_stock_identity(ctx, balanced_payload, "balanced_candidate_evidence")
-        ctx.set_stage("balanced_candidate_evidence", balanced_payload)
-        _emit(
-            progress_callback,
-            "selection_balanced_candidate_evidence_done",
-            payload=ctx.stages["balanced_candidate_evidence"].to_dict(include_full=False),
-        )
+        balanced_payload = _resume_stage_payload(resume_state, "balanced_candidate_evidence")
+        if balanced_payload:
+            reused_stages.append("balanced_candidate_evidence")
+            _emit_resumed_stage(progress_callback, "balanced_candidate_evidence", ctx, balanced_payload, reused_stages)
+        else:
+            balanced_payload = _build_balanced_candidate_evidence_stage(
+                ctx=ctx,
+                tool_registry=tool_registry,
+                discovery_full=ctx.stage_full("candidate_discovery"),
+                canonical_codes=candidates,
+            )
+            _enforce_stage_stock_identity(ctx, balanced_payload, "balanced_candidate_evidence")
+            ctx.set_stage("balanced_candidate_evidence", balanced_payload)
+            _emit_stage_done(progress_callback, "selection_balanced_candidate_evidence_done", ctx, "balanced_candidate_evidence")
 
         base_evidence = _collect_base_evidence(ctx, tool_registry, candidates)
-        screening_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="candidate_screening",
-            prompt=build_candidate_screening_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "candidate_pool_summary": ctx.stage_summary("candidate_discovery"),
-                "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "candidate_evidence_table": _screening_candidate_evidence_table(ctx),
-                "candidate_evidence_data": _screening_candidate_evidence_data(ctx),
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-                "base_evidence": _compact_base_evidence(base_evidence),
-            }),
-            fallback=_fallback_candidate_screening(ctx, base_evidence),
-            timeout_seconds=timeout_seconds,
-        )
-        _enforce_stage_stock_identity(ctx, screening_payload, "candidate_screening")
-        ctx.set_stage("candidate_screening", screening_payload)
-        _emit(progress_callback, "selection_candidate_screening_done", payload=ctx.stages["candidate_screening"].to_dict(include_full=False))
-
-        deep_dive_limit = _selection_deep_dive_limit()
-        deep_targets, deep_dive_provenance = _select_deep_dive_targets(
-            candidates=candidates,
-            screening_summary=ctx.stage_summary("candidate_screening"),
-            screening_full=ctx.stage_full("candidate_screening"),
-            limit=deep_dive_limit,
-        )
-        setup_router_enabled = _deep_dive_setup_router_enabled()
-        candidate_records = (
-            _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
-            if setup_router_enabled
-            else {}
-        )
-        deep_dive_outputs: List[Dict[str, Any]] = []
-        for code in deep_targets:
-            detailed_evidence = _balanced_raw_evidence_for_code(ctx, code)
-            if detailed_evidence is None:
-                detailed_evidence = _collect_deep_dive_evidence(ctx, tool_registry, code)
-            stock_name = _stock_name_from_evidence(code, detailed_evidence)
-            evidence_cards = build_evidence_cards_for_stock(
-                run_id=ctx.run_id,
-                stock_code=code,
-                stock_name=stock_name,
-                market=ctx.market,
-                evidence=detailed_evidence,
-            )
-            prompt_evidence = _deep_dive_prompt_evidence(
-                ctx=ctx,
-                code=code,
-                stock_name=stock_name,
-                detailed_evidence=detailed_evidence,
-                evidence_cards=evidence_cards,
-            )
-            deep_dive_payload_in: Dict[str, Any] = {
-                "user_message": task,
-                "stock_code": code,
-                "stock_name": stock_name,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "screening_summary": ctx.stage_summary("candidate_screening"),
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-                "stock_evidence": prompt_evidence,
-            }
-            if setup_router_enabled:
-                deep_dive_payload_in.update(
-                    _deep_dive_setup_fields(candidate_records.get(code), market=ctx.market)
-                )
-            deep_payload = _call_stage_json(
+        screening_payload = _resume_stage_payload(resume_state, "candidate_screening")
+        if screening_payload:
+            reused_stages.append("candidate_screening")
+            _emit_resumed_stage(progress_callback, "candidate_screening", ctx, screening_payload, reused_stages)
+        else:
+            screening_payload = _call_stage_json(
                 ctx=ctx,
                 llm_adapter=llm_adapter,
-                stage_name=f"single_stock_deep_dive:{code}",
-                prompt=build_deep_dive_prompt(deep_dive_payload_in),
-                fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
+                stage_name="candidate_screening",
+                prompt=build_candidate_screening_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "candidate_pool_summary": ctx.stage_summary("candidate_discovery"),
+                    "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "candidate_evidence_table": _screening_candidate_evidence_table(ctx),
+                    "candidate_evidence_data": _screening_candidate_evidence_data(ctx),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                    "base_evidence": _compact_base_evidence(base_evidence),
+                }),
+                fallback=_fallback_candidate_screening(ctx, base_evidence),
                 timeout_seconds=timeout_seconds,
             )
-            _attach_evidence_cards(deep_payload, evidence_cards)
-            if deep_dive_provenance.get(code) == "pool_fallback":
-                _mark_deep_dive_pool_fallback(deep_payload)
-            _enforce_stage_stock_identity(ctx, deep_payload, f"single_stock_deep_dive:{code}")
-            deep_dive_outputs.append(deep_payload)
+            _enforce_stage_stock_identity(ctx, screening_payload, "candidate_screening")
+            ctx.set_stage("candidate_screening", screening_payload)
+            _emit_stage_done(progress_callback, "selection_candidate_screening_done", ctx, "candidate_screening")
 
-        deep_dive_stage = _combine_deep_dive_outputs(deep_dive_outputs)
-        _enforce_stage_stock_identity(ctx, deep_dive_stage, "single_stock_deep_dive")
-        ctx.set_stage("single_stock_deep_dive", deep_dive_stage)
-        _emit(progress_callback, "selection_deep_dive_done", payload=ctx.stages["single_stock_deep_dive"].to_dict(include_full=False))
+        deep_dive_stage = _resume_stage_payload(resume_state, "single_stock_deep_dive")
+        if deep_dive_stage:
+            reused_stages.append("single_stock_deep_dive")
+            _emit_resumed_stage(progress_callback, "single_stock_deep_dive", ctx, deep_dive_stage, reused_stages)
+        else:
+            deep_dive_limit = _selection_deep_dive_limit()
+            deep_targets, deep_dive_provenance = _select_deep_dive_targets(
+                candidates=candidates,
+                screening_summary=ctx.stage_summary("candidate_screening"),
+                screening_full=ctx.stage_full("candidate_screening"),
+                limit=deep_dive_limit,
+            )
+            setup_router_enabled = _deep_dive_setup_router_enabled()
+            candidate_records = (
+                _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
+                if setup_router_enabled
+                else {}
+            )
+            deep_dive_outputs: List[Dict[str, Any]] = []
+            for code in deep_targets:
+                detailed_evidence = _balanced_raw_evidence_for_code(ctx, code)
+                if detailed_evidence is None:
+                    detailed_evidence = _collect_deep_dive_evidence(ctx, tool_registry, code)
+                _attach_symbol_regime_probability(
+                    ctx=ctx,
+                    tool_registry=tool_registry,
+                    code=code,
+                    evidence=detailed_evidence,
+                    scope="deep_dive",
+                )
+                stock_name = _stock_name_from_evidence(code, detailed_evidence)
+                evidence_cards = build_evidence_cards_for_stock(
+                    run_id=ctx.run_id,
+                    stock_code=code,
+                    stock_name=stock_name,
+                    market=ctx.market,
+                    evidence=detailed_evidence,
+                )
+                prompt_evidence = _deep_dive_prompt_evidence(
+                    ctx=ctx,
+                    code=code,
+                    stock_name=stock_name,
+                    detailed_evidence=detailed_evidence,
+                    evidence_cards=evidence_cards,
+                )
+                deep_dive_payload_in: Dict[str, Any] = {
+                    "user_message": task,
+                    "stock_code": code,
+                    "stock_name": stock_name,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "screening_summary": ctx.stage_summary("candidate_screening"),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                    "stock_evidence": prompt_evidence,
+                }
+                if setup_router_enabled:
+                    deep_dive_payload_in.update(
+                        _deep_dive_setup_fields(candidate_records.get(code), market=ctx.market)
+                    )
+                deep_payload = _call_stage_json(
+                    ctx=ctx,
+                    llm_adapter=llm_adapter,
+                    stage_name=f"single_stock_deep_dive:{code}",
+                    prompt=build_deep_dive_prompt(deep_dive_payload_in),
+                    fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
+                    timeout_seconds=timeout_seconds,
+                )
+                _attach_evidence_cards(deep_payload, evidence_cards)
+                _attach_symbol_regime_to_deep_payload(deep_payload, detailed_evidence.get("get_symbol_regime_probability"))
+                if deep_dive_provenance.get(code) == "pool_fallback":
+                    _mark_deep_dive_pool_fallback(deep_payload)
+                _enforce_stage_stock_identity(ctx, deep_payload, f"single_stock_deep_dive:{code}")
+                deep_dive_outputs.append(deep_payload)
 
-        meta_payload = _call_stage_json(
+            deep_dive_stage = _combine_deep_dive_outputs(deep_dive_outputs)
+            _enforce_stage_stock_identity(ctx, deep_dive_stage, "single_stock_deep_dive")
+            ctx.set_stage("single_stock_deep_dive", deep_dive_stage)
+            _emit_stage_done(progress_callback, "selection_deep_dive_done", ctx, "single_stock_deep_dive")
+
+        _build_symbol_regime_probability_stage(ctx)
+        _attach_holding_symbol_regime_probabilities(
             ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="meta_orchestrator",
-            prompt=build_meta_orchestrator_prompt(_build_meta_orchestrator_input(ctx)),
-            fallback=_fallback_meta_orchestrator(ctx),
-            timeout_seconds=timeout_seconds,
+            tool_registry=tool_registry,
+            positions=_positions_summary(agent_user_context),
         )
-        _enforce_stage_stock_identity(ctx, meta_payload, "meta_orchestrator")
-        ctx.set_stage("meta_orchestrator", meta_payload)
-        _emit(progress_callback, "selection_meta_orchestrator_done", payload=ctx.stages["meta_orchestrator"].to_dict(include_full=False))
 
-        pricing_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="pricing_agent",
-            prompt=build_pricing_agent_prompt(_build_pricing_agent_input(ctx)),
-            fallback=_fallback_pricing_agent(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        _enforce_stage_stock_identity(ctx, pricing_payload, "pricing_agent")
-        ctx.set_stage("pricing_agent", pricing_payload)
-        _emit(progress_callback, "selection_pricing_agent_done", payload=ctx.stages["pricing_agent"].to_dict(include_full=False))
+        meta_payload = _resume_stage_payload(resume_state, "meta_orchestrator")
+        if meta_payload:
+            reused_stages.append("meta_orchestrator")
+            _emit_resumed_stage(progress_callback, "meta_orchestrator", ctx, meta_payload, reused_stages)
+        else:
+            meta_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="meta_orchestrator",
+                prompt=build_meta_orchestrator_prompt(_build_meta_orchestrator_input(ctx)),
+                fallback=_fallback_meta_orchestrator(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _enforce_stage_stock_identity(ctx, meta_payload, "meta_orchestrator")
+            ctx.set_stage("meta_orchestrator", meta_payload)
+            _emit_stage_done(progress_callback, "selection_meta_orchestrator_done", ctx, "meta_orchestrator")
 
-        allocation_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="portfolio_allocation",
-            prompt=build_portfolio_allocation_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
-                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
-                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
-                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
-                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "positions": _positions_summary(agent_user_context),
-                "available_cash": ctx.account_summary.get("available_cash"),
-            }),
-            fallback=_fallback_portfolio_allocation(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        allocation_payload = _apply_market_regime_constraints(ctx, allocation_payload)
-        _enforce_stage_stock_identity(ctx, allocation_payload, "portfolio_allocation")
-        ctx.set_stage("portfolio_allocation", allocation_payload)
-        _emit(progress_callback, "selection_allocation_done", payload=ctx.stages["portfolio_allocation"].to_dict(include_full=False))
+        pricing_payload = _resume_stage_payload(resume_state, "pricing_agent")
+        if pricing_payload:
+            reused_stages.append("pricing_agent")
+            _emit_resumed_stage(progress_callback, "pricing_agent", ctx, pricing_payload, reused_stages)
+        else:
+            pricing_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="pricing_agent",
+                prompt=build_pricing_agent_prompt(_build_pricing_agent_input(ctx)),
+                fallback=_fallback_pricing_agent(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _enforce_stage_stock_identity(ctx, pricing_payload, "pricing_agent")
+            ctx.set_stage("pricing_agent", pricing_payload)
+            _emit_stage_done(progress_callback, "selection_pricing_agent_done", ctx, "pricing_agent")
 
-        adversarial_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="adversarial_review",
-            prompt=build_adversarial_review_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "candidate_discovery_summary": ctx.stage_summary("candidate_discovery"),
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "screening_summary": ctx.stage_summary("candidate_screening"),
-                "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
-                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
-                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
-                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
-                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
-                "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-            }),
-            fallback=_fallback_adversarial_review(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        _enforce_stage_stock_identity(ctx, adversarial_payload, "adversarial_review")
-        ctx.set_stage("adversarial_review", adversarial_payload)
-        _emit(progress_callback, "selection_adversarial_done", payload=ctx.stages["adversarial_review"].to_dict(include_full=False))
+        allocation_payload = _resume_stage_payload(resume_state, "portfolio_allocation")
+        if allocation_payload:
+            reused_stages.append("portfolio_allocation")
+            _emit_resumed_stage(progress_callback, "portfolio_allocation", ctx, allocation_payload, reused_stages)
+        else:
+            allocation_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="portfolio_allocation",
+                prompt=build_portfolio_allocation_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                    "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                    "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                    "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                    "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "symbol_regime_probabilities": _compact_symbol_regime_stage_for_prompt(ctx),
+                    "positions": _positions_summary(agent_user_context),
+                    "available_cash": ctx.account_summary.get("available_cash"),
+                }),
+                fallback=_fallback_portfolio_allocation(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            allocation_payload = _apply_market_regime_constraints(ctx, allocation_payload)
+            _enforce_stage_stock_identity(ctx, allocation_payload, "portfolio_allocation")
+            ctx.set_stage("portfolio_allocation", allocation_payload)
+            _emit_stage_done(progress_callback, "selection_allocation_done", ctx, "portfolio_allocation")
 
-        judge_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="judge_decision",
-            prompt=build_judge_decision_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
-                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
-                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
-                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
-                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
-                "opposing_review_summary": ctx.stage_summary("adversarial_review"),
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-            }),
-            fallback=_fallback_judge_decision(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        _stabilize_judge_decision(ctx, judge_payload)
-        judge_payload = apply_judge_sanity(
-            judge_payload,
-            allocation_payload=ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
-            market_regime=ctx.market_regime,
-            investor_profile=ctx.investor_profile,
-        )
-        sanitized_allocation = (
-            judge_payload.get("full", {}).get("sanitized_allocation")
-            if isinstance(judge_payload.get("full"), dict)
-            else None
-        )
-        if isinstance(sanitized_allocation, dict):
-            judge_payload["full"].pop("sanitized_allocation", None)
-            ctx.set_stage("portfolio_allocation", sanitized_allocation)
-        _apply_judge_position_overrides(ctx, judge_payload)
-        _enforce_stage_stock_identity(ctx, judge_payload, "judge_decision")
-        ctx.set_stage("judge_decision", judge_payload)
+        adversarial_payload = _resume_stage_payload(resume_state, "adversarial_review")
+        if adversarial_payload:
+            reused_stages.append("adversarial_review")
+            _emit_resumed_stage(progress_callback, "adversarial_review", ctx, adversarial_payload, reused_stages)
+        else:
+            adversarial_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="adversarial_review",
+                prompt=build_adversarial_review_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "candidate_discovery_summary": ctx.stage_summary("candidate_discovery"),
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "screening_summary": ctx.stage_summary("candidate_screening"),
+                    "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                    "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                    "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                    "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                    "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
+                    "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                }),
+                fallback=_fallback_adversarial_review(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _enforce_stage_stock_identity(ctx, adversarial_payload, "adversarial_review")
+            ctx.set_stage("adversarial_review", adversarial_payload)
+            _emit_stage_done(progress_callback, "selection_adversarial_done", ctx, "adversarial_review")
+
+        judge_payload = _resume_stage_payload(resume_state, "judge_decision")
+        if judge_payload:
+            reused_stages.append("judge_decision")
+            _emit_resumed_stage(progress_callback, "judge_decision", ctx, judge_payload, reused_stages)
+        else:
+            judge_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="judge_decision",
+                prompt=build_judge_decision_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
+                    "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                    "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                    "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                    "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
+                    "opposing_review_summary": ctx.stage_summary("adversarial_review"),
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                }),
+                fallback=_fallback_judge_decision(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _stabilize_judge_decision(ctx, judge_payload)
+            judge_payload = apply_judge_sanity(
+                judge_payload,
+                allocation_payload=ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
+                market_regime=ctx.market_regime,
+                investor_profile=ctx.investor_profile,
+            )
+            sanitized_allocation = (
+                judge_payload.get("full", {}).get("sanitized_allocation")
+                if isinstance(judge_payload.get("full"), dict)
+                else None
+            )
+            if isinstance(sanitized_allocation, dict):
+                judge_payload["full"].pop("sanitized_allocation", None)
+                ctx.set_stage("portfolio_allocation", sanitized_allocation)
+            _apply_judge_position_overrides(ctx, judge_payload)
+            _enforce_stage_stock_identity(ctx, judge_payload, "judge_decision")
+            ctx.set_stage("judge_decision", judge_payload)
         ctx.next_step = (judge_payload.get("summary") or {}).get("next_step") or "render_final_report"
-        _emit(progress_callback, "selection_judge_done", payload=ctx.stages["judge_decision"].to_dict(include_full=False))
+        if "judge_decision" not in reused_stages:
+            _emit_stage_done(progress_callback, "selection_judge_done", ctx, "judge_decision")
         _maybe_run_expert_graph(
             ctx=ctx,
             task=task,
@@ -1469,6 +1563,7 @@ def _complete_failed_candidate_discovery_result(
     ctx: SelectionRunContext,
     result: StockSelectionResult,
     error: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """Fail fast when thesis desks do not produce candidates."""
 
@@ -1492,6 +1587,15 @@ def _complete_failed_candidate_discovery_result(
         },
         "full_ref": "judge_decision.json",
     })
+    try:
+        _maybe_run_expert_graph(
+            ctx=ctx,
+            task=ctx.user_message,
+            base_evidence={},
+            progress_callback=progress_callback,
+        )
+    except Exception as expert_exc:
+        logger.exception("Expert graph failed during candidate-discovery failure finalization: %s", expert_exc)
     result.success = False
     result.error = error
     result.final_report_json = _build_final_report_json(ctx)
@@ -2228,6 +2332,128 @@ def _attach_regime_forward_probability(
     )
 
 
+def _attach_symbol_regime_probability(
+    *,
+    ctx: SelectionRunContext,
+    tool_registry: ToolRegistry,
+    code: str,
+    evidence: Dict[str, Any],
+    scope: str,
+) -> None:
+    if not isinstance(evidence, dict) or tool_registry.get("get_symbol_regime_probability") is None:
+        return
+    if evidence.get("get_symbol_regime_probability"):
+        return
+    quote = evidence.get("get_realtime_quote") if isinstance(evidence.get("get_realtime_quote"), dict) else {}
+    current_price = quote.get("price") or quote.get("current_price") or quote.get("close")
+    regime = str(ctx.market_regime.get("regime") or "").strip()
+    result = _execute_tool(
+        ctx,
+        tool_registry,
+        "get_symbol_regime_probability",
+        {
+            "stock_code": code,
+            "market": ctx.market,
+            "regime": regime or None,
+            "current_price": current_price,
+            "lookback_days": 900,
+            "windows": [7, 30, 60, 90],
+        },
+    )
+    if isinstance(result, dict):
+        payload = dict(result)
+        payload["calculation_scope"] = scope
+    else:
+        payload = {"status": "unknown", "raw": result, "calculation_scope": scope}
+    evidence["get_symbol_regime_probability"] = payload
+
+
+def _attach_holding_symbol_regime_probabilities(
+    *,
+    ctx: SelectionRunContext,
+    tool_registry: ToolRegistry,
+    positions: List[Dict[str, Any]],
+) -> None:
+    if tool_registry.get("get_symbol_regime_probability") is None:
+        return
+    existing = {
+        _normalize_stock_identity_code(item.get("stock_code") or item.get("code"))
+        for item in _symbol_regime_stage_items(ctx)
+        if isinstance(item, dict)
+    }
+    for position in positions or []:
+        code = _normalize_stock_identity_code(position.get("symbol"))
+        if not code or code in existing:
+            continue
+        evidence: Dict[str, Any] = {"get_realtime_quote": {"price": position.get("last_price")}}
+        _attach_symbol_regime_probability(
+            ctx=ctx,
+            tool_registry=tool_registry,
+            code=code,
+            evidence=evidence,
+            scope="holding",
+        )
+        payload = evidence.get("get_symbol_regime_probability")
+        if isinstance(payload, dict):
+            payload["position"] = position
+            _append_symbol_regime_stage_item(ctx, payload, scope="holding")
+            existing.add(code)
+
+
+def _build_symbol_regime_probability_stage(ctx: SelectionRunContext) -> None:
+    items: List[Dict[str, Any]] = []
+    deep = ctx.stage_full("single_stock_deep_dive")
+    for payload in deep.get("results") or [] if isinstance(deep, dict) else []:
+        if not isinstance(payload, dict):
+            continue
+        full = payload.get("full") if isinstance(payload.get("full"), dict) else {}
+        symbol_regime = full.get("symbol_regime_probability")
+        if isinstance(symbol_regime, dict):
+            item = dict(symbol_regime)
+            item.setdefault("calculation_scope", "deep_dive")
+            items.append(item)
+    if items:
+        ctx.set_stage("symbol_regime_probability", _symbol_regime_probability_stage_payload(items))
+
+
+def _append_symbol_regime_stage_item(ctx: SelectionRunContext, payload: Dict[str, Any], *, scope: str) -> None:
+    stage = ctx.stages.get("symbol_regime_probability")
+    items = _symbol_regime_stage_items(ctx)
+    item = dict(payload)
+    item["calculation_scope"] = scope
+    items.append(item)
+    ctx.set_stage("symbol_regime_probability", _symbol_regime_probability_stage_payload(items))
+    if stage is not None:
+        ctx.stages["symbol_regime_probability"].full_ref = stage.full_ref
+
+
+def _symbol_regime_stage_items(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    stage = ctx.stages.get("symbol_regime_probability")
+    if stage is None:
+        return []
+    items = stage.full.get("results") if isinstance(stage.full, dict) else []
+    return [item for item in items or [] if isinstance(item, dict)]
+
+
+def _symbol_regime_probability_stage_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    compact_items = [_compact_symbol_regime_probability(item) for item in items if isinstance(item, dict)]
+    scopes: Dict[str, int] = {}
+    for item in compact_items:
+        scope = str(item.get("calculation_scope") or "unknown")
+        scopes[scope] = scopes.get(scope, 0) + 1
+    return {
+        "stage": "symbol_regime_probability",
+        "status": "ok" if items else "insufficient_data",
+        "summary": {
+            "target_count": len(items),
+            "scope_counts": scopes,
+            "results_brief": compact_items,
+        },
+        "full": {"results": items},
+        "full_ref": "symbol_regime_probability.json",
+    }
+
+
 def _collect_base_evidence(
     ctx: SelectionRunContext,
     tool_registry: ToolRegistry,
@@ -2800,13 +3026,15 @@ def _is_failed_tool_result(result: Any) -> bool:
     status = str(result.get("status") or "").strip().lower()
     if status in FAILED_TOOL_STATUSES:
         return True
-    if status != "not_supported" and _result_has_errors(result):
-        return True
     if result.get("timeout") is True:
         return True
     if result.get("success") is False:
         return True
-    return bool(result.get("error")) and status != "not_supported"
+    if bool(result.get("error")) and status != "not_supported":
+        return True
+    if status != "not_supported" and _result_has_errors(result):
+        return not (status in {"ok", "partial"} and _has_effective_tool_data(result))
+    return False
 
 
 def _result_has_errors(result: Dict[str, Any]) -> bool:
@@ -2819,7 +3047,21 @@ def _result_has_errors(result: Dict[str, Any]) -> bool:
 
 
 def _has_effective_tool_data(result: Dict[str, Any]) -> bool:
-    ignored_keys = {"status", "errors", "error", "note", "message", "stock_code", "code"}
+    ignored_keys = {
+        "status",
+        "errors",
+        "error",
+        "error_summary",
+        "note",
+        "message",
+        "stock_code",
+        "code",
+        "query",
+        "source_chain",
+        "amount_unit",
+        "raw_amount_unit",
+        "context_policy",
+    }
     for key, value in result.items():
         if key in ignored_keys:
             continue
@@ -3338,6 +3580,9 @@ def _deep_dive_prompt_evidence(
         "stock": {"code": code, "name": stock_name, "market": ctx.market},
         "evidence_cards": card_view,
         "dimension_summary": _dimension_summary_from_cards(card_view),
+        "symbol_regime_probability": _compact_symbol_regime_probability(
+            detailed_evidence.get("get_symbol_regime_probability")
+        ),
         "tool_failures": _tool_failures_from_evidence(detailed_evidence),
         "raw_refs": [card.get("raw_ref") for card in card_view if card.get("raw_ref")],
         "protocol": {
@@ -3641,6 +3886,9 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             quote_basis = "latest_trading_day"
     bias = trend.get("bias_ma5") if isinstance(trend, dict) else None
     trend_status = trend.get("trend_status") if isinstance(trend, dict) else None
+    symbol_regime_probability = _compact_symbol_regime_probability(
+        evidence.get("get_symbol_regime_probability") if isinstance(evidence, dict) else None
+    )
     action = "wait"
     strength = "weak"
     risks: List[str] = []
@@ -3665,6 +3913,7 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             "main_supporting_evidence": [f"当前价={price}" if price is not None else "行情价格缺失"],
             "main_risks": risks,
             "main_missing_evidence": _missing_from_evidence(evidence),
+            "symbol_regime_probability": symbol_regime_probability,
         },
         "full": {
             "stock": {"code": code, "name": name, "market": "cn", "data_status": "partial"},
@@ -3690,6 +3939,7 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             "failure_conditions": ["跌破关键支撑", "出现重大利空", "价格高于追高线且无回踩确认"],
             "missing_evidence": _missing_from_evidence(evidence),
             "tool_failures": _tool_failures_from_evidence(evidence),
+            "symbol_regime_probability": symbol_regime_probability,
         },
         "full_ref": f"single_stock_deep_dive_{code}.json",
     }
@@ -4499,6 +4749,30 @@ def _compact_regime_forward_probability(payload: Any) -> Dict[str, Any]:
     }
 
 
+def _compact_symbol_regime_probability(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compact = _compact_regime_forward_probability(payload)
+    compact.update({
+        "stock_code": payload.get("stock_code"),
+        "index_symbol": payload.get("index_symbol"),
+        "regime": payload.get("regime"),
+        "matched_anchor_count": payload.get("matched_anchor_count"),
+        "symbol_history_records": payload.get("symbol_history_records"),
+        "calculation_scope": payload.get("calculation_scope"),
+        "source": payload.get("source"),
+    })
+    return compact
+
+
+def _compact_symbol_regime_stage_for_prompt(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    stage = ctx.stages.get("symbol_regime_probability")
+    items = stage.summary.get("results_brief") if stage and isinstance(stage.summary, dict) else []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)][:8]
+
+
 def _apply_market_regime_constraints(
     ctx: SelectionRunContext,
     allocation_payload: Dict[str, Any],
@@ -4806,6 +5080,7 @@ def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
         "balanced_candidate_evidence": ctx.stages.get("balanced_candidate_evidence", SelectionStage()).to_dict(include_full=True),
         "candidate_screening": ctx.stages.get("candidate_screening", SelectionStage()).to_dict(include_full=True),
         "single_stock_deep_dive": ctx.stages.get("single_stock_deep_dive", SelectionStage()).to_dict(include_full=True),
+        "symbol_regime_probability": ctx.stages.get("symbol_regime_probability", SelectionStage()).to_dict(include_full=True),
         "meta_orchestrator": ctx.stages.get("meta_orchestrator", SelectionStage()).to_dict(include_full=True),
         "pricing_agent": ctx.stages.get("pricing_agent", SelectionStage()).to_dict(include_full=True),
         "portfolio_allocation": ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
@@ -4830,6 +5105,25 @@ def _combine_deep_dive_outputs(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "full": {"results": outputs},
         "full_ref": "deep_dive_results.json",
     }
+
+
+def _attach_symbol_regime_to_deep_payload(payload: Dict[str, Any], symbol_regime: Any) -> None:
+    compact = _compact_symbol_regime_probability(symbol_regime)
+    if not compact:
+        return
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary["symbol_regime_probability"] = compact
+        reentry = compact.get("reentry_reference") if isinstance(compact.get("reentry_reference"), dict) else {}
+        if reentry.get("reentry_price") is not None:
+            summary.setdefault("reentry_reference", reentry)
+    full = payload.get("full")
+    if not isinstance(full, dict):
+        full = {}
+        payload["full"] = full
+    full["symbol_regime_probability"] = symbol_regime if isinstance(symbol_regime, dict) else compact
+    if isinstance(symbol_regime, dict) and isinstance(symbol_regime.get("reentry_reference"), dict):
+        full.setdefault("reentry_reference", symbol_regime["reentry_reference"])
 
 
 def _attach_evidence_cards(payload: Dict[str, Any], cards: List[Any]) -> None:
@@ -6613,6 +6907,230 @@ def _emit(callback: Optional[Callable[[Dict[str, Any]], None]], event_type: str,
         callback(event)
     except Exception:
         logger.debug("Selection progress callback failed", exc_info=True)
+
+
+def _emit_stage_done(
+    callback: Optional[Callable[[Dict[str, Any]], None]],
+    event_type: str,
+    ctx: SelectionRunContext,
+    stage_name: str,
+    *,
+    message: Optional[str] = None,
+) -> None:
+    stage = ctx.stages.get(stage_name)
+    if not stage:
+        return
+    event_payload: Dict[str, Any] = {
+        "payload": stage.to_dict(include_full=False),
+        "__artifact_payload": stage.to_dict(include_full=True),
+    }
+    if message:
+        event_payload["message"] = message
+    _emit(callback, event_type, **event_payload)
+
+
+def _emit_resumed_stage(
+    callback: Optional[Callable[[Dict[str, Any]], None]],
+    stage_name: str,
+    ctx: SelectionRunContext,
+    payload: Dict[str, Any],
+    reused_stages: Sequence[str],
+) -> None:
+    _enforce_stage_stock_identity(ctx, payload, stage_name)
+    ctx.set_stage(stage_name, payload)
+    _emit(
+        callback,
+        "selection_resume_reused_stage",
+        message=f"已复用历史 Trace 的 {stage_name} 阶段结果。",
+        payload={
+            "stage": stage_name,
+            "reused_stages": list(reused_stages),
+            "full_ref": ctx.stages[stage_name].full_ref,
+        },
+    )
+    _emit_stage_done(
+        callback,
+        _resume_stage_event_type(stage_name),
+        ctx,
+        stage_name,
+        message=f"已复用历史 Trace 的 {stage_name} 阶段结果。",
+    )
+
+
+def _resume_stage_event_type(stage_name: str) -> str:
+    mapping = {
+        "candidate_discovery": "selection_candidate_discovery_done",
+        "balanced_candidate_evidence": "selection_balanced_candidate_evidence_done",
+        "candidate_screening": "selection_candidate_screening_done",
+        "single_stock_deep_dive": "selection_deep_dive_done",
+        "meta_orchestrator": "selection_meta_orchestrator_done",
+        "pricing_agent": "selection_pricing_agent_done",
+        "portfolio_allocation": "selection_allocation_done",
+        "adversarial_review": "selection_adversarial_done",
+        "judge_decision": "selection_judge_done",
+    }
+    return mapping.get(stage_name, f"selection_{stage_name}_done")
+
+
+def _load_stock_selection_resume_state(resume_artifact_dir: Optional[str]) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "requested": bool(str(resume_artifact_dir or "").strip()),
+        "artifact_dir": str(resume_artifact_dir or "").strip(),
+        "stages": {},
+        "available_stages": [],
+        "resumable_stages": [],
+        "warnings": [],
+    }
+    artifact_dir_text = str(resume_artifact_dir or "").strip()
+    if not artifact_dir_text:
+        return state
+    artifact_dir = Path(artifact_dir_text).expanduser()
+    if not artifact_dir.exists() or not artifact_dir.is_dir():
+        state["warnings"].append("resume artifact directory not found")
+        return state
+
+    selection_context = _read_resume_json(artifact_dir / "selection_context.json")
+    if isinstance(selection_context, dict):
+        stages = selection_context.get("stages") if isinstance(selection_context.get("stages"), dict) else {}
+        for stage_name, stage_payload in stages.items():
+            if isinstance(stage_payload, dict):
+                state["stages"][str(stage_name)] = _stage_payload_from_trace_stage(str(stage_name), stage_payload)
+
+    for stage_name in (
+        "candidate_discovery",
+        "balanced_candidate_evidence",
+        "candidate_screening",
+        "single_stock_deep_dive",
+        "meta_orchestrator",
+        "pricing_agent",
+        "portfolio_allocation",
+        "adversarial_review",
+        "judge_decision",
+    ):
+        payload = _read_resume_json(artifact_dir / f"{stage_name}.json")
+        if isinstance(payload, dict):
+            state["stages"][stage_name] = _stage_payload_from_trace_stage(stage_name, payload)
+
+    market_regime = _read_resume_json(artifact_dir / "market_regime.json")
+    if isinstance(market_regime, dict):
+        state["market_regime"] = market_regime
+    else:
+        events = _read_resume_events(artifact_dir / "events.ndjson")
+        for event in events:
+            if event.get("type") == "selection_market_regime_done" and isinstance(event.get("payload"), dict):
+                state["market_regime"] = event["payload"]
+        if events:
+            state["available_events"] = [
+                str(event.get("type"))
+                for event in events
+                if str(event.get("type") or "").startswith("selection_")
+            ]
+
+    state["available_stages"] = sorted(state["stages"].keys())
+    state["resumable_stages"] = [
+        name
+        for name in state["available_stages"]
+        if _resume_stage_payload(state, name) is not None
+    ]
+    if state.get("available_events") and not state["resumable_stages"]:
+        state["warnings"].append("old trace has selection events but no complete reusable stage artifacts")
+    return state
+
+
+def _read_resume_json(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("resume artifact JSON read failed for %s: %s", path, exc)
+        return None
+
+
+def _read_resume_events(path: Path) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    try:
+        if not path.exists():
+            return events
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                events.append(item)
+    except Exception as exc:
+        logger.debug("resume artifact events read failed for %s: %s", path, exc)
+    return events
+
+
+def _stage_payload_from_trace_stage(stage_name: str, stage_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if "status" in stage_payload and "summary" in stage_payload and "full" in stage_payload:
+        return {
+            "stage": stage_payload.get("stage") or stage_name,
+            "status": stage_payload.get("status") or "partial",
+            "summary": stage_payload.get("summary") if isinstance(stage_payload.get("summary"), dict) else {},
+            "full": stage_payload.get("full") if isinstance(stage_payload.get("full"), dict) else {},
+            "full_ref": stage_payload.get("full_ref") or f"{stage_name}.json",
+        }
+    payload = dict(stage_payload)
+    payload.setdefault("stage", stage_name)
+    payload.setdefault("status", payload.get("status") or "partial")
+    payload.setdefault("summary", payload.get("summary") if isinstance(payload.get("summary"), dict) else {})
+    payload.setdefault("full", payload.get("full") if isinstance(payload.get("full"), dict) else dict(stage_payload))
+    payload.setdefault("full_ref", payload.get("full_ref") or f"{stage_name}.json")
+    return payload
+
+
+def _resume_stage_payload(resume_state: Dict[str, Any], stage_name: str) -> Optional[Dict[str, Any]]:
+    stages = resume_state.get("stages") if isinstance(resume_state.get("stages"), dict) else {}
+    payload = stages.get(stage_name)
+    if not isinstance(payload, dict) or not _is_resumable_stage_payload(stage_name, payload):
+        return None
+    return payload
+
+
+def _is_resumable_stage_payload(stage_name: str, payload: Dict[str, Any]) -> bool:
+    full = payload.get("full") if isinstance(payload.get("full"), dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    if str(payload.get("status") or "").lower() in {"failed", "error"}:
+        return False
+    if stage_name == "candidate_discovery":
+        candidates = full.get("candidates")
+        return isinstance(candidates, list) and len(candidates) > 0
+    if stage_name == "balanced_candidate_evidence":
+        candidates = full.get("candidates")
+        return isinstance(candidates, list) and len(candidates) > 0
+    if stage_name == "candidate_screening":
+        return bool(summary.get("deep_dive_targets") or full.get("shortlist"))
+    if stage_name == "single_stock_deep_dive":
+        results = full.get("results")
+        return isinstance(results, list) and len(results) > 0
+    if stage_name == "meta_orchestrator":
+        return isinstance(full.get("packages"), list)
+    if stage_name == "pricing_agent":
+        return isinstance(full.get("if_then_order_matrix"), list)
+    if stage_name == "portfolio_allocation":
+        return isinstance(full.get("positions_plan"), list)
+    if stage_name == "adversarial_review":
+        return bool(summary or full)
+    if stage_name == "judge_decision":
+        return bool(summary.get("final_action") or full)
+    return bool(summary or full)
+
+
+def _resume_market_regime(resume_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    value = resume_state.get("market_regime")
+    return value if isinstance(value, dict) and value else None
+
+
+def _selection_resume_message(resume_state: Dict[str, Any]) -> str:
+    resumable = resume_state.get("resumable_stages") or []
+    if resumable:
+        return "已找到历史 Trace，可复用阶段：" + "、".join(str(item) for item in resumable)
+    return "已找到历史 Trace，但没有完整可复用的阶段文件，将沿用原请求重新继续运行。"
 
 
 def _format_pct(value: Any) -> str:

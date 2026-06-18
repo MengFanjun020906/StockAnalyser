@@ -2468,14 +2468,29 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
+        def task() -> Dict[str, Any]:
+            try:
+                return self._fundamental_adapter.get_capital_flow(
+                    stock_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    page_no=page_no,
+                    page_size=page_size,
+                    budget_seconds=timeout,
+                )
+            except TypeError as exc:
+                if "budget_seconds" not in str(exc):
+                    raise
+                return self._fundamental_adapter.get_capital_flow(
+                    stock_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    page_no=page_no,
+                    page_size=page_size,
+                )
+
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(
-                stock_code,
-                start_date=start_date,
-                end_date=end_date,
-                page_no=page_no,
-                page_size=page_size,
-            ),
+            task,
             timeout,
             "capital_flow",
         )

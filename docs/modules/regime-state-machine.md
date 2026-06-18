@@ -273,8 +273,32 @@ Regime 概率层回答：
       "p_down_gt_5pct": 0.18,
       "p10_return_pct": -6.4,
       "p20_return_pct": -3.2,
+      "p20_min_return_pct": -5.1,
       "p90_return_pct": 8.5,
+      "regime_persist_days_at_anchor_median": 9,
+      "forward_regime_persist_days_median": 16,
+      "anchor_atr_pct_median": 1.7,
+      "sample_quality": {
+        "samples": 420,
+        "suspect_samples": 12,
+        "flag_counts": {
+          "limit_move_suspect": 10,
+          "zero_volume_or_suspension_suspect": 2
+        }
+      },
       "low_confidence": false
+    }
+  },
+  "sample_quality_summary": {
+    "bars": 1090,
+    "eligible_anchor_count": 920,
+    "classified_anchor_count": 884,
+    "tail_lookahead_excluded": 90,
+    "per_window": {
+      "30": {
+        "samples": 420,
+        "suspect_samples": 12
+      }
     }
   },
   "path_profile": {
@@ -287,14 +311,15 @@ Regime 概率层回答：
     "days_to_trough_median": 12,
     "pop_median_pct": 5.6,
     "days_to_peak_median": 18,
-    "regime_persist_median_days": 16,
+    "significant_move_threshold_pct_median": 1.8,
+    "threshold_method": "anchor_atr_pct_floor_1pct_cap_8pct",
     "window_median_days": 62
   },
   "reentry_reference": {
     "current_price": 10.0,
     "downside_quantile": 0.2,
-    "downside_pct": -3.2,
-    "reentry_price": 9.68,
+    "downside_pct": -5.1,
+    "reentry_price": 9.49,
     "p_below_current": 0.44,
     "low_confidence": false
   }
@@ -317,16 +342,24 @@ Regime 概率层回答：
 
 - 默认 `index_code=000300`。
 - 支持 `000001 / 000016 / 000300 / 000852 / 000905 / 399006`。
+- 指数历史优先走 Tushare `index_daily`，成功后写入 `.cache/regime/index_daily/<TS_CODE>.json`；Tushare 失败、空返回或未配置 token 时可读取本地缓存作为稳定降级源。
 - 输出当前市场 regime 对应的 forward probability。
-- `market_regime.forward_probability` 中保留概率摘要、`low_confidence`、路径画像和买回参考。
+- `market_regime.forward_probability` 中保留概率摘要、`low_confidence`、路径画像、买回参考和样本质量摘要。
+- `effective_n` 按非重叠锚点窗口折算，不再把高度重叠的日频样本直接当作独立样本。
+- 显著回踩/冲高使用锚点 ATR% 自适应阈值，路径画像会输出 `threshold_method` 和阈值中位数。
+- `reentry_reference.downside_pct` 优先使用窗口内最低收益分位 `p20_min_return_pct`，不是终点 forward return 分位。
+- 样本质量第一版只标记不自动剔除，标记包括尾部 lookahead 不足、零成交/疑似停牌、涨跌停样本和疑似除权或异常跳点。
 - `pricing_agent` prompt 明确禁止把概率层当成买卖信号；fallback 只会在 `Mean_Reversion_Pullback` 中把 `reentry_price` 写成“参考回踩/买回价”，并保留“仍需量价确认”。
 - 最终报告的 Meta/点位计算链路会展示 `Regime 概率证据`；当样本或有效样本不足时，会明确标记“仅作弱证据，不能单独支持开仓”。
 
-下一阶段做单股级概率：
+第二阶段已接入单股级概率：
 
-- 只对持仓、用户指定单股或 deep dive 候选计算。
-- 输出 `symbol_regime_probability` 和 `reentry_reference`。
-- 供点位计算层生成入场区间、等待回踩线、TRIM 后买回点和失效条件。
+- 新增工具 `get_symbol_regime_probability`，市场 regime 标签来自指数代理，forward return、窗口内最低/最高路径和 reentry_reference 来自单股自身 K 线。
+- 选股流水线只对 `single_stock_deep_dive` 标的和当前持仓标的计算，不对全量候选池批量计算。
+- 深挖标的的结果写入单股 deep dive payload 的 `symbol_regime_probability`；持仓标的和深挖标的汇总写入独立 stage `symbol_regime_probability`。
+- 组合配置层会收到压缩后的 `symbol_regime_probabilities`，只能作为后验概率证据和买回参考；`low_confidence=true` 时不得单独提高仓位或绕过点位/风控条件。
+- 单股询问路径（`entry_analysis` / `position_review`）会在进入 ReAct loop 前，对明确单一标的预取 `get_symbol_regime_probability` 并注入用户消息；`watchlist_scan` 不走该预取，避免全市场候选池放大调用成本。
+- 四席位专家的工具白名单和 YAML 手册均显式暴露 `get_symbol_regime_probability`；席位只能把它作为路径画像/等待回踩弱证据，不能替代本席位的趋势、资金、基本面或主题证据。
 
 第三阶段做后验校准：
 
@@ -344,13 +377,16 @@ Regime 概率层回答：
 
 ## 13. 后续增强顺序
 
-建议优先级：
+已完成：
 
 1. 用 `TUSHARE_TOKEN` 接入 `index_daily`，稳定指数历史数据。
 2. 扩展 `get_regime_forward_probability` 的本地指数缓存和复权/不可成交样本标记。
 3. 新增单股级 `symbol_regime_probability` 和 `reentry_reference`，只对 deep dive 标的和持仓标的计算。
-4. 将概率摘要接入 Meta-Agent、点位计算层和 Judge，不直接接入 Risk Gate。
-5. 接入 `fut_daily` / `fut_holding`，加入股指期货持仓和基差信号。
-6. 接入 `opt_basic` / `opt_daily`，加入 ETF/股指期权成交、持仓和 PCR。
-7. 建立 A 股 Fear & Greed 指数，融合涨跌家数、成交额、涨停跌停、北向、两融和波动率。
-8. 对不同 Regime 下的选股命中率、回撤和机会成本做回测校准，调整 risk multiplier 和仓位降档规则。
+
+后续建议优先级：
+
+1. 将概率摘要进一步接入 Meta-Agent 和 Judge 的显式约束检查；继续保持不直接接入 Risk Gate。
+2. 接入 `fut_daily` / `fut_holding`，加入股指期货持仓和基差信号。
+3. 接入 `opt_basic` / `opt_daily`，加入 ETF/股指期权成交、持仓和 PCR。
+4. 建立 A 股 Fear & Greed 指数，融合涨跌家数、成交额、涨停跌停、北向、两融和波动率。
+5. 对不同 Regime 下的选股命中率、回撤和机会成本做回测校准，调整 risk multiplier 和仓位降档规则。

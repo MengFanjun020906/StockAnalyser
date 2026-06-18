@@ -247,13 +247,17 @@ def resolve_tool_etl_profile(tool_name: str) -> str:
         "score_stock_news_sentiment": "news",
         "search_comprehensive_intel": "news",
         "detect_market_regime": "market_regime",
+        "get_regime_forward_probability": "market_regime",
+        "get_symbol_regime_probability": "market_regime",
         "get_market_indices": "market_indices",
+        "get_board_capital_flow": "market_flow",
         "get_sector_rankings": "market_flow",
         "discover_watchlist_candidates": "candidate_discovery",
         "get_skill_backtest_summary": "backtest",
         "get_strategy_backtest_summary": "backtest",
         "get_stock_backtest_summary": "backtest",
         "search_knowledge_graph": "knowledge_graph",
+        "search_openinvest_news": "news",
     }
     if tool_name in explicit:
         return explicit[tool_name]
@@ -462,6 +466,8 @@ def _compact_market_regime_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     fields = (
         "status", "market", "index_code", "regime", "regime_label", "confidence",
         "trend", "volatility", "breadth", "liquidity", "risk_level", "as_of",
+        "stock_code", "windows", "forward_probability", "path_profile",
+        "reentry_reference", "sample_quality_summary", "low_confidence",
         "summary", "signals", "warnings", "error",
     )
     return _compact_keep_fields(payload, fields, include_errors=True)
@@ -785,13 +791,15 @@ def _is_failed_tool_result(result: Any) -> bool:
     status = str(result.get("status") or "").strip().lower()
     if status in {"failed", "error", "tool_failed", "timeout"}:
         return True
-    if status != "not_supported" and _result_has_errors(result):
-        return True
     if result.get("timeout") is True:
         return True
     if result.get("success") is False:
         return True
-    return bool(result.get("error")) and result.get("status") != "not_supported"
+    if bool(result.get("error")) and result.get("status") != "not_supported":
+        return True
+    if status != "not_supported" and _result_has_errors(result):
+        return not (status in {"ok", "partial"} and _has_effective_tool_data(result))
+    return False
 
 
 def _result_has_errors(result: Dict[str, Any]) -> bool:
@@ -805,7 +813,21 @@ def _result_has_errors(result: Dict[str, Any]) -> bool:
 
 def _has_effective_tool_data(result: Dict[str, Any]) -> bool:
     """Return True when a partial payload still contains usable evidence."""
-    ignored_keys = {"status", "errors", "error", "note", "message", "stock_code", "code"}
+    ignored_keys = {
+        "status",
+        "errors",
+        "error",
+        "error_summary",
+        "note",
+        "message",
+        "stock_code",
+        "code",
+        "query",
+        "source_chain",
+        "amount_unit",
+        "raw_amount_unit",
+        "context_policy",
+    }
     for key, value in result.items():
         if key in ignored_keys:
             continue

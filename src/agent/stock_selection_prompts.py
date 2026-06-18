@@ -661,6 +661,7 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 15. balanced_candidate_evidence 是候选池统一证据包；生成组合计划时必须优先参考其中已取证信息，不要要求重新拉取同一批候选数据。
 16. 如果输入包含 meta_orchestrator_summary、meta_constraint_packages 和 if_then_order_matrix，必须优先遵守 Meta-Agent 的硬约束和点位计算层的 If-Then 条件单；不得把 Meta 只用于定性的 asset_regime 误写成无条件买入建议。
 17. positions_plan.entry_condition / stop_loss_condition 应优先来自 if_then_order_matrix 中选中的场景；如果点位计算层只给 monitor/plain_wait，不得强行升级为 open。
+18. symbol_regime_probabilities 只对 deep dive 标的和持仓标的提供后验概率证据与 reentry_reference；low_confidence=true 时只能作为弱证据，不得单独提高仓位或绕过点位/风控条件。
 
 {META_POINT_CALC_FIELD_GUIDE}
 

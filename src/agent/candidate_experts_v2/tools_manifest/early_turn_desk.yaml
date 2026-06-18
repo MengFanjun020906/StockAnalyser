@@ -161,8 +161,30 @@ tools:
       - 每日盘后更新，不能当盘中实时资金。
       - 这是东财大盘口径，不能和个股/板块资金直接相加。
 
-  - tool: get_chip_distribution
+  - tool: get_market_capital_flow
     priority: 20
+    when_to_use: >-
+      当低位反转需要确认全市场资金水位、行业/概念资金前后排时调用。
+      它是市场级资金总入口，适合判断反转是否有流动性环境支持。
+    typical_args:
+      top_n: 5
+    returns_summary: >-
+      返回全市场资金快照、个股/行业/概念资金前后排和来源链路。
+    key_fields:
+      - status
+      - market_flow
+      - top_stocks
+      - top_industries
+      - top_concepts
+    combo_hints:
+      - 市场资金回暖 + 个股低位放量 = 反转环境更友好。
+      - 市场资金持续净流出时，低位反转只能降低 stance 或等待确认。
+    cost: medium
+    failure_modes:
+      - 单个资金源失败时会降级，必须查看 source_chain/errors。
+
+  - tool: get_chip_distribution
+    priority: 21
     when_to_use: >-
       分析筹码分布：是否有底部横盘换手（廉价筹码集中）、上方套牢盘压力。
       低位启动的「吸筹」证据来源。
@@ -180,8 +202,29 @@ tools:
     failure_modes:
       - 部分数据源不提供实时筹码。
 
-  - tool: get_realtime_quote
+  - tool: get_northbound_capital_flow
     priority: 22
+    when_to_use: >-
+      低位反转若发生在外资风险偏好转暖阶段，调用它查看北向资金近几日流入/流出背景。
+      它只作为市场风险偏好背景，不替代个股资金。
+    typical_args:
+      limit: 10
+    returns_summary: >-
+      返回北向资金摘要和近期历史。
+    key_fields:
+      - status
+      - summary
+      - items
+      - errors
+    combo_hints:
+      - 北向连续流入 + 大盘资金回暖 = 低位转强可提高观察权重。
+      - 北向流出且市场资金走弱 = 低位信号更容易失败。
+    cost: medium
+    failure_modes:
+      - 节假日或数据源失败时为空，不能据此判断外资没有动作。
+
+  - tool: get_realtime_quote
+    priority: 23
     when_to_use: >-
       快速确认当前价格是否仍处低位、今日涨跌幅和换手率，
       防止 FactSheet 数据滞后。
@@ -199,6 +242,52 @@ tools:
     cost: cheap
     failure_modes:
       - 休市返回最近可用价，不代表盘中异动。
+
+  - tool: get_margin_trading_summary
+    priority: 24
+    when_to_use: >-
+      判断两融杠杆资金是否在支持或削弱反转环境。低位反转若伴随融资快速扩张，
+      需要检查是否只是杠杆短炒。
+    typical_args:
+      limit: 10
+    returns_summary: >-
+      返回沪深两市融资融券摘要、交易日期、融资余额和来源链路。
+    key_fields:
+      - status
+      - sse
+      - szse
+      - exchange_status
+    combo_hints:
+      - 融资温和回升 + 趋势转强 = 风险偏好改善。
+      - 融资快速扩张但个股仍弱 = 杠杆风险上升。
+    cost: medium
+    failure_modes:
+      - 数据通常盘后更新，不能当盘中实时杠杆变化。
+
+  - tool: get_symbol_regime_probability
+    priority: 25
+    when_to_use: >-
+      对入席标的补充当前市场 regime 下的单股历史路径画像和 reentry_reference。
+      只作为低位反转的弱证据，不能直接当成买入信号。
+    typical_args:
+      stock_code: "{code}"
+      market: "cn"
+      lookback_days: 900
+      windows: [7, 30, 60, 90]
+    returns_summary: >-
+      返回该股票在当前市场 regime 下的 forward-return 概率、窗口内低点/高点路径和买回参考。
+    key_fields:
+      - status
+      - regime
+      - windows
+      - reentry_reference
+      - low_confidence
+    combo_hints:
+      - 低位结构转强 + 历史路径给过回踩确认 = 可以写等待确认条件。
+      - low_confidence=true 时只能降级为观察，不得提高 stance。
+    cost: medium
+    failure_modes:
+      - 仅支持 A 股；样本不足或本地 K 线不足时会低置信返回。
 
   - tool: get_stock_info
     priority: 30

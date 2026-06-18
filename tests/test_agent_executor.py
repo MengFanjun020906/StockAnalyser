@@ -67,6 +67,26 @@ def _make_registry_with_echo():
     return registry
 
 
+def _make_registry_with_symbol_regime():
+    registry = _make_registry_with_echo()
+    registry.register(
+        ToolDefinition(
+            name="get_symbol_regime_probability",
+            description="symbol regime probability",
+            parameters=[ToolParameter(name="stock_code", type="string", description="code")],
+            handler=lambda stock_code, **kwargs: {
+                "status": "ok",
+                "stock_code": stock_code,
+                "regime": "trending_up",
+                "sample_count": 16,
+                "windows": {"30": {"n": 16, "p_up": 0.6, "p_below_current": 0.4, "low_confidence": False}},
+                "reentry_reference": {"reentry_price": 98.5, "low_confidence": False},
+            },
+        )
+    )
+    return registry
+
+
 def _make_counting_echo_registry(counter):
     """Create an echo registry that records real handler executions."""
     registry = ToolRegistry()
@@ -839,8 +859,8 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertFalse(result.tool_calls_log[0]["success"])
         self.assertIn("capital flow fetch failed", result.tool_calls_log[0]["result_preview"])
 
-    def test_tool_result_with_errors_but_partial_data_is_logged_as_failure(self):
-        """Any explicit errors in tool payloads should mark the call failed."""
+    def test_tool_result_with_errors_but_partial_data_is_logged_as_success(self):
+        """Partial payloads with usable data keep errors as diagnostics."""
         def _partial_with_errors():
             return {
                 "stock_code": "600519",
@@ -886,7 +906,7 @@ class TestAgentExecutor(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(len(result.tool_calls_log), 1)
-        self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertTrue(result.tool_calls_log[0]["success"])
 
     def test_not_supported_tool_result_is_not_logged_as_failure(self):
         """Unsupported-but-valid tool payloads remain visible without being treated as crashes."""
@@ -1486,6 +1506,64 @@ class TestBuildUserMessage(unittest.TestCase):
         prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
         self.assertIn("Planning -> Execute", prompt)
         self.assertIn("账户", prompt)
+
+    def test_single_stock_planning_run_prefetches_symbol_regime_probability(self):
+        registry = _make_registry_with_symbol_regime()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            )
+        )
+
+        result = executor.run(
+            "600519 可以买吗",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        user_message = adapter.call_with_tools.call_args.args[0][1]["content"]
+        self.assertIn("单股 Regime 概率证据", user_message)
+        self.assertIn('"stock_code": "600519"', user_message)
+        self.assertEqual(result.tool_calls_log[0]["tool"], "get_symbol_regime_probability")
+        self.assertTrue(result.tool_calls_log[0]["prefetch"])
+
+    def test_watchlist_scan_does_not_prefetch_symbol_regime_probability(self):
+        registry = _make_registry_with_symbol_regime()
+        adapter = _make_mock_adapter()
+        adapter.call_text.return_value = LLMResponse(
+            content='{"stage":"candidate_discovery","status":"failed","summary":{},"full":{"candidates":[]}}',
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+                target_symbols=[],
+            )
+        )
+
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="帮我选股",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertFalse(any(call.get("tool") == "get_symbol_regime_probability" for call in result.tool_calls_log))
 
     def test_chat_uses_planning_system_prompt_when_context_requests_it(self):
         registry = _make_registry_with_echo()

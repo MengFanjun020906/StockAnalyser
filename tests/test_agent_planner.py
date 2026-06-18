@@ -89,6 +89,16 @@ def test_get_tools_for_capability_prefers_detect_market_regime():
     assert plan.missing_tools == []
 
 
+def test_get_tools_for_capability_includes_symbol_regime_probability():
+    plan = get_tools_for_capability(
+        "symbol_regime_probability",
+        tool_registry=_registry("get_symbol_regime_probability"),
+    )
+
+    assert plan.tools == ["get_symbol_regime_probability"]
+    assert plan.missing_tools == []
+
+
 def test_build_planning_result_selects_position_review_capabilities():
     context = AgentUserContext(
         positions=[PositionContext(symbol="600519", quantity=100, avg_cost=1500)],
@@ -111,6 +121,7 @@ def test_build_planning_result_selects_position_review_capabilities():
             "get_market_capital_flow",
             "get_northbound_capital_flow",
             "get_margin_trading_summary",
+            "get_symbol_regime_probability",
             "detect_market_regime",
             "get_market_indices",
             "get_sector_rankings",
@@ -126,6 +137,7 @@ def test_build_planning_result_selects_position_review_capabilities():
     assert "margin_pressure" in result.risk_checks
     assert "get_market_capital_flow" in result.required_tools
     assert "get_board_capital_flow" in result.required_tools
+    assert "get_symbol_regime_probability" in result.required_tools
     assert "detect_market_regime" in result.required_tools
     assert "analyze_price_structure" in result.required_tools
 
@@ -147,6 +159,7 @@ def test_build_planning_result_defaults_to_entry_analysis_without_position():
             "get_tushare_daily_basic",
             "get_tushare_financial_indicators",
             "get_tushare_financial_statements",
+            "get_symbol_regime_probability",
         ),
     )
 
@@ -158,6 +171,7 @@ def test_build_planning_result_defaults_to_entry_analysis_without_position():
     assert "get_tushare_daily_basic" in result.required_tools
     assert "get_tushare_financial_indicators" in result.required_tools
     assert "get_tushare_financial_statements" in result.required_tools
+    assert "get_symbol_regime_probability" in result.required_tools
 
 
 def test_build_planning_result_watchlist_scan_starts_with_candidate_discovery():

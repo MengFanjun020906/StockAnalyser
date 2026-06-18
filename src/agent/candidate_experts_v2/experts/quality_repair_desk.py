@@ -17,15 +17,21 @@ from src.agent.candidate_experts_v2.tools_manifest import load_manifest, validat
 
 QUALITY_REPAIR_DESK_TOOLS: tuple[str, ...] = (
     "get_stock_info",
+    "get_stock_business_context",
     "get_tushare_daily_basic",
     "get_tushare_financial_indicators",
     "get_tushare_financial_statements",
     "get_tushare_forecast",
     "get_tushare_express",
     "get_tushare_dividend",
+    "get_tushare_announcements",
+    "get_stock_disclosure_events",
     "analyze_trend",
     "get_tushare_stk_factor",
     "analyze_price_structure",
+    "get_capital_flow",
+    "get_chip_distribution",
+    "get_symbol_regime_probability",
 )
 
 # FeatureFlag kinds that signal quality-repair eligibility

@@ -18,7 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock
+from queue import Full, Queue
+from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -31,6 +32,13 @@ _fetcher_manager_singleton = None
 _fetcher_manager_lock = Lock()
 _tushare_trade_date_cache: Dict[Tuple[int, int, int, int, str, bool], List[str]] = {}
 _tushare_trade_date_cache_lock = Lock()
+_capital_flow_audit_queue: Queue = Queue(maxsize=128)
+_capital_flow_audit_cache: Dict[Tuple[str, str, str, str, str], Tuple[float, Dict[str, Any]]] = {}
+_capital_flow_audit_inflight: Dict[Tuple[str, str, str, str, str], bool] = {}
+_capital_flow_audit_lock = Lock()
+_capital_flow_audit_worker_started = False
+_CAPITAL_FLOW_AUDIT_CACHE_TTL_SECONDS = 1800.0
+_CAPITAL_FLOW_AUDIT_CACHE_MAX_ITEMS = 128
 _DAILY_HISTORY_DEFAULT_DAYS = 60
 _DAILY_HISTORY_MAX_DAYS = 365
 _TUSHARE_NEWS_SOURCES = {
@@ -1167,6 +1175,234 @@ def _normalize_stockapi_page_arg(value: Any, default: int, minimum: int = 1, max
     return max(minimum, min(maximum, normalized))
 
 
+def _capital_flow_audit_cache_key(
+    stock_code: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    selected_source: Optional[str],
+    latest_date: Optional[str],
+) -> Tuple[str, str, str, str, str]:
+    return (
+        str(stock_code or "").strip().upper(),
+        str(start_date or ""),
+        str(end_date or ""),
+        str(selected_source or ""),
+        str(latest_date or ""),
+    )
+
+
+def _read_capital_flow_audit_cache(key: Tuple[str, str, str, str, str]) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _capital_flow_audit_lock:
+        cached = _capital_flow_audit_cache.get(key)
+        if not cached:
+            return None
+        created_at, payload = cached
+        if now - created_at > _CAPITAL_FLOW_AUDIT_CACHE_TTL_SECONDS:
+            _capital_flow_audit_cache.pop(key, None)
+            return None
+        return dict(payload)
+
+
+def _store_capital_flow_audit_cache(key: Tuple[str, str, str, str, str], payload: Dict[str, Any]) -> None:
+    with _capital_flow_audit_lock:
+        _capital_flow_audit_cache[key] = (time.time(), dict(payload))
+        while len(_capital_flow_audit_cache) > _CAPITAL_FLOW_AUDIT_CACHE_MAX_ITEMS:
+            oldest_key = min(_capital_flow_audit_cache.items(), key=lambda item: item[1][0])[0]
+            _capital_flow_audit_cache.pop(oldest_key, None)
+
+
+def _run_capital_flow_audit_task(
+    adapter: Any,
+    stock_code: str,
+    selected_source: Optional[str],
+    selected_flow: Dict[str, Any],
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Dict[str, Any]:
+    started_at = time.time()
+    try:
+        result = adapter.audit_capital_flow_sources(
+            stock_code,
+            selected_source=selected_source,
+            selected_flow=selected_flow,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception as exc:
+        logger.debug("capital flow source audit failed for %s: %s", stock_code, exc)
+        result = {
+            "status": "failed",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": [f"capital_flow_audit:{type(exc).__name__}:{exc}"],
+        }
+    if not isinstance(result, dict):
+        result = {
+            "status": "failed",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": ["capital_flow_audit:invalid_result"],
+        }
+    result["mode"] = "background"
+    result["duration_ms"] = int((time.time() - started_at) * 1000)
+    return result
+
+
+def _capital_flow_audit_worker_loop() -> None:
+    while True:
+        item = _capital_flow_audit_queue.get()
+        try:
+            (
+                key,
+                adapter,
+                stock_code,
+                selected_source,
+                selected_flow,
+                start_date,
+                end_date,
+            ) = item
+            payload = _run_capital_flow_audit_task(
+                adapter,
+                stock_code,
+                selected_source,
+                selected_flow,
+                start_date,
+                end_date,
+            )
+            _store_capital_flow_audit_cache(key, payload)
+        except Exception as exc:
+            logger.debug("capital flow audit worker failed: %s", exc)
+        finally:
+            try:
+                cache_key = item[0]
+                with _capital_flow_audit_lock:
+                    _capital_flow_audit_inflight.pop(cache_key, None)
+            except Exception:
+                pass
+            _capital_flow_audit_queue.task_done()
+
+
+def _ensure_capital_flow_audit_worker() -> None:
+    global _capital_flow_audit_worker_started
+    with _capital_flow_audit_lock:
+        if _capital_flow_audit_worker_started:
+            return
+        worker = Thread(
+            target=_capital_flow_audit_worker_loop,
+            name="capital_flow_audit",
+            daemon=True,
+        )
+        _capital_flow_audit_worker_started = True
+        worker.start()
+
+
+def _schedule_capital_flow_audit(
+    manager: Any,
+    stock_code: str,
+    selected_source: Optional[str],
+    selected_flow: Dict[str, Any],
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Dict[str, Any]:
+    key = _capital_flow_audit_cache_key(
+        stock_code,
+        start_date,
+        end_date,
+        selected_source,
+        selected_flow.get("latest_date") if isinstance(selected_flow, dict) else None,
+    )
+    cached = _read_capital_flow_audit_cache(key)
+    if cached is not None:
+        cached["cache"] = "hit"
+        return cached
+
+    adapter = getattr(manager, "_fundamental_adapter", None)
+    if adapter is None or not hasattr(adapter, "audit_capital_flow_sources"):
+        return {
+            "status": "unavailable",
+            "mode": "background",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": ["capital_flow_audit:adapter_unavailable"],
+        }
+
+    with _capital_flow_audit_lock:
+        if _capital_flow_audit_inflight.get(key):
+            return {
+                "status": "pending",
+                "mode": "background",
+                "selected_flow_source": selected_source,
+                "checked_sources": [],
+                "source_conflicts": [],
+                "warnings": [],
+                "errors": [],
+            }
+        _capital_flow_audit_inflight[key] = True
+
+    _ensure_capital_flow_audit_worker()
+    try:
+        _capital_flow_audit_queue.put_nowait((
+            key,
+            adapter,
+            stock_code,
+            selected_source,
+            dict(selected_flow),
+            start_date,
+            end_date,
+        ))
+    except Full:
+        with _capital_flow_audit_lock:
+            _capital_flow_audit_inflight.pop(key, None)
+        return {
+            "status": "skipped_busy",
+            "mode": "background",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": ["capital_flow_audit:queue_full"],
+        }
+
+    return {
+        "status": "pending",
+        "mode": "background",
+        "selected_flow_source": selected_source,
+        "checked_sources": [],
+        "source_conflicts": [],
+        "warnings": [],
+        "errors": [],
+    }
+
+
+def _compact_capital_flow_audit(audit: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "status": audit.get("status"),
+        "mode": audit.get("mode", "background"),
+        "selected_flow_source": audit.get("selected_flow_source"),
+        "checked_sources": audit.get("checked_sources", []),
+        "cache": audit.get("cache"),
+        "duration_ms": audit.get("duration_ms"),
+        "errors": audit.get("errors", []),
+        "source_summaries": audit.get("source_summaries", {}),
+    }
+
+
+def _attach_capital_flow_audit(response: Dict[str, Any], audit: Dict[str, Any]) -> Dict[str, Any]:
+    warnings = list(response.get("warnings") or [])
+    warnings.extend(str(item) for item in audit.get("warnings", []) if str(item).strip())
+    response["warnings"] = warnings
+    response["source_conflicts"] = list(audit.get("source_conflicts", []) or [])
+    response["capital_flow_audit"] = _compact_capital_flow_audit(audit)
+    return response
+
+
 def _handle_get_capital_flow(
     stock_code: str,
     start_date: Optional[str] = None,
@@ -1248,7 +1484,7 @@ def _handle_get_capital_flow(
         else:
             error_summary = str(errors[0])
 
-    return {
+    response = {
         "stock_code": stock_code,
         "status": status,
         "query": {
@@ -1293,16 +1529,30 @@ def _handle_get_capital_flow(
         "error_summary": error_summary,
         "errors": errors,
     }
+    if status in {"ok", "partial"} and isinstance(stock_flow, dict) and stock_flow.get("selected_flow_source"):
+        audit = _schedule_capital_flow_audit(
+            manager,
+            stock_code,
+            selected_source=stock_flow.get("selected_flow_source"),
+            selected_flow=stock_flow,
+            start_date=normalized_start_date,
+            end_date=normalized_end_date,
+        )
+        response = _attach_capital_flow_audit(response, audit)
+    return response
 
 
 get_capital_flow_tool = ToolDefinition(
     name="get_capital_flow",
     description=(
         "Get A-share stock capital flow with explicit semantics and units. The tool normalizes "
-        "three different per-stock sources into one contract: Tushare Eastmoney `moneyflow_dc`, "
+        "three different per-stock sources into one failover contract: Tushare Eastmoney `moneyflow_dc`, "
         "Tushare THS `moneyflow_ths`, and legacy Tushare `moneyflow`; StockAPI codeFlow is still "
-        "a fallback. `selected_flow_source` tells which source populates the top-level fields, and "
-        "`flow_sources` retains each successful source so their different statistics are auditable. "
+        "a fallback. The tool returns as soon as the first usable source is found. "
+        "`selected_flow_source` tells which source populates the top-level fields, and "
+        "`flow_sources` retains the successful source so its statistics are auditable. "
+        "After the main result returns, a background audit may compare non-selected Tushare sources; "
+        "completed conflicts appear only in `warnings`/`source_conflicts` and do not override top-level fields. "
         "`main_net_inflow`, `main_inflow_5d`, and `main_inflow_10d` always follow the selected source's "
         "documented main/large-order definition and are in CNY. `net_inflow*` keeps the selected "
         "source's own net-flow definition. `inflow_5d`/`inflow_10d` remain backward-compatible aliases "

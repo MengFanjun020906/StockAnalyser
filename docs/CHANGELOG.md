@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] 单股 Planner 与四席位专家工具白名单补齐资金水位、北向/两融、单股 Regime 概率、公告披露、StockAPI 热点和 openInvest/综合新闻补证工具，避免工具已注册但模型或席位不可感知。
+- [新功能] 新增 `get_symbol_regime_probability` 单股 Regime 概率工具；选股流水线仅对 deep dive 标的和持仓标的计算，单股 `entry_analysis` / `position_review` 会对明确单一标的预取 `symbol_regime_probability` / `reentry_reference` 作为弱证据。
+- [改进] `get_regime_forward_probability` 增加 Tushare `index_daily` 本地缓存、非重叠有效样本数、ATR 自适应路径画像、regime 持续天数、样本质量摘要和基于窗口内低点分位的 `reentry_reference`。
 - [修复] 选股最终报告的加分条件只有多个备选项时才显示“满足其一即可”，避免单个条件被误读为还有缺失条件。
 - [改进] `get_sector_rankings` 优先使用 Tushare `ths_hot(market=行业板块)` 获取同花顺行业板块热榜，保留 Eastmoney 与 StockAPI 作为降级来源，并在 `source_chain` 暴露热榜口径。
 - [新功能] 新增 `get_tushare_stk_factor` 股票技术因子工具，接入 Tushare `stk_factor` 的 MACD、KDJ、RSI、BOLL、CCI 等前复权技术指标，并纳入 planning 技术分析能力及结构反转、动量、质量修复、主题催化席工具 YAML。
@@ -16,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] `get_tushare_moneyflow_ind_ths` 补齐 Tushare 行业资金流向的 `start_date/end_date` 参数，并同步纳入主题催化席与动量席工具 YAML 白名单，确保行业资金流工具可被候选专家实际调用。
 - [新功能] 新增 `get_board_capital_flow` 板块资金统一工具，合成 Tushare `moneyflow_ind_dc`、`moneyflow_ind_ths` 和 `moneyflow_cnt_ths`，统一 CNY 字段并保留 `source_definitions/flow_sources`，避免 DC 行业/概念/地域与 THS 行业/概念口径混读。
 - [改进] `get_capital_flow` 合成 Tushare `moneyflow_dc`、`moneyflow_ths` 与 legacy `moneyflow` 三套个股资金流来源，统一输出 CNY 和 `selected_flow_source/flow_sources`，并保留各来源独立统计定义，避免 DC、THS、legacy 口径混读。
+- [修复] `get_capital_flow` 单票资金流改为真正 failover：优先 Tushare `moneyflow_dc` 成功即返回，仅失败时才查 THS、legacy moneyflow 和 StockAPI，并将 `ok/partial` 且有有效数据的降级 errors 作为 warning 保留，避免并发 Tushare 工具排队时被 15 秒预算误判失败。
+- [改进] `get_capital_flow` 增加后台资金流审计：主链路首源成功即返回，后台 best-effort 比较未选中的 THS/legacy 来源，发现日期、方向或量级冲突时仅写入 `warnings/source_conflicts/capital_flow_audit`，不覆盖顶层资金流字段。
+- [修复] Agent 运行态资金流、板块榜单和 Regime 前向概率工具修正预算竞争：`get_capital_flow` 在 Agent 预算内并发探测三路 Tushare 个股资金流并保留 StockAPI fallback 时间，`get_sector_rankings` 不再把后续 fallback 挤成 0 秒，`get_regime_forward_probability` 优先复用指数历史缓存，降低单测通过但实际 Trace 超时失败的概率。
 - [修复] `scripts/update_sequoia_candidates.py` 的断点续跑目标改用 A 股最新已完成交易日，避免周末或节假日 daily run 因自然日无行情而反复从头扫描日线缓存。
 - [修复] 四席位专家最终 JSON 输出轮启用 DeepSeek/OpenAI-compatible `response_format={"type":"json_object"}` 并提高最终 JSON `max_tokens`，减少 `final_output_not_json`。
 - [改进] 四席位开发排障默认提高单 seed 行级等待和 SeedFact 工具超时，降低 `analyze_trend` 等工具未返回导致的席位 timeout。
