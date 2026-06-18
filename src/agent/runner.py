@@ -62,6 +62,7 @@ _HEAVY_TOOL_TIMEOUT_FLOOR_SECONDS: Dict[str, float] = {
     # diagnostic payload is produced.
     "detect_market_regime": 60.0,
     "discover_watchlist_candidates": 70.0,
+    "get_capital_flow": 45.0,
 }
 
 

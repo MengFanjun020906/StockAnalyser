@@ -310,7 +310,7 @@ daily_stock_analysis/
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `8.0` | 可选 |
 | `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS` | 单能力源调用超时（秒） | `3.0` | 可选 |
-| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；Agent 路径会在该预算内并发探测 Tushare `moneyflow_dc`、`moneyflow_ths`、legacy `moneyflow`，按优先级选择首个可用个股资金流，全部失败时回退 StockAPI `codeFlow`；未选中的 Tushare 来源会后台 best-effort 审计，不占用主返回路径 | `15.0` | 可选 |
+| `AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS` | Agent 显式调用 `get_capital_flow` 的资金流预算（秒）；Agent 路径会在该预算内并发探测 Tushare `moneyflow_dc`、`moneyflow_ths`、legacy `moneyflow`，按优先级选择首个可用个股资金流，全部失败时回退 StockAPI `codeFlow`；未选中的 Tushare 来源会后台 best-effort 审计，不占用主返回路径 | `30.0` | 可选 |
 | `get_board_capital_flow` | Agent 工具：合成 Tushare `moneyflow_ind_dc`、`moneyflow_ind_ths`、`moneyflow_cnt_ths` 的行业/概念/地域板块资金流，统一输出 CNY，并保留 `flow_sources/source_definitions` 防止 DC/THS 口径混读 | - | 工具 |
 | `get_tushare_stk_factor` | Agent 工具：Tushare 股票技术因子（`stk_factor`），输出 MACD、KDJ、RSI、BOLL、CCI 等基于前复权价格计算的技术指标；已纳入 planning 技术分析能力和结构反转、动量、质量修复、主题催化席工具 YAML | - | 工具 |
 | `get_tushare_moneyflow_ind_ths` | Agent 工具：同花顺行业资金流向（`moneyflow_ind_ths`），支持 `trade_date` 或 `start_date/end_date`，将原始亿元字段转换为 CNY；已纳入主题催化席和动量席工具 YAML | - | 工具 |

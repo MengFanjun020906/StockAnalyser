@@ -1555,6 +1555,7 @@ class AkshareFundamentalAdapter:
         """
         Return stock capital flow.
         """
+        start_time = time.monotonic()
         result: Dict[str, Any] = {
             "status": "not_supported",
             "stock_flow": {},
@@ -1598,12 +1599,17 @@ class AkshareFundamentalAdapter:
             result["status"] = "partial"
             return result
 
+        stockapi_budget: Optional[float] = None
+        if budget_seconds is not None:
+            stockapi_budget = max(0.0, float(budget_seconds) - time.monotonic() + start_time)
+
         stockapi_flow, stockapi_source, stockapi_errors = self._get_stockapi_capital_flow(
             stock_code,
             start_date=start_date,
             end_date=end_date,
             page_no=page_no,
             page_size=page_size,
+            budget_seconds=stockapi_budget,
         )
         if stockapi_flow:
             result["stock_flow"] = stockapi_flow
@@ -1666,9 +1672,9 @@ class AkshareFundamentalAdapter:
         budget_seconds: float,
     ) -> Dict[str, Any]:
         total_budget = max(1.0, float(budget_seconds or 0.0))
-        stockapi_reserve = 3.0 if total_budget >= 6.0 else 0.0
-        tushare_budget = max(0.75, min(8.0, total_budget - stockapi_reserve))
-        query_timeout = max(1.0, min(8.0, tushare_budget))
+        stockapi_reserve = min(5.0, max(3.0, total_budget * 0.2)) if total_budget >= 6.0 else 0.0
+        tushare_budget = max(0.75, total_budget - stockapi_reserve)
+        query_timeout = max(1.0, tushare_budget)
         started_at = time.monotonic()
         completed: Dict[str, Tuple[Dict[str, Any], Optional[str], List[str]]] = {}
         result: Dict[str, Any] = {
@@ -2242,6 +2248,7 @@ class AkshareFundamentalAdapter:
         end_date: Optional[str] = None,
         page_no: int = 1,
         page_size: int = 50,
+        budget_seconds: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
         """
         Fetch historical stock capital flow from stockapi.com.cn.
@@ -2287,9 +2294,18 @@ class AkshareFundamentalAdapter:
                 windows.append((window_start, window_end))
                 window_end = window_start - timedelta(days=1)
 
+        deadline = None
+        if budget_seconds is not None:
+            deadline = time.monotonic() + max(0.0, float(budget_seconds))
+
         rows: List[Any] = []
         errors: List[str] = []
         for start_date, window_end in windows:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    errors.append("stockapi_codeFlow:timeout:budget_exhausted")
+                    break
             params: Dict[str, Any] = {
                 "code": code,
                 "startDate": start_date.isoformat(),
@@ -2301,7 +2317,14 @@ class AkshareFundamentalAdapter:
                 params["token"] = token
 
             try:
-                response = requests.get(_stockapi_code_flow_url(), params=params, timeout=3.0)
+                request_timeout = 3.0
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        errors.append("stockapi_codeFlow:timeout:budget_exhausted")
+                        break
+                    request_timeout = max(0.2, min(3.0, remaining))
+                response = requests.get(_stockapi_code_flow_url(), params=params, timeout=request_timeout)
                 response.raise_for_status()
                 payload = response.json()
             except Exception as exc:

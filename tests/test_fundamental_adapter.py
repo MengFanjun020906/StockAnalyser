@@ -463,6 +463,30 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertIn("tushare_moneyflow_ths:timeout", result["errors"])
         self.assertIn("tushare_moneyflow:timeout", result["errors"])
 
+    def test_budgeted_capital_flow_passes_remaining_budget_to_stockapi(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        with patch.object(adapter, "_get_tushare_moneyflow_dc_capital_flow", return_value=({}, None, ["dc failed"])), \
+                patch.object(adapter, "_get_tushare_moneyflow_ths_capital_flow", return_value=({}, None, ["ths failed"])), \
+                patch.object(adapter, "_get_tushare_capital_flow", return_value=({}, None, ["legacy failed"])), \
+                patch.object(adapter, "_get_stockapi_capital_flow", return_value=({}, None, ["stockapi timeout"])) as stockapi_mock:
+            adapter.get_capital_flow("600004", budget_seconds=5.0)
+
+        self.assertIn("budget_seconds", stockapi_mock.call_args.kwargs)
+        self.assertGreaterEqual(stockapi_mock.call_args.kwargs["budget_seconds"], 0.0)
+        self.assertLessEqual(stockapi_mock.call_args.kwargs["budget_seconds"], 5.0)
+
+    def test_stockapi_capital_flow_stops_when_budget_is_exhausted(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        with patch("data_provider.fundamental_adapter.requests.get") as mock_get:
+            flow, source, errors = adapter._get_stockapi_capital_flow("600004", budget_seconds=0.0)
+
+        self.assertEqual(flow, {})
+        self.assertIsNone(source)
+        self.assertIn("stockapi_codeFlow:timeout:budget_exhausted", errors)
+        mock_get.assert_not_called()
+
     def test_capital_flow_stockapi_honors_explicit_window_and_page(self) -> None:
         adapter = AkshareFundamentalAdapter()
 

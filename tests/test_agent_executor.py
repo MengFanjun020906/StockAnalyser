@@ -1293,6 +1293,60 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertTrue(result.tool_calls_log[0]["success"])
         self.assertIn("stale_fallback", result.tool_calls_log[0]["result_preview"])
 
+    def test_capital_flow_gets_runner_timeout_floor(self):
+        """Capital-flow should return its own timeout/fallback diagnostics."""
+        registry = ToolRegistry()
+
+        def _capital_flow_tool(stock_code="600519"):
+            time.sleep(0.05)
+            return {
+                "stock_code": stock_code,
+                "status": "failed",
+                "source_chain": [{"provider": "capital_stock:tushare_moneyflow_dc", "result": "failed"}],
+                "errors": ["tushare_moneyflow_dc:timeout:budget_exhausted"],
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="get_capital_flow",
+                description="Get capital flow",
+                parameters=[],
+                handler=_capital_flow_tool,
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gathering capital flow.",
+                tool_calls=[ToolCall(id="flow", name="get_capital_flow", arguments={"stock_code": "603667"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Analyze"},
+            ],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+            tool_call_timeout_seconds=0.01,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertFalse(result.tool_calls_log[0].get("timeout"))
+        self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertIn("tushare_moneyflow_dc:timeout", result.tool_calls_log[0]["result_preview"])
+
     def test_llm_call_receives_remaining_timeout_budget(self):
         """LLM tool calls should receive the remaining wall-clock budget."""
         registry = _make_registry_with_echo()

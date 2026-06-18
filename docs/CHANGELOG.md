@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
 - [修复] 单股 Planner 与四席位专家工具白名单补齐资金水位、北向/两融、单股 Regime 概率、公告披露、StockAPI 热点和 openInvest/综合新闻补证工具，避免工具已注册但模型或席位不可感知。
+- [修复] `get_capital_flow` 纳入 Agent 重工具外层等待下限并将默认显式预算提升到 30 秒，避免单股 Trace 中与 Tushare 重工具并发时被 15 秒资金流壳超时截断为 `capital_flow timeout`。
 - [新功能] 新增 `get_symbol_regime_probability` 单股 Regime 概率工具；选股流水线仅对 deep dive 标的和持仓标的计算，单股 `entry_analysis` / `position_review` 会对明确单一标的预取 `symbol_regime_probability` / `reentry_reference` 作为弱证据。
 - [改进] `get_regime_forward_probability` 增加 Tushare `index_daily` 本地缓存、非重叠有效样本数、ATR 自适应路径画像、regime 持续天数、样本质量摘要和基于窗口内低点分位的 `reentry_reference`。
 - [修复] 选股最终报告的加分条件只有多个备选项时才显示“满足其一即可”，避免单个条件被误读为还有缺失条件。
