@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -37,15 +38,23 @@ from src.agent.candidate_experts_v2.recall import build_recall_pool
 from src.agent.candidate_experts_v2.schemas import SeedFactPacket, SeedItem
 
 
-DEFAULT_TRACE_DIR = (
-    ROOT
-    / "data/agent_traces/20260530-214336-trace-6ca8c64be6bf431fa27d7ec5e6471dce"
-)
-
-
 def _read_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _resolve_trace_dir(value: Path | None, parser: argparse.ArgumentParser) -> Path:
+    raw = str(value) if value is not None else os.getenv("AGENT_TRACE_DIR", "").strip()
+    if not raw:
+        parser.error("--trace-dir is required unless AGENT_TRACE_DIR is set")
+
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+
+    cwd_path = (Path.cwd() / path).resolve()
+    root_path = (ROOT / path).resolve()
+    return root_path if root_path.exists() and not cwd_path.exists() else cwd_path
 
 
 def _extract_seed_preview(trace_dir: Path) -> List[Dict[str, Any]]:
@@ -693,7 +702,12 @@ def _run_direct_llm_probe(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trace-dir", type=Path, default=DEFAULT_TRACE_DIR)
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        default=None,
+        help="Trace artifact directory. Relative paths are resolved from cwd, or from the repo root if only that exists. Defaults to AGENT_TRACE_DIR.",
+    )
     parser.add_argument("--real-llm", action="store_true", help="also call the configured real LLM")
     parser.add_argument("--direct-llm-only", action="store_true", help="call the real LLM once per desk without the desk per-seed guard")
     parser.add_argument("--with-tool-schemas", action="store_true", help="send real OpenAI tool schemas")
@@ -704,8 +718,9 @@ def main() -> None:
     parser.add_argument("--per-seed-timeout-s", type=float, default=12.0)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
+    trace_dir = _resolve_trace_dir(args.trace_dir, parser)
 
-    preview = _extract_seed_preview(args.trace_dir)[: args.limit]
+    preview = _extract_seed_preview(trace_dir)[: args.limit]
     seeds = _seed_items_from_preview(preview)
     pool = SeedPoolBuildResult(seeds=seeds, total_limit=max(len(seeds), args.limit))
     recall = build_recall_pool(
@@ -716,7 +731,7 @@ def main() -> None:
         prebuilt_pool=pool,
     )
     rows = recall.rows
-    seed_facts = _load_seed_facts_from_trace(args.trace_dir)
+    seed_facts = _load_seed_facts_from_trace(trace_dir)
     attached_seed_facts = 0
     for row in rows:
         packet = seed_facts.get(row.code)

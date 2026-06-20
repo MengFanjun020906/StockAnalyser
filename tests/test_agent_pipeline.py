@@ -905,6 +905,15 @@ class TestAgentConstructionChain(unittest.TestCase):
             adapter = LLMToolAdapter()
             self.assertIsNotNone(adapter)
 
+    def test_glm_52_uses_thinking_extra_body(self):
+        """GLM 5.2 should receive the provider-specific thinking payload."""
+        from src.agent.llm_adapter import get_thinking_extra_body
+
+        self.assertEqual(
+            get_thinking_extra_body("glm-5.2"),
+            {"thinking": {"type": "enabled"}, "reasoning_effort": "max"},
+        )
+
     def test_full_construction_chain(self):
         """Test ToolRegistry + SkillManager + LLMToolAdapter + AgentExecutor wiring."""
         from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter

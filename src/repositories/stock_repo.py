@@ -10,13 +10,13 @@
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional, List, Dict, Any
 
 import pandas as pd
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, func, select
 
-from src.storage import DatabaseManager, StockDaily
+from src.storage import DatabaseManager, StockDaily, StockMinuteBar
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,14 @@ class StockRepository:
         except Exception as e:
             logger.error(f"保存日线数据失败: {e}")
             return 0
+
+    def save_minute_bars(self, records: List[Dict[str, Any]], data_source: str = "BaostockMinute") -> int:
+        """保存分钟线记录。"""
+        try:
+            return self.db.save_minute_bars(records, data_source=data_source)
+        except Exception as e:
+            logger.error(f"保存分钟线数据失败: {e}")
+            return 0
     
     def has_today_data(self, code: str, target_date: Optional[date] = None) -> bool:
         """
@@ -159,3 +167,70 @@ class StockRepository:
                 .limit(eval_window_days)
             ).scalars().all()
             return list(rows)
+
+    def get_forward_minute_bars(
+        self,
+        *,
+        code: str,
+        analysis_date: date,
+        eval_window_days: int,
+        frequency: str = "5",
+        adjustflag: str = "3",
+    ) -> List[StockMinuteBar]:
+        """Return cached minute bars after analysis_date.
+
+        `eval_window_days` is interpreted as trading-session count by the
+        simulator. The SQL range uses a wider calendar window to cover weekends
+        and holidays without requiring a trading calendar lookup here.
+        """
+        calendar_padding = max(10, int(eval_window_days or 1) * 2)
+        end_date = analysis_date + timedelta(days=calendar_padding)
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(StockMinuteBar)
+                .where(
+                    and_(
+                        StockMinuteBar.code == code,
+                        StockMinuteBar.bar_date > analysis_date,
+                        StockMinuteBar.bar_date <= end_date,
+                        StockMinuteBar.frequency == str(frequency),
+                        StockMinuteBar.adjustflag == str(adjustflag),
+                    )
+                )
+                .order_by(StockMinuteBar.bar_datetime)
+            ).scalars().all()
+            return list(rows)
+
+    def get_minute_coverage(
+        self,
+        *,
+        code: str,
+        start_date: date,
+        end_date: date,
+        frequency: str = "5",
+        adjustflag: str = "3",
+    ) -> Dict[str, Any]:
+        """Return count and date range for cached minute bars."""
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(
+                    func.count(StockMinuteBar.id),
+                    func.min(StockMinuteBar.bar_datetime),
+                    func.max(StockMinuteBar.bar_datetime),
+                ).where(
+                    and_(
+                        StockMinuteBar.code == code,
+                        StockMinuteBar.bar_date >= start_date,
+                        StockMinuteBar.bar_date <= end_date,
+                        StockMinuteBar.frequency == str(frequency),
+                        StockMinuteBar.adjustflag == str(adjustflag),
+                    )
+                )
+            ).one()
+        return {
+            "count": int(row[0] or 0),
+            "min_datetime": row[1].isoformat() if row[1] else None,
+            "max_datetime": row[2].isoformat() if row[2] else None,
+            "frequency": str(frequency),
+            "adjustflag": str(adjustflag),
+        }

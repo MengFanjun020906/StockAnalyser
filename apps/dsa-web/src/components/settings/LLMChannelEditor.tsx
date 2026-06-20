@@ -15,6 +15,12 @@ interface ChannelPreset {
 }
 
 const CHANNEL_PRESETS: Record<string, ChannelPreset> = {
+  glm: {
+    label: '智谱 GLM',
+    protocol: 'openai',
+    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    placeholder: 'glm-5.2',
+  },
   aihubmix: {
     label: 'AIHubmix（聚合平台）',
     protocol: 'openai',
@@ -37,7 +43,7 @@ const CHANNEL_PRESETS: Record<string, ChannelPreset> = {
     label: '智谱 GLM',
     protocol: 'openai',
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-    placeholder: 'glm-4-flash,glm-4-plus',
+    placeholder: 'glm-5.2',
   },
   moonshot: {
     label: 'Moonshot（月之暗面）',
@@ -907,12 +913,22 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
 
   const prevChannelsRef = useRef(channelsFingerprint);
   const prevRuntimeRef = useRef(runtimeFingerprint);
+  const savedRefreshFingerprintRef = useRef<{ channels: string; runtime: string } | null>(null);
   const discoveryNonceRef = useRef<Record<string, number>>({});
   const discoveryRequestIdRef = useRef(0);
 
   useEffect(() => {
     if (prevChannelsRef.current === channelsFingerprint && prevRuntimeRef.current === runtimeFingerprint) {
       return;
+    }
+    const savedRefreshFingerprint = savedRefreshFingerprintRef.current;
+    const shouldPreserveSaveFeedback = Boolean(
+      savedRefreshFingerprint
+      && savedRefreshFingerprint.channels === channelsFingerprint
+      && savedRefreshFingerprint.runtime === runtimeFingerprint,
+    );
+    if (shouldPreserveSaveFeedback) {
+      savedRefreshFingerprintRef.current = null;
     }
     prevChannelsRef.current = channelsFingerprint;
     prevRuntimeRef.current = runtimeFingerprint;
@@ -923,8 +939,10 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
     setDiscoveryStates({});
     setExpandedRows({});
     discoveryNonceRef.current = {};
-    setSaveMessage(null);
-    setSaveWarnings([]);
+    if (!shouldPreserveSaveFeedback) {
+      setSaveMessage(null);
+      setSaveWarnings([]);
+    }
     setIsCollapsed(false);
   }, [channelsFingerprint, runtimeFingerprint, initialChannels, initialRuntimeConfig]);
 
@@ -965,6 +983,8 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
   }, [channels, initialChannels, initialRuntimeConfig, runtimeConfig]);
 
   const busy = disabled || isSaving;
+  const currentPrimaryModel = runtimeConfig.primaryModel || availableModels[0] || '';
+  const currentAgentModel = runtimeConfig.agentPrimaryModel || currentPrimaryModel;
 
   const updateChannel = (index: number, field: keyof ChannelConfig, value: string | boolean) => {
     setChannels((previous) => previous.map((channel, rowIndex) => {
@@ -1123,10 +1143,15 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
         items: updateItems,
       });
       const responseWarnings = response.warnings || [];
+      savedRefreshFingerprintRef.current = {
+        channels: JSON.stringify(parseChannelsFromItems(updateItems)),
+        runtime: JSON.stringify(parseRuntimeConfigFromItems(updateItems)),
+      };
       await onSaved(updateItems);
       setSaveWarnings(responseWarnings);
       setSaveMessage({ type: 'success', text: managesRuntimeConfig ? 'AI 配置已保存' : '渠道配置已保存' });
     } catch (error: unknown) {
+      savedRefreshFingerprintRef.current = null;
       setSaveWarnings([]);
       setSaveMessage({ type: 'error', error: getParsedApiError(error) });
     } finally {
@@ -1261,7 +1286,7 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
         className="flex w-full items-center justify-between rounded-[1.35rem] border border-[var(--settings-border)] bg-[var(--settings-surface)] px-5 py-4 text-left shadow-soft-card transition-[background-color,border-color,box-shadow] duration-200 hover:border-[var(--settings-border-strong)] hover:bg-[var(--settings-surface-hover)]"
         onClick={() => setIsCollapsed((previous) => !previous)}
       >
-        <div className="space-y-1">
+        <div className="min-w-0 space-y-1">
           <div className="flex items-center gap-2">
             <h3 className="text-base font-semibold text-foreground">AI 模型配置</h3>
             <Badge variant="info" className="settings-accent-badge">渠道管理</Badge>
@@ -1269,6 +1294,16 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
           <p className="text-xs text-muted-text">
             添加服务商渠道后可自动获取模型列表并多选，也可继续手动填写。配置会自动同步到 .env 文件。
           </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Badge variant={currentPrimaryModel ? 'success' : 'warning'} className="min-w-0 max-w-full">
+              <span className="block truncate">当前主模型：{currentPrimaryModel || '未配置'}</span>
+            </Badge>
+            {currentAgentModel ? (
+              <Badge variant="default" className="min-w-0 max-w-full">
+                <span className="block truncate">Agent：{currentAgentModel}</span>
+              </Badge>
+            ) : null}
+          </div>
         </div>
         <span className="text-xs text-muted-text">{isCollapsed ? '▶ 展开' : '▼ 收起'}</span>
       </button>

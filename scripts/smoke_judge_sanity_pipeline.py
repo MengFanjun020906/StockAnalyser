@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -67,6 +68,7 @@ class SmokeLLMAdapter:
         tools: List[Dict[str, Any]],
         timeout: float | None = None,
         response_format: Dict[str, Any] | None = None,
+        **_kwargs: Any,
     ) -> LLMResponse:
         self.call_with_tools_count += 1
         # Committee desks receive this no-tool final JSON. It is enough to
@@ -278,8 +280,9 @@ def main() -> int:
 
     executor = AgentExecutor(registry, adapter, max_steps=1, timeout_seconds=30)
     events: List[Dict[str, Any]] = []
-    out_path = Path("/tmp/dsa_judge_sanity_pipeline_smoke.json")
-    telemetry_dir = Path("/tmp/dsa_judge_sanity_pipeline_smoke_trace")
+    smoke_dir = Path(os.getenv("DSA_SMOKE_OUTPUT_DIR", tempfile.gettempdir())).expanduser()
+    out_path = smoke_dir / "dsa_judge_sanity_pipeline_smoke.json"
+    telemetry_dir = smoke_dir / "dsa_judge_sanity_pipeline_smoke_trace"
     telemetry_path = telemetry_dir / "llm_usage.jsonl"
     telemetry_dir.mkdir(parents=True, exist_ok=True)
     if telemetry_path.exists():

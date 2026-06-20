@@ -19,7 +19,7 @@ import logging
 import re
 import time
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Iterable
 
 import pandas as pd
 from sqlalchemy import (
@@ -132,6 +132,64 @@ class StockDaily(Base):
             'ma10': self.ma10,
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
+            'data_source': self.data_source,
+        }
+
+
+class StockMinuteBar(Base):
+    """股票分钟线数据缓存。
+
+    主要服务于 Agent 入场执行回测。分钟线来自 baostock，按股票、频率、
+    复权标记和分钟时间戳做 UPSERT，便于用户每天手动增量同步。
+    """
+
+    __tablename__ = 'stock_minute_bars'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(16), nullable=False, index=True)
+    baostock_code = Column(String(16), index=True)
+    frequency = Column(String(8), nullable=False, default='5', index=True)
+    adjustflag = Column(String(4), nullable=False, default='3', index=True)
+
+    bar_datetime = Column(DateTime, nullable=False, index=True)
+    bar_date = Column(Date, nullable=False, index=True)
+    bar_time = Column(String(16))
+
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Float)
+    amount = Column(Float)
+
+    data_source = Column(String(50), default='BaostockMinute')
+    fetched_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'bar_datetime', 'frequency', 'adjustflag', name='uix_minute_code_dt_freq_adj'),
+        Index('ix_minute_code_date_freq', 'code', 'bar_date', 'frequency'),
+        Index('ix_minute_code_dt', 'code', 'bar_datetime'),
+    )
+
+    def __repr__(self):
+        return f"<StockMinuteBar(code={self.code}, frequency={self.frequency}, bar_datetime={self.bar_datetime})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'baostock_code': self.baostock_code,
+            'frequency': self.frequency,
+            'adjustflag': self.adjustflag,
+            'bar_datetime': self.bar_datetime.isoformat() if self.bar_datetime else None,
+            'bar_date': self.bar_date.isoformat() if self.bar_date else None,
+            'bar_time': self.bar_time,
+            'open': self.open,
+            'high': self.high,
+            'low': self.low,
+            'close': self.close,
+            'volume': self.volume,
+            'amount': self.amount,
             'data_source': self.data_source,
         }
 
@@ -1033,6 +1091,29 @@ class DatabaseManager:
         return value
 
     @staticmethod
+    def _normalize_minute_datetime(value: Any) -> Optional[datetime]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        text = str(value).strip()
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y%m%d%H%M%S%f", "%Y%m%d%H%M%S"):
+            try:
+                return datetime.strptime(text[: len(fmt.replace('%f', '000000'))] if "%f" in fmt else text, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+    @staticmethod
     def _normalize_sql_value(value: Any) -> Any:
         return None if pd.isna(value) else value
     
@@ -1781,6 +1862,150 @@ class DatabaseManager:
             return saved_count
         except Exception as e:
             logger.error(f"保存 {code} 数据失败: {e}")
+            raise
+
+    def save_minute_bars(
+        self,
+        records: Iterable[Dict[str, Any]],
+        *,
+        data_source: str = "BaostockMinute",
+    ) -> int:
+        """保存分钟线数据到 `stock_minute_bars`。
+
+        Args:
+            records: 每条至少包含 code/bar_datetime/open/high/low/close。
+            data_source: 数据来源标记。
+
+        Returns:
+            本次实际新增的记录数（不含更新）。
+        """
+        now = datetime.now()
+        normalized_by_key: Dict[Tuple[str, datetime, str, str], Dict[str, Any]] = {}
+        for row in records or []:
+            code = str(row.get('code') or '').strip().upper()
+            bar_dt = self._normalize_minute_datetime(row.get('bar_datetime') or row.get('datetime'))
+            if not code or bar_dt is None:
+                continue
+            frequency = str(row.get('frequency') or '5').strip()
+            adjustflag = str(row.get('adjustflag') or '3').strip()
+            bar_time = str(row.get('bar_time') or bar_dt.strftime('%H:%M:%S'))
+            key = (code, bar_dt, frequency, adjustflag)
+            normalized_by_key[key] = {
+                'code': code,
+                'baostock_code': str(row.get('baostock_code') or '').strip().lower() or None,
+                'frequency': frequency,
+                'adjustflag': adjustflag,
+                'bar_datetime': bar_dt,
+                'bar_date': bar_dt.date(),
+                'bar_time': bar_time,
+                'open': self._normalize_sql_value(row.get('open')),
+                'high': self._normalize_sql_value(row.get('high')),
+                'low': self._normalize_sql_value(row.get('low')),
+                'close': self._normalize_sql_value(row.get('close')),
+                'volume': self._normalize_sql_value(row.get('volume')),
+                'amount': self._normalize_sql_value(row.get('amount')),
+                'data_source': data_source,
+                'fetched_at': now,
+                'updated_at': now,
+            }
+
+        if not normalized_by_key:
+            return 0
+
+        records_to_write = list(normalized_by_key.values())
+        keys = list(normalized_by_key.keys())
+
+        def _write(session: Session) -> int:
+            existing_keys = set()
+            _COUNT_CHUNK = 500
+            for i in range(0, len(keys), _COUNT_CHUNK):
+                chunk = keys[i : i + _COUNT_CHUNK]
+                conditions = [
+                    and_(
+                        StockMinuteBar.code == code,
+                        StockMinuteBar.bar_datetime == bar_dt,
+                        StockMinuteBar.frequency == frequency,
+                        StockMinuteBar.adjustflag == adjustflag,
+                    )
+                    for code, bar_dt, frequency, adjustflag in chunk
+                ]
+                if not conditions:
+                    continue
+                existing_keys.update(
+                    (
+                        row.code,
+                        row.bar_datetime,
+                        row.frequency,
+                        row.adjustflag,
+                    )
+                    for row in session.execute(
+                        select(StockMinuteBar).where(or_(*conditions))
+                    ).scalars().all()
+                )
+
+            new_count = sum(1 for key in keys if key not in existing_keys)
+            if self._is_sqlite_engine:
+                _SQLITE_CHUNK = 100
+                for i in range(0, len(records_to_write), _SQLITE_CHUNK):
+                    chunk = records_to_write[i : i + _SQLITE_CHUNK]
+                    stmt = sqlite_insert(StockMinuteBar).values(chunk)
+                    excluded = stmt.excluded
+                    session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=['code', 'bar_datetime', 'frequency', 'adjustflag'],
+                            set_={
+                                'baostock_code': excluded.baostock_code,
+                                'bar_date': excluded.bar_date,
+                                'bar_time': excluded.bar_time,
+                                'open': excluded.open,
+                                'high': excluded.high,
+                                'low': excluded.low,
+                                'close': excluded.close,
+                                'volume': excluded.volume,
+                                'amount': excluded.amount,
+                                'data_source': excluded.data_source,
+                                'fetched_at': excluded.fetched_at,
+                                'updated_at': excluded.updated_at,
+                            },
+                        )
+                    )
+                return new_count
+
+            existing_rows = {
+                (row.code, row.bar_datetime, row.frequency, row.adjustflag): row
+                for row in session.execute(
+                    select(StockMinuteBar).where(or_(*[
+                        and_(
+                            StockMinuteBar.code == code,
+                            StockMinuteBar.bar_datetime == bar_dt,
+                            StockMinuteBar.frequency == frequency,
+                            StockMinuteBar.adjustflag == adjustflag,
+                        )
+                        for code, bar_dt, frequency, adjustflag in keys
+                    ]))
+                ).scalars().all()
+            }
+            for record in records_to_write:
+                key = (
+                    record['code'],
+                    record['bar_datetime'],
+                    record['frequency'],
+                    record['adjustflag'],
+                )
+                existing = existing_rows.get(key)
+                if existing is None:
+                    session.add(StockMinuteBar(**record))
+                    continue
+                for field, value in record.items():
+                    setattr(existing, field, value)
+            return new_count
+
+        try:
+            saved_count = self._run_write_transaction("save_minute_bars", _write)
+            logger.info("保存分钟线数据成功，新增 %s 条，写入/更新 %s 条", saved_count, len(records_to_write))
+            return saved_count
+        except Exception as e:
+            logger.error("保存分钟线数据失败: %s", e)
             raise
     
     def get_analysis_context(

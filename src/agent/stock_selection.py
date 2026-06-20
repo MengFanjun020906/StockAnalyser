@@ -785,7 +785,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     ]
     headline_watch_items = _headline_watch_items(
         displayed_recommendations=displayed_recommendations,
-        primary_items=execution_recommendations or headline_opportunity_items,
+        primary_items=execution_recommendations[:1] + headline_opportunity_items[:1],
     )
     observation_items = [
         item for item in recommendations
@@ -5983,15 +5983,19 @@ def _headline_watch_items(
 
     if not displayed_recommendations:
         return []
-    primary_code = (
-        _normalize_stock_identity_code(primary_items[0].get("code"))
-        if primary_items and isinstance(primary_items[0], dict)
-        else None
-    )
+    primary_codes = {
+        code
+        for code in (
+            _normalize_stock_identity_code(item.get("code"))
+            for item in primary_items
+            if isinstance(item, dict)
+        )
+        if code
+    }
     items: List[Dict[str, Any]] = []
     for item in displayed_recommendations:
         code = _normalize_stock_identity_code(item.get("code"))
-        if primary_code and code == primary_code:
+        if code in primary_codes:
             continue
         if _is_observable_item(item):
             items.append(item)

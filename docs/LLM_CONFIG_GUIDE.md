@@ -49,7 +49,23 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
 GEMINI_API_KEY=AIzac...
 ```
 
-### 示例 4：使用 Ollama 本地模型
+### 示例 4：使用智谱 GLM 官方接口
+```env
+# 智谱 GLM 采用 OpenAI-Compatible Chat Completions 协议
+GLM_API_KEY=your-api-key
+LLM_CHANNELS=glm
+LLM_GLM_PROTOCOL=openai
+LLM_GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+LLM_GLM_API_KEY=${GLM_API_KEY}
+LLM_GLM_MODELS=glm-5.2
+LITELLM_MODEL=openai/glm-5.2
+AGENT_LITELLM_MODEL=openai/glm-5.2
+LLM_TEMPERATURE=1.0
+```
+
+`glm-5.2` 会通过 OpenAI-compatible 渠道路由；Agent 调用会随模型自动附加 `thinking={"type":"enabled"}` 与 `reasoning_effort="max"`。
+
+### 示例 5：使用 Ollama 本地模型
 ```env
 # Ollama 无需 API Key，本地运行 ollama serve 后即可使用
 OLLAMA_API_BASE=http://localhost:11434
@@ -103,6 +119,7 @@ python test_env.py --all
 - OpenAI Compatible 规范（LiteLLM）：<https://docs.litellm.ai/docs/providers/openai_compatible>
 - OpenAI 官方：<https://platform.openai.com/docs/api-reference/chat>
 - DeepSeek 官方：<https://api-docs.deepseek.com/>
+- 智谱 GLM 官方：<https://open.bigmodel.cn/>
 - 阿里百炼 DashScope 兼容模式：<https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope>
 - Moonshot / Kimi 官方：<https://platform.moonshot.ai/docs/guide/compatibility>
 - Anthropic 官方：<https://docs.anthropic.com/en/api/messages>

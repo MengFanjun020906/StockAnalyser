@@ -9,8 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [改进] 补齐智谱 GLM `glm-5.2` 渠道示例与前端预设，设置页会显示当前主模型；Agent 调用 `glm-5.2` 时自动携带 thinking 与 `reasoning_effort=max`。
+- [改进] Agent 入场执行回测 summary 新增策略级累计 PnL、胜率、成交率、最好/最差收益和盈亏比，Web“入场”页增加系统总览指标面板。
+- [改进] Web“入场”页保留当前日期总览，并新增历史全量总览，用于对比当日表现与截至当前的长期平均指标。
+- [改进] Agent 入场执行回测导入规则改为只纳入最终组合中的可执行等待/条件入场项，排除明确 reject 项，并支持每个 Trace 最多 4 个最终标的。
+- [新功能] Agent 入场执行回测新增 baostock 5 分钟线手动同步、本地 `stock_minute_bars` 缓存表和分钟线优先撮合；Web“入场”页可同步最终报告标的分钟 K，并用 ECharts 交互日 K 展示入场区间、止盈止损和入出场点。
 - [修复] 单股 Planner 与四席位专家工具白名单补齐资金水位、北向/两融、单股 Regime 概率、公告披露、StockAPI 热点和 openInvest/综合新闻补证工具，避免工具已注册但模型或席位不可感知。
+- [修复] 排障脚本移除固定本地路径和固定 Trace 默认值，`probe_thesis_desks_from_trace.py` 改为显式 `--trace-dir`/`AGENT_TRACE_DIR`，Judge smoke 输出目录改为 `DSA_SMOKE_OUTPUT_DIR` 或系统临时目录。
 - [修复] `get_capital_flow` 纳入 Agent 重工具外层等待下限并将默认显式预算提升到 30 秒，避免单股 Trace 中与 Tushare 重工具并发时被 15 秒资金流壳超时截断为 `capital_flow timeout`。
+- [修复] 选股最终报告核心表的“可观察标的”不再重复展示已作为“机会首选”或“执行首选”的股票，避免同一标的在首选和观察位产生语义混淆。
+- [新功能] Agent Trace 选股页面支持从历史 Trace 继续运行，后端可复用已落盘的选股阶段 artifact，并为未来中断的选股流水线增量保存阶段结果。
+- [新功能] 新增 Agent 入场执行回测离线链路、只读/重建 API 与 Web“入场”标签页，只评估选股报告最终输出标的，并用 strict/next-open/ATR 弹性/突破跟随四套策略诊断 AI 入场点位过保守问题。
 - [新功能] 新增 `get_symbol_regime_probability` 单股 Regime 概率工具；选股流水线仅对 deep dive 标的和持仓标的计算，单股 `entry_analysis` / `position_review` 会对明确单一标的预取 `symbol_regime_probability` / `reentry_reference` 作为弱证据。
 - [改进] `get_regime_forward_probability` 增加 Tushare `index_daily` 本地缓存、非重叠有效样本数、ATR 自适应路径画像、regime 持续天数、样本质量摘要和基于窗口内低点分位的 `reentry_reference`。
 - [修复] 选股最终报告的加分条件只有多个备选项时才显示“满足其一即可”，避免单个条件被误读为还有缺失条件。

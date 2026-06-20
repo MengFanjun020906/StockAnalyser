@@ -1765,6 +1765,117 @@ def test_stock_selection_headline_and_meta_chain_align_with_deep_dive_body():
     assert "### 1. 300308 中际旭创" not in markdown
 
 
+def test_stock_selection_headline_watch_excludes_opportunity_and_execution_picks():
+    report = {
+        "candidate_discovery": {
+            "summary": {"source_count": 3},
+            "full": {
+                "candidates": [
+                    {"code": "688401", "name": "路维光电", "source": "theme_catalyst", "final_score": 94, "reason": "光刻掩膜版主题催化"},
+                    {"code": "300308", "name": "中际旭创", "source": "momentum", "final_score": 93, "reason": "CPO 动量延续"},
+                    {"code": "600487", "name": "亨通光电", "source": "capital_flow", "final_score": 88, "reason": "资金流入但等待确认"},
+                ]
+            },
+        },
+        "candidate_screening": {"summary": {}, "full": {}},
+        "single_stock_deep_dive": {
+            "summary": {},
+            "full": {
+                "results": [
+                    {
+                        "summary": {
+                            "code": "688401",
+                            "name": "路维光电",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "回踩 5 日线企稳",
+                            "stop_loss": "跌破前低",
+                            "main_supporting_evidence": ["主题与基本面匹配，机会质量最高"],
+                        },
+                        "full": {
+                            "stock": {"code": "688401", "name": "路维光电"},
+                            "key_evidence": ["主题与基本面匹配，机会质量最高"],
+                            "failure_conditions": ["跌破前低"],
+                        },
+                    },
+                    {
+                        "summary": {
+                            "code": "300308",
+                            "name": "中际旭创",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "回踩 MA20 企稳",
+                            "stop_loss": "跌破 MA20",
+                            "main_supporting_evidence": ["动量和资金共振"],
+                        },
+                        "full": {
+                            "stock": {"code": "300308", "name": "中际旭创"},
+                            "key_evidence": ["动量和资金共振"],
+                            "failure_conditions": ["跌破 MA20"],
+                        },
+                    },
+                    {
+                        "summary": {
+                            "code": "600487",
+                            "name": "亨通光电",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "回踩支撑确认",
+                            "stop_loss": "跌破支撑",
+                            "main_supporting_evidence": ["资金流入，仍需确认"],
+                        },
+                        "full": {
+                            "stock": {"code": "600487", "name": "亨通光电"},
+                            "key_evidence": ["资金流入，仍需确认"],
+                            "failure_conditions": ["跌破支撑"],
+                        },
+                    },
+                ]
+            },
+        },
+        "portfolio_allocation": {
+            "summary": {
+                "portfolio_action": "wait",
+                "core_reason": "本轮没有无条件买入标的，但存在可按次日条件触发的强候选",
+            },
+            "full": {
+                "positions_plan": [
+                    {
+                        "rank": 1,
+                        "code": "300308",
+                        "name": "中际旭创",
+                        "action": "wait",
+                        "execution_mode": "conditional_open",
+                        "entry_condition": "回踩 MA20 企稳",
+                        "stop_loss_condition": "跌破 MA20",
+                    },
+                    {
+                        "rank": 2,
+                        "code": "688401",
+                        "name": "路维光电",
+                        "action": "wait",
+                        "action_strength": "medium",
+                        "execution_mode": "strong_watch",
+                        "entry_condition": "等待量价确认",
+                        "stop_loss_condition": "跌破前低",
+                    },
+                ]
+            },
+        },
+        "adversarial_review": {"summary": {}, "full": {}},
+        "judge_decision": {"summary": {"primary_plan_verdict": "wait_for_more_data", "final_action": "wait"}, "full": {}},
+    }
+
+    markdown = render_stock_selection_markdown(report)
+    headline = markdown.split("## 二、", 1)[0]
+
+    assert "| 机会首选 | 688401 路维光电 |" in headline
+    assert "| 执行首选 | 300308 中际旭创（条件触发） |" in headline
+    assert "| 可观察标的 | 600487 亨通光电 |" in headline
+    assert "| 可观察标的 | 688401 路维光电 |" not in headline
+    assert "| 可观察标的 | 300308 中际旭创 |" not in headline
+
+
 def test_stock_selection_high_score_without_exit_condition_renders_strong_watch():
     report = {
         "candidate_discovery": {

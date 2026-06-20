@@ -110,6 +110,7 @@ class AgentTraceRunRequest(BaseModel):
     default_stop_loss_pct: Optional[float] = Field(default=None, ge=0, le=100)
     investor_notes: Optional[str] = None
     candidate_discovery_mode: Optional[Literal["deterministic", "llm_expert_committee", "thesis_desk_committee"]] = None
+    resume_from_session_id: Optional[str] = None
 
     @property
     def effective_skills(self) -> Optional[List[str]]:
@@ -392,6 +393,16 @@ def _build_trace_context(
     config: Any,
 ) -> Dict[str, Any]:
     context = dict(request.context or {})
+    resume_session_id = _normalize_trace_session_id(request.resume_from_session_id)
+    if resume_session_id:
+        resume_artifact_dir = _find_trace_artifact_dir(resume_session_id)
+        if resume_artifact_dir is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "resume_trace_not_found", "message": f"未找到可继续运行的 Trace {resume_session_id}"},
+            )
+        context["resume_from_session_id"] = resume_session_id
+        context["stock_selection_resume_artifact_dir"] = str(resume_artifact_dir)
     stock_code = (request.stock_code or context.get("stock_code") or _infer_stock_code_from_message(request.message) or "").strip()
     if stock_code:
         context["stock_code"] = stock_code
@@ -920,6 +931,13 @@ def _find_trace_artifact_dir(session_id: str) -> Optional[Path]:
     return max(matches, key=lambda path: path.stat().st_mtime)
 
 
+def _normalize_trace_session_id(session_id: Optional[str]) -> str:
+    normalized = str(session_id or "").strip()
+    if not normalized:
+        return ""
+    return normalized if normalized.startswith("trace-") else f"trace-{normalized}"
+
+
 def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, Any]:
     summary = _read_trace_json_file(path / "summary.json", {}) or {}
     request_payload = _read_trace_json_file(path / "request.json", {}) or {}
@@ -1241,8 +1259,48 @@ def _structured_tool_payload_has_errors(payload: Any) -> bool:
         return True
     errors = payload.get("errors")
     if isinstance(errors, list):
-        return any(str(item).strip() for item in errors)
-    return bool(errors)
+        has_errors = any(str(item).strip() for item in errors)
+    else:
+        has_errors = bool(errors)
+    if has_errors:
+        return not (status in {"ok", "partial"} and _structured_tool_payload_has_effective_data(payload))
+    return False
+
+
+def _structured_tool_payload_has_effective_data(payload: Dict[str, Any]) -> bool:
+    ignored_keys = {
+        "status",
+        "errors",
+        "error",
+        "error_summary",
+        "note",
+        "message",
+        "stock_code",
+        "code",
+        "query",
+        "source_chain",
+        "amount_unit",
+        "raw_amount_unit",
+        "context_policy",
+    }
+    for key, value in payload.items():
+        if key in ignored_keys:
+            continue
+        if _structured_tool_value_has_effective_data(value):
+            return True
+    return False
+
+
+def _structured_tool_value_has_effective_data(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value == "":
+        return False
+    if isinstance(value, dict):
+        return any(_structured_tool_value_has_effective_data(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_structured_tool_value_has_effective_data(item) for item in value)
+    return True
 
 
 def _normalize_tool_call_status(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -1908,13 +1966,31 @@ class TraceArtifactWriter:
     def append_event(self, event: Dict[str, Any]) -> None:
         if not self._initialized:
             return
-        self._events.append(event)
-        _append_trace_event(self.path / "events.ndjson", event)
+        stored_event = dict(event)
+        stored_event.pop("__artifact_payload", None)
+        self._events.append(stored_event)
+        _append_trace_event(self.path / "events.ndjson", stored_event)
         self._write_incremental_artifact_from_event(event)
 
     def _write_incremental_artifact_from_event(self, event: Dict[str, Any]) -> None:
         event_type = str(event.get("type") or event.get("event") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        artifact_payload = event.get("__artifact_payload") if isinstance(event.get("__artifact_payload"), dict) else None
+        stage_name_by_event = {
+            "selection_candidate_discovery_done": "candidate_discovery",
+            "selection_balanced_candidate_evidence_done": "balanced_candidate_evidence",
+            "selection_candidate_screening_done": "candidate_screening",
+            "selection_deep_dive_done": "single_stock_deep_dive",
+            "selection_meta_orchestrator_done": "meta_orchestrator",
+            "selection_pricing_agent_done": "pricing_agent",
+            "selection_allocation_done": "portfolio_allocation",
+            "selection_adversarial_done": "adversarial_review",
+            "selection_judge_done": "judge_decision",
+        }
+        stage_name = stage_name_by_event.get(event_type)
+        if stage_name and artifact_payload:
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage_name).strip("._") or "stage"
+            _write_trace_json(self.path / f"{safe_name}.json", artifact_payload)
         if event_type == "selection_seed_pool_built":
             _write_trace_json(
                 self.path / "seed_pool.json",
@@ -2236,8 +2312,9 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         if event_payload.get("type") in ("tool_start", "tool_done"):
             tool = event_payload.get("tool", "")
             event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
-        events.append(event_payload)
         _safe_artifact_event(artifact_writer, event_payload)
+        event_payload.pop("__artifact_payload", None)
+        events.append(event_payload)
 
     def run_sync():
         executor = _build_executor(config, skills or None)
@@ -2329,7 +2406,9 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
 
     def put_event(event: Dict[str, Any]) -> None:
         _safe_artifact_event(artifact_writer, event)
-        asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        stream_event = dict(event)
+        stream_event.pop("__artifact_payload", None)
+        asyncio.run_coroutine_threadsafe(queue.put(stream_event), loop)
 
     def progress_callback(event: dict):
         event_payload = dict(event)

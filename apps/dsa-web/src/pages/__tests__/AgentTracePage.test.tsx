@@ -340,6 +340,63 @@ describe('AgentTracePage', () => {
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
   });
 
+  it('continues a local history trace from the history row button', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        content: '历史继续后的结论',
+        tool_calls: [],
+        stock_selection: { enabled: true, success: true },
+      },
+    ]));
+    window.localStorage.setItem('dsa.agentTrace.history.v1', JSON.stringify([
+      {
+        id: 'trace-row-old',
+        createdAt: '2026-06-15T10:00:00.000Z',
+        message: '历史选股问题',
+        stockCode: '',
+        accountId: 9,
+        status: 'error',
+        result: {
+          success: false,
+          session_id: 'trace-row-old',
+          content: '',
+          error: 'interrupted',
+          total_steps: 3,
+          total_tokens: 0,
+          provider: 'agent',
+          model: '',
+          mode: 'planning_execute',
+          events: [],
+          tool_calls: [],
+          planner: { intent: 'watchlist_scan' },
+          context_summary: { account_count: 0, position_count: 0 },
+          stock_selection: { enabled: true, success: false },
+        },
+      },
+    ]));
+
+    renderPage();
+
+    expect(await screen.findByText('历史')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^继续$/ }));
+
+    await waitFor(() => {
+      expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        session_id: 'trace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        resume_from_session_id: 'trace-row-old',
+        message: '历史选股问题',
+        account_id: 9,
+      }));
+    });
+    expect(await screen.findByText('历史继续后的结论')).toBeInTheDocument();
+    vi.spyOn(crypto, 'randomUUID').mockRestore();
+  });
+
   it('loads a completed trace from backend artifact when URL session is not in local history', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
@@ -381,6 +438,71 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('已从后端加载 Trace')).toBeInTheDocument();
     expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-remote');
     expect(JSON.parse(window.localStorage.getItem('dsa.agentTrace.history.v1') || '[]')[0].id).toBe('trace-remote');
+  });
+
+  it('continues a loaded trace by passing the source session id to trace stream', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-half-done',
+      createdAt: '2026-06-15T19:21:53',
+      message: '帮我选一下可以入手的股票',
+      stockCode: '',
+      accountId: null,
+      status: 'error',
+      result: {
+        success: false,
+        session_id: 'trace-half-done',
+        content: '',
+        error: 'interrupted',
+        total_steps: 52,
+        total_tokens: 0,
+        provider: 'agent',
+        model: '',
+        mode: 'planning_execute',
+        events: [{ type: 'selection_candidate_screening_done' }],
+        tool_calls: [],
+        planner: { intent: 'watchlist_scan' },
+        context_summary: { account_count: 0, position_count: 0, investor: { risk_preference: 'balanced' } },
+        stock_selection: { enabled: true, success: false, selection_context: { stages: {} } },
+        risk_gate: null,
+        artifact_dir: '/tmp/trace-half-done',
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'selection_resume_loaded',
+        session_id: 'trace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        message: '已找到历史 Trace，可继续运行',
+        payload: { source_run_id: 'trace-half-done', resumable_stages: [] },
+      },
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        content: '继续运行后的结论',
+        tool_calls: [],
+        stock_selection: { enabled: true, success: true },
+      },
+    ]));
+
+    renderPage('/agent-trace/trace-half-done');
+
+    expect(await screen.findByText('已从后端加载失败记录')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /继续此 Trace/ }));
+
+    await waitFor(() => {
+      expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        session_id: 'trace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        resume_from_session_id: 'trace-half-done',
+        message: '帮我选一下可以入手的股票',
+        candidate_discovery_mode: 'thesis_desk_committee',
+      }));
+    });
+    expect(await screen.findByText('继续运行后的结论')).toBeInTheDocument();
+    vi.spyOn(crypto, 'randomUUID').mockRestore();
   });
 
   it('does not show OK for get_capital_flow events without explicit success', async () => {

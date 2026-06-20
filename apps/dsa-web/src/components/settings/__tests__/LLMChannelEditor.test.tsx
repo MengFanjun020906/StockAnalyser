@@ -122,6 +122,47 @@ describe('LLMChannelEditor', () => {
     expect(screen.getByLabelText('模型（逗号分隔）')).toHaveValue('deepseek-v4-flash,deepseek-v4-pro');
   });
 
+  it('uses GLM 5.2 defaults when adding the GLM preset', async () => {
+    render(
+      <LLMChannelEditor
+        items={[]}
+        configVersion="v1"
+        maskToken="******"
+        onSaved={() => {}}
+      />
+    );
+
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'glm' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ 添加渠道' }));
+
+    await screen.findByRole('button', { name: /智谱 GLM/i });
+    expect(screen.getByLabelText('Base URL')).toHaveValue('https://open.bigmodel.cn/api/paas/v4');
+    expect(screen.getByLabelText('模型（逗号分隔）')).toHaveValue('glm-5.2');
+  });
+
+  it('shows the current primary model in the editor header', () => {
+    render(
+      <LLMChannelEditor
+        items={[
+          { key: 'LLM_CHANNELS', value: 'glm' },
+          { key: 'LLM_GLM_PROTOCOL', value: 'openai' },
+          { key: 'LLM_GLM_BASE_URL', value: 'https://open.bigmodel.cn/api/paas/v4' },
+          { key: 'LLM_GLM_ENABLED', value: 'true' },
+          { key: 'LLM_GLM_API_KEY', value: 'secret-key' },
+          { key: 'LLM_GLM_MODELS', value: 'glm-5.2' },
+          { key: 'LITELLM_MODEL', value: 'openai/glm-5.2' },
+          { key: 'AGENT_LITELLM_MODEL', value: 'openai/glm-5.2' },
+        ]}
+        configVersion="v1"
+        maskToken="******"
+        onSaved={() => {}}
+      />
+    );
+
+    expect(screen.getByText('当前主模型：openai/glm-5.2')).toBeInTheDocument();
+    expect(screen.getByText('Agent：openai/glm-5.2')).toBeInTheDocument();
+  });
+
   it('sanitizes stale runtime models before saving DeepSeek V4 channel changes', async () => {
     update.mockResolvedValue({
       success: true,

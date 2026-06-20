@@ -10,6 +10,7 @@ import {
   History,
   Loader2,
   Play,
+  RotateCcw,
   Trash2,
   Wrench,
 } from 'lucide-react';
@@ -247,6 +248,21 @@ const mergeSelectionProgress = (
   event: TraceStreamEvent,
 ): Record<string, unknown> | null | undefined => {
   const type = String(event.type || '');
+  if (type.startsWith('selection_') && type !== 'selection_expert_graph_done') {
+    const payload = asRecord(event.payload);
+    const existing = normalizeStockSelectionPayload(stockSelection) || {};
+    const selectionContext = asRecord(existing.selection_context) || {};
+    const stages = asRecord(selectionContext.stages) || {};
+    const stageName = selectionStageNameFromEvent(type, payload);
+    return {
+      ...existing,
+      enabled: existing.enabled ?? true,
+      selection_context: {
+        ...selectionContext,
+        stages: stageName && payload ? { ...stages, [stageName]: payload } : stages,
+      },
+    };
+  }
   if (type !== 'selection_expert_graph_done') return stockSelection;
   const payload = asRecord(event.payload) || {};
   const mode = String(payload.orchestration_mode || 'expert_graph');
@@ -267,6 +283,26 @@ const mergeSelectionProgress = (
       expert_state: selectionContext.expert_state || payload.expert_state || null,
     },
   };
+};
+
+const selectionStageNameFromEvent = (
+  type: string,
+  payload: Record<string, unknown> | null,
+): string | null => {
+  const explicitStage = typeof payload?.stage === 'string' ? payload.stage : '';
+  if (explicitStage && !explicitStage.startsWith('selection_')) return explicitStage;
+  const mapping: Record<string, string> = {
+    selection_candidate_discovery_done: 'candidate_discovery',
+    selection_balanced_candidate_evidence_done: 'balanced_candidate_evidence',
+    selection_candidate_screening_done: 'candidate_screening',
+    selection_deep_dive_done: 'single_stock_deep_dive',
+    selection_meta_orchestrator_done: 'meta_orchestrator',
+    selection_pricing_agent_done: 'pricing_agent',
+    selection_allocation_done: 'portfolio_allocation',
+    selection_adversarial_done: 'adversarial_review',
+    selection_judge_done: 'judge_decision',
+  };
+  return mapping[type] || null;
 };
 
 const looksLikeFinalReport = (value: Record<string, unknown>): boolean => (
@@ -1776,6 +1812,8 @@ const extractExpertState = (stockSelection: Record<string, unknown> | null): Rec
 
 const SELECTION_STAGE_LABELS: Record<string, string> = {
   selection_start: '选股流水线启动',
+  selection_resume_loaded: '断点信息已加载',
+  selection_resume_reused_stage: '历史阶段已复用',
   selection_candidate_discovery_done: '候选发现完成',
   selection_market_regime_done: '市场环境识别完成',
   selection_candidate_screening_done: '候选筛选完成',
@@ -1943,6 +1981,11 @@ const AgentTracePage: React.FC = () => {
   const [runtimeConfig, setRuntimeConfig] = useState<Record<string, unknown> | null>(null);
   const activeRunSessionIdRef = useRef<string | null>(null);
   const runtimeConfigRef = useRef<Record<string, unknown> | null>(null);
+  const activeRunMetaRef = useRef<{
+    message: string;
+    stockCode: string;
+    accountId?: number;
+  }>({ message: DEFAULT_PROMPT, stockCode: DEFAULT_STOCK_CODE });
 
   const hydrateTraceSessionFromBackend = useCallback((sessionId: string, fallback?: TraceHistoryItem) => {
     const placeholder = fallback?.result || createEmptyTraceResult();
@@ -2044,11 +2087,21 @@ const AgentTracePage: React.FC = () => {
 
   const selectedTool = result?.tool_calls[selectedToolIndex] ?? null;
 
-  const handleRun = async () => {
+  const handleRun = async (options?: {
+    resumeFromSessionId?: string;
+    messageOverride?: string;
+    stockCodeOverride?: string;
+    accountIdOverride?: number | null;
+  }) => {
     const sessionId = createTraceSessionId();
     activeRunSessionIdRef.current = sessionId;
-    const stockCodeToSend = shouldSendStockCode(message, stockCode) ? stockCode.trim() : undefined;
-    const selectedAccountNumber = selectedAccountId ? Number(selectedAccountId) : undefined;
+    const runMessage = options?.messageOverride ?? message;
+    const runStockCode = options?.stockCodeOverride ?? stockCode;
+    const selectedAccountNumber = options?.accountIdOverride !== undefined
+      ? (options.accountIdOverride ?? undefined)
+      : (selectedAccountId ? Number(selectedAccountId) : undefined);
+    const stockCodeToSend = shouldSendStockCode(runMessage, runStockCode) ? runStockCode.trim() : undefined;
+    activeRunMetaRef.current = { message: runMessage, stockCode: runStockCode, accountId: selectedAccountNumber };
     const shouldInjectPortfolioContext = injectPortfolioContext || selectedAccountNumber != null;
     navigate(`/agent-trace/${encodeURIComponent(sessionId)}`, { replace: false });
     setRunning(true);
@@ -2060,7 +2113,7 @@ const AgentTracePage: React.FC = () => {
     try {
       const response = await agentApi.traceStream({
         session_id: sessionId,
-        message,
+        message: runMessage,
         account_id: selectedAccountNumber,
         stock_code: stockCodeToSend,
         inject_portfolio_context: shouldInjectPortfolioContext,
@@ -2074,6 +2127,7 @@ const AgentTracePage: React.FC = () => {
         default_stop_loss_pct: parseOptionalPercent(defaultStopLossPct),
         investor_notes: investorNotes.trim() || undefined,
         candidate_discovery_mode: candidateDiscoveryMode,
+        resume_from_session_id: options?.resumeFromSessionId,
       });
       await consumeTraceStream(response);
     } catch (err) {
@@ -2084,6 +2138,23 @@ const AgentTracePage: React.FC = () => {
       activeRunSessionIdRef.current = null;
       setRunning(false);
     }
+  };
+
+  const handleResumeCurrentTrace = async () => {
+    const sourceSessionId = result?.session_id || normalizeTraceSessionId(routeSessionId);
+    if (!sourceSessionId || running) return;
+    await handleRun({ resumeFromSessionId: sourceSessionId });
+  };
+
+  const handleResumeHistory = async (item: TraceHistoryItem) => {
+    const sourceSessionId = item.result.session_id || item.id;
+    if (!sourceSessionId || running) return;
+    await handleRun({
+      resumeFromSessionId: sourceSessionId,
+      messageOverride: item.message,
+      stockCodeOverride: item.stockCode,
+      accountIdOverride: item.accountId ?? null,
+    });
   };
 
   const handleSelectHistory = (item: TraceHistoryItem) => {
@@ -2227,8 +2298,11 @@ const AgentTracePage: React.FC = () => {
         };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
-          message, stockCode: shouldSendStockCode(message, stockCode) ? stockCode.trim() : '',
-          accountId: selectedAccountId ? Number(selectedAccountId) : undefined,
+          message: activeRunMetaRef.current.message,
+          stockCode: shouldSendStockCode(activeRunMetaRef.current.message, activeRunMetaRef.current.stockCode)
+            ? activeRunMetaRef.current.stockCode.trim()
+            : '',
+          accountId: activeRunMetaRef.current.accountId,
           status: next.success ? 'success' : 'error', result: next,
         }));
         return next;
@@ -2243,8 +2317,13 @@ const AgentTracePage: React.FC = () => {
         const next = { ...cur, success: false, error: event.message || 'Trace 运行失败', events: [...cur.events, eventToTraceEvent(event)] };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
-          message, stockCode: shouldSendStockCode(message, stockCode) ? stockCode.trim() : '',
-          accountId: selectedAccountId ? Number(selectedAccountId) : undefined, status: 'error', result: next,
+          message: activeRunMetaRef.current.message,
+          stockCode: shouldSendStockCode(activeRunMetaRef.current.message, activeRunMetaRef.current.stockCode)
+            ? activeRunMetaRef.current.stockCode.trim()
+            : '',
+          accountId: activeRunMetaRef.current.accountId,
+          status: 'error',
+          result: next,
         }));
         return next;
       });
@@ -2311,6 +2390,19 @@ const AgentTracePage: React.FC = () => {
                 <Play className="h-3.5 w-3.5" />
                 运行
               </Button>
+              {result?.session_id && traceStatus !== 'running' ? (
+                <Button
+                  type="button"
+                  onClick={() => void handleResumeCurrentTrace()}
+                  isLoading={running}
+                  loadingText="继续中"
+                  size="sm"
+                  variant="secondary"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  继续此 Trace
+                </Button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setShowConfig(!showConfig)}
@@ -2418,14 +2510,32 @@ const AgentTracePage: React.FC = () => {
             </div>
             <div className="flex max-h-64 flex-col gap-2 overflow-y-auto pr-1">
               {historyItems.map((item) => (
-                <button key={`${item.id}-${item.createdAt}`} type="button" onClick={() => handleSelectHistory(item)}
-                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-left text-xs transition-all hover:border-border hover:shadow-sm">
-                  <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
-                    <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
-                  </span>
-                </button>
+                <div
+                  key={`${item.id}-${item.createdAt}`}
+                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs transition-all hover:border-border hover:shadow-sm"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleSelectHistory(item)}
+                    className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                  >
+                    <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
+                      <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={running}
+                    onClick={() => void handleResumeHistory(item)}
+                    className="inline-flex h-7 shrink-0 items-center gap-1 border border-border px-2 text-label text-secondary-text transition-colors hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    title={`从 ${item.result.session_id || item.id} 继续运行`}
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    继续
+                  </button>
+                </div>
               ))}
             </div>
           </div>
