@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] CI checkout 补齐 `graphiti` 子模块映射，并在 backend-gate / docker-build 拉取子模块，避免 `-e ./graphiti` 依赖安装在 GitHub Actions 中失败。
 - [文档] 更新 openInvest 原理接入索引，补充新版 openInvest 的信息隔离委员会、事件层、path profile、运行时治理、回测防前视和 PnL/benchmark 自审计等可借鉴原则。
 - [修复] `scripts/ci_gate.sh` 默认优先使用仓库 `.venv` Python，并在 flake8 critical check / offline pytest 排除本地外部 clone 与 gitlink 目录，避免系统 Python 或 `openInvest`、`graphiti`、`Sequoia-X`、`alphasift` 干扰 DSA 后端门禁。
 - [修复] 系统配置 API schema 同步 `graphiti` 分类与 `float` 数据类型，并修正未显式指定 `ENV_FILE` 时 schedule immediate 配置被默认 `.env` 抢占的问题。

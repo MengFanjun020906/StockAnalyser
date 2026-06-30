@@ -4,3 +4,6 @@
 [submodule "Sequoia-X"]
 	path = Sequoia-X
 	url = https://github.com/sngyai/Sequoia-X.git
+[submodule "graphiti"]
+	path = graphiti
+	url = https://github.com/getzep/graphiti.git
