@@ -27,6 +27,7 @@ from src.agent.planner import build_planning_result
 from src.agent.planning_prompts import PromptBuildOptions, build_planning_system_prompt
 from src.agent.runner import run_agent_loop, parse_dashboard_json
 from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
+from src.agent.theme_momentum import build_single_stock_theme_profile
 from src.agent.tools.registry import ToolRegistry
 from src.schemas.agent_context import AgentUserContext
 from src.report_language import normalize_report_language
@@ -844,37 +845,75 @@ class AgentExecutor:
                     "\n[系统已获取的单股 Regime 概率证据]\n"
                     + json.dumps(prefetch_context["symbol_regime_probability"], ensure_ascii=False, default=str)
                 )
+            if prefetch_context and prefetch_context.get("single_stock_theme_profile"):
+                parts.append(
+                    "\n[系统已获取的单股主线动量分型证据]\n"
+                    + json.dumps(prefetch_context["single_stock_theme_profile"], ensure_ascii=False, default=str)
+                )
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)
 
     def _prefetch_single_symbol_regime_context(self, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         symbol = _single_symbol_for_regime_prefetch(context)
-        if not symbol or self.tool_registry.get("get_symbol_regime_probability") is None:
+        if not symbol:
             return {}
+        prefetch_context: Dict[str, Any] = {"tool_calls_log": []}
+
+        if self.tool_registry.get("get_symbol_regime_probability") is not None:
+            arguments = {"stock_code": symbol, "market": "cn", "lookback_days": 900, "windows": [7, 30, 60, 90]}
+            result, log_entry = self._execute_prefetch_tool("get_symbol_regime_probability", arguments)
+            prefetch_context["symbol_regime_probability"] = result if isinstance(result, dict) else {"status": "unknown", "raw": result}
+            prefetch_context["tool_calls_log"].append(log_entry)
+
+        theme_payloads: Dict[str, Any] = {}
+        if _should_prefetch_single_symbol_theme(context, symbol):
+            for tool_name, arguments in (
+                ("get_stockapi_hot_sectors", {"date": "", "limit": 20}),
+                ("get_stockapi_limit_up_pool", {"date": "", "limit": 50}),
+                ("get_stockapi_hot_sector_leaders", {"date": "", "bk_code": "", "limit": 50}),
+                ("get_stockapi_popularity_rank", {"limit": 50}),
+            ):
+                if self.tool_registry.get(tool_name) is None:
+                    continue
+                result, log_entry = self._execute_prefetch_tool(tool_name, arguments)
+                theme_payloads[tool_name] = result
+                prefetch_context["tool_calls_log"].append(log_entry)
+
+        if theme_payloads:
+            prefetch_context["single_stock_theme_profile"] = build_single_stock_theme_profile(
+                symbol=symbol,
+                name=_single_symbol_name_for_theme_prefetch(context, symbol),
+                hot_sectors=theme_payloads.get("get_stockapi_hot_sectors"),
+                limit_up_pool=theme_payloads.get("get_stockapi_limit_up_pool"),
+                hot_sector_leaders=theme_payloads.get("get_stockapi_hot_sector_leaders"),
+                popularity_rank=theme_payloads.get("get_stockapi_popularity_rank"),
+            )
+
+        if not prefetch_context.get("tool_calls_log") and not prefetch_context.get("single_stock_theme_profile"):
+            return {}
+        return prefetch_context
+
+    def _execute_prefetch_tool(self, tool_name: str, arguments: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
         started = time.time()
-        arguments = {"stock_code": symbol, "market": "cn", "lookback_days": 900, "windows": [7, 30, 60, 90]}
         try:
-            result = self.tool_registry.execute("get_symbol_regime_probability", **arguments)
-            success = not (isinstance(result, dict) and str(result.get("status") or "").lower() in {"failed", "error", "tool_failed", "timeout"})
+            result = self.tool_registry.execute(tool_name, **arguments)
+            success = _is_successful_prefetch_result(result)
         except Exception as exc:
-            result = {"status": "tool_failed", "tool": "get_symbol_regime_probability", "error": str(exc)}
+            result = {"status": "tool_failed", "tool": tool_name, "error": str(exc)}
             success = False
         result_text = json.dumps(result, ensure_ascii=False, default=str)
-        return {
-            "symbol_regime_probability": result if isinstance(result, dict) else {"status": "unknown", "raw": result},
-            "tool_calls_log": [{
-                "step": 0,
-                "tool": "get_symbol_regime_probability",
-                "arguments": arguments,
-                "success": success,
-                "result_json": result,
-                "result_preview": result_text[:1200],
-                "result_length": len(result_text),
-                "duration": round(time.time() - started, 3),
-                "prefetch": True,
-                "selection_stage": False,
-            }],
+        return result, {
+            "step": 0,
+            "tool": tool_name,
+            "arguments": arguments,
+            "success": success,
+            "result_json": result,
+            "result_preview": result_text[:1200],
+            "result_length": len(result_text),
+            "duration": round(time.time() - started, 3),
+            "prefetch": True,
+            "selection_stage": False,
         }
 
 
@@ -939,6 +978,66 @@ def _single_symbol_for_regime_prefetch(context: Optional[Dict[str, Any]]) -> str
             return str(agent_user_context.positions[0].symbol or "").strip()
         return ""
     return str(context.get("stock_code") or "").strip()
+
+
+def _should_prefetch_single_symbol_theme(context: Optional[Dict[str, Any]], symbol: str) -> bool:
+    if not _looks_like_cn_a_share_symbol(symbol):
+        return False
+    agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+    if agent_user_context is None:
+        return True
+    report = agent_user_context.report
+    return report.intent in {"auto", "entry_analysis", "position_review", "risk_review"}
+
+
+def _looks_like_cn_a_share_symbol(symbol: str) -> bool:
+    normalized = _normalize_prefetch_symbol(symbol)
+    return len(normalized) == 6 and normalized[0] in {"0", "3", "6", "8", "4"}
+
+
+def _normalize_prefetch_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if "." in text:
+        head, tail = text.split(".", 1)
+        if tail in {"SH", "SZ", "BJ"}:
+            text = head
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix) and len(text) > len(prefix):
+            text = text[len(prefix):]
+    return re.sub(r"[^0-9A-Z]", "", text)
+
+
+def _single_symbol_name_for_theme_prefetch(context: Optional[Dict[str, Any]], symbol: str) -> str:
+    context = context or {}
+    for key in ("stock_name", "name"):
+        value = context.get(key)
+        if value:
+            return str(value).strip()
+    quote = context.get("realtime_quote")
+    if isinstance(quote, dict):
+        for key in ("stock_name", "name", "stockName"):
+            value = quote.get(key)
+            if value:
+                return str(value).strip()
+    agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+    if agent_user_context is not None:
+        normalized = _normalize_prefetch_symbol(symbol)
+        for position in agent_user_context.positions:
+            if _normalize_prefetch_symbol(position.symbol) != normalized:
+                continue
+            raw_name = getattr(position, "stock_name", None) or getattr(position, "name", None)
+            if not raw_name and getattr(position, "model_extra", None):
+                raw_name = position.model_extra.get("stock_name") or position.model_extra.get("name")
+            if raw_name:
+                return str(raw_name).strip()
+    return ""
+
+
+def _is_successful_prefetch_result(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return True
+    status = str(result.get("status") or "").strip().lower()
+    return status not in {"failed", "error", "tool_failed", "timeout"}
 
 
 def _position_name_lookup(agent_user_context: AgentUserContext) -> Dict[str, str]:

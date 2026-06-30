@@ -721,7 +721,12 @@ class AkshareFundamentalAdapter:
             })
 
         if not sectors and errors and allow_fallback:
-            fallback_sectors, fallback_errors, fallback_source = self._fallback_hot_sectors(effective_limit)
+            try:
+                fallback_sectors, fallback_errors, fallback_source = self._fallback_hot_sectors(effective_limit)
+            except Exception as exc:
+                fallback_sectors = []
+                fallback_errors = [f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"]
+                fallback_source = "akshare:stock_board_industry_name_em"
             if fallback_sectors:
                 return {
                     "status": "partial",

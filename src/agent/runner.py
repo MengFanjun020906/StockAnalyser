@@ -21,7 +21,7 @@ import re
 import time
 import contextvars
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -63,6 +63,9 @@ _HEAVY_TOOL_TIMEOUT_FLOOR_SECONDS: Dict[str, float] = {
     "detect_market_regime": 60.0,
     "discover_watchlist_candidates": 70.0,
     "get_capital_flow": 45.0,
+    "get_chip_distribution": 75.0,
+    "get_tushare_financial_indicators": 45.0,
+    "get_volume_analysis": 45.0,
 }
 
 
@@ -1818,12 +1821,11 @@ def _execute_tools(
         timeout_triggered = False
         try:
             futures = {pool.submit(contextvars.copy_context().run, _exec_single, tc): tc for tc in tool_calls}
-            pending = set(futures)
-            for future in as_completed(
-                futures,
-                timeout=tool_wait_timeout_seconds if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 else None,
-            ):
-                pending.discard(future)
+            if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0:
+                done, pending = wait(futures, timeout=tool_wait_timeout_seconds)
+            else:
+                done, pending = wait(futures)
+            for future in done:
                 tc_item, result_str, success, dur, cached = future.result()
                 log_entry = {
                     "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
@@ -1840,16 +1842,16 @@ def _execute_tools(
                 if progress_callback:
                     progress_callback({"type": "tool_done", **log_entry})
                 results.append({"tc": tc_item, "result_str": result_str, "model_result_str": model_result_str})
-        except FuturesTimeoutError:
-            timeout_triggered = True
-            timeout_label = (
-                f"{tool_wait_timeout_seconds:.2f}s"
-                if tool_wait_timeout_seconds is not None
-                else "the configured limit"
-            )
-            logger.warning("Tool batch timed out after %s at step %d", timeout_label, step)
-            for future, tc_item in futures.items():
-                if future in pending:
+            if pending:
+                timeout_triggered = True
+                timeout_label = (
+                    f"{tool_wait_timeout_seconds:.2f}s"
+                    if tool_wait_timeout_seconds is not None
+                    else "the configured limit"
+                )
+                logger.warning("Tool batch timed out after %s at step %d", timeout_label, step)
+                for future in pending:
+                    tc_item = futures[future]
                     future.cancel()
                     result_str = json.dumps({
                         "error": f"Tool execution timed out after {timeout_label}",

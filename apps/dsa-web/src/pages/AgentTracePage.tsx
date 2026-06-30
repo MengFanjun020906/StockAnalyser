@@ -2875,7 +2875,7 @@ const L1Detail: React.FC<{
             <p className="text-label font-medium uppercase tracking-wider text-muted-text">P4 四席位可观察性</p>
             {seedPool ? (
               <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">
-                Seed {seedPool.seedCount}{seedPool.totalLimit != null ? ` / ${seedPool.totalLimit}` : ''}
+                Seed {seedPool.seedCount}{seedPool.totalLimit != null && seedPool.totalLimit >= seedPool.seedCount ? ` / ${seedPool.totalLimit}` : ''}
               </span>
             ) : null}
             {thesisDeskPackets.length ? (
@@ -2905,7 +2905,9 @@ const L1Detail: React.FC<{
               </div>
               {seedPool.preview.length ? (
                 <div>
-                  <p className="mb-2 text-xxs uppercase tracking-wider text-muted-text">Seed Preview ({seedPool.preview.length})</p>
+                  <p className="mb-2 text-xxs uppercase tracking-wider text-muted-text">
+                    Seed Preview ({seedPool.preview.length}{seedPool.seedCount > seedPool.preview.length ? ` / ${seedPool.seedCount}` : ''})
+                  </p>
                   <div className="grid max-h-[360px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-4">
                     {seedPool.preview.slice(0, 20).map((seed) => (
                       <div key={`seed-${seed.code}-${seed.source}`} className="min-h-[92px] rounded-md border border-border/70 bg-surface-2 px-3 py-2">

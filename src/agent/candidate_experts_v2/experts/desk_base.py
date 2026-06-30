@@ -5,8 +5,8 @@ Key changes vs BaseExpert:
 1. `run(rows, market, regime)` replaces `run(seed_pool, market)`.
 2. `_build_user_message` renders FactSheet + FeatureFlags per stock.
 3. `_filter_eligible_rows` hook lets subclasses apply cheap eligibility
-   filtering (cost control), with mandatory OR fallback so the desk never
-   silently starves on missing data.
+   filtering (cost control). Subclasses may return empty when a seed is outside
+   the desk's responsibility.
 4. max_llm_rounds=5 / max_tool_calls=10 desk defaults (per spec §3.1).
 """
 

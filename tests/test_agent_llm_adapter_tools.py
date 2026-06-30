@@ -8,6 +8,15 @@ import time
 from types import SimpleNamespace
 
 
+def _minimal_adapter_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        agent_litellm_model="",
+        litellm_model="",
+        llm_model_list=[],
+        llm_temperature=0.7,
+    )
+
+
 def test_convert_messages_handles_nested_and_flat_tool_calls():
     """Regression: candidate-expert committee emits nested OpenAI tool_calls
     ({"function": {"name", "arguments"}}); the main executor emits the flat
@@ -62,7 +71,7 @@ def test_call_completion_enforces_hard_timeout_around_litellm_retries(monkeypatc
 
     monkeypatch.setattr(module, "get_effective_agent_models_to_try", lambda _config: ["unit/model"])
 
-    adapter = LLMToolAdapter()
+    adapter = LLMToolAdapter(config=_minimal_adapter_config())
 
     def slow_call(*_args, **_kwargs):
         time.sleep(0.3)
@@ -81,22 +90,21 @@ def test_call_completion_enforces_hard_timeout_around_litellm_retries(monkeypatc
     assert "hard timeout" in str(response.content)
 
 
-def test_call_completion_reserves_timeout_for_fallback_model(monkeypatch):
-    """A slow primary model must not consume the entire timeout budget."""
+def test_call_completion_passes_full_remaining_timeout_to_current_model(monkeypatch):
+    """The adapter should not pre-split the timeout between primary and fallback."""
     from src.agent import llm_adapter as module
     from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
 
     monkeypatch.setattr(module, "get_effective_agent_models_to_try", lambda _config: ["unit/slow", "unit/fast"])
 
-    adapter = LLMToolAdapter()
+    adapter = LLMToolAdapter(config=_minimal_adapter_config())
     calls = []
 
     def fake_call(*_args, **kwargs):
         model = _args[2]
         calls.append((model, kwargs.get("timeout")))
         if model == "unit/slow":
-            time.sleep(0.2)
-            raise AssertionError("slow primary should be hard-timed-out")
+            raise RuntimeError("primary failed quickly")
         return LLMResponse(content="ok", provider="unit", model=model)
 
     monkeypatch.setattr(adapter, "_call_litellm_model", fake_call)
@@ -109,8 +117,8 @@ def test_call_completion_reserves_timeout_for_fallback_model(monkeypatch):
     assert response.provider == "unit"
     assert response.model == "unit/fast"
     assert [item[0] for item in calls] == ["unit/slow", "unit/fast"]
-    assert calls[0][1] <= 0.11
-    assert calls[1][1] > 0
+    assert calls[0][1] > 0.18
+    assert 0 < calls[1][1] <= calls[0][1]
 
 
 def test_call_completion_passes_response_format_to_litellm(monkeypatch):
@@ -120,7 +128,7 @@ def test_call_completion_passes_response_format_to_litellm(monkeypatch):
 
     monkeypatch.setattr(module, "get_effective_agent_models_to_try", lambda _config: ["unit/model"])
 
-    adapter = LLMToolAdapter()
+    adapter = LLMToolAdapter(config=_minimal_adapter_config())
     seen = {}
 
     def fake_call(*_args, **kwargs):
@@ -145,7 +153,7 @@ def test_call_completion_injects_json_prompt_for_json_response_format(monkeypatc
 
     monkeypatch.setattr(module, "get_effective_agent_models_to_try", lambda _config: ["unit/model"])
 
-    adapter = LLMToolAdapter()
+    adapter = LLMToolAdapter(config=_minimal_adapter_config())
     seen = {}
 
     def fake_call(messages, *_args, **kwargs):

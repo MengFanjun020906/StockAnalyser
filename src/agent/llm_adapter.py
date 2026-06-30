@@ -389,13 +389,6 @@ class LLMToolAdapter:
                     )
                     break
                 model_timeout = remaining_timeout
-                remaining_model_count = len(models_to_try) - idx - 1
-                if remaining_model_count > 0:
-                    fallback_reserve = min(
-                        remaining_timeout * 0.5,
-                        max(0.1, min(30.0, float(timeout) * 0.5)),
-                    )
-                    model_timeout = max(0.1, remaining_timeout - fallback_reserve)
             try:
                 response = self._call_litellm_model_with_hard_timeout(
                     messages,

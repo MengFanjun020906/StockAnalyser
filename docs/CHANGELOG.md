@@ -9,7 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [文档] 更新 openInvest 原理接入索引，补充新版 openInvest 的信息隔离委员会、事件层、path profile、运行时治理、回测防前视和 PnL/benchmark 自审计等可借鉴原则。
+- [修复] `scripts/ci_gate.sh` 默认优先使用仓库 `.venv` Python，并在 flake8 critical check / offline pytest 排除本地外部 clone 与 gitlink 目录，避免系统 Python 或 `openInvest`、`graphiti`、`Sequoia-X`、`alphasift` 干扰 DSA 后端门禁。
+- [修复] 系统配置 API schema 同步 `graphiti` 分类与 `float` 数据类型，并修正未显式指定 `ENV_FILE` 时 schedule immediate 配置被默认 `.env` 抢占的问题。
+- [改进] Agent planning_execute 的 `planner.json` / `todo.md` 补齐主辅维度、初始假设、工具预期结果、下游使用方式、失败降级、停止条件和 replan 策略，避免 Trace 计划产物只展示重复工具清单。
+- [改进] 四席位主题催化席收窄为 AI/科技产业链候选，并要求新闻证据摘要化为产品品类出口、国产替代政策、业务映射和资金验证，避免原文堆砌和非科技行业消息面拖慢链路。
+- [改进] Agent 选股候选源对齐新版 AlphaSift / Sequoia-X：AlphaSift YAML 的 scoring/risk profile 会参与分数扣罚，Sequoia 新增定增公告事件策略并以可降级方式接入 seed pool。
+- [新功能] Agent Seed Pool 新增主线动量 Theme Regime 分型，基于热点板块、涨停池、热榜和热点龙头证据输出 `theme_momentum`，并给候选 seed 标注 `theme_profile`、`stock_role`、`momentum_setup` 与超买解释。
+- [新功能] Agent 单股 `entry_analysis` / `position_review` 新增主线动量画像预取，围绕当前股票生成 `single_stock_theme_profile`，并将高潮、退潮、后排和无关主题显式降级为不可追高。
+- [修复] StockAPI 工具入口会加载仓库 `.env` 中的 `STOCKAPI_TOKEN`，并将 Eastmoney patch 的 `fake_useragent` 改为可选依赖，避免续费 token 未被工具进程读取或无关导入错误拖垮 StockAPI 检测。
 - [改进] 补齐智谱 GLM `glm-5.2` 渠道示例与前端预设，设置页会显示当前主模型；Agent 调用 `glm-5.2` 时自动携带 thinking 与 `reasoning_effort=max`。
+- [改进] Agent 市场状态识别改为方向优先、波动单独约束，高波动上涨趋势不再被误判为纯风险环境；不追高规则改为按回踩、突破、涨停和资金接力 setup 分层处理。
+- [修复] Agent 工具批量执行超时时保留已完成工具结果，并为资金流、筹码、Tushare 财务指标和量能等慢工具设置外层等待下限；历史 K 线 loader 在主库缺日线时可读取 Sequoia 本地 `stock_daily`，减少误报工具超时。
+- [修复] Seed Pool 质量评估改为根据本地上证指数 OHLC 识别 seed 后的下一交易日，跳过节假日休市，避免误要求同步休市日行情。
+- [修复] Seed Pool 质量快照改为优先保存完整 `seed_fact_packets`，不再只保存 `seed_pool_summary.preview` 前 20 条，避免预览外 seed 无法在质量页复盘。
+- [修复] Agent Trace 的 Seed Preview 改为显示“预览数 / 完整 seed 数”，并修正四席位 `seed_pool_summary.total_limit` 误写为 seed gate 输出上限导致的 `Seed 32 / 12` 误导。
+- [改进] Web“入场”页交互日 K 默认只保留当前策略入场/出场标记，并补充图例说明，减少基准策略紫色点位与当前策略信号混读。
 - [改进] Agent 入场执行回测 summary 新增策略级累计 PnL、胜率、成交率、最好/最差收益和盈亏比，Web“入场”页增加系统总览指标面板。
 - [改进] Web“入场”页保留当前日期总览，并新增历史全量总览，用于对比当日表现与截至当前的长期平均指标。
 - [改进] Agent 入场执行回测导入规则改为只纳入最终组合中的可执行等待/条件入场项，排除明确 reject 项，并支持每个 Trace 最多 4 个最终标的。

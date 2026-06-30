@@ -70,6 +70,9 @@ describe('AgentEntryExecutionBacktestsPage', () => {
     expect(screen.getAllByText('+9.80%').some((item) => item.classList.contains('text-danger'))).toBe(true);
     expect(screen.getAllByText('已成交').length).toBeGreaterThan(0);
     expect(screen.getByTestId('entry-execution-kline')).toBeInTheDocument();
+    expect(screen.getByText('当前策略入场')).toBeInTheDocument();
+    expect(screen.getByText('当前策略出场')).toBeInTheDocument();
+    expect(screen.getByText('AI 入场区')).toBeInTheDocument();
   });
 
   it('submits filters to the API', async () => {

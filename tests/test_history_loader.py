@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import os
+import sqlite3
+import tempfile
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +14,19 @@ import pandas as pd
 
 class HistoryLoaderTestCase(unittest.TestCase):
     """Tests for load_history_df and frozen target date ContextVar."""
+
+    def setUp(self):
+        self._env_patch = patch.dict(
+            os.environ,
+            {
+                "SEQUOIA_CANDIDATE_DB_PATH": os.path.join(tempfile.gettempdir(), "missing-sequoia-history-loader.db"),
+                "ALPHASIFT_CANDIDATE_DB_PATH": "",
+            },
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
 
     # ------------------------------------------------------------------
     # ContextVar lifecycle
@@ -98,6 +114,62 @@ class HistoryLoaderTestCase(unittest.TestCase):
         self.assertIsNone(df)
         self.assertEqual(source, "db_cache_miss")
         mock_get_fm.assert_not_called()
+
+    @patch("src.services.history_loader._get_fetcher_manager")
+    @patch("src.storage.get_db")
+    def test_falls_back_to_sequoia_stock_daily_before_network(self, mock_get_db, mock_get_fm):
+        from src.services.history_loader import load_history_df
+
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = []
+        mock_get_db.return_value = mock_db
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "sequoia_v2.db")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """CREATE TABLE stock_daily (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        volume REAL,
+                        turnover REAL
+                    )"""
+                )
+                rows = [
+                    (
+                        "300243",
+                        date(2026, 5, day).isoformat(),
+                        10.0,
+                        11.0,
+                        9.5,
+                        10.5,
+                        1000000 + day,
+                        2000000 + day,
+                    )
+                    for day in range(1, 31)
+                ]
+                conn.executemany(
+                    "INSERT INTO stock_daily(symbol,date,open,high,low,close,volume,turnover) VALUES (?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.dict(os.environ, {"SEQUOIA_CANDIDATE_DB_PATH": db_path}):
+                with patch("src.services.history_loader._effective_cache_end", return_value=date(2026, 5, 30)):
+                    df, source = load_history_df("300243", days=30, target_date=date(2026, 5, 30))
+
+        self.assertIsNotNone(df)
+        self.assertEqual(source, "sequoia_stock_daily")
+        self.assertEqual(len(df), 30)
+        mock_get_fm.return_value.get_daily_data.assert_not_called()
 
     # ------------------------------------------------------------------
     # ContextVar integration

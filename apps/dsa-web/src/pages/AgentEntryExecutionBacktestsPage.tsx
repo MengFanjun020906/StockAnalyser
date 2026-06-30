@@ -24,6 +24,13 @@ const strategyLabels: Record<string, string> = {
   breakout_fallback_entry: '突破跟随',
 };
 
+const klineLegendItems = [
+  { label: '当前策略入场', className: 'bg-cyan', text: '入' },
+  { label: '当前策略出场', className: 'bg-warning', text: '出' },
+  { label: 'AI 入场区', className: 'bg-cyan/25' },
+  { label: '止盈 / 止损线', className: 'bg-danger/70' },
+];
+
 const PAGE_SIZE = 20;
 
 const statusLabels: Record<string, string> = {
@@ -298,9 +305,8 @@ const EntryExecutionKlineChart: React.FC<{
   bars?: EntryExecutionDailyBar[];
   plan?: EntryExecutionTradePlan;
   result: EntryExecutionStrategyResult;
-  baseline?: EntryExecutionStrategyResult;
   strategyName: string;
-}> = ({ bars = [], plan = {}, result, baseline, strategyName }) => {
+}> = ({ bars = [], plan = {}, result, strategyName }) => {
   const ref = useRef<HTMLDivElement | null>(null);
   const usableBars = useMemo(() => bars
     .filter((bar) => bar.date && Number.isFinite(Number(bar.high)) && Number.isFinite(Number(bar.low)) && Number.isFinite(Number(bar.close)))
@@ -324,13 +330,13 @@ const EntryExecutionKlineChart: React.FC<{
         yAxis: Number(plan.entryZoneHigh),
         name: hasEntryRange ? 'AI 入场上沿' : 'AI 入场',
         lineStyle: { color: entryLineColor, type: hasEntryRange ? 'dotted' : 'solid', width: hasEntryRange ? 1.4 : 2.2 },
-        label: { color: entryLineColor, formatter: `${hasEntryRange ? 'AI High' : 'AI'} ${fmtPrice(plan.entryZoneHigh)}` },
+        label: { color: entryLineColor, formatter: `${hasEntryRange ? '入场上沿' : '入场'} ${fmtPrice(plan.entryZoneHigh)}` },
       } : null,
       hasEntryRange && plan.entryZoneLow != null ? {
         yAxis: Number(plan.entryZoneLow),
         name: 'AI 入场下沿',
         lineStyle: { color: entryLineColor, type: 'dotted', width: 1.4 },
-        label: { color: entryLineColor, formatter: `AI Low ${fmtPrice(plan.entryZoneLow)}` },
+        label: { color: entryLineColor, formatter: `入场下沿 ${fmtPrice(plan.entryZoneLow)}` },
       } : null,
       plan.takeProfitPrice != null ? {
         yAxis: Number(plan.takeProfitPrice),
@@ -417,13 +423,12 @@ const EntryExecutionKlineChart: React.FC<{
           name: `${strategyLabels[strategyName] || strategyName}出场`,
           type: 'scatter',
           data: marker(result, 'exit'),
-          symbol: 'rect',
-          symbolSize: 12,
+          symbol: 'diamond',
+          symbolSize: 18,
           itemStyle: { color: '#f59e0b' },
+          label: { show: true, formatter: '出', color: '#0f172a', fontSize: 10, fontWeight: 700 },
           z: 6,
         },
-        { name: '次日开盘入场', type: 'scatter', data: strategyName === 'next_open_baseline' ? [] : marker(baseline, 'entry'), symbolSize: 9, itemStyle: { color: '#a78bfa' }, z: 4 },
-        { name: '次日开盘出场', type: 'scatter', data: strategyName === 'next_open_baseline' ? [] : marker(baseline, 'exit'), symbol: 'rect', symbolSize: 9, itemStyle: { color: '#c4b5fd' }, z: 4 },
       ],
     });
     const resize = () => chart.resize();
@@ -432,10 +437,24 @@ const EntryExecutionKlineChart: React.FC<{
       window.removeEventListener('resize', resize);
       chart.dispose();
     };
-  }, [baseline, plan, result, strategyName, usableBars]);
+  }, [plan, result, strategyName, usableBars]);
 
   if (!usableBars.length) return <span className="text-xs text-secondary-text">--</span>;
-  return <div ref={ref} className="h-[180px] w-[360px]" data-testid="entry-execution-kline" />;
+  return (
+    <div className="w-[360px]">
+      <div ref={ref} className="h-[170px] w-full" data-testid="entry-execution-kline" />
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-4 text-secondary-text">
+        {klineLegendItems.map((item) => (
+          <span key={item.label} className="inline-flex items-center gap-1">
+            <span className={cn('inline-flex h-3 w-3 items-center justify-center text-[8px] font-bold leading-none text-slate-950', item.text ? 'rounded-sm' : '', item.className)}>
+              {item.text || ''}
+            </span>
+            {item.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 };
 
 const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy: string }> = ({ rows, strategy }) => {
@@ -508,7 +527,6 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
                       bars={priceData.dailyBars}
                       plan={plan}
                       result={result}
-                      baseline={strategyResult(row, 'next_open_baseline')}
                       strategyName={selectedStrategy}
                     />
                   </td>

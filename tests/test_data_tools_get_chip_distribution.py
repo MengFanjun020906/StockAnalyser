@@ -150,6 +150,20 @@ class TestGetChipDistributionContract(unittest.TestCase):
         self.assertEqual(result["source_chain"][0]["provider"], "tushare:cyq_chips")
         self.assertEqual(result["source_chain"][-1]["provider"], "chip_distribution")
 
+    def test_tushare_fast_path_has_hard_tool_boundary_timeout(self) -> None:
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerTimeout(),
+        ), patch(
+            "src.agent.tools.data_tools._query_tushare_chip_distribution",
+            side_effect=lambda _code: (time.sleep(0.2) or {"status": "ok"}),
+        ), patch("src.agent.tools.data_tools._get_agent_timeout_attr", return_value=0.05):
+            result = _handle_get_chip_distribution("603418")
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["source_chain"][0]["provider"], "tushare:cyq_chips")
+        self.assertEqual(result["source_chain"][0]["result"], "timeout")
+
     def test_manager_fallback_uses_remaining_timeout_budget(self) -> None:
         manager = _DummyManagerCaptureTimeout()
         with patch(

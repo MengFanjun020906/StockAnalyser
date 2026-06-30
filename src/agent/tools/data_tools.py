@@ -646,7 +646,23 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
     else:
         fast_path_enabled = False
     if fast_path_enabled:
-        fast_result = _query_tushare_chip_distribution(stock_code)
+        fast_result, fast_err, fast_cost_ms = _run_data_task_with_timeout(
+            lambda: _query_tushare_chip_distribution(stock_code),
+            timeout,
+            "tushare_cyq_chips",
+        )
+        if fast_err or not isinstance(fast_result, dict):
+            fast_result = {
+                "stock_code": stock_code,
+                "status": "timeout" if fast_err and "timeout" in str(fast_err).lower() else "failed",
+                "error_summary": str(fast_err or "Tushare cyq_chips unavailable"),
+                "errors": [str(fast_err or "Tushare cyq_chips unavailable")],
+                "source_chain": [{
+                    "provider": "tushare:cyq_chips",
+                    "result": "timeout" if fast_err and "timeout" in str(fast_err).lower() else "failed",
+                    "duration_ms": fast_cost_ms,
+                }],
+            }
         if fast_result.get("status") == "ok":
             return fast_result
 
@@ -1608,6 +1624,12 @@ ALL_DATA_TOOLS.append(get_capital_flow_tool)
 # ============================================================
 
 def _get_fundamental_adapter():
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=Path(__file__).resolve().parents[3] / ".env", override=False)
+    except Exception:
+        pass
     from data_provider.fundamental_adapter import AkshareFundamentalAdapter
 
     return AkshareFundamentalAdapter()

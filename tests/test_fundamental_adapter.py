@@ -774,13 +774,43 @@ class TestFundamentalAdapter(unittest.TestCase):
                     "data": [],
                 }
 
-        fallback_df = pd.DataFrame([
-            {"板块名称": "机器人", "板块代码": "BK1234", "涨跌幅": 3.2, "成交额": 120000000},
-            {"板块名称": "半导体", "板块代码": "BK5678", "涨跌幅": 2.1, "成交额": 90000000},
-        ])
-
         with patch("data_provider.fundamental_adapter.requests.get", return_value=_Resp()), \
-                patch("akshare.stock_board_industry_name_em", return_value=fallback_df):
+                patch.object(
+                    adapter,
+                    "_fallback_hot_sectors",
+                    return_value=(
+                        [
+                            {
+                                "id": None,
+                                "bk_code": "BK1234",
+                                "bk_name": "机器人",
+                                "return_pct": 3.2,
+                                "return_diff": None,
+                                "net_inflow": None,
+                                "net_inflow_diff": None,
+                                "inflow_days": None,
+                                "strength": None,
+                                "strength_diff": None,
+                                "amount": 120000000.0,
+                            },
+                            {
+                                "id": None,
+                                "bk_code": "BK5678",
+                                "bk_name": "半导体",
+                                "return_pct": 2.1,
+                                "return_diff": None,
+                                "net_inflow": None,
+                                "net_inflow_diff": None,
+                                "inflow_days": None,
+                                "strength": None,
+                                "strength_diff": None,
+                                "amount": 90000000.0,
+                            },
+                        ],
+                        [],
+                        "akshare:stock_board_industry_name_em",
+                    ),
+                ):
             result = adapter.get_stockapi_hot_sectors(date="2026-05-15", limit=2)
 
         self.assertEqual(result["status"], "partial")

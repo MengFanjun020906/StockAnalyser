@@ -218,6 +218,66 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.assertEqual(dates_resp.status_code, 200)
         self.assertEqual(dates_resp.json()["dates"][0]["seed_date"], "2026-06-05")
 
+    def test_snapshot_persists_full_seed_fact_packets_beyond_preview(self):
+        seed_date = date(2026, 6, 5)
+        payload = {
+            "status": "ok",
+            "market": "cn",
+            "seed_pool_summary": {
+                "seed_count": 2,
+                "preview": [
+                    {"code": "600001", "name": "测试一", "source": "daily_screener", "hint": "预览内"}
+                ],
+            },
+            "seed_fact_packets": [
+                {
+                    "code": "600001",
+                    "name": "测试一",
+                    "market": "cn",
+                    "recall_sources": ["daily_screener"],
+                    "flags": [{"kind": "pattern", "detector": "screener:ma", "summary": "预览内"}],
+                    "fact_sheet": {"freshness": "2026-06-05"},
+                },
+                {
+                    "code": "603072",
+                    "name": "天和磁材",
+                    "market": "cn",
+                    "recall_sources": ["alphasift"],
+                    "flags": [{"kind": "pattern", "detector": "alphasift:high_tight_flag", "summary": "放量突破"}],
+                    "fact_sheet": {"freshness": "local_phase_a", "trend_state": "bullish"},
+                },
+            ],
+            "thesis_desk_packets": [
+                {
+                    "expert": "momentum_desk",
+                    "status": "ok",
+                    "candidates": [{"code": "603072", "name": "天和磁材", "reason": "动量席选中"}],
+                }
+            ],
+            "candidates": [
+                {"code": "603072", "name": "天和磁材", "candidate_source": "thesis_desk_committee"}
+            ],
+        }
+
+        saved = SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id="run-full-seeds",
+            trace_id="trace-full-seeds",
+            seed_date=seed_date,
+            generated_at=datetime(2026, 6, 5, 18, 0),
+            market="cn",
+            candidate_discovery_mode="thesis_desk_committee",
+        )
+
+        self.assertEqual(saved["status"], "ok")
+        self.assertEqual(saved["item_count"], 2)
+        quality = self.client.get("/api/v1/seed-pool-quality", params={"seed_date": "2026-06-05"}).json()
+        codes = [item["code"] for item in quality["items"]]
+        self.assertEqual(codes, ["600001", "603072"])
+        item_603072 = next(item for item in quality["items"] if item["code"] == "603072")
+        self.assertEqual(item_603072["source"], "alphasift")
+        self.assertEqual(item_603072["desk_outcomes"][0]["desk"], "momentum_desk")
+
     def test_same_run_id_can_persist_distinct_seed_dates_without_overwrite(self) -> None:
         service = SeedPoolQualityService()
         first = service.persist_candidate_discovery_snapshot(
@@ -466,6 +526,53 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         item = quality["items"][0]
         self.assertEqual(item["evaluation"]["evaluation_date"], "2026-06-08")
         self.assertAlmostEqual(item["evaluation"]["seed_close"], 10.0)
+        self.assertAlmostEqual(item["evaluation"]["alpha_return_pct"], 4.0)
+
+    def test_evaluate_skips_exchange_holiday_using_benchmark_trading_day(self) -> None:
+        seed_date = date(2026, 6, 18)
+        holiday_date = date(2026, 6, 19)
+        eval_date = date(2026, 6, 22)
+        payload = {
+            "status": "ok",
+            "market": "cn",
+            "seed_pool_summary": {
+                "seed_count": 1,
+                "preview": [{"code": "600001", "name": "测试一", "source": "daily_screener"}],
+            },
+        }
+        SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id="run-holiday",
+            trace_id="trace-holiday",
+            seed_date=seed_date,
+            generated_at=datetime(2026, 6, 18, 18, 0),
+            market="cn",
+            candidate_discovery_mode="thesis_desk_committee",
+        )
+        self._save_bars(
+            "600001",
+            [
+                {"date": seed_date, "open": 9.8, "high": 10.2, "low": 9.7, "close": 10.0},
+                {"date": eval_date, "open": 10.2, "high": 11.0, "low": 9.5, "close": 10.5},
+            ],
+        )
+        self._save_bars(
+            "000001.SH",
+            [
+                {"date": seed_date, "open": 3000, "high": 3020, "low": 2990, "close": 3000},
+                {"date": eval_date, "open": 3010, "high": 3040, "low": 3000, "close": 3030},
+            ],
+        )
+
+        eval_resp = self.client.post("/api/v1/seed-pool-quality/evaluate", params={"seed_date": "2026-06-18"})
+        self.assertEqual(eval_resp.status_code, 200)
+        self.assertEqual(eval_resp.json()["expected_evaluation_date"], "2026-06-22")
+        self.assertEqual(eval_resp.json()["updated"], 1)
+
+        quality = self.client.get("/api/v1/seed-pool-quality", params={"seed_date": "2026-06-18"}).json()
+        item = quality["items"][0]
+        self.assertEqual(item["evaluation"]["evaluation_date"], "2026-06-22")
+        self.assertNotEqual(item["evaluation"]["evaluation_date"], holiday_date.isoformat())
         self.assertAlmostEqual(item["evaluation"]["alpha_return_pct"], 4.0)
 
     def test_evaluate_seed_date_refreshes_existing_ok_evaluations(self) -> None:

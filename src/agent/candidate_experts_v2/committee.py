@@ -49,6 +49,10 @@ from src.agent.candidate_experts_v2.schemas import (
     SeedSummaryV2,
 )
 from src.agent.candidate_experts_v2.runtime import ExpertTask  # noqa: F401 — re-export for callers
+from src.agent.theme_momentum import (
+    apply_theme_profile_to_seed,
+    build_theme_momentum_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +130,7 @@ class SeedPoolBuildResult:
     source_quality: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     total_limit: int = 40
     market_regime: Dict[str, Any] = field(default_factory=dict)
+    theme_momentum: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,12 +163,34 @@ def _format_stockapi_date(value: Any) -> str:
     return text
 
 
+def _annotate_seed_buckets_with_theme(
+    seeds_by_source: Dict[str, List[SeedItem]],
+    theme_momentum: Dict[str, Any],
+) -> None:
+    for bucket in seeds_by_source.values():
+        for seed in bucket:
+            try:
+                apply_theme_profile_to_seed(seed, theme_momentum)
+            except Exception as exc:
+                logger.debug("theme profile annotation failed for %s: %s", getattr(seed, "code", ""), exc)
+
+
 def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[str, Any]:
     source_counts: Dict[str, int] = {}
     preview: List[Dict[str, Any]] = []
     dimension_counts: Dict[str, int] = {}
+    theme_regime_counts: Dict[str, int] = {}
+    stock_role_counts: Dict[str, int] = {}
     for seed in seeds:
         source_counts[seed.source] = source_counts.get(seed.source, 0) + 1
+        theme_profile = seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None
+        if isinstance(theme_profile, dict):
+            theme_regime = str(theme_profile.get("theme_regime") or "").strip()
+            stock_role = str(theme_profile.get("stock_role") or "").strip()
+            if theme_regime:
+                theme_regime_counts[theme_regime] = theme_regime_counts.get(theme_regime, 0) + 1
+            if stock_role:
+                stock_role_counts[stock_role] = stock_role_counts.get(stock_role, 0) + 1
         for signal in seed.trigger_signals or []:
             if not isinstance(signal, dict):
                 continue
@@ -180,12 +207,15 @@ def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[s
                     "priority_score": seed.priority_score,
                     "freshness": seed.freshness,
                     "trigger_signals": seed.trigger_signals[:4],
+                    "theme_profile": theme_profile if isinstance(theme_profile, dict) else None,
                 }
             )
     return {
         "seed_count": len(seeds),
         "seed_sources": source_counts,
         "signal_dimensions": dimension_counts,
+        "theme_regime_counts": theme_regime_counts,
+        "stock_role_counts": stock_role_counts,
         "total_limit": total_limit,
         "preview": preview,
     }
@@ -1448,6 +1478,7 @@ def _build_seed_pool_result(
     exclusion_counts: Dict[str, int] = {}
     local_hard_exclusion: Dict[str, Any] = {}
     market_regime: Dict[str, Any] = {}
+    theme_payloads: Dict[str, Dict[str, Any]] = {}
     started = time.time()
 
     def _collect(item: SeedItem) -> None:
@@ -1484,6 +1515,8 @@ def _build_seed_pool_result(
             freshness="request",
         )
     if user_seed_count >= max(1, int(total_limit or 1)):
+        theme_momentum = build_theme_momentum_snapshot()
+        _annotate_seed_buckets_with_theme(seeds_by_source, theme_momentum)
         result_pool = _assemble_seed_pool(
             seeds_by_source,
             total_limit=total_limit,
@@ -1509,6 +1542,7 @@ def _build_seed_pool_result(
             source_quality=source_quality,
             total_limit=total_limit,
             market_regime=market_regime,
+            theme_momentum=theme_momentum,
         )
 
     # Use the most recent trading day for limit-up/hot-rank so weekend/holiday
@@ -1769,6 +1803,7 @@ def _build_seed_pool_result(
             tool_registry, "get_tushare_limit_list_d",
             trade_date=trade_date, limit=limit_per_source,
         )
+        theme_payloads["limit_up_pool"] = result if isinstance(result, dict) else {}
         items = _extract_payload_items(result)
         for item in items:
             if not isinstance(item, dict):
@@ -1799,6 +1834,19 @@ def _build_seed_pool_result(
                 priority_score=78.0 + min(float(_safe_float(streak) or 1.0), 5.0) * 2.0,
                 freshness=trade_date or "latest_trade_date",
                 context_hint="涨停池在线来源，只代表短线关注度上升，后续必须核验流动性和可参与空间。",
+                extras={
+                    "metrics": {
+                        "limit_up_streak": _safe_float(streak) or 1.0,
+                        "bomb_num": _safe_float(item.get("bomb_num") or item.get("open_times") or item.get("open_num")),
+                        "concepts": item.get("concepts"),
+                        "industry": item.get("industry"),
+                        "stock_reason": item.get("stock_reason") or item.get("reason"),
+                        "plate_reason": item.get("plate_reason"),
+                        "plate_name": item.get("plate_name"),
+                        "ceiling_amount": item.get("ceiling_amount"),
+                        "turnover_ratio": item.get("turnover_ratio") or item.get("turnover_rate"),
+                    }
+                },
             ))
         status = str(result.get("status") or ("ok" if items else "empty")).lower()
         diagnostic = _source_diagnostic("limit_up_pool", status, count=len(items), detail={"trade_date": trade_date})
@@ -1819,6 +1867,7 @@ def _build_seed_pool_result(
             tool_registry, "get_stockapi_popularity_rank",
             limit=limit_per_source,
         )
+        theme_payloads["popularity_rank"] = result if isinstance(result, dict) else {}
         items = _extract_payload_items(result)
         for item in items:
             if not isinstance(item, dict):
@@ -1875,12 +1924,14 @@ def _build_seed_pool_result(
             date=stockapi_date,
             limit=max(3, min(limit_per_source, 10)),
         )
+        theme_payloads["hot_sectors"] = sectors_result if isinstance(sectors_result, dict) else {}
         leaders_result = _safe_tool_call(
             tool_registry,
             "get_stockapi_hot_sector_leaders",
             date=stockapi_date,
             limit=limit_per_source,
         )
+        theme_payloads["hot_sector_leaders"] = leaders_result if isinstance(leaders_result, dict) else {}
         leaders = _extract_payload_items(leaders_result)
         accepted = 0
         for rank, item in enumerate(leaders, start=1):
@@ -2235,6 +2286,31 @@ def _build_seed_pool_result(
         _log_seed_source_diagnostic(diagnostic)
         source_quality["discover_watchlist_candidates_auto"] = _source_quality("failed", freshness="online_or_cached", error=message)
 
+    theme_momentum = build_theme_momentum_snapshot(
+        hot_sectors=theme_payloads.get("hot_sectors"),
+        limit_up_pool=theme_payloads.get("limit_up_pool"),
+        hot_sector_leaders=theme_payloads.get("hot_sector_leaders"),
+        popularity_rank=theme_payloads.get("popularity_rank"),
+    )
+    diagnostics.append(
+        _source_diagnostic(
+            "theme_momentum_snapshot",
+            str(theme_momentum.get("data_quality") or "unknown"),
+            count=int((theme_momentum.get("matched_counts") or {}).get("total") or 0),
+            detail={
+                "theme": theme_momentum.get("theme"),
+                "regime": theme_momentum.get("regime"),
+                "confidence": theme_momentum.get("confidence"),
+                "source_status": theme_momentum.get("source_status"),
+            },
+        )
+    )
+    source_quality["theme_momentum_snapshot"] = _source_quality(
+        "ok" if theme_momentum.get("regime") not in {None, "", "unknown"} else "partial",
+        freshness=trade_date or today or "latest_trade_date",
+    )
+    _annotate_seed_buckets_with_theme(seeds_by_source, theme_momentum)
+
     for source, bucket in list(seeds_by_source.items()):
         seeds_by_source[source] = _dedupe_by_code(bucket)
 
@@ -2267,6 +2343,7 @@ def _build_seed_pool_result(
         source_quality=source_quality,
         total_limit=total_limit,
         market_regime=market_regime,
+        theme_momentum=theme_momentum,
     )
 
 def _build_daily_screener_seeds(*, trade_date: str, limit: int) -> Tuple[List[SeedItem], Dict[str, Any]]:
@@ -3087,6 +3164,7 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         })
     recall_sources = seed.extras.get("recall_sources") if isinstance(seed.extras, dict) else None
     metrics = dict(seed.extras.get("metrics", {}) if isinstance(seed.extras, dict) else {})
+    theme_profile = seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None
     source_diagnostics = dict(metrics.get("source_diagnostics") or {})
     source_diagnostics.update({
         "source": seed.source,
@@ -3111,6 +3189,7 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         "trigger_signals": seed.trigger_signals,
         "freshness": seed.freshness,
         "context_hint": seed.context_hint,
+        "theme_profile": theme_profile if isinstance(theme_profile, dict) else None,
         "metrics": metrics,
         "seed_gate": seed.extras.get("seed_gate") if isinstance(seed.extras, dict) else None,
     }
@@ -3310,12 +3389,19 @@ def run_committee_discovery(
         seeds = list(prebuilt_seeds)
     else:
         seeds = _to_seed_items(seed_symbols, market_value)
-    deterministic_payload["seed_pool_summary"] = _seed_pool_summary(seeds, total_limit=SEED_GATE_OUTPUT_LIMIT)
+    summary_total_limit = int(
+        getattr(build_result, "total_limit", None)
+        or len(seeds)
+        or limit
+        or SEED_BUILD_LIMIT
+    )
+    deterministic_payload["seed_pool_summary"] = _seed_pool_summary(seeds, total_limit=summary_total_limit)
     if build_result is not None:
         deterministic_payload["seed_pool_diagnostics"] = build_result.diagnostics
         deterministic_payload["seed_pool_hard_exclusion"] = build_result.hard_exclusion
         deterministic_payload["seed_source_quality"] = build_result.source_quality
         deterministic_payload["seed_market_regime"] = build_result.market_regime
+        deterministic_payload["theme_momentum"] = build_result.theme_momentum
     deterministic_payload["candidates"] = []
     deterministic_payload["candidate_count"] = 0
     logger.info(

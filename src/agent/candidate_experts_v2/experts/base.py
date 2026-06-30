@@ -208,6 +208,10 @@ class BaseExpert:
         self.freshness = freshness
         self._progress_events: Optional[List[Dict[str, Any]]] = None
 
+    def _tool_result_for_model(self, tool_name: str, result_payload: Any) -> Any:
+        """Return the tool result shape appended to the next LLM message."""
+        return result_payload
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -482,12 +486,26 @@ class BaseExpert:
                                 "elapsed_ms": elapsed_ms,
                             }
                         )
+                    try:
+                        model_payload = _coerce_tool_result(
+                            self._tool_result_for_model(call.name, result_payload)
+                        )
+                    except Exception as exc:
+                        model_payload = result_payload
+                        diagnostics.append(
+                            {
+                                "source": "bounded_loop",
+                                "status": "tool_result_compaction_failed",
+                                "tool": call.name,
+                                "error": str(exc),
+                            }
+                        )
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": call.call_id or call.name,
                             "name": call.name,
-                            "content": json.dumps(result_payload, ensure_ascii=False, default=str),
+                            "content": json.dumps(model_payload, ensure_ascii=False, default=str),
                         }
                     )
                 messages.append({"role": "user", "content": FINAL_JSON_REMINDER})

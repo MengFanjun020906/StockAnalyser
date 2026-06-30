@@ -344,6 +344,7 @@ apps/dsa-web/src/pages/AgentEntryExecutionBacktestsPage.tsx
 - 展示严格 AI 入场成交率。
 - 展示 `strict_ai_entry`、`next_open_baseline`、`atr_elastic_entry`、`breakout_fallback_entry` 四套策略平均收益。
 - 表格逐条展示最终报告标的、入场区间、止盈止损、行情粒度、当前策略状态、收益、退出原因和 Trace。
+- 表格内交互日 K 默认只标注当前策略的入场/出场点，并在图下展示图例；`next_open_baseline` 等对照策略保留在汇总指标和策略切换里，避免多个策略点位叠在同一张小图上造成误读。
 
 导航策略：
 

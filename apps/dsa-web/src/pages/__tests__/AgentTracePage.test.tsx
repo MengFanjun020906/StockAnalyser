@@ -1736,7 +1736,7 @@ describe('AgentTracePage', () => {
                 ],
                 seed_pool_summary: {
                   seed_count: 20,
-                  total_limit: 20,
+                  total_limit: 12,
                   seed_sources: { daily_screener: 12, alphasift: 8 },
                   signal_dimensions: { technical: 11, fundamental: 4 },
                   preview: [
@@ -1825,8 +1825,8 @@ describe('AgentTracePage', () => {
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     expect(await screen.findByText('P4 四席位可观察性')).toBeInTheDocument();
-    expect(screen.getByText('Seed 20 / 20')).toBeInTheDocument();
-    expect(screen.getByText('Seed Preview (2)')).toBeInTheDocument();
+    expect(screen.getByText('Seed 20')).toBeInTheDocument();
+    expect(screen.getByText('Seed Preview (2 / 20)')).toBeInTheDocument();
     expect(screen.getByText('低位启动席')).toBeInTheDocument();
     expect(screen.getByText('动量席')).toBeInTheDocument();
     expect(screen.getByText('质量修复席')).toBeInTheDocument();

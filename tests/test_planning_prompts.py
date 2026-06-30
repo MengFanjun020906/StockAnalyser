@@ -15,6 +15,7 @@ from src.agent.planning_prompts import (
     build_zh_planning_system_prompt,
     get_default_prompt_sections,
 )
+from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 
 
 def test_default_zh_prompt_uses_single_section_source():
@@ -140,6 +141,18 @@ def test_entry_analysis_requires_actionable_entry_plan():
     for snippet in required_snippets:
         assert snippet in ENTRY_ANALYSIS_OUTPUT_FORMAT
         assert snippet in build_planning_system_prompt()
+
+
+def test_entry_analysis_no_chase_policy_is_setup_aware():
+    prompt = build_planning_system_prompt()
+
+    assert "不能仅因高乖离直接淘汰强势候选" in ENTRY_ANALYSIS_OUTPUT_FORMAT
+    assert "不能仅因高乖离直接淘汰强势候选" in prompt
+
+
+def test_default_trading_skill_no_chase_policy_is_setup_aware():
+    assert "按 setup 分层处理追高" in CORE_TRADING_SKILL_POLICY_ZH
+    assert "乖离率 > 5%：严禁追高！直接判定" not in CORE_TRADING_SKILL_POLICY_ZH
 
 
 def test_watchlist_candidate_pool_protocol_defines_l1_boundaries_and_schema():

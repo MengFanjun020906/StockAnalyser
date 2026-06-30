@@ -731,21 +731,28 @@ class TestThemeCatalystDeskEligibility:
 
     def test_news_theme_source_included(self):
         expert = self._make_expert()
-        rows = [_make_row("A", recall_sources=["news_theme_daily"])]
+        rows = [
+            _make_row(
+                "A",
+                recall_sources=["news_theme_daily"],
+                flags=[FeatureFlag(detector="news_theme_daily", kind="news", summary="MLCC 出口和国产替代政策催化")],
+                fact_sheet=FactSheet(code="A", sector_name="电子元件"),
+            )
+        ]
         filtered = expert._filter_eligible_rows(rows)
         assert len(filtered) == 1
 
-    def test_sector_flag_included(self):
+    def test_non_tech_sector_flag_excluded(self):
         expert = self._make_expert()
-        rows = [_make_row("A", flags=[FeatureFlag(detector="sector_theme", kind="sector")])]
+        rows = [_make_row("A", flags=[FeatureFlag(detector="sector_theme", kind="sector", summary="食品饮料板块走强")])]
         filtered = expert._filter_eligible_rows(rows)
-        assert len(filtered) == 1
+        assert filtered == []
 
-    def test_strong_sector_fallback_when_no_direct_theme(self):
+    def test_strong_sector_no_longer_fallbacks_without_tech_chain(self):
         expert = self._make_expert()
-        rows = [_make_row("A", fact_sheet=FactSheet(code="A", sector_strength="strong"))]
+        rows = [_make_row("A", fact_sheet=FactSheet(code="A", sector_name="食品饮料", sector_strength="strong"))]
         filtered = expert._filter_eligible_rows(rows)
-        assert len(filtered) == 1
+        assert filtered == []
 
 
 def test_aggregate_desk_picks_surfaces_failed_desk_errors():

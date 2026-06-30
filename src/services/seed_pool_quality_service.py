@@ -228,7 +228,7 @@ class SeedPoolQualityService:
     def _preflight_evaluation(self, *, seed_date: date, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not items:
             return {"expected_evaluation_date": _next_weekday(seed_date)}
-        expected = _next_weekday(seed_date)
+        expected, benchmark_bars, has_future_benchmark_bar = self._resolve_expected_evaluation_date(seed_date)
         now = datetime.now(CN_TZ)
         if now.date() < expected or (now.date() == expected and now.time() < CN_MARKET_CLOSE_BUFFER):
             raise SeedPoolEvaluationPreconditionError(
@@ -242,12 +242,24 @@ class SeedPoolQualityService:
                 },
             )
 
-        benchmark_bars = self.market_data.get_daily_bars_from_db(BENCHMARK_CODE, seed_date - timedelta(days=14), expected)
         if not benchmark_bars:
             raise SeedPoolEvaluationPreconditionError(
                 status_code=409,
                 error="missing_benchmark_ohlc",
-                message=f"本地数据库缺少 {expected.isoformat()} 的上证指数行情，无法计算 Alpha；请先同步当日 OHLC。",
+                message="本地数据库缺少上证指数行情，无法识别 seed 基准日和下一交易日；请先同步 OHLC。",
+                details={
+                    "seed_date": seed_date.isoformat(),
+                    "fallback_expected_evaluation_date": expected.isoformat(),
+                    "benchmark_code": BENCHMARK_CODE,
+                    "data_source": "local_db",
+                },
+            )
+        has_seed_benchmark_bar = any(bar.trade_date <= seed_date for bar in benchmark_bars)
+        if not has_seed_benchmark_bar:
+            raise SeedPoolEvaluationPreconditionError(
+                status_code=409,
+                error="missing_benchmark_ohlc",
+                message="本地数据库缺少上证指数 seed 基准日行情，无法计算 Alpha；请先同步 OHLC。",
                 details={
                     "seed_date": seed_date.isoformat(),
                     "expected_evaluation_date": expected.isoformat(),
@@ -255,14 +267,14 @@ class SeedPoolQualityService:
                     "data_source": "local_db",
                 },
             )
-        if not any(bar.trade_date <= seed_date for bar in benchmark_bars) or not any(bar.trade_date == expected for bar in benchmark_bars):
+        if not has_future_benchmark_bar:
             raise SeedPoolEvaluationPreconditionError(
                 status_code=409,
                 error="missing_benchmark_ohlc",
-                message=f"本地数据库缺少上证指数 seed 基准日或 {expected.isoformat()} 行情，无法计算 Alpha；请先同步 OHLC。",
+                message=f"本地数据库缺少 {seed_date.isoformat()} 之后的上证指数下一交易日行情，无法识别评估日并计算 Alpha；请先同步 OHLC。",
                 details={
                     "seed_date": seed_date.isoformat(),
-                    "expected_evaluation_date": expected.isoformat(),
+                    "fallback_expected_evaluation_date": expected.isoformat(),
                     "benchmark_code": BENCHMARK_CODE,
                     "data_source": "local_db",
                 },
@@ -287,6 +299,23 @@ class SeedPoolQualityService:
             )
 
         return {"expected_evaluation_date": expected}
+
+    def _resolve_expected_evaluation_date(self, seed_date: date) -> tuple[date, List[DailyBar], bool]:
+        """Resolve T+1 as the next observed benchmark trading day.
+
+        Weekday-only calendars misclassify exchange holidays. The local
+        benchmark OHLC table is the source of truth for whether a date traded.
+        """
+        fallback = _next_weekday(seed_date)
+        benchmark_bars = self.market_data.get_daily_bars_from_db(
+            BENCHMARK_CODE,
+            seed_date - timedelta(days=14),
+            seed_date + timedelta(days=14),
+        )
+        future_trade_dates = sorted({bar.trade_date for bar in benchmark_bars if bar.trade_date > seed_date})
+        if future_trade_dates:
+            return future_trade_dates[0], benchmark_bars, True
+        return fallback, benchmark_bars, False
 
     def chart_data(self, item_id: int) -> Dict[str, Any]:
         item = self.repo.get_item_with_snapshot(item_id)
@@ -422,8 +451,21 @@ def _extract_seed_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     summary = payload.get("seed_pool_summary") if isinstance(payload.get("seed_pool_summary"), dict) else {}
     preview = summary.get("preview") if isinstance(summary.get("preview"), list) else []
     candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
-    items = [item for item in preview if isinstance(item, dict)] or [item for item in candidates if isinstance(item, dict)]
+    seed_packets = payload.get("seed_fact_packets") if isinstance(payload.get("seed_fact_packets"), list) else []
+    preview_by_code = {
+        _normalize_code(item.get("code") or item.get("stock_code")): item
+        for item in preview
+        if isinstance(item, dict)
+    }
     candidate_by_code = {_normalize_code(item.get("code") or item.get("stock_code")): item for item in candidates if isinstance(item, dict)}
+    if seed_packets:
+        items = [
+            _seed_fact_packet_to_seed_item(packet, preview_by_code=preview_by_code, candidate_by_code=candidate_by_code)
+            for packet in seed_packets
+            if isinstance(packet, dict)
+        ]
+    else:
+        items = [item for item in preview if isinstance(item, dict)] or [item for item in candidates if isinstance(item, dict)]
     merged: List[Dict[str, Any]] = []
     for idx, item in enumerate(items):
         code = _normalize_code(item.get("code") or item.get("stock_code"))
@@ -435,6 +477,80 @@ def _extract_seed_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             enriched["name"] = _resolve_seed_stock_name(code, enriched)
         merged.append(enriched)
     return merged
+
+
+def _seed_fact_packet_to_seed_item(
+    packet: Dict[str, Any],
+    *,
+    preview_by_code: Dict[str, Dict[str, Any]],
+    candidate_by_code: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    code = _normalize_code(packet.get("code") or packet.get("stock_code"))
+    preview = preview_by_code.get(code, {})
+    candidate = candidate_by_code.get(code, {})
+    flags = [item for item in packet.get("flags") or [] if isinstance(item, dict)]
+    recall_sources = [
+        str(item).strip()
+        for item in packet.get("recall_sources") or []
+        if str(item).strip()
+    ]
+    fact_sheet = packet.get("fact_sheet") if isinstance(packet.get("fact_sheet"), dict) else {}
+    source = (
+        preview.get("source")
+        or (recall_sources[0] if recall_sources else "")
+        or candidate.get("source")
+        or candidate.get("candidate_source")
+        or "unknown"
+    )
+    trigger_signals = preview.get("trigger_signals") if isinstance(preview.get("trigger_signals"), list) else []
+    if not trigger_signals:
+        trigger_signals = [
+            {
+                "signal_type": flag.get("detector") or flag.get("kind") or "seed_fact_flag",
+                "label": flag.get("kind") or "seed_fact",
+                "summary": flag.get("summary") or flag.get("reason") or "",
+            }
+            for flag in flags
+        ]
+    hint = str(preview.get("hint") or "").strip()
+    if not hint:
+        hint = "；".join(str(flag.get("summary") or "").strip() for flag in flags if flag.get("summary"))
+    source_diagnostics = preview.get("source_diagnostics") if isinstance(preview.get("source_diagnostics"), dict) else {}
+    if not source_diagnostics:
+        source_diagnostics = {
+            "source": source,
+            "recall_sources": recall_sources,
+            "fact_sheet_freshness": fact_sheet.get("freshness"),
+        }
+    return {
+        "code": code,
+        "name": packet.get("name") or preview.get("name") or candidate.get("name") or candidate.get("stock_name") or code,
+        "market": packet.get("market") or preview.get("market") or candidate.get("market") or "cn",
+        "source": source,
+        "source_diagnostics": {key: value for key, value in source_diagnostics.items() if value not in (None, "", [])},
+        "trigger_signals": trigger_signals,
+        "catalyst_tags": _seed_fact_catalyst_tags(flags=flags, trigger_signals=trigger_signals),
+        "entry_reason": hint,
+        "freshness": preview.get("freshness") or fact_sheet.get("freshness") or packet.get("freshness") or "",
+        "raw_seed_fact_packet": packet,
+    }
+
+
+def _seed_fact_catalyst_tags(*, flags: Sequence[Dict[str, Any]], trigger_signals: Sequence[Dict[str, Any]]) -> List[str]:
+    tags: List[str] = []
+    for flag in flags:
+        for key in ("kind", "detector", "summary"):
+            text = str(flag.get(key) or "").strip()
+            if text and text not in tags:
+                tags.append(text)
+    for signal in trigger_signals:
+        if not isinstance(signal, dict):
+            continue
+        for key in ("label", "signal_type", "summary"):
+            text = str(signal.get(key) or "").strip()
+            if text and text not in tags:
+                tags.append(text)
+    return tags[:8]
 
 
 def _resolve_seed_stock_name(code: str, item: Dict[str, Any]) -> str:

@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Keep this test runnable when optional LLM runtime deps are not installed.
 try:
     import litellm  # noqa: F401
-except ModuleNotFoundError:
+except Exception:
     sys.modules["litellm"] = MagicMock()
 try:
     import json_repair  # noqa: F401
@@ -81,6 +81,63 @@ def _make_registry_with_symbol_regime():
                 "sample_count": 16,
                 "windows": {"30": {"n": 16, "p_up": 0.6, "p_below_current": 0.4, "low_confidence": False}},
                 "reentry_reference": {"reentry_price": 98.5, "low_confidence": False},
+            },
+        )
+    )
+    return registry
+
+
+def _make_registry_with_theme_prefetch_tools():
+    registry = _make_registry_with_echo()
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_hot_sectors",
+            description="hot sectors",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "sectors": [
+                    {"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 92}
+                ],
+            },
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_limit_up_pool",
+            description="limit up pool",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "items": [
+                    {"code": "300001", "name": "光模块龙头", "concepts": "CPO 光模块", "limit_up_streak": 2, "bomb_num": 0}
+                ],
+            },
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_hot_sector_leaders",
+            description="hot sector leaders",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "items": [
+                    {"code": "300001", "name": "光模块龙头", "bk_name": "CPO 光模块", "rank": 1, "net_inflow": 500_000_000}
+                ],
+            },
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_popularity_rank",
+            description="popularity rank",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "items": [
+                    {"code": "300001", "name": "光模块龙头", "concepts": ["CPO"], "rank": 2}
+                ],
             },
         )
     )
@@ -1592,6 +1649,42 @@ class TestBuildUserMessage(unittest.TestCase):
         self.assertEqual(result.tool_calls_log[0]["tool"], "get_symbol_regime_probability")
         self.assertTrue(result.tool_calls_log[0]["prefetch"])
 
+    def test_single_stock_planning_run_prefetches_theme_profile(self):
+        registry = _make_registry_with_theme_prefetch_tools()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="300001",
+                target_symbols=["300001"],
+            )
+        )
+
+        result = executor.run(
+            "300001 可以买吗",
+            context={"stock_code": "300001", "stock_name": "光模块龙头", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        user_message = adapter.call_with_tools.call_args.args[0][1]["content"]
+        self.assertIn("单股主线动量分型证据", user_message)
+        self.assertIn('"symbol": "300001"', user_message)
+        self.assertIn('"stock_role": "core_leader"', user_message)
+        self.assertIn('"chase_permission": "conditional_only"', user_message)
+        prefetch_tools = [call["tool"] for call in result.tool_calls_log if call.get("prefetch")]
+        self.assertIn("get_stockapi_hot_sectors", prefetch_tools)
+        self.assertIn("get_stockapi_limit_up_pool", prefetch_tools)
+        self.assertIn("get_stockapi_hot_sector_leaders", prefetch_tools)
+        self.assertIn("get_stockapi_popularity_rank", prefetch_tools)
+
     def test_watchlist_scan_does_not_prefetch_symbol_regime_probability(self):
         registry = _make_registry_with_symbol_regime()
         adapter = _make_mock_adapter()
@@ -1618,6 +1711,21 @@ class TestBuildUserMessage(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertFalse(any(call.get("tool") == "get_symbol_regime_probability" for call in result.tool_calls_log))
+
+    def test_watchlist_scan_does_not_prefetch_single_stock_theme_profile(self):
+        registry = _make_registry_with_theme_prefetch_tools()
+        executor = AgentExecutor(registry, _make_mock_adapter(), max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+                target_symbols=[],
+            )
+        )
+
+        prefetch = executor._prefetch_single_symbol_regime_context({"agent_user_context": context})
+
+        self.assertEqual(prefetch, {})
 
     def test_chat_uses_planning_system_prompt_when_context_requests_it(self):
         registry = _make_registry_with_echo()

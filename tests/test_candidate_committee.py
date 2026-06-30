@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 try:
     import litellm  # noqa: F401
-except ModuleNotFoundError:
+except Exception:
     sys.modules["litellm"] = MagicMock()
 
 from src.agent.candidate_experts_v2 import committee as committee_module
@@ -29,8 +29,9 @@ from src.agent.candidate_experts_v2.committee import (
     run_thesis_desk_committee,
 )
 from src.agent.candidate_experts_v2.runtime import run_experts_parallel
-from src.agent.candidate_experts_v2.experts.base import LLMTurn
+from src.agent.candidate_experts_v2.experts.base import LLMToolCall, LLMTurn
 from src.agent.candidate_experts_v2.experts.desk_base import BaseDeskExpert
+from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import ThemeCatalystDeskExpert
 from src.agent.candidate_experts_v2.schemas import (
     EvidenceItem,
     ExpertCandidateV2,
@@ -574,6 +575,142 @@ def test_desk_filter_explains_why_seed_did_not_enter_desk():
     )
 
 
+def test_theme_catalyst_desk_only_accepts_ai_tech_chain_news_rows():
+    desk = ThemeCatalystDeskExpert(
+        tool_registry={},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+    )
+    tech_row = FeatureRow(
+        code="000636",
+        name="风华高科",
+        flags=[
+            FeatureFlag(
+                detector="news_theme_daily",
+                kind="news",
+                summary="MLCC 出口和国产替代政策催化，关注电子元件产业链。",
+            )
+        ],
+        fact_sheet=FactSheet(code="000636", sector_name="电子元件", sector_strength="strong"),
+        recall_sources=["news_theme_daily"],
+    )
+    non_tech_row = FeatureRow(
+        code="600001",
+        name="食品样本",
+        flags=[FeatureFlag(detector="sector_theme", kind="sector", summary="食品饮料板块走强")],
+        fact_sheet=FactSheet(code="600001", sector_name="食品饮料", sector_strength="strong"),
+        recall_sources=["sector_theme"],
+    )
+    hot_rank_row = FeatureRow(
+        code="600002",
+        name="普通热榜",
+        flags=[FeatureFlag(detector="hot_rank", kind="sector", summary="市场关注度提升")],
+        fact_sheet=FactSheet(code="600002", sector_name="基础化工", sector_strength="strong"),
+        recall_sources=["hot_rank"],
+    )
+
+    eligible = desk._filter_eligible_rows([tech_row, non_tech_row, hot_rank_row])
+
+    assert [row.code for row in eligible] == ["000636"]
+    assert "未识别为 AI/科技产业链候选" in desk._ineligible_row_reason(non_tech_row)
+    assert "召回来源未命中 news_theme_daily/sector_theme" in desk._ineligible_row_reason(hot_rank_row)
+
+
+def test_theme_catalyst_tool_result_is_compacted_for_model_context():
+    desk = ThemeCatalystDeskExpert(
+        tool_registry={},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+    )
+    compact = desk._tool_result_for_model(
+        "get_eastmoney_cjzc_daily",
+        {
+            "status": "ok",
+            "themes": [
+                {
+                    "theme": "MLCC",
+                    "title": "MLCC 出口改善",
+                    "evidence_section": "海外补库带动 MLCC 品类出口改善。",
+                    "matched_keywords": ["MLCC", "出口"],
+                    "raw_text": "原文正文" * 1000,
+                    "ContentBody": "公告正文" * 1000,
+                }
+            ],
+            "items": [{"title": f"新闻{i}", "summary": "国产替代政策验证"} for i in range(10)],
+        },
+    )
+
+    dumped = json.dumps(compact, ensure_ascii=False)
+    assert compact["context_policy"] == "theme_catalyst_summary_card"
+    assert "product_export" in compact["evidence_focus"]
+    assert "domestic_substitution_policy" in compact["evidence_focus"]
+    assert "海外补库带动 MLCC 品类出口改善" in dumped
+    assert "原文正文" not in dumped
+    assert "raw_text" not in compact["result"]["themes"][0]
+    assert "ContentBody" not in compact["result"]["themes"][0]
+    assert set(compact["omitted_raw_fields"]) >= {"raw_text", "ContentBody"}
+    assert compact["result"]["items"][-1]["omitted_count"] == 4
+
+
+def test_theme_catalyst_loop_feeds_compacted_tool_result_to_next_llm_turn():
+    captured_tool_content = {}
+
+    def llm(messages, tool_decls):
+        tool_messages = [message for message in messages if message.get("role") == "tool"]
+        if not tool_messages:
+            return LLMTurn(
+                tool_calls=[
+                    LLMToolCall(
+                        name="get_eastmoney_cjzc_daily",
+                        arguments={"date": "2026-06-28"},
+                        call_id="call_theme_news",
+                    )
+                ]
+            )
+        captured_tool_content.update(json.loads(tool_messages[-1]["content"]))
+        return LLMTurn(text='{"data_quality":{"freshness":"intraday"},"candidates":[],"rejected":[]}')
+
+    with patch("src.agent.candidate_experts_v2.experts.theme_catalyst_desk.validate_manifest"):
+        desk = ThemeCatalystDeskExpert(
+            tool_registry={
+                "get_eastmoney_cjzc_daily": lambda date: {
+                    "status": "ok",
+                    "themes": [
+                        {
+                            "theme": "MLCC",
+                            "evidence_section": "MLCC 出口改善，国产替代政策继续推进。",
+                            "raw_text": "超长新闻正文" * 1000,
+                        }
+                    ],
+                }
+            },
+            tool_decls=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_eastmoney_cjzc_daily",
+                        "parameters": {"type": "object", "properties": {"date": {"type": "string"}}},
+                    },
+                }
+            ],
+            llm=llm,
+            max_llm_rounds=2,
+            max_tool_calls=1,
+        )
+
+    packet = desk._run_uncached(
+        [committee_module.SeedItem(code="000636", name="风华高科", source="news_theme_daily")],
+        market="cn",
+    )
+
+    dumped = json.dumps(captured_tool_content, ensure_ascii=False)
+    assert packet.status == "empty"
+    assert captured_tool_content["context_policy"] == "theme_catalyst_summary_card"
+    assert captured_tool_content["result"]["themes"][0]["evidence_section"] == "MLCC 出口改善，国产替代政策继续推进。"
+    assert "超长新闻正文" not in dumped
+    assert "raw_text" not in captured_tool_content["result"]["themes"][0]
+
+
 def _deterministic_stub(*, market: str, seed_symbols, limit: int):
     return {
         "status": "ok",
@@ -666,6 +803,43 @@ def test_run_committee_discovery_fails_without_seed_fallback_when_thesis_desk_is
         {"desk": "early_turn_desk", "status": "empty", "picks": 0},
     ]
     assert any(step.get("source") == "thesis_desk_committee" for step in result["discovery_steps"])
+
+
+def test_run_committee_discovery_seed_summary_uses_build_total_limit():
+    seed_result = committee_module.SeedPoolBuildResult(
+        seeds=[
+            committee_module.SeedItem(code=f"6000{i:02d}", name=f"测试{i}", source="alphasift")
+            for i in range(32)
+        ],
+        total_limit=32,
+    )
+
+    with patch.object(
+        committee_module,
+        "run_thesis_desk_committee",
+        return_value={
+            "status": "ok",
+            "candidate_source": "thesis_desk_committee",
+            "candidates": [],
+            "candidate_count": 0,
+            "recall_total_in": 32,
+            "recall_total_kept": 0,
+            "thesis_desk_diagnostics": [],
+        },
+    ):
+        result = run_committee_discovery(
+            market="cn",
+            seed_symbols=[],
+            limit=20,
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            today="20260523",
+            seed_pool_result=seed_result,
+        )
+
+    assert result["seed_pool_summary"]["seed_count"] == 32
+    assert result["seed_pool_summary"]["total_limit"] == 32
+    assert len(result["seed_pool_summary"]["preview"]) == 20
 
 
 def test_run_committee_discovery_propagates_partial_thesis_desk_candidates():
@@ -874,6 +1048,99 @@ def test_build_seed_pool_result_caps_total_limit_to_thirty_two():
 
     assert result.total_limit == 32
     assert len(result.seeds) <= 32
+
+
+def test_seed_pool_attaches_theme_momentum_profiles_with_partial_stockapi_sources():
+    with patch(
+        "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.alphasift_provider.AlphaSiftCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.sequoia_provider.SequoiaCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch.object(
+        committee_module,
+        "_build_daily_screener_seeds",
+        return_value=([], {"source": "daily_screener", "status": "empty", "count": 0}),
+    ), patch.object(
+        committee_module,
+        "_build_low_base_structure_seeds",
+        side_effect=AssertionError("low_base_structure should not be called by default"),
+    ):
+        result = committee_module._build_seed_pool_result(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={
+                "get_tushare_moneyflow_dc": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_margin_detail": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_block_trade": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_dragon_tiger_list": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_daily_basic": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_limit_list_d": lambda **kwargs: {
+                    "status": "ok",
+                    "trade_date": "20260622",
+                    "items": [
+                        {"code": "600001", "name": "光模块龙头", "limit_status": "U", "concepts": "CPO 光模块", "limit_up_streak": 2, "bomb_num": 0},
+                        {"code": "600000", "name": "银行热榜", "limit_status": "U", "concepts": "银行", "limit_up_streak": 1, "bomb_num": 0},
+                    ],
+                },
+                "get_stockapi_popularity_rank": lambda **kwargs: {
+                    "status": "partial",
+                    "date": "2026-06-22",
+                    "items": [
+                        {"code": "600001", "name": "光模块龙头", "rank": 1, "concepts": ["CPO", "光模块"]},
+                        {"code": "600000", "name": "银行热榜", "rank": 2, "concepts": ["银行"]},
+                    ],
+                },
+                "get_stockapi_hot_sectors": lambda **kwargs: {
+                    "status": "failed",
+                    "date": "2026-06-22",
+                    "sectors": [],
+                    "errors": ["stockapi:/v1/hotBkJlrDr:60050:permission"],
+                },
+                "get_stockapi_hot_sector_leaders": lambda **kwargs: {
+                    "status": "partial",
+                    "date": "2026-06-22",
+                    "items": [
+                        {"code": "600001", "name": "光模块龙头", "bk_name": "CPO 光模块", "rank": 1, "net_inflow": 600_000_000, "strength": 90}
+                    ],
+                },
+                "get_stockapi_sector_constituents": lambda **kwargs: {"status": "empty", "items": []},
+                "get_eastmoney_cjzc_daily": lambda **kwargs: {"status": "empty", "themes": []},
+                "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
+            },
+            today="20260623",
+            limit_per_source=5,
+            total_limit=12,
+        )
+
+    assert result.theme_momentum["regime"] in {"mainline_markup", "mainline_divergence", "range_rotation"}
+    assert result.theme_momentum["source_status"]["hot_sectors"] == "failed"
+    assert result.theme_momentum["matched_counts"]["total"] >= 2
+    assert any(item["source"] == "theme_momentum_snapshot" for item in result.diagnostics)
+
+    core_profiles = [
+        seed.extras.get("theme_profile")
+        for seed in result.seeds
+        if seed.code == "600001" and isinstance(seed.extras, dict)
+    ]
+    unrelated_profiles = [
+        seed.extras.get("theme_profile")
+        for seed in result.seeds
+        if seed.code == "600000" and isinstance(seed.extras, dict)
+    ]
+    assert any(
+        profile and profile["stock_role"] in {"core_leader", "core_midcap", "high_beta_leader"}
+        for profile in core_profiles
+    ), core_profiles
+    assert any(profile and profile["stock_role"] == "unrelated" for profile in unrelated_profiles)
+    assert any(
+        signal.get("dimension") == "theme_regime"
+        for seed in result.seeds
+        for signal in seed.trigger_signals
+    )
 
 
 def test_build_seed_pool_result_records_quality_and_structured_signals():

@@ -2167,15 +2167,18 @@ class Config:
         """Resolve one env value, optionally preferring the persisted `.env` copy."""
         env_value = os.getenv(key)
         file_value = cls._get_env_file_value(key)
+        env_file_explicit = bool(os.getenv("ENV_FILE"))
 
         should_prefer_file = prefer_env_file or key in cls._WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS
         if should_prefer_file and file_value is not None:
-            if env_value is not None and cls._has_bootstrap_runtime_env_override(key):
-                return env_value
-            return file_value
+            if env_value is not None:
+                if cls._has_bootstrap_runtime_env_override(key) or not env_file_explicit:
+                    return env_value
+            if env_file_explicit:
+                return file_value
         if env_value is not None:
             return env_value
-        if file_value is not None:
+        if file_value is not None and env_file_explicit:
             return file_value
         return default
 

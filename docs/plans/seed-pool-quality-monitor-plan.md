@@ -171,6 +171,7 @@ candidate_discovery
 
 - 找出还没有 `selection_seed_pool_evaluations` 的 seed item。
 - 根据 `seed_date` 找下一交易日。
+- 下一交易日以本地基准指数 OHLC 中 seed_date 之后的第一根交易日为准，不能只按自然工作日推断，节假日休市要自动跳过。
 - 通过统一 `MarketDataProvider` 读取 seed_date 和 evaluation_date 的个股日线 OHLC。
 - 同步读取基准指数上证指数的 seed_date 和 evaluation_date 日线 OHLC。
 - 计算 `next_close_return_pct`、`benchmark_return_pct`、`alpha_return_pct`、`mfe_pct`、`mae_pct`。

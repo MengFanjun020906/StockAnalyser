@@ -73,6 +73,32 @@ def test_regime_confirmation_requires_consecutive_bars_before_switching():
     assert state.regime == MarketRegime.RANGE_BOUND
 
 
+def test_high_volatility_uptrend_keeps_directional_regime():
+    bars = _bars(220, drift=0.35, vol=0.5)
+    widened = []
+    for idx, bar in enumerate(bars):
+        if idx < len(bars) - 30:
+            widened.append(bar)
+            continue
+        widened.append(
+            MarketBar(
+                date=bar.date,
+                open=bar.open,
+                high=bar.close + 10.0,
+                low=max(1.0, bar.close - 10.0),
+                close=bar.close,
+                volume=bar.volume * 1.5,
+                amount=bar.amount,
+            )
+        )
+
+    state = detect_market_regime(widened)
+
+    assert state.volatility_bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}
+    assert state.regime == MarketRegime.TRENDING_UP
+    assert any("波动不是开仓否决项" in item for item in state.strategy_hints)
+
+
 def test_sentiment_and_wyckoff_are_structured():
     bars = _bars(180, drift=0.35, vol=1.0)
     sentiment = SentimentComponents(

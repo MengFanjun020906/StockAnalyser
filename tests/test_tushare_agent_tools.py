@@ -588,7 +588,8 @@ def test_get_tushare_reference_events_can_select_unlock():
 
 def test_get_tushare_moneyflow_ths_uses_latest_trade_date_and_normalizes_rows():
     with patch("data_provider.tushare_client.query_tushare_api", side_effect=_fake_query), \
-            patch("data_provider.tushare_client.get_tushare_http_url", return_value="http://unit/"):
+            patch("data_provider.tushare_client.get_tushare_http_url", return_value="http://unit/"), \
+            patch("src.agent.tools.data_tools._recent_tushare_trade_dates", return_value=["20260508"]):
         result = _handle_get_tushare_moneyflow_ths(limit=2)
 
     assert result["status"] == "ok"

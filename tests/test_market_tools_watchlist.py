@@ -1,3 +1,5 @@
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -12,6 +14,10 @@ def _isolated_candidate_env(tmp_path, **overrides):
     env = {
         "DATABASE_PATH": str(tmp_path / "isolated-stock-analysis.db"),
         "AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH": str(tmp_path / "missing-fundamental.db"),
+        "AGENT_CANDIDATE_BLACKLIST_CODES": "",
+        "AGENT_CANDIDATE_MIN_AVG_AMOUNT": "0",
+        "AGENT_CANDIDATE_MIN_LISTING_DAYS": "0",
+        "AGENT_CANDIDATE_ENFORCE_NAME_CODE_MATCH": "true",
     }
     env.update({key: str(value) for key, value in overrides.items()})
     return env
@@ -56,6 +62,46 @@ def _write_alphasift_strategy_dir(path):
     )
 
 
+def _write_profiled_alphasift_strategy_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "profiled_heat.yaml").write_text(
+        "\n".join(
+            [
+                "name: profiled_heat",
+                "display_name: Profiled Heat",
+                "description: Strategy with AlphaSift scoring/risk profile fields.",
+                "category: momentum",
+                "tags: [capital_flow]",
+                "screening:",
+                "  enabled: true",
+                "  market_scope: [cn]",
+                "  hard_filters:",
+                "    exclude_st: true",
+                "    amount_min: 1000000",
+                "    price_min: 1",
+                "  factor_weights:",
+                "    momentum: 0.6",
+                "    activity: 0.4",
+                "  scoring_profile:",
+                "    momentum_chase_start_pct: 3.0",
+                "    momentum_chase_penalty_slope: 15.0",
+                "    activity_ideal_volume_ratio: 2.0",
+                "    activity_high_volume_ratio: 4.0",
+                "    activity_ideal_turnover_rate: 3.0",
+                "    activity_high_turnover_rate: 10.0",
+                "  risk_profile:",
+                "    chase_change_pct: 4.0",
+                "    abnormal_volume_ratio: 5.0",
+                "    high_turnover_rate: 12.0",
+                "    weak_signal_score: 45.0",
+                "  max_output: 5",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _bars_for_turtle(symbol: str):
     rows = []
     base = pd.Timestamp("2026-01-01")
@@ -76,6 +122,30 @@ def _bars_for_turtle(symbol: str):
             "close": close,
             "volume": 1_000_000 + i,
             "turnover": 150_000_000 if i == 21 else 20_000_000,
+        })
+    return rows
+
+
+def _bars_for_hot_chase(symbol: str):
+    rows = []
+    base = pd.Timestamp("2026-01-01")
+    for i in range(80):
+        close = 10.0 + i * 0.02
+        volume = 900_000
+        turnover = 80_000_000
+        if i == 79:
+            close = 14.8
+            volume = 18_000_000
+            turnover = 1_800_000_000
+        rows.append({
+            "symbol": symbol,
+            "date": (base + pd.Timedelta(days=i)).strftime("%Y-%m-%d"),
+            "open": close * 0.9 if i == 79 else close - 0.05,
+            "high": close + 0.3,
+            "low": close - 0.3,
+            "close": close,
+            "volume": volume,
+            "turnover": turnover,
         })
     return rows
 
@@ -364,6 +434,37 @@ def test_sequoia_provider_returns_structured_strategy_candidates(tmp_path):
     assert candidate["signal_score"] > 0
 
 
+def test_sequoia_provider_supports_private_placement_event_strategy_without_daily_db(tmp_path):
+    df = pd.DataFrame(
+        [
+            {
+                "股票代码": "600111.SH",
+                "发行方式": "定向增发",
+                "发行日期": pd.Timestamp.today().strftime("%Y-%m-%d"),
+                "实际募集资金总额": 123000000,
+                "增发价格": 12.34,
+            },
+            {
+                "股票代码": "600222.SH",
+                "发行方式": "公开增发",
+                "发行日期": pd.Timestamp.today().strftime("%Y-%m-%d"),
+            },
+        ]
+    )
+    provider = SequoiaCandidateProvider(str(tmp_path / "missing.db"))
+
+    with patch.dict(sys.modules, {"akshare": SimpleNamespace(stock_qbzf_em=lambda: df)}):
+        result = provider.discover(limit=5, strategy_names=["private_placement"])
+
+    assert result["status"] == "ok"
+    assert result["candidate_count"] == 1
+    candidate = result["candidates"][0]
+    assert candidate["code"] == "600111"
+    assert candidate["source"] == "sequoia:private_placement"
+    assert candidate["matched_strategies"] == ["private_placement"]
+    assert "announcement" in candidate["strategy_tags"]
+
+
 def test_alphasift_provider_returns_yaml_strategy_candidates(tmp_path):
     db_path = tmp_path / "alphasift.db"
     strategy_dir = tmp_path / "strategies"
@@ -390,6 +491,38 @@ def test_alphasift_provider_returns_yaml_strategy_candidates(tmp_path):
     assert capital_detail.startswith("流动性代理：")
     assert candidate["signal_score"] > 0
     assert "ranking_hints" in candidate
+
+
+def test_alphasift_provider_consumes_scoring_and_risk_profiles(tmp_path):
+    db_path = tmp_path / "alphasift.db"
+    strategy_dir = tmp_path / "strategies"
+    _write_daily_db(db_path, _bars_for_hot_chase("600006"))
+    _write_profiled_alphasift_strategy_dir(strategy_dir)
+
+    profiled = AlphaSiftCandidateProvider(str(db_path), str(strategy_dir)).discover(
+        limit=5,
+        strategy_names=["profiled_heat"],
+    )
+    assert profiled["status"] == "ok"
+    score_with_profile = profiled["candidates"][0]["signal_score"]
+
+    (strategy_dir / "profiled_heat.yaml").write_text(
+        (strategy_dir / "profiled_heat.yaml")
+        .read_text(encoding="utf-8")
+        .replace("momentum_chase_penalty_slope: 15.0", "momentum_chase_penalty_slope: 0.0")
+        .replace("activity_high_volume_ratio: 4.0", "activity_high_volume_ratio: 99.0")
+        .replace("activity_high_turnover_rate: 10.0", "activity_high_turnover_rate: 99.0")
+        .replace("chase_change_pct: 4.0", "chase_change_pct: 99.0")
+        .replace("abnormal_volume_ratio: 5.0", "abnormal_volume_ratio: 99.0")
+        .replace("high_turnover_rate: 12.0", "high_turnover_rate: 99.0"),
+        encoding="utf-8",
+    )
+    relaxed = AlphaSiftCandidateProvider(str(db_path), str(strategy_dir)).discover(
+        limit=5,
+        strategy_names=["profiled_heat"],
+    )
+
+    assert relaxed["candidates"][0]["signal_score"] > score_with_profile
 
 
 def test_discover_watchlist_candidates_alphasift_source(tmp_path):
@@ -429,6 +562,12 @@ def test_auto_alphasift_falls_back_to_yaml_strategies_when_requested_names_are_s
     ), patch(
         "src.agent.tools.market_tools._discover_news_momentum_candidates",
         return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._data_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
+    ), patch(
+        "src.agent.tools.market_tools._stockapi_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
     ):
         result = _handle_discover_watchlist_candidates(
             candidate_source="auto",
@@ -506,6 +645,12 @@ def test_discover_watchlist_candidates_auto_uses_candidate_experts(tmp_path):
     ), patch(
         "src.agent.tools.market_tools._discover_news_momentum_candidates",
         return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._data_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
+    ), patch(
+        "src.agent.tools.market_tools._stockapi_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
     ):
         result = _handle_discover_watchlist_candidates(
             candidate_source="auto",
@@ -566,6 +711,12 @@ def test_discover_watchlist_candidates_auto_merges_sequoia_and_sector(tmp_path):
     ), patch(
         "src.agent.tools.market_tools._discover_news_momentum_candidates",
         return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._data_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
+    ), patch(
+        "src.agent.tools.market_tools._stockapi_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
     ):
         result = _handle_discover_watchlist_candidates(
             candidate_source="auto",
@@ -766,6 +917,12 @@ def test_discover_watchlist_candidates_excludes_hard_risk_candidates(tmp_path):
     ), patch(
         "src.agent.tools.market_tools._discover_news_momentum_candidates",
         return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools._data_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
+    ), patch(
+        "src.agent.tools.market_tools._stockapi_tool_result",
+        return_value={"status": "empty", "candidates": [], "items": [], "data": []},
     ):
         result = _handle_discover_watchlist_candidates(
             candidate_source="auto",

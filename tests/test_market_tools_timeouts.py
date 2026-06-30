@@ -128,6 +128,7 @@ def test_tushare_sector_rankings_uses_ths_hot_industry_market():
         def query(self, api_name, fields="", **params):
             seen.append((api_name, params, fields, self._timeout))
             assert api_name == "ths_hot"
+            trade_date = params.get("trade_date") or "20260612"
             return pd.DataFrame([
                 {
                     "trade_date": "20260611",
@@ -141,7 +142,7 @@ def test_tushare_sector_rankings_uses_ths_hot_industry_market():
                     "rank_time": "22:30",
                 },
                 {
-                    "trade_date": "20260612",
+                    "trade_date": trade_date,
                     "data_type": "行业板块",
                     "ts_code": "881001.TI",
                     "ts_name": "半导体",
@@ -152,7 +153,7 @@ def test_tushare_sector_rankings_uses_ths_hot_industry_market():
                     "rank_time": "22:30",
                 },
                 {
-                    "trade_date": "20260612",
+                    "trade_date": trade_date,
                     "data_type": "热股",
                     "ts_code": "600000.SH",
                     "ts_name": "浦发银行",

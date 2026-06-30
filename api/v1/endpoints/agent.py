@@ -1082,6 +1082,8 @@ def _planner_to_todo_md(
         f"- [x] intent: {planner.get('intent') or '-'}",
         f"- [x] primary_symbol: {planner.get('primary_symbol') or '-'}",
         f"- [x] has_position: {planner.get('has_position')}",
+        f"- [x] main_dimension: {planner.get('main_dimension') or '-'}",
+        f"- [x] supporting_dimensions: {', '.join(str(item) for item in planner.get('supporting_dimensions') or []) or '-'}",
         f"- [x] expected_output: {planner.get('expected_output') or '-'}",
         f"- [x] context_accounts: {account_count if account_count is not None else '-'}",
         f"- [x] context_positions: {position_count if position_count is not None else '-'}",
@@ -1093,11 +1095,30 @@ def _planner_to_todo_md(
             f"- [x] target_position_pct: {target_position.get('position_pct') or '-'}",
         ])
 
+    lines.extend(["", "## 初始假设"])
+    hypotheses = planner.get("hypotheses") or []
+    if hypotheses:
+        for hypothesis in hypotheses:
+            if isinstance(hypothesis, dict):
+                lines.append(f"- [ ] {hypothesis.get('id') or '-'}: {hypothesis.get('text') or '-'}")
+            else:
+                lines.append(f"- [ ] {hypothesis}")
+    else:
+        lines.append("- [ ] 无初始假设")
+
     lines.extend(["", "## 维度计划"])
+    main_dimension = planner.get("main_dimension")
     for capability in planner.get("capabilities") or []:
-        lines.append(f"- [x] capability={capability}")
+        role = "主维度" if capability == main_dimension else "辅助维度"
+        lines.append(f"- [x] {role}: capability={capability}")
     if not planner.get("capabilities"):
         lines.append("- [ ] 无能力域")
+    skipped_dimensions = planner.get("skipped_dimensions") or []
+    for item in skipped_dimensions:
+        if isinstance(item, dict):
+            lines.append(f"- [x] 可省略维度: capability={item.get('capability') or '-'} reason={item.get('reason') or '-'}")
+        else:
+            lines.append(f"- [x] 可省略维度: {item}")
 
     lines.extend(["", "## 工具计划"])
     if tool_plan:
@@ -1107,7 +1128,14 @@ def _planner_to_todo_md(
             tools = ", ".join(str(tool) for tool in item.get("tools") or []) or "-"
             missing = ", ".join(str(tool) for tool in item.get("missing_tools") or []) or "-"
             purpose = item.get("purpose") or "-"
-            lines.append(f"- [ ] capability={item.get('capability') or '-'} -> tools=[{tools}] -> purpose={purpose}")
+            lines.append(
+                f"- [ ] capability={item.get('capability') or '-'} -> tools=[{tools}] "
+                f"-> purpose={purpose}"
+            )
+            lines.append(f"  expected_result={item.get('expected_result') or '-'}")
+            lines.append(f"  downstream_use={item.get('downstream_use') or '-'}")
+            lines.append(f"  fallback_on_failure={item.get('fallback_on_failure') or '-'}")
+            lines.append(f"  next_step={item.get('next_step') or '-'}")
             if missing != "-":
                 lines.append(f"  missing_tools=[{missing}]")
     else:
@@ -1124,6 +1152,35 @@ def _planner_to_todo_md(
     if missing_tools:
         lines.extend(["", "## 缺失工具", *[f"- [ ] {tool}" for tool in missing_tools]])
 
+    lines.extend(["", "## 执行停止条件"])
+    stop_conditions = planner.get("stop_conditions") or []
+    if stop_conditions:
+        lines.extend([f"- [ ] {condition}" for condition in stop_conditions])
+    else:
+        lines.append("- [ ] 无停止条件")
+
+    lines.extend(["", "## Replan 策略"])
+    replan_policy = planner.get("replan_policy") or {}
+    if isinstance(replan_policy, dict) and replan_policy:
+        mode = replan_policy.get("mode")
+        if mode:
+            lines.append(f"- [x] mode={mode}")
+        for title, key in (
+            ("触发条件", "trigger_conditions"),
+            ("允许动作", "allowed_actions"),
+            ("禁止动作", "forbidden_actions"),
+        ):
+            values = replan_policy.get(key) or []
+            if values:
+                lines.append(f"- [ ] {title}:")
+                lines.extend([f"  - {value}" for value in values])
+        if replan_policy.get("artifact_update"):
+            lines.append(f"- [ ] artifact_update={replan_policy.get('artifact_update')}")
+        if replan_policy.get("watchlist_note"):
+            lines.append(f"- [ ] watchlist_note={replan_policy.get('watchlist_note')}")
+    else:
+        lines.append("- [ ] 无 replan 策略")
+
     _append_execute_status_to_todo(lines, tool_plan, tool_calls or [])
 
     return "\n".join(lines) + "\n"
@@ -1135,6 +1192,7 @@ def _append_execute_status_to_todo(
     tool_calls: List[Dict[str, Any]],
 ) -> None:
     executed_tools = _summarize_executed_tools(tool_calls)
+    planned_contracts = _planned_tool_contracts(tool_plan)
     lines.extend(["", "## 执行状态"])
     if tool_calls:
         for call in tool_calls:
@@ -1155,6 +1213,13 @@ def _append_execute_status_to_todo(
             arguments = call.get("arguments")
             if arguments:
                 lines.append(f"  arguments={json.dumps(arguments, ensure_ascii=False, default=str)}")
+            contract = planned_contracts.get(str(tool_name)) if tool_name else None
+            if contract:
+                lines.append(f"  planned_capability={contract.get('capability') or '-'}")
+                lines.append(f"  expected_result={contract.get('expected_result') or '-'}")
+                lines.append(f"  downstream_use={contract.get('downstream_use') or '-'}")
+                lines.append(f"  fallback_on_failure={contract.get('fallback_on_failure') or '-'}")
+                lines.append(f"  next_step={contract.get('next_step') or '-'}")
             preview = call.get("result_preview")
             if preview:
                 lines.append(f"  result_preview={preview}")
@@ -1164,7 +1229,15 @@ def _append_execute_status_to_todo(
     planned_tools = _planned_tool_names(tool_plan)
     not_called = [tool for tool in planned_tools if tool not in executed_tools]
     if not_called:
-        lines.extend(["", "## 未调用计划工具", *[f"- [ ] {tool}" for tool in not_called]])
+        lines.extend(["", "## 未调用计划工具"])
+        for tool in not_called:
+            contract = planned_contracts.get(tool) or {}
+            suffix = f" capability={contract.get('capability')}" if contract.get("capability") else ""
+            lines.append(f"- [ ] {tool}{suffix}")
+            if contract.get("purpose"):
+                lines.append(f"  purpose={contract.get('purpose')}")
+            if contract.get("fallback_on_failure"):
+                lines.append(f"  fallback_on_failure={contract.get('fallback_on_failure')}")
 
     lines.extend(["", "## Execute Protocol 复核"])
     if tool_calls:
@@ -1174,6 +1247,27 @@ def _append_execute_status_to_todo(
         lines.append("- [x] 停止条件已复核")
     else:
         lines.append("- [ ] 等待工具执行后复核")
+
+
+def _planned_tool_contracts(tool_plan: Any) -> Dict[str, Dict[str, Any]]:
+    contracts: Dict[str, Dict[str, Any]] = {}
+    for item in tool_plan or []:
+        if not isinstance(item, dict):
+            continue
+        for tool in item.get("tools") or []:
+            name = str(tool or "").strip()
+            if not name or name in contracts:
+                continue
+            contracts[name] = {
+                "capability": item.get("capability"),
+                "purpose": item.get("purpose"),
+                "expected_result": item.get("expected_result"),
+                "downstream_use": item.get("downstream_use"),
+                "fallback_on_failure": item.get("fallback_on_failure"),
+                "next_step": item.get("next_step"),
+                "required": item.get("required"),
+            }
+    return contracts
 
 
 def _planned_tool_names(tool_plan: Any) -> List[str]:

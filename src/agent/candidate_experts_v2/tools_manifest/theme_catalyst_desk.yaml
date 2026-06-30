@@ -1,7 +1,8 @@
 dimension: theme_catalyst_desk
 description: >-
-  主题催化席位可调用的工具集。目标是核实「盘前/当日高质量主题催化 + 业务归属匹配
-  + 资金或板块验证」，避免把泛概念、澄清公告或已透支高位票误判为利好。
+  主题催化席位可调用的工具集。目标是只核实 AI/科技产业链里的「产品品类出口消息
+  + 国产替代政策 + 业务归属匹配 + 资金或板块验证」，避免把泛概念、澄清公告、
+  原文堆砌或已透支高位票误判为利好。
 
 tools:
   - tool: get_eastmoney_cjzc_daily
@@ -13,7 +14,8 @@ tools:
       target_date: "{today}"
       allow_previous: false
     returns_summary: >-
-      返回当天财经早餐标题、链接、原文抓取状态、主题列表、公司新闻诊断和映射股票。
+      返回当天财经早餐标题、链接、原文抓取状态、主题列表、公司新闻诊断和映射股票；
+      只允许把原文压缩成 evidence_section、matched_keywords、high_impact_terms 等摘要证据。
     key_fields:
       - themes
       - article_fetch_status
@@ -24,6 +26,7 @@ tools:
     combo_hints:
       - 与 get_stock_business_context 联动：日报主题与业务归属一致才是有效催化。
       - 与 get_stockapi_hot_sectors 联动：盘前主题若盘中成为强板块，优先级提高。
+      - 优先抽取 product_export / domestic_substitution_policy / business_fit 三类摘要，不要复制长原文。
     cost: cheap
     failure_modes:
       - 盘前 6 点前当天日报可能 missing。
@@ -44,7 +47,8 @@ tools:
       - source
     combo_hints:
       - 业务归属与日报主题不匹配时，不得仅凭热门词 support。
-      - 宽口径映射可以 watch，但 reason 必须写清产业链角色。
+      - 宽口径映射可以 watch，但 reason 必须写清「产品品类 -> 产业链环节 -> 公司角色」。
+      - 公司生产某产品不等于品类出口或国产替代政策受益，必须等待新闻/政策或披露交叉验证。
     cost: cheap
     failure_modes:
       - 所属板块缺失时只能作为业务不明，不能臆测主营。
@@ -68,6 +72,7 @@ tools:
       - source_chain
     combo_hints:
       - 日报主题 + 业务上下文 + 披露事件三者一致，才是高质量公司级催化。
+      - 披露只能验证公司是否属于品类/产业链，不能代替品类出口或国产替代政策新闻。
       - 披露中出现澄清、减持、处罚、问询等负面信号时必须降级。
     cost: expensive
     failure_modes:
@@ -90,6 +95,7 @@ tools:
     combo_hints:
       - 近期公告与主题关键词一致 = 公司级催化证据增强。
       - 近期澄清/减持/处罚公告优先于热点强度。
+      - 若公告只证明业务归属，不得直接推导产品出口或国产替代政策受益。
     cost: medium
     failure_modes:
       - 公告列表为空不代表无公告，需结合搜索或 CNInfo 披露降级判断。
@@ -111,6 +117,7 @@ tools:
     combo_hints:
       - 日报主题 + 热点板块强 = 主题催化被资金验证。
       - 板块净流出时，主题只保留观察或剔除。
+      - 热点板块强只代表 funding_validation，不能替代 product_export 或 domestic_substitution_policy 证据。
     cost: medium
     failure_modes:
       - StockAPI 网络失败或当天无数据时返回 empty/failed。
@@ -135,6 +142,7 @@ tools:
     combo_hints:
       - 候选在成分股资金前排 = 主题资金落地更强。
       - 候选不在成分列表或资金靠后 = 只能 watch 或剔除。
+      - 板块成分只验证 business_fit / funding_validation，不验证出口或政策本身。
     cost: medium
     failure_modes:
       - 需要 hot_sectors 给出 bk_code；没有 bk_code 时不要臆造参数。
@@ -157,6 +165,7 @@ tools:
     combo_hints:
       - 板块连续净流入 + 候选业务匹配 = 主题持续性更强。
       - 只有单日冲高且历史转弱 = 情绪脉冲，需等待分歧。
+      - 连续净流入仍只是交易验证，新闻结论必须回到摘要化的品类出口/国产替代政策证据。
     cost: medium
     failure_modes:
       - 需要有效 bk_code；StockAPI 失败或无历史时只能降级。
@@ -507,7 +516,7 @@ tools:
     priority: 35
     when_to_use: >-
       当 SeedFactPacket 的消息证据缺失或冲突时，补查个股最新新闻摘要。
-      只用于补证，不替代盘前日报主题。
+      只用于公司级补证、负面排雷和业务匹配确认，不替代盘前日报主题或品类/政策证据。
     typical_args:
       stock_code: "{code}"
       stock_name: "{name}"
@@ -520,6 +529,7 @@ tools:
       - published_at
     combo_hints:
       - 若查到澄清、减持、处罚等负向新闻，主题催化必须降级或剔除。
+      - 个股新闻只证明公司事件或业务相关性，不能单独证明产品品类出口或国产替代政策。
     cost: expensive
     failure_modes:
       - 搜索源网络失败或中文结果不足。
@@ -528,7 +538,7 @@ tools:
     priority: 36
     when_to_use: >-
       当通用搜索源失败、中文结果不足，或需要 ticker 关联新闻作为补充时调用。
-      默认优先 yfinance ticker news，RSS/DDGS 作为可选降级源。
+      默认优先 yfinance ticker news，RSS/DDGS 作为可选降级源；主要用于公司级补证和负面排雷。
     typical_args:
       stock_code: "{code}"
       stock_name: "{name}"
@@ -543,6 +553,7 @@ tools:
       - provider_status
     combo_hints:
       - 与 search_stock_news 结果一致 = 新闻证据更稳。
+      - 仍需回到 product_export / domestic_substitution_policy 摘要证据，不能只凭 ticker 新闻定性主题。
       - 单源失败只能降级，不能据此判断无新闻。
     cost: expensive
     failure_modes:
@@ -551,8 +562,9 @@ tools:
   - tool: search_comprehensive_intel
     priority: 37
     when_to_use: >-
-      当主题催化需要综合新闻、风险事件、行业趋势和分析摘要时调用。
-      用于补齐单一新闻搜索覆盖不到的风险和行业背景。
+      当主题催化需要补齐产品品类出口、国产替代政策、行业趋势、风险事件和分析摘要时调用。
+      查询方向优先围绕「产品品类 + 出口/订单/海外需求」或「产品品类 + 国产替代/信创/自主可控/政策」，
+      再映射回候选公司的产业链角色。
     typical_args:
       stock_code: "{code}"
       stock_name: "{name}"
@@ -564,7 +576,8 @@ tools:
       - source_chain
       - errors
     combo_hints:
-      - 综合情报支持主题且无重大负面 = 主题催化证据增强。
+      - 综合情报若能直接形成 product_export 或 domestic_substitution_policy 摘要，主题催化证据增强。
+      - 只搜到公司泛新闻但没有品类出口/政策证据时，最多作为 business_fit 或 funding_validation。
       - 查到澄清、监管、减持或业绩风险时，优先降级。
     cost: expensive
     failure_modes:

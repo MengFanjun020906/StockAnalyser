@@ -156,6 +156,7 @@ ANALYSIS_DIMENSIONS = """\
    - 判断趋势、震荡、突破、回调、风险释放、情绪过热等状态。
    - 可结合波动率、趋势强度、板块轮动、资金行为和消息催化。
    - 单股 `entry_analysis` / `position_review` 中，若系统提供 `symbol_regime_probability`，只能把它作为该股票在当前市场 regime 下的历史 forward-return / reentry_reference 弱证据，不得直接翻译成买卖动作。
+   - 单股 `entry_analysis` / `position_review` 中，若系统提供 `single_stock_theme_profile`，必须区分 `theme_regime`、`stock_role` 和 `momentum_setup`：只有 `mainline_markup/mainline_divergence + core_leader/core_midcap/high_beta_leader` 才允许把超买解释为强势但仍需承接确认；`climax_extension`、`theme_risk_off`、`late_chaser`、`exhaustion_candidate` 或 `unrelated` 不能升级为主动追高。
 
 3. 信号生成（signal_generation）
    - 趋势突破信号
@@ -339,6 +340,7 @@ Planner 必须先选择主维度，再选择辅助维度。
 | `sector_industry` | 个股是否跟随主线或板块拖累 | 板块强弱、行业位置、主题共振 |
 | `backtest_memory` | 需要校准策略可靠性 | 历史信号表现，只能辅助权重 |
 | `symbol_regime_probability` | 单股入场分析、持仓复盘、TRIM 后买回参考 | 当前市场 regime 下该股票历史 forward-return、路径画像和 reentry_reference；只能辅助点位与风险权重 |
+| `single_stock_theme_profile` | 系统已预取的单股主线动量画像 | 判断该股是否属于当前主题、是核心还是后排、超买应解释为强势确认还是衰竭风险；不能覆盖账户风控 |
 
 ### watchlist_scan 规划规则
 
@@ -638,8 +640,8 @@ TOOL_USE_POLICY = """\
 
 - 先问“我缺什么证据”，再决定工具。
 - 不要为了显得全面而调用所有工具。
-- 对持仓诊断，优先需要 portfolio_snapshot、realtime_quote、trend_analysis、capital_flow、chip_distribution、news_intel、symbol_regime_probability 和市场 regime 约束。
-- 对开仓分析，优先需要 realtime_quote、trend_analysis、capital_flow、chip_distribution、fundamental_analysis、sector_industry、news_intel、symbol_regime_probability 和市场 regime 约束。
+- 对持仓诊断，优先需要 portfolio_snapshot、realtime_quote、trend_analysis、capital_flow、chip_distribution、news_intel、symbol_regime_probability、系统预取的 single_stock_theme_profile 和市场 regime 约束。
+- 对开仓分析，优先需要 realtime_quote、trend_analysis、capital_flow、chip_distribution、fundamental_analysis、sector_industry、news_intel、symbol_regime_probability、系统预取的 single_stock_theme_profile 和市场 regime 约束。
 - watchlist_scan 的候选池规则、触发边界、压缩注入格式和逐股取证要求见 `Watchlist Candidate Pool Protocol`；本节不重复展开。
 - 对事件影响，优先需要 news_intel，并结合持仓成本、仓位和关键技术位。
 - 对融资融券账户，必须检查 margin_debt、maintenance_ratio、risk_line_ratio 或等价风险字段。
@@ -1197,8 +1199,8 @@ ENTRY_ANALYSIS_OUTPUT_FORMAT = """\
 - `当前价` 必须按工具返回的 `price_label` 展示；休市或非交易日时写“最新可用价（截至YYYY-MM-DD）”，不得写成“今日最新价”。
 - `行情口径` 必须来自 `market_session`、`query_date`、`quote_trade_date` 或 `freshness_note`；无法确认时写“时效未确认”并降低动作强度。
 - 理想入场区间优先来自支撑位、回踩位、均线、箱体下沿、筹码成本、估值安全边际或明确工具证据。
-- 次优入场区间用于突破确认或错过理想买点后的备选方案，不得等同于追高。
-- 禁止追高线必须高于当前计划允许买入的合理区间；若数据不足，写“突破后仍需回踩确认，不给追高线”。
+- 次优入场区间用于突破确认或错过理想买点后的备选方案，不得等同于无条件追高。
+- 禁止追高线是回踩/低吸计划的失效边界；对突破、涨停、资金接力计划，应表达为“超过该条件后必须看到承接确认，否则不买”，不能仅因高乖离直接淘汰强势候选。
 - 首仓比例必须受风险偏好、交易周期、账户现金和单票上限约束；没有账户信息时，默认给保守比例或写“缺失”。
 - 止损位必须与入场区间成套出现；无法给止损时，不得建议 OPEN。
 - 目标位必须可复盘，来自压力位、历史高点、估值区间、趋势通道或明确假设；禁止拍脑袋给目标价。

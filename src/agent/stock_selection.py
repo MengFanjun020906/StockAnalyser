@@ -1909,7 +1909,7 @@ def _apply_quote_snapshot_to_deep_dive(
         price_text = f"{price:g}" if isinstance(price, (int, float)) else str(price)
         if summary.get("action_bias") == "reject":
             if not entry_quality.get("no_chase_line"):
-                entry_quality["no_chase_line"] = f"当前价位（约{price_text}）为禁止追高区域"
+                entry_quality["no_chase_line"] = f"当前价位（约{price_text}）已超过回踩型合理区间；除非重新出现承接确认，否则不追"
         elif not entry_quality.get("no_chase_line"):
             entry_quality["no_chase_line"] = _default_no_chase_condition()
 
@@ -3928,7 +3928,7 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
                 "pullback_trigger": "回踩关键支撑或均线不破后重新放量",
                 "no_chase_line": "高于关键压力位且乖离扩大时不追",
                 "stop_loss": "跌破关键支撑或账户止损线",
-                "failure_condition": "跌破关键支撑、资金转弱或出现重大利空",
+                "failure_condition": "跌破关键支撑、资金转弱、突破后无承接或出现重大利空",
                 "target_1": "前高或筹码压力位",
                 "target_2": "趋势延伸位",
                 "risk_reward_comment": "证据不足时只给条件型计划。",
@@ -3936,7 +3936,7 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             "dimension_summary": _dimension_summary_from_evidence(evidence),
             "key_evidence": [],
             "risk_flags": risks,
-            "failure_conditions": ["跌破关键支撑", "出现重大利空", "价格高于追高线且无回踩确认"],
+            "failure_conditions": ["跌破关键支撑", "出现重大利空", "价格高于追高线且既无回踩确认也无承接确认"],
             "missing_evidence": _missing_from_evidence(evidence),
             "tool_failures": _tool_failures_from_evidence(evidence),
             "symbol_regime_probability": symbol_regime_probability,
@@ -4112,7 +4112,7 @@ def _meta_risk_constraints(record: Dict[str, Any], item: Dict[str, Any], market:
     for risk in _short_list(item.get("main_risks") or record.get("risks"), 5):
         constraints.append({"constraint": str(risk), "source": "desk_or_deep_dive_risk"})
     if item.get("no_chase_line"):
-        constraints.append({"constraint": f"超过追高线不得追高: {item.get('no_chase_line')}", "source": "deep_dive"})
+        constraints.append({"constraint": f"超过追高线后必须有回踩或承接确认: {item.get('no_chase_line')}", "source": "deep_dive"})
     regime = str(market.get("regime") or "")
     if regime in {"risk_off", "panic", "trending_down"}:
         constraints.append({"constraint": f"市场状态 {regime} 下不得主动追高或无条件开仓", "source": "detect_market_regime"})
@@ -4504,7 +4504,7 @@ def _fallback_meta_orchestrator(ctx: SelectionRunContext) -> Dict[str, Any]:
         asset_regime = _asset_regime_from_setup(setup_type, item, market)
         invalidation_text = item.get("stop_loss") or item.get("failure_condition") or "跌破关键结构位则论点失效"
         mean_anchor_text = item.get("ideal_entry_zone") or item.get("no_chase_line") or "等待回踩确认"
-        no_chase_text = item.get("no_chase_line") or "高于追高线且无回踩确认时禁止追高"
+        no_chase_text = item.get("no_chase_line") or "高于追高线且无回踩/承接确认时不追"
         package = {
             "stock": {"code": code, "name": item.get("name") or code, "market": item.get("market") or ctx.market},
             "meta_analysis": {
@@ -4662,7 +4662,7 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
             "stop_loss_condition": (selected_scenario or {}).get("stop_loss") or summary.get("stop_loss") or "跌破关键支撑",
             "take_profit_condition": "到达第一压力位分批止盈",
             "review_trigger": "下一交易日开盘或关键价格触发",
-            "auto_downgrade_rules": ["如果价格高于 no_chase_line，降级为 wait"],
+            "auto_downgrade_rules": ["如果价格高于 no_chase_line 且无回踩/承接确认，降级为 wait"],
             "reason": "来自单股深度分析和 Meta/点位计算条件矩阵的条件型计划。",
             "risk_flags": summary.get("main_risks") or [],
             "pricing_scenario": (selected_scenario or {}).get("scenario_name"),
@@ -4695,7 +4695,7 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
             "positions_plan": plans,
             "execution_matrix": pricing_matrix,
             "cash_plan": {"reserved_cash_pct": max(0, 100 - total_pct), "reason": "保留现金等待确认和回撤机会。"},
-            "risk_controls": ["价格高于追高线不买", "工具证据缺失时降低动作强度"],
+            "risk_controls": ["价格高于追高线且无回踩/承接确认时不买", "工具证据缺失时降低动作强度"],
             "missing_evidence": [],
         },
         "full_ref": "portfolio_allocation.json",
@@ -4859,7 +4859,7 @@ def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
         "status": "ok",
         "summary": {
             "opposing_summary": "反方认为当前选股和仓位配置仍需防范追高、证据缺口和账户风险。",
-            "top_risk_points": ["候选可能依赖热点板块", "资金面或消息面可能缺失", "价格高于追高线时不宜开仓"],
+            "top_risk_points": ["候选可能依赖热点板块", "资金面或消息面可能缺失", "价格高于追高线且无回踩/承接确认时不宜开仓"],
             "top_evidence_gaps": _all_missing_evidence(ctx),
             "recommended_verdict": "accept_with_changes",
         },
@@ -4869,7 +4869,7 @@ def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
                 "risk_points": ["追高风险", "数据缺口", "仓位执行风险"],
                 "evidence_gaps": _all_missing_evidence(ctx),
                 "failure_scenarios": ["热点退潮", "开盘跳高后回落", "重大利空出现"],
-                "plan_changes_required": ["高于 no_chase_line 时降级为 wait"],
+                "plan_changes_required": ["高于 no_chase_line 且无回踩/承接确认时降级为 wait"],
             },
             "missing_evidence": _all_missing_evidence(ctx),
         },
@@ -4896,7 +4896,7 @@ def _fallback_judge_decision(ctx: SelectionRunContext) -> Dict[str, Any]:
             "winner": "mixed",
             "accepted_arguments": ["保留条件型执行计划"],
             "rejected_arguments": ["证据不足时立即开仓"],
-            "required_plan_changes": ["高于 no_chase_line 降级为 wait"],
+            "required_plan_changes": ["高于 no_chase_line 且无回踩/承接确认时降级为 wait"],
             "risk_controls": ["不追高", "先确认行情口径", "资金/消息缺失时降低仓位"],
             "fallback_path": {
                 "when": "wait_for_more_data",
@@ -5931,7 +5931,7 @@ def _execution_mode(item: Dict[str, Any]) -> str:
 
 
 def _default_no_chase_condition() -> str:
-    return f"高开超过默认阈值 {_format_score(_no_chase_pct_default())}% 且无回踩确认不追；缩量冲高或板块分化不追。"
+    return f"高开超过默认阈值 {_format_score(_no_chase_pct_default())}% 时只作为条件边界；无回踩确认、无承接确认、缩量冲高或板块分化时不追。"
 
 
 def _is_observable_item(item: Dict[str, Any]) -> bool:

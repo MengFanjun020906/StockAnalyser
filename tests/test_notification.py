@@ -170,7 +170,11 @@ class TestNotificationServiceSendToMethods(unittest.TestCase):
         ok = service.send("A" * 6000)
 
         self.assertTrue(ok)
-        self.assertAlmostEqual(mock_post.call_count, 4, delta=1)
+        self.assertGreater(mock_post.call_count, 1)
+        for call in mock_post.call_args_list:
+            payload = call.kwargs["json"]
+            chunk = payload["content"]
+            self.assertLessEqual(len(chunk), cfg.discord_max_words)
 
 
 class TestNotificationServiceReportGeneration(unittest.TestCase):
@@ -422,7 +426,17 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         ok = service.send("A" * 6000)
 
         self.assertTrue(ok)
-        self.assertAlmostEqual(mock_post.call_count, 4, delta=1)
+        feishu_calls = [
+            call
+            for call in mock_post.call_args_list
+            if call.args and call.args[0] == "https://feishu.example"
+        ]
+        self.assertGreater(len(feishu_calls), 1)
+        for call in feishu_calls:
+            payload = call.kwargs["json"]
+            self.assertEqual(payload.get("msg_type"), "interactive")
+            chunk = payload["card"]["elements"][0]["text"]["content"]
+            self.assertLessEqual(len(chunk.encode("utf-8")), cfg.feishu_max_bytes)
 
     @mock.patch("src.notification.get_config")
     @mock.patch("requests.post")

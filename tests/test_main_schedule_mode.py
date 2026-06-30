@@ -269,6 +269,10 @@ class MainScheduleModeTestCase(unittest.TestCase):
         with patch(
             "src.core.config_manager.ConfigManager.read_config_map",
             side_effect=RuntimeError("boom"),
+        ), patch.object(
+            main,
+            "_INITIAL_PROCESS_ENV",
+            {},
         ):
             provider = main._build_schedule_time_provider("18:00")
 

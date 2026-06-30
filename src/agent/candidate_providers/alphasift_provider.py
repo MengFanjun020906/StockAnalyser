@@ -38,6 +38,8 @@ class AlphaSiftStrategy:
     tags: List[str]
     hard_filters: Dict[str, Any] = field(default_factory=dict)
     factor_weights: Dict[str, float] = field(default_factory=dict)
+    scoring_profile: Dict[str, Any] = field(default_factory=dict)
+    risk_profile: Dict[str, Any] = field(default_factory=dict)
     ranking_hints: str = ""
     max_output: int = 5
 
@@ -259,6 +261,8 @@ def _load_strategy_file(path: Path) -> AlphaSiftStrategy:
         raise ValueError("strategy disabled or missing screening section")
     hard_filters = screening.get("hard_filters") or {}
     factor_weights = screening.get("factor_weights") or {}
+    scoring_profile = screening.get("scoring_profile") or {}
+    risk_profile = screening.get("risk_profile") or {}
     return AlphaSiftStrategy(
         name=str(data.get("name") or path.stem),
         display_name=str(data.get("display_name") or data.get("name") or path.stem),
@@ -267,6 +271,8 @@ def _load_strategy_file(path: Path) -> AlphaSiftStrategy:
         tags=[str(item) for item in (data.get("tags") or [])],
         hard_filters=hard_filters if isinstance(hard_filters, dict) else {},
         factor_weights={str(k): float(v) for k, v in factor_weights.items()} if isinstance(factor_weights, dict) else {},
+        scoring_profile=scoring_profile if isinstance(scoring_profile, dict) else {},
+        risk_profile=risk_profile if isinstance(risk_profile, dict) else {},
         ranking_hints=str(screening.get("ranking_hints") or ""),
         max_output=int(screening.get("max_output") or 5),
     )
@@ -498,8 +504,8 @@ def _apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
 def _score_features(df: pd.DataFrame, strategy: AlphaSiftStrategy) -> pd.DataFrame:
     result = df.copy()
     factor_scores = {
-        "momentum": _momentum_score(result),
-        "activity": _activity_score(result),
+        "momentum": _momentum_score(result, strategy.scoring_profile),
+        "activity": _activity_score(result, strategy.scoring_profile),
         "stability": _stability_score(result),
         "reversal": _reversal_score(result),
         "liquidity": _liquidity_score(result),
@@ -515,24 +521,35 @@ def _score_features(df: pd.DataFrame, strategy: AlphaSiftStrategy) -> pd.DataFra
     for factor, weight in weights.items():
         result[f"factor_{factor}_score"] = factor_scores[factor].round(4)
         result["screen_score"] += factor_scores[factor] * (max(weight, 0.0) / total)
+    result["screen_score"] -= _profile_risk_penalty(result, strategy.scoring_profile, strategy.risk_profile)
     result["screen_score"] = result["screen_score"].clip(0, 100)
     return result
 
 
-def _momentum_score(df: pd.DataFrame) -> pd.Series:
+def _momentum_score(df: pd.DataFrame, profile: Dict[str, Any]) -> pd.Series:
     score = pd.Series(55.0, index=df.index)
-    score += pd.to_numeric(df["change_pct"], errors="coerce").fillna(0).clip(-6, 8) * 3.0
+    chase_start = _profile_float(profile, "momentum_chase_start_pct", 7.0)
+    chase_slope = _profile_float(profile, "momentum_chase_penalty_slope", 10.0)
+    change_pct = pd.to_numeric(df["change_pct"], errors="coerce").fillna(0)
+    score += change_pct.clip(-6, 8) * 3.0
+    score -= (change_pct - chase_start).clip(lower=0) * chase_slope
     score += pd.to_numeric(df["change_60d"], errors="coerce").fillna(0).clip(-30, 45) * 0.4
     score += (pd.to_numeric(df["signal_score"], errors="coerce").fillna(50) - 50) * 0.25
     return score.clip(0, 100)
 
 
-def _activity_score(df: pd.DataFrame) -> pd.Series:
+def _activity_score(df: pd.DataFrame, profile: Dict[str, Any]) -> pd.Series:
     volume_ratio = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(1.0)
     turnover = pd.to_numeric(df["turnover_rate"], errors="coerce").fillna(0.0)
+    ideal_volume_ratio = _profile_float(profile, "activity_ideal_volume_ratio", 1.0)
+    high_volume_ratio = _profile_float(profile, "activity_high_volume_ratio", 8.0)
+    ideal_turnover = _profile_float(profile, "activity_ideal_turnover_rate", 0.0)
+    high_turnover = _profile_float(profile, "activity_high_turnover_rate", 20.0)
     score = 55 + (volume_ratio - 1.0).clip(-1, 5) * 9 + turnover.clip(0, 12) * 2.2
-    score -= (volume_ratio - 8).clip(lower=0) * 7
-    score -= (turnover - 20).clip(lower=0) * 4
+    score += (volume_ratio - ideal_volume_ratio).abs().clip(0, 3) * -1.5
+    score += (turnover - ideal_turnover).abs().clip(0, 8) * -0.8
+    score -= (volume_ratio - high_volume_ratio).clip(lower=0) * 7
+    score -= (turnover - high_turnover).clip(lower=0) * 4
     return score.clip(0, 100)
 
 
@@ -555,6 +572,38 @@ def _liquidity_score(df: pd.DataFrame) -> pd.Series:
 
     amount = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
     return (np.log10(amount.clip(lower=1)) * 12 - 40).clip(0, 100)
+
+
+def _profile_risk_penalty(
+    df: pd.DataFrame,
+    scoring_profile: Dict[str, Any],
+    risk_profile: Dict[str, Any],
+) -> pd.Series:
+    penalty = pd.Series(0.0, index=df.index)
+    change_pct = pd.to_numeric(df["change_pct"], errors="coerce").fillna(0)
+    volume_ratio = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(1)
+    turnover = pd.to_numeric(df["turnover_rate"], errors="coerce").fillna(0)
+    signal_score = pd.to_numeric(df["signal_score"], errors="coerce").fillna(50)
+
+    chase_change = _profile_float(risk_profile, "chase_change_pct", _profile_float(scoring_profile, "stability_hot_change_pct", 9.0))
+    abnormal_volume = _profile_float(risk_profile, "abnormal_volume_ratio", _profile_float(scoring_profile, "activity_high_volume_ratio", 8.0))
+    high_turnover = _profile_float(risk_profile, "high_turnover_rate", _profile_float(scoring_profile, "activity_high_turnover_rate", 20.0))
+    weak_signal = _profile_float(risk_profile, "weak_signal_score", 0.0)
+
+    penalty += (change_pct - chase_change).clip(lower=0) * 5.0
+    penalty += (volume_ratio - abnormal_volume).clip(lower=0) * 4.0
+    penalty += (turnover - high_turnover).clip(lower=0) * 2.0
+    if weak_signal > 0:
+        penalty += (weak_signal - signal_score).clip(lower=0) * 0.35
+    return penalty.clip(0, 40)
+
+
+def _profile_float(profile: Dict[str, Any], key: str, default: float) -> float:
+    try:
+        value = float(profile.get(key))
+    except (TypeError, ValueError):
+        return float(default)
+    return value
 
 
 def _candidate_payload(row: pd.Series, strategy: AlphaSiftStrategy) -> Dict[str, Any]:

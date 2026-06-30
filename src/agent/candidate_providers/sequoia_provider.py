@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -75,6 +76,12 @@ STRATEGY_SPECS: Dict[str, SequoiaStrategySpec] = {
         tags=["rps", "relative_strength", "breakout"],
         reason="120日相对强度位于市场前10%，且收盘价接近120日滚动高点。",
     ),
+    "private_placement": SequoiaStrategySpec(
+        name="private_placement",
+        min_bars=0,
+        tags=["private_placement", "announcement", "event"],
+        reason="近 7 天存在定向增发公告，属于事件型候选，需要后续核实发行对象、价格和摊薄影响。",
+    ),
 }
 
 
@@ -93,33 +100,52 @@ class SequoiaCandidateProvider:
         effective_limit = max(1, min(int(limit or 8), 50))
         strategies = _normalize_strategy_names(strategy_names)
         diagnostics: List[Dict[str, Any]] = []
+        event_strategies = [name for name in strategies if name == "private_placement"]
+        bar_strategies = [name for name in strategies if name != "private_placement"]
+        candidates: List[Dict[str, Any]] = []
 
-        validation_error = self._validate_db()
-        if validation_error:
+        for event_strategy in event_strategies:
+            event_candidates, event_diagnostic = _run_event_strategy(event_strategy)
+            diagnostics.append(event_diagnostic)
+            candidates.extend(event_candidates)
+
+        validation_error = self._validate_db() if bar_strategies else None
+        if validation_error and not candidates:
             return {
                 "status": "unavailable",
                 "provider": "sequoia",
                 "db_path": self.db_path,
                 "candidates": [],
-                "diagnostics": [{"source": "sequoia_db", "status": "unavailable", "error": validation_error}],
+                "diagnostics": [
+                    *diagnostics,
+                    {"source": "sequoia_db", "status": "unavailable", "error": validation_error},
+                ],
                 "error": validation_error,
             }
+        if validation_error:
+            diagnostics.append({"source": "sequoia_db", "status": "unavailable", "error": validation_error})
+            bars = pd.DataFrame()
+        elif bar_strategies:
+            try:
+                bars = self._load_bars()
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                logger.warning("Sequoia candidate DB load failed: %s", message)
+                if not candidates:
+                    return {
+                        "status": "failed",
+                        "provider": "sequoia",
+                        "db_path": self.db_path,
+                        "candidates": [],
+                        "diagnostics": [{"source": "stock_daily", "status": "failed", "error": message}],
+                        "error": message,
+                    }
+                diagnostics.append({"source": "stock_daily", "status": "failed", "error": message})
+                bars = pd.DataFrame()
+        else:
+            bars = pd.DataFrame()
 
-        try:
-            bars = self._load_bars()
-        except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            logger.warning("Sequoia candidate DB load failed: %s", message)
-            return {
-                "status": "failed",
-                "provider": "sequoia",
-                "db_path": self.db_path,
-                "candidates": [],
-                "diagnostics": [{"source": "stock_daily", "status": "failed", "error": message}],
-                "error": message,
-            }
-
-        if bars.empty:
+        if bars.empty and bar_strategies and not candidates:
             return {
                 "status": "empty",
                 "provider": "sequoia",
@@ -128,9 +154,8 @@ class SequoiaCandidateProvider:
                 "diagnostics": [{"source": "stock_daily", "status": "empty"}],
             }
 
-        candidates: List[Dict[str, Any]] = []
-        latest_date = str(bars["date"].max())
-        for strategy_name in strategies:
+        latest_date = str(bars["date"].max()) if not bars.empty else None
+        for strategy_name in bar_strategies:
             strategy_candidates = self._run_strategy(strategy_name, bars)
             diagnostics.append({
                 "source": f"sequoia:{strategy_name}",
@@ -229,6 +254,9 @@ def _normalize_strategy_names(strategy_names: Optional[Sequence[str]]) -> List[s
         "shakeout": "limit_up_shakeout",
         "limit_down": "uptrend_limit_down",
         "rps": "rps_breakout",
+        "placement": "private_placement",
+        "private": "private_placement",
+        "定增": "private_placement",
     }
     result: List[str] = []
     for name in raw:
@@ -350,6 +378,67 @@ def _run_rps_breakout(bars: pd.DataFrame) -> List[Dict[str, Any]]:
         metrics = {"rps": row["rps"], "pct_change_120": row["pct_change"] * 100, "roll_high_120": row["roll_high"]}
         candidates.append(_candidate_payload(symbol, "rps_breakout", row, score, {**common_metrics, **metrics}))
     return candidates
+
+
+def _run_event_strategy(strategy_name: str) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if strategy_name != "private_placement":
+        return [], {"source": f"sequoia:{strategy_name}", "status": "unsupported"}
+    try:
+        import akshare as ak
+
+        df = ak.stock_qbzf_em()
+    except Exception as exc:
+        return [], {
+            "source": "sequoia:private_placement",
+            "status": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    candidates = _private_placement_candidates(df)
+    return candidates, {
+        "source": "sequoia:private_placement",
+        "status": "ok" if candidates else "empty",
+        "count": len(candidates),
+    }
+
+
+def _private_placement_candidates(df: Any, *, today: Optional[date] = None) -> List[Dict[str, Any]]:
+    if df is None or getattr(df, "empty", True):
+        return []
+    work = pd.DataFrame(df).copy()
+    if "发行方式" in work.columns:
+        work = work[work["发行方式"].astype(str) == "定向增发"]
+    if work.empty or "发行日期" not in work.columns or "股票代码" not in work.columns:
+        return []
+    current_date = today or date.today()
+    cutoff = current_date - timedelta(days=7)
+    work["发行日期"] = pd.to_datetime(work["发行日期"], errors="coerce")
+    work = work.dropna(subset=["发行日期"])
+    work = work[work["发行日期"].dt.date >= cutoff]
+    if work.empty:
+        return []
+    work = work.sort_values("发行日期", ascending=False)
+    by_code: Dict[str, Dict[str, Any]] = {}
+    for _, row in work.iterrows():
+        code_match = pd.Series([row.get("股票代码")]).astype(str).str.extract(r"(\d{6})").iloc[0, 0]
+        code = str(code_match or "").strip()
+        if not code or code in by_code:
+            continue
+        latest_date = _format_date(row.get("发行日期"))
+        amount = _jsonable_metrics({"amount": row.get("实际募集资金总额"), "issue_price": row.get("增发价格")})
+        metrics = {
+            **amount,
+            "issue_method": str(row.get("发行方式") or "定向增发"),
+            "announcement_date": latest_date,
+        }
+        by_code[code] = _candidate_payload(
+            code,
+            "private_placement",
+            row,
+            70.0,
+            metrics,
+        )
+        by_code[code]["latest_date"] = latest_date
+    return list(by_code.values())
 
 
 def _common_technical_metrics(df: pd.DataFrame) -> Dict[str, Any]:
@@ -511,6 +600,7 @@ def _display_strategy_names(names: Iterable[Any]) -> List[str]:
         "limit_up_shakeout": "涨停洗盘",
         "uptrend_limit_down": "上升趋势跌停错杀",
         "rps_breakout": "RPS 强势突破",
+        "private_placement": "定增公告事件",
         "breakout": "突破",
         "rps": "RPS 强势",
         "relative_strength": "相对强势",
