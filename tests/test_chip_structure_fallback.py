@@ -177,7 +177,7 @@ class TestFillChipStructureIfNeeded(unittest.TestCase):
         chip = self._make_chip()
         fill_chip_structure_if_needed(result, chip)
         cs = result.dashboard["data_perspective"]["chip_structure"]
-        self.assertEqual(cs["profit_ratio"], "65.0%")  # LLM value kept
+        self.assertEqual(cs["profit_ratio"], "67.0%")  # source data overrides LLM precision
         self.assertEqual(cs["avg_cost"], 1850.0)  # filled from chip
         self.assertEqual(cs["concentration"], "11.00%")  # filled from chip
         self.assertEqual(cs["chip_health"], "健康")  # filled from chip
@@ -191,7 +191,7 @@ class TestFillChipStructureIfNeeded(unittest.TestCase):
         self.assertEqual(cs["profit_ratio"], "67.0%")
         self.assertEqual(cs["chip_health"], "健康")
 
-    def test_no_overwrite_valid_llm_values(self) -> None:
+    def test_source_data_overwrites_valid_llm_values(self) -> None:
         result = self._make_result(
             dashboard={
                 "data_perspective": {
@@ -207,9 +207,9 @@ class TestFillChipStructureIfNeeded(unittest.TestCase):
         chip = self._make_chip()
         fill_chip_structure_if_needed(result, chip)
         cs = result.dashboard["data_perspective"]["chip_structure"]
-        self.assertEqual(cs["profit_ratio"], "70.0%")
-        self.assertEqual(cs["avg_cost"], 1900.0)
-        self.assertEqual(cs["concentration"], "10.00%")
+        self.assertEqual(cs["profit_ratio"], "67.0%")
+        self.assertEqual(cs["avg_cost"], 1850.0)
+        self.assertEqual(cs["concentration"], "11.00%")
         self.assertEqual(cs["chip_health"], "健康")
 
     def test_data_perspective_null_handled(self) -> None:

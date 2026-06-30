@@ -5,14 +5,17 @@ Search tools — wraps SearchService methods as agent-callable tools.
 Tools:
 - search_stock_news: search latest stock news
 - score_stock_news_sentiment: score company-level news and announcement events
+- search_stock_prompt_intel: search a user's single-stock prompt with the stock anchor
 - search_comprehensive_intel: multi-dimensional intelligence search
 """
 
 import logging
+import sys
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -89,6 +92,180 @@ def _to_tushare_ts_code(stock_code: str) -> str:
     if digits.startswith(("8", "4")):
         return f"{digits}.BJ"
     return f"{digits}.SZ"
+
+
+def _to_yfinance_symbol(stock_code: str) -> str:
+    code = str(stock_code or "").strip().upper()
+    if not code:
+        return ""
+    if any(code.endswith(suffix) for suffix in (".SS", ".SZ", ".BJ", ".HK")):
+        return code
+    if "." in code:
+        return code
+    digits = re.sub(r"\D", "", code)
+    if not digits:
+        return code
+    if len(digits) == 5:
+        return f"{digits}.HK"
+    if digits.startswith(("6", "9")):
+        return f"{digits}.SS"
+    if digits.startswith(("0", "2", "3")):
+        return f"{digits}.SZ"
+    if digits.startswith(("8", "4")):
+        return f"{digits}.BJ"
+    return code
+
+
+def _openinvest_path() -> Optional[Path]:
+    root = Path(__file__).resolve().parents[3] / "openInvest"
+    return root if root.exists() else None
+
+
+def _ensure_openinvest_import_path() -> Optional[Path]:
+    root = _openinvest_path()
+    if root is None:
+        return None
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    return root
+
+
+def _raw_openinvest_item_to_dict(item: Any) -> Dict[str, Any]:
+    return {
+        "title": str(getattr(item, "title", "") or ""),
+        "snippet": str(getattr(item, "snippet", "") or ""),
+        "url": str(getattr(item, "url", "") or ""),
+        "source": str(getattr(item, "src_name", "") or ""),
+        "published_date": getattr(item, "published_at", None),
+        "fetched_at": getattr(item, "fetched_at", None),
+        "raw_meta": getattr(item, "raw_meta", {}) or {},
+    }
+
+
+def _handle_search_openinvest_news(
+    stock_code: str = "",
+    stock_name: str = "",
+    symbol: str = "",
+    query: str = "",
+    include_yfinance: bool = True,
+    include_rss: bool = False,
+    include_ddgs: bool = False,
+    max_results: int = 8,
+    timeout_seconds: float = 12.0,
+) -> dict:
+    """Fetch ticker-linked/news-source items using openInvest's news adapters."""
+
+    started = time.time()
+    root = _ensure_openinvest_import_path()
+    if root is None:
+        return {
+            "status": "unavailable",
+            "provider": "openInvest.news_sources",
+            "results": [],
+            "results_count": 0,
+            "source_chain": [{"provider": "openInvest.news_sources", "result": "missing_openInvest_dir"}],
+            "errors": ["openInvest directory not found"],
+        }
+
+    resolved_name = _resolve_stock_name(stock_code, stock_name) if stock_code else str(stock_name or "").strip()
+    yf_symbol = str(symbol or "").strip() or _to_yfinance_symbol(stock_code)
+    effective_query = str(query or "").strip()
+    if not effective_query and (stock_code or resolved_name):
+        effective_query = " ".join(item for item in (resolved_name, stock_code, "新闻") if item)
+    effective_limit = max(1, min(20, int(max_results or 8)))
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    items: List[Dict[str, Any]] = []
+
+    try:
+        from services.news_sources import fetch_all
+        from services.news_sources.rss_feed import load_default_feeds
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "provider": "openInvest.news_sources",
+            "results": [],
+            "results_count": 0,
+            "source_chain": [{"provider": "openInvest.news_sources", "result": "import_failed"}],
+            "errors": [f"{type(exc).__name__}: {exc}"],
+        }
+
+    queries = [effective_query] if include_ddgs and effective_query else []
+    symbols = [yf_symbol] if include_yfinance and yf_symbol else []
+    rss_feeds = load_default_feeds()[:4] if include_rss else []
+    if include_ddgs:
+        try:
+            __import__("ddgs")
+        except Exception as exc:
+            source_chain.append({
+                "provider": "openInvest.ddgs_news",
+                "result": "missing_dependency",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            queries = []
+    if include_rss and not rss_feeds:
+        source_chain.append({"provider": "openInvest.rss_feed", "result": "no_feeds"})
+
+    raw_items, err, elapsed_ms = _run_search_task_with_timeout(
+        lambda: fetch_all(
+            queries=queries,
+            symbols=symbols,
+            rss_feeds=rss_feeds,
+            max_per_source=effective_limit,
+            extract_fulltext=False,
+            timeout_sec=max(1.0, float(timeout_seconds or 12.0)),
+        ),
+        max(1.0, float(timeout_seconds or 12.0) + 1.0),
+        "openinvest_news_sources",
+    )
+    if err:
+        errors.append(str(err))
+    for item in raw_items or []:
+        row = _raw_openinvest_item_to_dict(item)
+        if row.get("title") and row.get("url"):
+            items.append(row)
+
+    provider_counts: Dict[str, int] = {}
+    for item in items:
+        provider = str(item.get("source") or "unknown").split(":", 1)[0]
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+    for provider in ("yfinance", "rss", "ddgs"):
+        requested = (
+            (provider == "yfinance" and include_yfinance and bool(yf_symbol))
+            or (provider == "rss" and include_rss)
+            or (provider == "ddgs" and include_ddgs and bool(effective_query))
+        )
+        if requested:
+            source_chain.append({
+                "provider": f"openInvest.{provider}",
+                "result": "ok" if provider_counts.get(provider, 0) else "empty",
+                "count": provider_counts.get(provider, 0),
+            })
+
+    scored = score_news_items(items)
+    return {
+        "status": "ok" if items else ("error" if errors else "empty"),
+        "provider": "openInvest.news_sources",
+        "stock_code": _canonical_search_code(stock_code) if stock_code else "",
+        "stock_name": resolved_name,
+        "symbol": yf_symbol,
+        "query": effective_query,
+        "results_count": len(items),
+        "results": items[:effective_limit],
+        "message_score": scored["message_score"],
+        "message_state": scored["message_state"],
+        "event_tags": scored["event_tags"],
+        "risk_flags": scored["risk_flags"],
+        "source_chain": source_chain,
+        "errors": errors,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "fetch_elapsed_ms": elapsed_ms,
+        "notes": [
+            "yfinance source is ticker-linked and useful for US/HK/A-share Yahoo symbols",
+            "ddgs full search is optional and requires ddgs dependency",
+        ],
+    }
 
 
 def _persist_news_response(
@@ -367,6 +544,171 @@ def _handle_score_stock_news_sentiment(
     }
 
 
+_PROMPT_QUERY_STOPWORDS = {
+    "这个",
+    "一下",
+    "看看",
+    "帮我",
+    "有吗",
+    "了吗",
+    "如何",
+    "怎么样",
+    "为什么",
+    "什么",
+    "现在",
+    "最近",
+    "今天",
+    "昨天",
+}
+
+
+def _extract_prompt_search_terms(user_prompt: str, limit: int = 8) -> List[str]:
+    text = str(user_prompt or "").strip()
+    if not text:
+        return []
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._%+-]*|[\u4e00-\u9fa5]{2,}", text)
+    terms: List[str] = []
+    seen = set()
+    for token in tokens:
+        cleaned = token.strip(" ，。！？；;：:、（）()[]【】\"'")
+        if not cleaned or cleaned in _PROMPT_QUERY_STOPWORDS:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        terms.append(cleaned)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _build_stock_prompt_query(
+    stock_code: str,
+    stock_name: str = "",
+    user_prompt: str = "",
+    search_scope: str = "auto",
+) -> str:
+    code = str(stock_code or "").strip()
+    name = _resolve_stock_name(code, stock_name)
+    prompt = str(user_prompt or "").strip()
+    scope = str(search_scope or "auto").strip().lower()
+    terms = _extract_prompt_search_terms(prompt)
+    anchors = [item for item in [name, code] if item]
+    scope_terms: List[str] = []
+
+    if scope == "announcement" or any(word in prompt for word in ("公告", "年报", "季报", "互动", "投资者关系", "监管函", "问询函")):
+        scope_terms.extend(["公告", "投资者关系", "年报"])
+    elif scope == "price" or any(word in prompt for word in ("走势", "股价", "涨停", "跌停", "K线", "资金")):
+        scope_terms.extend(["走势", "股价", "资金"])
+    elif scope == "news" or any(word in prompt for word in ("新闻", "消息", "传闻", "订单", "合同", "合作")):
+        scope_terms.extend(["新闻", "消息"])
+    elif scope == "risk" or any(word in prompt for word in ("风险", "处罚", "减持", "诉讼", "立案", "问询")):
+        scope_terms.extend(["风险", "处罚", "减持", "问询"])
+
+    query_parts: List[str] = []
+    for item in anchors + terms + scope_terms:
+        if item and item not in query_parts:
+            query_parts.append(item)
+
+    if not query_parts:
+        return prompt
+    return " ".join(query_parts[:14])
+
+
+def _handle_search_stock_prompt_intel(
+    stock_code: str,
+    stock_name: Optional[str] = None,
+    user_prompt: str = "",
+    search_scope: str = "auto",
+    days: int = 30,
+    max_results: int = 6,
+) -> dict:
+    """Search the user's single-stock prompt using the configured search providers."""
+    service = _get_search_service()
+    resolved_name = _resolve_stock_name(stock_code, stock_name)
+    query = _build_stock_prompt_query(stock_code, resolved_name, user_prompt, search_scope)
+    effective_days = max(1, min(int(days or 30), 365))
+    effective_limit = max(1, min(int(max_results or 6), 10))
+
+    if not getattr(service, "is_available", False):
+        return {
+            "status": "disabled",
+            "stock_code": _canonical_search_code(stock_code),
+            "stock_name": resolved_name,
+            "user_prompt": str(user_prompt or ""),
+            "query": query,
+            "results_count": 0,
+            "results": [],
+            "source_chain": [{
+                "provider": "search_general_news",
+                "result": "disabled",
+                "days": effective_days,
+                "max_results": effective_limit,
+            }],
+            "errors": ["No search engine available (no API keys configured)"],
+        }
+
+    response = service.search_general_news(
+        query,
+        max_results=effective_limit,
+        days=effective_days,
+    )
+
+    if not getattr(response, "success", False):
+        return {
+            "status": "failed",
+            "stock_code": _canonical_search_code(stock_code),
+            "stock_name": resolved_name,
+            "user_prompt": str(user_prompt or ""),
+            "query": getattr(response, "query", query),
+            "provider": getattr(response, "provider", ""),
+            "results_count": 0,
+            "results": [],
+            "source_chain": [{
+                "provider": getattr(response, "provider", "") or "search_general_news",
+                "result": "failed",
+                "days": effective_days,
+                "max_results": effective_limit,
+            }],
+            "errors": [str(getattr(response, "error_message", "") or "search failed")],
+        }
+
+    _persist_news_response(
+        stock_code=stock_code,
+        stock_name=resolved_name,
+        dimension="prompt_intel",
+        response=response,
+    )
+
+    results = [
+        {
+            "title": r.title,
+            "snippet": r.snippet,
+            "url": r.url,
+            "source": r.source,
+            "published_date": r.published_date,
+        }
+        for r in getattr(response, "results", []) or []
+    ]
+    return {
+        "status": "ok" if results else "empty",
+        "stock_code": _canonical_search_code(stock_code),
+        "stock_name": resolved_name,
+        "user_prompt": str(user_prompt or ""),
+        "query": getattr(response, "query", query),
+        "provider": getattr(response, "provider", ""),
+        "results_count": len(results),
+        "results": results,
+        "source_chain": [{
+            "provider": getattr(response, "provider", "") or "search_general_news",
+            "result": "ok" if results else "empty",
+            "days": effective_days,
+            "max_results": effective_limit,
+        }],
+        "errors": [],
+    }
+
+
 search_stock_news_tool = ToolDefinition(
     name="search_stock_news",
     description="Search for the latest news articles about a specific stock. "
@@ -385,6 +727,135 @@ search_stock_news_tool = ToolDefinition(
         ),
     ],
     handler=_handle_search_stock_news,
+    category="search",
+)
+
+
+search_openinvest_news_tool = ToolDefinition(
+    name="search_openinvest_news",
+    description=(
+        "Fetch news through openInvest's multi-source news adapters. "
+        "Use this when configured search engines are unavailable or when ticker-linked Yahoo/yfinance "
+        "news may be more relevant than generic keyword search. DDGS/RSS are optional sources."
+    ),
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Optional stock code, e.g. '600519' or 'AAPL'. Used to infer a yfinance symbol.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name, e.g. '贵州茅台'.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="symbol",
+            type="string",
+            description="Optional explicit yfinance symbol, e.g. '600519.SS', '0700.HK', or 'AAPL'.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="query",
+            type="string",
+            description="Optional DDGS query. Only used when include_ddgs=true and ddgs is installed.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="include_yfinance",
+            type="boolean",
+            description="Whether to fetch yfinance ticker-linked news.",
+            required=False,
+            default=True,
+        ),
+        ToolParameter(
+            name="include_rss",
+            type="boolean",
+            description="Whether to fetch openInvest's default finance RSS feeds.",
+            required=False,
+            default=False,
+        ),
+        ToolParameter(
+            name="include_ddgs",
+            type="boolean",
+            description="Whether to fetch DuckDuckGo news via ddgs. Requires optional ddgs dependency.",
+            required=False,
+            default=False,
+        ),
+        ToolParameter(
+            name="max_results",
+            type="integer",
+            description="Max normalized news items to return (default: 8, max: 20).",
+            required=False,
+            default=8,
+        ),
+        ToolParameter(
+            name="timeout_seconds",
+            type="number",
+            description="Wall-clock timeout in seconds for the openInvest news fetch.",
+            required=False,
+            default=12.0,
+        ),
+    ],
+    handler=_handle_search_openinvest_news,
+    category="search",
+)
+
+
+search_stock_prompt_intel_tool = ToolDefinition(
+    name="search_stock_prompt_intel",
+    description=(
+        "Search the configured search engines for a user's single-stock question. "
+        "Use this when the user asks about one stock's announcements, latest events, regulatory letters, "
+        "orders/contracts, rumors, capital-flow news, or price-move context in natural language."
+    ),
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="Stock code, e.g. '688126'.",
+        ),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name in Chinese. If omitted, the local stock-name index is used.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="user_prompt",
+            type="string",
+            description="The user's original single-stock question, e.g. '有什么公告，你看看走势'.",
+        ),
+        ToolParameter(
+            name="search_scope",
+            type="string",
+            description="Optional search hint: auto, announcement, news, price, or risk.",
+            required=False,
+            default="auto",
+        ),
+        ToolParameter(
+            name="days",
+            type="integer",
+            description="Search freshness window in days (default: 30, max: 365).",
+            required=False,
+            default=30,
+        ),
+        ToolParameter(
+            name="max_results",
+            type="integer",
+            description="Max results to return (default: 6, max: 10).",
+            required=False,
+            default=6,
+        ),
+    ],
+    handler=_handle_search_stock_prompt_intel,
     category="search",
 )
 
@@ -590,6 +1061,8 @@ search_comprehensive_intel_tool = ToolDefinition(
 
 ALL_SEARCH_TOOLS = [
     search_stock_news_tool,
+    search_openinvest_news_tool,
+    search_stock_prompt_intel_tool,
     score_stock_news_sentiment_tool,
     search_comprehensive_intel_tool,
 ]

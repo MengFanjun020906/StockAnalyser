@@ -47,7 +47,12 @@ FINAL_JSON_REMINDER = (
     "不要输出 Markdown、解释、代码块或自然语言前后缀。"
     "顶层只能包含 data_quality、candidates、rejected 三个字段；"
     "单只股票结论必须放进 candidates 或 rejected 数组元素里，禁止把单只股票对象直接放在顶层。"
+    "示例 JSON："
+    '{"data_quality":{"freshness":"intraday","warnings":[]},"candidates":[],"rejected":[]}'
 )
+
+FINAL_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+FINAL_JSON_MAX_TOKENS = 8192
 
 
 ToolFn = Callable[..., Any]
@@ -68,9 +73,10 @@ class LLMTurn:
 
     tool_calls: List[LLMToolCall] = field(default_factory=list)
     text: str = ""
+    usage: Dict[str, Any] = field(default_factory=dict)
 
 
-LLMCallable = Callable[[List[Dict[str, Any]], List[Dict[str, Any]]], LLMTurn]
+LLMCallable = Callable[..., LLMTurn]
 """Signature for the LLM driver injected into a BaseExpert.
 
 Args:
@@ -80,6 +86,43 @@ Args:
 Returns:
     LLMTurn describing the model's response.
 """
+
+
+def _call_llm_driver(
+    llm: LLMCallable,
+    messages: List[Dict[str, Any]],
+    tool_decls: List[Dict[str, Any]],
+    *,
+    response_format: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
+) -> LLMTurn:
+    """Call an LLM driver with optional structured-output kwargs.
+
+    Existing tests and custom drivers may still implement the older
+    ``(messages, tool_decls)`` signature, so kwargs are best-effort.
+    """
+
+    kwargs: Dict[str, Any] = {}
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if kwargs:
+        try:
+            return llm(messages, tool_decls, **kwargs)
+        except TypeError as exc:
+            msg = str(exc)
+            if "unexpected keyword" not in msg and "positional" not in msg:
+                raise
+    return llm(messages, tool_decls)
+
+
+def _should_force_json_output(messages: Sequence[Dict[str, Any]]) -> bool:
+    if not messages:
+        return False
+    last = messages[-1]
+    content = str(last.get("content") or "").lower()
+    return "json" in content and "object" in content
 
 
 def _registry_lookup(tool_registry: Any, name: str) -> Any:
@@ -118,6 +161,23 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _completion_tokens(usage: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("completion_tokens") or usage.get("output_tokens")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _preview_text(text: str, limit: int = 1200) -> str:
+    cleaned = str(text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit] + "...[truncated]"
+
+
 class BaseExpert:
     """Bounded tool-calling expert. Subclasses define dimension/prompt/tools."""
 
@@ -146,6 +206,11 @@ class BaseExpert:
         self.max_llm_rounds = max(1, int(max_llm_rounds))
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.freshness = freshness
+        self._progress_events: Optional[List[Dict[str, Any]]] = None
+
+    def _tool_result_for_model(self, tool_name: str, result_payload: Any) -> Any:
+        """Return the tool result shape appended to the next LLM message."""
+        return result_payload
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -195,9 +260,39 @@ class BaseExpert:
 
         for round_idx in range(self.max_llm_rounds):
             try:
-                turn = self.llm(messages, list(self.tool_decls))
+                llm_started = time.time()
+                tool_decls = list(self.tool_decls)
+                final_json_turn = (not tool_decls) or _should_force_json_output(messages)
+                turn = _call_llm_driver(
+                    self.llm,
+                    messages,
+                    tool_decls,
+                    response_format=FINAL_JSON_RESPONSE_FORMAT if final_json_turn else None,
+                    max_tokens=FINAL_JSON_MAX_TOKENS if final_json_turn else None,
+                )
+                self._record_progress_event(
+                    {
+                        "source": "bounded_loop_progress",
+                        "phase": "llm_turn",
+                        "status": "tool_calls" if turn.tool_calls else "final_text",
+                        "round": round_idx,
+                        "tool_call_count": len(turn.tool_calls or []),
+                        "tools": [call.name for call in (turn.tool_calls or [])],
+                        "text_chars": len(turn.text or ""),
+                        "elapsed_ms": int((time.time() - llm_started) * 1000),
+                    }
+                )
             except Exception as exc:
                 errors.append(f"llm_call_failed_round_{round_idx}: {exc}")
+                self._record_progress_event(
+                    {
+                        "source": "bounded_loop_progress",
+                        "phase": "llm_turn",
+                        "status": "failed",
+                        "round": round_idx,
+                        "error": str(exc),
+                    }
+                )
                 return self._packet(
                     seeds=seeds,
                     status="failed",
@@ -237,6 +332,16 @@ class BaseExpert:
                                 "max_tool_calls": self.max_tool_calls,
                             }
                         )
+                        self._record_progress_event(
+                            {
+                                "source": "bounded_loop_progress",
+                                "phase": "tool_call_skipped",
+                                "status": "tool_call_cap_reached",
+                                "round": round_idx,
+                                "tool": call.name,
+                                "call_id": call.call_id,
+                            }
+                        )
                         messages.append(
                             {
                                 "role": "tool",
@@ -256,6 +361,16 @@ class BaseExpert:
                                 "source": "bounded_loop",
                                 "status": "tool_not_whitelisted",
                                 "tool": call.name,
+                            }
+                        )
+                        self._record_progress_event(
+                            {
+                                "source": "bounded_loop_progress",
+                                "phase": "tool_call_skipped",
+                                "status": "tool_not_whitelisted",
+                                "round": round_idx,
+                                "tool": call.name,
+                                "call_id": call.call_id,
                             }
                         )
                         tool_call_log.append(
@@ -286,6 +401,16 @@ class BaseExpert:
                                 "tool": call.name,
                             }
                         )
+                        self._record_progress_event(
+                            {
+                                "source": "bounded_loop_progress",
+                                "phase": "tool_call_skipped",
+                                "status": "tool_unavailable",
+                                "round": round_idx,
+                                "tool": call.name,
+                                "call_id": call.call_id,
+                            }
+                        )
                         tool_call_log.append(
                             {"tool": call.name, "status": "unavailable"}
                         )
@@ -305,24 +430,74 @@ class BaseExpert:
                     tool_calls_executed += 1
                     used_tools_any = True
                     call_started = time.time()
+                    self._record_progress_event(
+                        {
+                            "source": "bounded_loop_progress",
+                            "phase": "tool_call_start",
+                            "status": "started",
+                            "round": round_idx,
+                            "tool": call.name,
+                            "call_id": call.call_id,
+                            "arguments": _compact_progress_args(call.arguments),
+                        }
+                    )
                     try:
                         tool_result = fn(**(call.arguments or {}))
                         result_payload = _coerce_tool_result(tool_result)
+                        elapsed_ms = int((time.time() - call_started) * 1000)
                         tool_call_log.append(
                             {
                                 "tool": call.name,
                                 "status": "ok",
-                                "elapsed_ms": int((time.time() - call_started) * 1000),
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+                        self._record_progress_event(
+                            {
+                                "source": "bounded_loop_progress",
+                                "phase": "tool_call_end",
+                                "status": "ok",
+                                "round": round_idx,
+                                "tool": call.name,
+                                "call_id": call.call_id,
+                                "elapsed_ms": elapsed_ms,
                             }
                         )
                     except Exception as exc:
                         result_payload = {"status": "error", "reason": str(exc)}
+                        elapsed_ms = int((time.time() - call_started) * 1000)
                         tool_call_log.append(
                             {
                                 "tool": call.name,
                                 "status": "failed",
                                 "error": str(exc),
-                                "elapsed_ms": int((time.time() - call_started) * 1000),
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+                        self._record_progress_event(
+                            {
+                                "source": "bounded_loop_progress",
+                                "phase": "tool_call_end",
+                                "status": "failed",
+                                "round": round_idx,
+                                "tool": call.name,
+                                "call_id": call.call_id,
+                                "error": str(exc),
+                                "elapsed_ms": elapsed_ms,
+                            }
+                        )
+                    try:
+                        model_payload = _coerce_tool_result(
+                            self._tool_result_for_model(call.name, result_payload)
+                        )
+                    except Exception as exc:
+                        model_payload = result_payload
+                        diagnostics.append(
+                            {
+                                "source": "bounded_loop",
+                                "status": "tool_result_compaction_failed",
+                                "tool": call.name,
+                                "error": str(exc),
                             }
                         )
                     messages.append(
@@ -330,7 +505,7 @@ class BaseExpert:
                             "role": "tool",
                             "tool_call_id": call.call_id or call.name,
                             "name": call.name,
-                            "content": json.dumps(result_payload, ensure_ascii=False, default=str),
+                            "content": json.dumps(model_payload, ensure_ascii=False, default=str),
                         }
                     )
                 messages.append({"role": "user", "content": FINAL_JSON_REMINDER})
@@ -340,11 +515,39 @@ class BaseExpert:
             parsed = _safe_json_loads(turn.text)
             if parsed is None:
                 errors.append("final_output_not_json")
+                if not str(turn.text or "").strip():
+                    errors.append("final_output_empty_content")
+                completion_tokens = _completion_tokens(turn.usage)
+                if completion_tokens is not None and completion_tokens >= FINAL_JSON_MAX_TOKENS:
+                    errors.append("final_output_maybe_truncated")
+                diagnostics.append(
+                    {
+                        "source": "bounded_loop",
+                        "status": "final_output_not_json",
+                        "text_chars": len(turn.text or ""),
+                        "text_preview": _preview_text(turn.text),
+                        "completion_tokens": completion_tokens,
+                        "max_tokens": FINAL_JSON_MAX_TOKENS,
+                    }
+                )
                 return self._packet(
                     seeds=seeds,
                     status="failed",
                     candidates=[],
-                    rejected=[],
+                    rejected=[
+                        {
+                            "code": seed.code,
+                            "name": seed.name,
+                            "reason": "final_output_not_json",
+                            "evidence": [
+                                {
+                                    "tool": "llm_final_output",
+                                    "summary": _preview_text(turn.text) or "empty final output",
+                                }
+                            ],
+                        }
+                        for seed in seeds
+                    ],
                     diagnostics=diagnostics,
                     tool_calls=tool_call_log,
                     errors=errors,
@@ -461,6 +664,16 @@ class BaseExpert:
             errors=errors,
         )
 
+    def _record_progress_event(self, event: Dict[str, Any]) -> None:
+        """Expose in-flight LLM/tool progress to outer timeout guards."""
+
+        events = getattr(self, "_progress_events", None)
+        if not isinstance(events, list):
+            return
+        payload = dict(event)
+        payload.setdefault("ts_ms", int(time.time() * 1000))
+        events.append(payload)
+
     def _seed_summary(
         self,
         seeds: Sequence[SeedItem],
@@ -570,6 +783,18 @@ def _decl_name(decl: Dict[str, Any]) -> str:
     if fn and fn.get("name"):
         return str(fn["name"])
     return str(decl.get("name") or "")
+
+
+def _compact_progress_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for key in ("stock_code", "symbol", "code", "market", "period", "days", "timeout_seconds"):
+        if key in (arguments or {}):
+            value = arguments.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                compact[key] = value
+            else:
+                compact[key] = str(value)[:120]
+    return compact
 
 
 def _coerce_tool_result(value: Any) -> Any:

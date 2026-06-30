@@ -42,6 +42,7 @@ export interface AgentTraceRunRequest {
   default_stop_loss_pct?: number;
   investor_notes?: string;
   candidate_discovery_mode?: 'deterministic' | 'llm_expert_committee' | 'thesis_desk_committee';
+  resume_from_session_id?: string;
 }
 
 export interface AgentTraceEvent {
@@ -87,6 +88,8 @@ export interface AgentTraceRunResponse {
   debate?: Record<string, unknown> | null;
   stock_selection?: Record<string, unknown> | null;
   risk_gate?: Record<string, unknown> | null;
+  llm_telemetry?: Record<string, unknown> | null;
+  judge_sanity?: Record<string, unknown> | null;
   artifact_dir?: string | null;
   runtime_config?: Record<string, unknown> | null;
 }

@@ -256,6 +256,107 @@ class PortfolioService:
             )
             return {"id": int(row.id)}
 
+    def reset_account_baseline(
+        self,
+        *,
+        account_id: int,
+        as_of: date,
+        cash_amount: float = 0.0,
+        positions: Optional[List[Dict[str, Any]]] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Replace one account's event history with a point-in-time baseline."""
+        if cash_amount < 0:
+            raise ValueError("cash_amount must be >= 0")
+        reset_note = (note or "").strip() or "portfolio baseline reset"
+
+        with self.repo.portfolio_write_session() as session:
+            account = self._require_active_account_in_session(session=session, account_id=account_id)
+            baseline_positions: List[Dict[str, Any]] = []
+            seen_keys: Set[Tuple[str, str, str]] = set()
+            for item in positions or []:
+                symbol = self._normalize_symbol_for_storage(str(item.get("symbol") or ""))
+                if not symbol:
+                    raise ValueError("position symbol is required")
+                quantity = float(item.get("quantity") or 0.0)
+                price = float(item.get("price") or 0.0)
+                if quantity <= 0 or price <= 0:
+                    raise ValueError("position quantity and price must be > 0")
+                market = self._normalize_market(str(item.get("market") or account.market))
+                currency = self._normalize_currency(str(item.get("currency") or self._default_currency_for_market(market)))
+                key = (self._normalize_symbol_for_position(symbol), market, currency)
+                if key in seen_keys:
+                    raise ValueError(f"duplicate baseline position: {symbol}/{market}/{currency}")
+                seen_keys.add(key)
+                baseline_positions.append({
+                    "symbol": symbol,
+                    "market": market,
+                    "currency": currency,
+                    "quantity": quantity,
+                    "price": price,
+                })
+
+            cash_by_currency: Dict[str, float] = defaultdict(float)
+            for item in baseline_positions:
+                cash_by_currency[item["currency"]] += float(item["quantity"]) * float(item["price"])
+
+            deleted = self.repo.clear_account_events_in_session(session=session, account_id=account_id)
+            cash_count = 0
+            for currency, amount in sorted(cash_by_currency.items()):
+                if amount <= EPS:
+                    continue
+                self.repo.add_cash_ledger_in_session(
+                    session=session,
+                    account_id=account_id,
+                    event_date=as_of,
+                    direction="in",
+                    amount=float(amount),
+                    currency=currency,
+                    note=f"{reset_note}: position funding",
+                )
+                cash_count += 1
+            if cash_amount > EPS:
+                self.repo.add_cash_ledger_in_session(
+                    session=session,
+                    account_id=account_id,
+                    event_date=as_of,
+                    direction="in",
+                    amount=float(cash_amount),
+                    currency=self._normalize_currency(account.base_currency),
+                    note=f"{reset_note}: cash balance",
+                )
+                cash_count += 1
+
+            trade_count = 0
+            for item in baseline_positions:
+                self.repo.add_trade_in_session(
+                    session=session,
+                    account_id=account_id,
+                    trade_uid=None,
+                    symbol=item["symbol"],
+                    market=item["market"],
+                    currency=item["currency"],
+                    trade_date=as_of,
+                    side="buy",
+                    quantity=float(item["quantity"]),
+                    price=float(item["price"]),
+                    fee=0.0,
+                    tax=0.0,
+                    note=f"{reset_note}: baseline position",
+                    dedup_hash=None,
+                )
+                trade_count += 1
+
+        return {
+            "account_id": int(account_id),
+            "as_of": as_of.isoformat(),
+            "cash_amount": float(cash_amount),
+            "position_count": len(baseline_positions),
+            "cash_ledger_count": cash_count,
+            "trade_count": trade_count,
+            **deleted,
+        }
+
     def record_corporate_action(
         self,
         *,

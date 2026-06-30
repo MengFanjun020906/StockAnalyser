@@ -757,8 +757,8 @@ class Config:
     agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
-    agent_candidate_expert_timeout_seconds: float = 60.0  # Max seconds for one L1 candidate expert discovery packet
-    agent_seed_pool_total_limit: int = 20  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
+    agent_candidate_expert_timeout_seconds: float = 300.0  # Max seconds for one L1 candidate expert seed packet in development traces
+    agent_seed_pool_total_limit: int = 32  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
     agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
     agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
     agent_veto_gate_enabled: bool = True  # Enable shared bearish red-line veto gate (thesis_desk_committee); default only hard_risk_flags trigger
@@ -776,7 +776,7 @@ class Config:
     agent_regime_component_timeout_seconds: float = 25.0  # Max seconds for one market-regime auxiliary component
     agent_tushare_tool_timeout_seconds: float = 20.0  # Max seconds for one Tushare Agent tool request
     agent_seed_fact_max_workers: int = 12  # Max concurrent (seed, tool) workers before thesis desks
-    agent_seed_fact_tool_timeout_seconds: float = 12.0  # Max seconds for one SeedFactPacket tool call
+    agent_seed_fact_tool_timeout_seconds: float = 30.0  # Max seconds for one SeedFactPacket tool call
     agent_seed_fact_tools: List[str] = field(
         default_factory=lambda: [
             "analyze_price_structure",
@@ -959,7 +959,7 @@ class Config:
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = 3.0
     # Agent 显式资金流工具超时（秒）；资金流端点常慢于基本面聚合预算
-    agent_capital_flow_timeout_seconds: float = 15.0
+    agent_capital_flow_timeout_seconds: float = 30.0
     # 单能力失败重试次数（已包含首次）
     fundamental_retry_max: int = 1
     # 基本面上下文短 TTL（秒）
@@ -1507,13 +1507,13 @@ class Config:
             ),
             agent_candidate_expert_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS'),
-                60.0,
+                300.0,
                 field_name='AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
             agent_seed_pool_total_limit=parse_env_int(
                 os.getenv('AGENT_SEED_POOL_TOTAL_LIMIT'),
-                20,
+                32,
                 field_name='AGENT_SEED_POOL_TOTAL_LIMIT',
                 minimum=1,
                 maximum=40,
@@ -1602,7 +1602,7 @@ class Config:
             ),
             agent_seed_fact_tool_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS'),
-                12.0,
+                30.0,
                 field_name='AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS',
                 minimum=1.0,
             ),
@@ -1813,7 +1813,7 @@ class Config:
             ),
             agent_capital_flow_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS'),
-                15.0,
+                30.0,
                 field_name='AGENT_CAPITAL_FLOW_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),
@@ -2167,15 +2167,18 @@ class Config:
         """Resolve one env value, optionally preferring the persisted `.env` copy."""
         env_value = os.getenv(key)
         file_value = cls._get_env_file_value(key)
+        env_file_explicit = bool(os.getenv("ENV_FILE"))
 
         should_prefer_file = prefer_env_file or key in cls._WEBUI_RUNTIME_ENV_FILE_PRIORITY_KEYS
         if should_prefer_file and file_value is not None:
-            if env_value is not None and cls._has_bootstrap_runtime_env_override(key):
-                return env_value
-            return file_value
+            if env_value is not None:
+                if cls._has_bootstrap_runtime_env_override(key) or not env_file_explicit:
+                    return env_value
+            if env_file_explicit:
+                return file_value
         if env_value is not None:
             return env_value
-        if file_value is not None:
+        if file_value is not None and env_file_explicit:
             return file_value
         return default
 

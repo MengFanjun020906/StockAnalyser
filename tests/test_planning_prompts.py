@@ -15,6 +15,7 @@ from src.agent.planning_prompts import (
     build_zh_planning_system_prompt,
     get_default_prompt_sections,
 )
+from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 
 
 def test_default_zh_prompt_uses_single_section_source():
@@ -142,6 +143,18 @@ def test_entry_analysis_requires_actionable_entry_plan():
         assert snippet in build_planning_system_prompt()
 
 
+def test_entry_analysis_no_chase_policy_is_setup_aware():
+    prompt = build_planning_system_prompt()
+
+    assert "不能仅因高乖离直接淘汰强势候选" in ENTRY_ANALYSIS_OUTPUT_FORMAT
+    assert "不能仅因高乖离直接淘汰强势候选" in prompt
+
+
+def test_default_trading_skill_no_chase_policy_is_setup_aware():
+    assert "按 setup 分层处理追高" in CORE_TRADING_SKILL_POLICY_ZH
+    assert "乖离率 > 5%：严禁追高！直接判定" not in CORE_TRADING_SKILL_POLICY_ZH
+
+
 def test_watchlist_candidate_pool_protocol_defines_l1_boundaries_and_schema():
     prompt = build_planning_system_prompt()
     required_snippets = [
@@ -180,9 +193,9 @@ def test_watchlist_prompt_rules_keep_candidate_score_out_of_recommendation_score
         "未深度分析候选被包装为推荐",
         "候选池入池分只叫“入池分/召回分”",
         "表头必须叫“入池分”，禁止写“推荐分”",
-        "未完成逐股深度分析的股票不得进入首选/次选/可买入区域",
-        "如果全部候选都是 wait/monitor/reject",
-        "暂无可入手标的",
+        "未完成逐股深度分析的股票不得进入机会首选/执行首选/可买入区域",
+        "如果没有满足执行条件的计划，写“暂无可执行标的”",
+        "暂无高质量机会标的",
     ]
 
     for snippet in required_snippets:
@@ -204,8 +217,9 @@ def test_watchlist_scan_output_format_is_first_class_contract():
         "| 股票 | 入池来源 | 入池分 | 是否深度分析 | 入池理由 | 观察状态 |",
         "| 股票 | 结论 | 入场条件 | 止损/淘汰 | 关键支持 | 主要反证/缺口 |",
         "| 股票 | 动作 | 首仓金额/比例 | 加仓条件 | 降级条件 | 复查时间 |",
-        "如果全部候选都是 wait/monitor/reject",
-        "首选标的` 必须写“暂无可入手标的”",
+        "| 机会首选 | 代码 名称 / 暂无高质量机会标的 |",
+        "| 执行首选 | 代码 名称（可执行/条件触发） / 暂无可执行标的 |",
+        "如果没有满足执行条件的计划，写“暂无可执行标的”",
     ]
 
     for snippet in required_snippets:

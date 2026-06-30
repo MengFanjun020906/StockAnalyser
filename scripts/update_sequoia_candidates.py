@@ -33,15 +33,29 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.core.trading_calendar import get_effective_trading_date
 
 DEFAULT_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
 DEFAULT_TRADING_DAYS = 260
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 420
 DEFAULT_INCREMENTAL_THRESHOLD = 30
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 50
+BENCHMARK_INDEX_SYMBOL = "000001.SH"
+BENCHMARK_INDEX_BAOSTOCK_CODE = "sh.000001"
+BAOSTOCK_SESSION_EXPIRED_MARKERS = (
+    "用户未登录",
+    "not login",
+    "not logged in",
+    "please login",
+)
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS stock_daily (
@@ -78,7 +92,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-symbols", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=200,
                         help="Print progress every N symbols (default: 200)")
+    parser.add_argument("--skip-benchmark-index", action="store_true",
+                        help="Skip fetching the benchmark index row (default fetches 上证指数 000001.SH)")
+    parser.add_argument("--index-only", action="store_true",
+                        help="Only fetch the benchmark index, without updating stock symbols")
     return parser.parse_args()
+
+
+def resolve_cn_resume_target_date(current_time: Optional[datetime] = None) -> date:
+    """Return the latest reusable A-share daily-bar date."""
+    return get_effective_trading_date("cn", current_time=current_time)
 
 
 def init_db(db_path: str) -> None:
@@ -191,6 +214,70 @@ def fetch_symbol_rows(symbol: str, start_date: str, end_date: str):
     return rows
 
 
+def is_baostock_session_expired_error(error: Any) -> bool:
+    """Return True when baostock reports a dropped login session."""
+    text = str(error or "").strip().lower()
+    return any(marker.lower() in text for marker in BAOSTOCK_SESSION_EXPIRED_MARKERS)
+
+
+def refresh_baostock_login(bs: Any) -> Tuple[bool, str]:
+    """Best-effort baostock relogin used when a long update loses session state."""
+    try:
+        bs.logout()
+    except Exception:
+        pass
+    login = bs.login()
+    if getattr(login, "error_code", "") == "0":
+        return True, ""
+    return False, str(getattr(login, "error_msg", "") or "unknown baostock login error")
+
+
+def fetch_index_rows(
+    *,
+    symbol: str = BENCHMARK_INDEX_SYMBOL,
+    baostock_code: str = BENCHMARK_INDEX_BAOSTOCK_CODE,
+    start_date: str,
+    end_date: str,
+) -> List[Tuple]:
+    """Fetch benchmark index daily bars and store them under an unambiguous symbol.
+
+    上证指数和深市个股平安银行都会显示成 000001；SQLite 里必须保存为
+    000001.SH，避免覆盖个股 000001 的日线。
+    """
+    import baostock as bs
+
+    rs = bs.query_history_k_data_plus(
+        baostock_code,
+        "date,open,high,low,close,volume,amount",
+        start_date=start_date,
+        end_date=end_date,
+        frequency="d",
+        adjustflag="1",
+    )
+    if rs.error_code != "0":
+        raise RuntimeError(rs.error_msg)
+
+    rows: List[Tuple] = []
+    while rs.next():
+        r = rs.get_row_data()
+        try:
+            close_v = float(r[4]) if r[4] else None
+            if close_v is None:
+                continue
+            rows.append((
+                symbol, r[0],
+                float(r[1]) if r[1] else None,
+                float(r[2]) if r[2] else None,
+                float(r[3]) if r[3] else None,
+                close_v,
+                float(r[5]) if r[5] else None,
+                float(r[6]) if r[6] else None,
+            ))
+        except (ValueError, IndexError):
+            continue
+    return rows
+
+
 def _to_optional_float(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -295,7 +382,7 @@ def main() -> int:
     args = parse_args()
     db_path = str(Path(args.db_path).expanduser())
     trading_days = max(1, args.trading_days)
-    end = date.today()
+    end = resolve_cn_resume_target_date()
     end_text = end.strftime("%Y-%m-%d")
 
     init_db(db_path)
@@ -313,9 +400,11 @@ def main() -> int:
         start_text = start.strftime("%Y-%m-%d")
         mode = f"full ({start_text}..{end_text})"
 
-    # Resume target is today's fetch end date, not the DB's current max date.
-    # Using the DB max date caused all symbols to be skipped on re-runs of the
-    # same day because every symbol already has max_date == DB max date.
+    # Resume target is the latest completed A-share session, not the natural
+    # date. Weekend/holiday runs cannot write bars for "today" and must still
+    # be considered complete once symbols reach the previous trading day.
+    # It is also not the DB's current max date, because that caused all symbols
+    # to be skipped on re-runs of the same day.
     resume_target_date = end_text
 
     import baostock as bs
@@ -325,7 +414,7 @@ def main() -> int:
         return 2
 
     try:
-        symbols = parse_symbol_arg(args.symbols) or get_all_symbols()
+        symbols = [] if args.index_only else (parse_symbol_arg(args.symbols) or get_all_symbols())
         if args.limit_symbols > 0:
             symbols = symbols[: args.limit_symbols]
 
@@ -336,20 +425,41 @@ def main() -> int:
 
         print(
             f"Updating Sequoia candidate DB: db={db_path}, symbols={len(symbols)}, "
-            f"skipped_complete={skipped_complete}, mode={mode}, resume_target={resume_target_date}",
+            f"skipped_complete={skipped_complete}, mode={mode}, resume_target={resume_target_date} "
+            f"index_only={args.index_only}",
             flush=True,
         )
 
         success = empty = failed = written_rows = 0
+        index_written_rows = 0
+        index_status = "skipped" if args.skip_benchmark_index else "pending"
         aborted = False
         consecutive_failures = 0
+        relogin_count = 0
         started = time.time()
         progress_every = max(1, args.progress_every)
         max_consecutive_failures = max(0, args.max_consecutive_failures)
 
         for idx, symbol in enumerate(symbols, start=1):
+            session_retry_used = False
             try:
-                rows = fetch_symbol_rows(symbol, start_text, end_text)
+                while True:
+                    try:
+                        rows = fetch_symbol_rows(symbol, start_text, end_text)
+                        break
+                    except Exception as exc:
+                        if session_retry_used or not is_baostock_session_expired_error(exc):
+                            raise
+                        session_retry_used = True
+                        relogin_count += 1
+                        print(
+                            f"[WARN] baostock session expired while fetching {symbol}: {exc}; "
+                            "relogin and retry once",
+                            flush=True,
+                        )
+                        ok, relogin_error = refresh_baostock_login(bs)
+                        if not ok:
+                            raise RuntimeError(f"baostock relogin failed after session expired: {relogin_error}") from exc
                 if not rows:
                     empty += 1
                 else:
@@ -377,8 +487,26 @@ def main() -> int:
                 print(
                     f"progress {idx}/{len(symbols)} "
                     f"success={success} empty={empty} failed={failed} "
-                    f"written_rows={written_rows} elapsed={elapsed:.1f}s "
+                    f"written_rows={written_rows} relogin={relogin_count} elapsed={elapsed:.1f}s "
                     f"rate={rate:.1f}/s eta={eta:.0f}s",
+                    flush=True,
+                )
+
+        if not aborted and not args.skip_benchmark_index:
+            try:
+                index_rows = fetch_index_rows(start_date=start_text, end_date=end_text)
+                index_written_rows = upsert_rows(db_path, index_rows)
+                index_status = "ok" if index_written_rows > 0 else "empty"
+                print(
+                    f"benchmark_index {BENCHMARK_INDEX_SYMBOL} status={index_status} "
+                    f"written_rows={index_written_rows}",
+                    flush=True,
+                )
+            except Exception as exc:
+                index_status = "failed"
+                failed += 1
+                print(
+                    f"[WARN] benchmark_index {BENCHMARK_INDEX_SYMBOL} failed: {exc}",
                     flush=True,
                 )
     finally:
@@ -394,6 +522,9 @@ def main() -> int:
     print(
         f"Done. success={success} empty={empty} failed={failed} skipped_complete={skipped_complete} "
         f"aborted={aborted} written_rows={written_rows} "
+        f"baostock_relogin={relogin_count} "
+        f"benchmark_index={BENCHMARK_INDEX_SYMBOL} index_status={index_status} "
+        f"index_written_rows={index_written_rows} "
         f"pruned_by_date={deleted_by_date} pruned_by_symbol={deleted_by_symbol} "
         f"cutoff={cutoff} db_rows={total_rows} "
         f"symbols={symbol_count} date_range={min_date}..{max_date} "
@@ -402,7 +533,9 @@ def main() -> int:
     )
     if aborted:
         return 4
-    return 0 if success > 0 or (skipped_complete > 0 and failed == 0) else 3
+    if index_status == "failed":
+        return 5
+    return 0 if success > 0 or index_written_rows > 0 or (skipped_complete > 0 and failed == 0) else 3
 
 
 if __name__ == "__main__":

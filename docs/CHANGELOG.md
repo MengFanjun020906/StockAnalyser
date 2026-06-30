@@ -9,9 +9,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] CI checkout 补齐 `graphiti` 子模块映射，并在 backend-gate / docker-build 拉取子模块，避免 `-e ./graphiti` 依赖安装在 GitHub Actions 中失败。
+- [文档] 更新 openInvest 原理接入索引，补充新版 openInvest 的信息隔离委员会、事件层、path profile、运行时治理、回测防前视和 PnL/benchmark 自审计等可借鉴原则。
+- [修复] `scripts/ci_gate.sh` 默认优先使用仓库 `.venv` Python，并在 flake8 critical check / offline pytest 排除本地外部 clone 与 gitlink 目录，避免系统 Python 或 `openInvest`、`graphiti`、`Sequoia-X`、`alphasift` 干扰 DSA 后端门禁。
+- [修复] 系统配置 API schema 同步 `graphiti` 分类与 `float` 数据类型，并修正未显式指定 `ENV_FILE` 时 schedule immediate 配置被默认 `.env` 抢占的问题。
+- [改进] Agent planning_execute 的 `planner.json` / `todo.md` 补齐主辅维度、初始假设、工具预期结果、下游使用方式、失败降级、停止条件和 replan 策略，避免 Trace 计划产物只展示重复工具清单。
+- [改进] 四席位主题催化席收窄为 AI/科技产业链候选，并要求新闻证据摘要化为产品品类出口、国产替代政策、业务映射和资金验证，避免原文堆砌和非科技行业消息面拖慢链路。
+- [改进] Agent 选股候选源对齐新版 AlphaSift / Sequoia-X：AlphaSift YAML 的 scoring/risk profile 会参与分数扣罚，Sequoia 新增定增公告事件策略并以可降级方式接入 seed pool。
+- [新功能] Agent Seed Pool 新增主线动量 Theme Regime 分型，基于热点板块、涨停池、热榜和热点龙头证据输出 `theme_momentum`，并给候选 seed 标注 `theme_profile`、`stock_role`、`momentum_setup` 与超买解释。
+- [新功能] Agent 单股 `entry_analysis` / `position_review` 新增主线动量画像预取，围绕当前股票生成 `single_stock_theme_profile`，并将高潮、退潮、后排和无关主题显式降级为不可追高。
+- [修复] StockAPI 工具入口会加载仓库 `.env` 中的 `STOCKAPI_TOKEN`，并将 Eastmoney patch 的 `fake_useragent` 改为可选依赖，避免续费 token 未被工具进程读取或无关导入错误拖垮 StockAPI 检测。
+- [改进] 补齐智谱 GLM `glm-5.2` 渠道示例与前端预设，设置页会显示当前主模型；Agent 调用 `glm-5.2` 时自动携带 thinking 与 `reasoning_effort=max`。
+- [改进] Agent 市场状态识别改为方向优先、波动单独约束，高波动上涨趋势不再被误判为纯风险环境；不追高规则改为按回踩、突破、涨停和资金接力 setup 分层处理。
+- [修复] Agent 工具批量执行超时时保留已完成工具结果，并为资金流、筹码、Tushare 财务指标和量能等慢工具设置外层等待下限；历史 K 线 loader 在主库缺日线时可读取 Sequoia 本地 `stock_daily`，减少误报工具超时。
+- [修复] Seed Pool 质量评估改为根据本地上证指数 OHLC 识别 seed 后的下一交易日，跳过节假日休市，避免误要求同步休市日行情。
+- [修复] Seed Pool 质量快照改为优先保存完整 `seed_fact_packets`，不再只保存 `seed_pool_summary.preview` 前 20 条，避免预览外 seed 无法在质量页复盘。
+- [修复] Agent Trace 的 Seed Preview 改为显示“预览数 / 完整 seed 数”，并修正四席位 `seed_pool_summary.total_limit` 误写为 seed gate 输出上限导致的 `Seed 32 / 12` 误导。
+- [改进] Web“入场”页交互日 K 默认只保留当前策略入场/出场标记，并补充图例说明，减少基准策略紫色点位与当前策略信号混读。
+- [改进] Agent 入场执行回测 summary 新增策略级累计 PnL、胜率、成交率、最好/最差收益和盈亏比，Web“入场”页增加系统总览指标面板。
+- [改进] Web“入场”页保留当前日期总览，并新增历史全量总览，用于对比当日表现与截至当前的长期平均指标。
+- [改进] Agent 入场执行回测导入规则改为只纳入最终组合中的可执行等待/条件入场项，排除明确 reject 项，并支持每个 Trace 最多 4 个最终标的。
+- [新功能] Agent 入场执行回测新增 baostock 5 分钟线手动同步、本地 `stock_minute_bars` 缓存表和分钟线优先撮合；Web“入场”页可同步最终报告标的分钟 K，并用 ECharts 交互日 K 展示入场区间、止盈止损和入出场点。
+- [修复] 单股 Planner 与四席位专家工具白名单补齐资金水位、北向/两融、单股 Regime 概率、公告披露、StockAPI 热点和 openInvest/综合新闻补证工具，避免工具已注册但模型或席位不可感知。
+- [修复] 排障脚本移除固定本地路径和固定 Trace 默认值，`probe_thesis_desks_from_trace.py` 改为显式 `--trace-dir`/`AGENT_TRACE_DIR`，Judge smoke 输出目录改为 `DSA_SMOKE_OUTPUT_DIR` 或系统临时目录。
+- [修复] `get_capital_flow` 纳入 Agent 重工具外层等待下限并将默认显式预算提升到 30 秒，避免单股 Trace 中与 Tushare 重工具并发时被 15 秒资金流壳超时截断为 `capital_flow timeout`。
+- [修复] 选股最终报告核心表的“可观察标的”不再重复展示已作为“机会首选”或“执行首选”的股票，避免同一标的在首选和观察位产生语义混淆。
+- [新功能] Agent Trace 选股页面支持从历史 Trace 继续运行，后端可复用已落盘的选股阶段 artifact，并为未来中断的选股流水线增量保存阶段结果。
+- [新功能] 新增 Agent 入场执行回测离线链路、只读/重建 API 与 Web“入场”标签页，只评估选股报告最终输出标的，并用 strict/next-open/ATR 弹性/突破跟随四套策略诊断 AI 入场点位过保守问题。
+- [新功能] 新增 `get_symbol_regime_probability` 单股 Regime 概率工具；选股流水线仅对 deep dive 标的和持仓标的计算，单股 `entry_analysis` / `position_review` 会对明确单一标的预取 `symbol_regime_probability` / `reentry_reference` 作为弱证据。
+- [改进] `get_regime_forward_probability` 增加 Tushare `index_daily` 本地缓存、非重叠有效样本数、ATR 自适应路径画像、regime 持续天数、样本质量摘要和基于窗口内低点分位的 `reentry_reference`。
+- [修复] 选股最终报告的加分条件只有多个备选项时才显示“满足其一即可”，避免单个条件被误读为还有缺失条件。
+- [改进] `get_sector_rankings` 优先使用 Tushare `ths_hot(market=行业板块)` 获取同花顺行业板块热榜，保留 Eastmoney 与 StockAPI 作为降级来源，并在 `source_chain` 暴露热榜口径。
+- [新功能] 新增 `get_tushare_stk_factor` 股票技术因子工具，接入 Tushare `stk_factor` 的 MACD、KDJ、RSI、BOLL、CCI 等前复权技术指标，并纳入 planning 技术分析能力及结构反转、动量、质量修复、主题催化席工具 YAML。
+- [改进] `get_tushare_moneyflow_mkt_dc` 补齐东财大盘资金流向 `start_date/end_date` 参数，并接入 planning `capital_flow` 能力及结构反转、动量、主题催化席工具 YAML，用于大盘资金水位背景判断。
+- [改进] `get_tushare_moneyflow_ind_ths` 补齐 Tushare 行业资金流向的 `start_date/end_date` 参数，并同步纳入主题催化席与动量席工具 YAML 白名单，确保行业资金流工具可被候选专家实际调用。
+- [新功能] 新增 `get_board_capital_flow` 板块资金统一工具，合成 Tushare `moneyflow_ind_dc`、`moneyflow_ind_ths` 和 `moneyflow_cnt_ths`，统一 CNY 字段并保留 `source_definitions/flow_sources`，避免 DC 行业/概念/地域与 THS 行业/概念口径混读。
+- [改进] `get_capital_flow` 合成 Tushare `moneyflow_dc`、`moneyflow_ths` 与 legacy `moneyflow` 三套个股资金流来源，统一输出 CNY 和 `selected_flow_source/flow_sources`，并保留各来源独立统计定义，避免 DC、THS、legacy 口径混读。
+- [修复] `get_capital_flow` 单票资金流改为真正 failover：优先 Tushare `moneyflow_dc` 成功即返回，仅失败时才查 THS、legacy moneyflow 和 StockAPI，并将 `ok/partial` 且有有效数据的降级 errors 作为 warning 保留，避免并发 Tushare 工具排队时被 15 秒预算误判失败。
+- [改进] `get_capital_flow` 增加后台资金流审计：主链路首源成功即返回，后台 best-effort 比较未选中的 THS/legacy 来源，发现日期、方向或量级冲突时仅写入 `warnings/source_conflicts/capital_flow_audit`，不覆盖顶层资金流字段。
+- [修复] Agent 运行态资金流、板块榜单和 Regime 前向概率工具修正预算竞争：`get_capital_flow` 在 Agent 预算内并发探测三路 Tushare 个股资金流并保留 StockAPI fallback 时间，`get_sector_rankings` 不再把后续 fallback 挤成 0 秒，`get_regime_forward_probability` 优先复用指数历史缓存，降低单测通过但实际 Trace 超时失败的概率。
+- [修复] `scripts/update_sequoia_candidates.py` 的断点续跑目标改用 A 股最新已完成交易日，避免周末或节假日 daily run 因自然日无行情而反复从头扫描日线缓存。
+- [修复] 四席位专家最终 JSON 输出轮启用 DeepSeek/OpenAI-compatible `response_format={"type":"json_object"}` 并提高最终 JSON `max_tokens`，减少 `final_output_not_json`。
+- [改进] 四席位开发排障默认提高单 seed 行级等待和 SeedFact 工具超时，降低 `analyze_trend` 等工具未返回导致的席位 timeout。
+- [改进] 选股最终报告正文改为中文动作/裁决口径，合并重叠推荐与证据段落，移除字段说明和 Execute 证据摘要，并将入场条件拆成必要条件与加分条件。
+- [改进] 四席位单 seed 超时会保留超时前 LLM/tool 进度，Trace 可显示“LLM 已返回工具调用但卡在工具执行”等原因，避免只看到 `timeout`、`工具 0` 或“本席位未输出候选”。
+- [修复] Agent LLM fallback 调用不再把单次 timeout 均分给主模型和备选模型，候选专家可用完整剩余预算调用当前模型，降低 DeepSeek 慢响应导致的 30 秒硬超时。
+- [修复] 四席位候选发现的 LLM telemetry 支持跨线程写入 Trace，`llm_usage.jsonl` 能记录席位内单 seed LLM 成功、失败和超时，便于排查候选发现降级。
+- [修复] Web Trace 页区分四席位 partial 降级与真实 fallback 候选池，避免把已保留可用席位候选误提示为“候选池回退到召回结果”。
+- [修复] Seed Pool 质量快照按 `code+desk` 去重落库并优先使用 seed 自身 `freshness/as_of` 归属日期，避免四席位意见重复写入失败后质量页继续显示旧快照；Trace 运行会把真实 `trace_id` 写入快照。
+- [改进] 四席位候选发现新增 `negative_conclusion_reasons`，对“未入席/未进入最终候选/席位拒绝/席位超时/未产出结构化结论”等负面结论写明原因，并让报告缺失席位意见时优先展示原因而非只显示未落盘。
+- [改进] 四席位并行超时诊断补充总预算、专家预算、实际等待时长和 `overall_timeout_exhausted_before_expert_returned` 原因，`.env.example` 明确开发排障可临时调高 `AGENT_CANDIDATE_EXPERT_TIMEOUT_SECONDS`。
+- [新功能] 新增 `search_openinvest_news` Agent 工具，复用 `openInvest/services/news_sources` 的多源新闻适配，默认通过 `yfinance.Ticker.news` 获取 ticker 关联新闻，RSS/DDGS 作为可选源并在 `source_chain` 暴露缺依赖或单源失败原因。
+- [改进] Seed Pool 质量页将未进入某席位评估范围显示为“未入席”，不再把缺失占位误写成“未落盘该席位理由”或暗示拒绝意见。
+- [修复] 四席位委员会在单个席位超时或失败但其它席位已有候选时改为 partial degraded 输出，保留可用候选和 `partial_errors`，避免因质量修复席失败把动量席/主题催化席候选整体丢弃。
+- [改进] 选股 Judge 阶段接入 openInvest 迁移评估中的确定性 sanity check，主动交易裁决在 worker 不可用、无可执行仓位、risk_off/panic/extreme 市场或单票仓位超限时会降级或截断，并在 Trace `judge_decision.full.sanity_checks` 留审计。
+- [改进] Agent Trace 接入 openInvest 迁移评估中的 LLM telemetry，阶段 LLM 调用会写入 `llm_usage.jsonl`，记录 `trace_id/stage/agent_role/symbol/provider/model/token/latency/tool_calls/ok/error`，写入失败不阻断主流程。
+- [改进] Agent Trace API、历史会话和 Web Trace 页新增 openInvest 可观测性汇总，展示 `llm_telemetry` 的调用次数、token、latency、estimated cost、按阶段统计，以及 `judge_sanity` 的裁决修正规则和 required plan changes。
+- [新功能] 接入 openInvest Phase 2 Regime 概率层：新增 `get_regime_forward_probability` 工具和 `src/agent/regime_probability.py`，基于现有 `detect_market_regime` 分类历史切片并输出 forward return、路径画像和 `reentry_reference`；选股链路会把概率摘要挂到 `market_regime.forward_probability`，点位 fallback 输出 `regime_probability` / `reentry_reference` 作为弱证据。
+- [改进] 点位计算 prompt、fallback 和最终报告适配 Regime 概率层：`low_confidence` 只能作弱证据，`reentry_reference` 只作为等待回踩或 TRIM 后买回参考，报告会展示 `Regime 概率证据` 便于复盘。
+- [新功能] 新增 Agent verdict 后验复盘离线链路：`scripts/build_agent_verdict_reviews.py` 会从 Agent Trace 和本地 `StockDaily` 生成 `data/agent_reviews/verdict_review.jsonl`，选股链路输出 `chain_type=stock_selection`，单股 ReAct 链路输出 `chain_type=single_stock_analysis`，标记 `hit`、`missed_up`、`avoided_down`、`wrong_direction` 或 `insufficient_data`，第一版不自动注入线上决策。
+- [新功能] 新增 Agent 后验复盘只读 API 与 Web 页面：`GET /api/v1/agent-verdict-reviews` 可按链路、标签和股票代码筛选 `verdict_review.jsonl`，Web `/agent-verdict-reviews` 展示样本数、完成率、平均后验收益、链路覆盖、标签分布和明细表。
+- [改进] Agent 后验复盘页新增样本生成/刷新闭环：`POST /api/v1/agent-verdict-reviews/rebuild` 和 Web “重建样本”按钮会从本地 Trace 与本地 `StockDaily` 重建 `verdict_review.jsonl`，默认扫描最近 300 个 Trace，不重跑 Agent、不拉取外部行情、不自动注入线上决策。
+- [新功能] Agent 后验复盘新增离线 insight Markdown：`scripts/build_agent_verdict_insights.py` 会从本地 `verdict_review.jsonl` 聚合稳定样本分组，写入 `data/agent_reviews/insights/agent_verdict_insights.md`，默认至少 20 条 completed 样本才形成洞察，仍不注入线上 Agent、Meta-Agent 或 Judge。
+- [文档] 整理 `docs/` 目录结构，将架构、模块说明、方案计划、部署迁移、外部集成和多语言首页分层归档，并新增 `docs/README.md` 作为分类入口。
+- [文档] 新增 `docs/integrations/openinvest-integration-assessment.md`，并补充 `docs/modules/regime-state-machine.md` 的 Regime forward probability、路径画像与买回点参考方案，评估 openInvest 投资委员会、后处理、Dreaming 复盘、telemetry 和收益率展示页面等能力在当前仓库的可接入位置与迁移边界。
+- [改进] Agent 单股 ReAct 工具结果回灌改为工具级 ETL 事实卡，76 个注册工具均映射到明确 profile；模型只接收业务有效字段、错误状态和摘要，原始长度、hash 与预览留在 Trace，避免长 K 线、公告正文、新闻原文和 source/query 诊断字段污染上下文注意力。
+- [改进] Seed Pool 默认移除 `low_base_structure` 低位结构来源，不再调用低位结构扫描；AlphaSift 与 Sequoia 调整为加权主干来源，source cap 分别提升到 14/12，让实际效果更好的两个席位获得更多入池名额。
+- [修复] `scripts/update_sequoia_candidates.py` 识别 baostock 长批量更新中的“用户未登录”会话失效，自动重新登录并重试当前标的，避免日线刷新中途掉线后连续污染后续股票为失败。
+- [修复] Agent 单股 `fundamental_analysis` 不再只依赖易超时的 `get_stock_info` 聚合工具，Planner 默认追加 `get_tushare_daily_basic`、`get_tushare_financial_indicators` 和 `get_tushare_financial_statements` 做估值与财报兜底验证。
+- [修复] Agent Trace 单股问题在注入组合上下文时固定以用户明确股票代码作为 `primary_symbol/target_symbols`，避免被已有持仓标的污染为错误的持仓复盘。
+- [修复] Agent 最终报告新增事实校验门禁，缺少工具来源的资金流、筹码分布和均线精确值会被替换为 `N/A`，并拦截 A 股非法零散买入股数建议。
+- [修复] `get_capital_flow` 区分 Tushare `moneyflow` 全口径净流入与大单/特大单主力净流入，避免把 `net_mf_amount` 误标为主力资金。
+- [改进] `get_capital_flow` 的工具描述、模型压缩上下文和 Agent 提示词显式保留资金口径定义，防止模型把 `net_inflow*` 解读为主力资金。
+- [改进] Agent 新增高风险指标语义注册表，只向模型压缩上下文注入资金流、筹码分布等易误读字段的短说明，避免所有工具全量解释挤占上下文。
+- [修复] planning_execute 最终报告生成前会审计 Planner 核心工具是否已执行，防止 `calculate_ma`、`analyze_pattern` 等计划内技术工具未调用时提前收尾。
+- [改进] `analyze_trend` 单股技术工具新增布林带中轨/上下轨/带宽/位置输出，并让均线、量价和 K 线形态工具进入证据卡适配。
+- [改进] `scripts/daily_run.sh` 的 Sequoia 日线更新步骤同步写入上证指数 `000001.SH`，为 Seed Pool 质量评估的基准 Alpha 提供本地 OHLC。
+- [文档] 新增 `docs/plans/seed-pool-quality-monitor-plan.md`，规划按日期长期记录 seed pool 快照、次日收盘表现评估、四席位支持/拒绝理由追溯和前端质量监控页。
+- [文档] 完善 Seed Pool 质量监控计划，将上证指数 Alpha、MFE/MAE、一字涨停不可买入过滤、催化剂字段、K 线 price lines 和归因分析面板纳入第一版验收范围。
+- [新功能] 新增 Seed Pool 质量监控 API 与 Web 页面，可按日期查看 seed 次日 Alpha、MFE/MAE、流动性状态、来源/席位/Catalyst 归因，并用 ECharts 展示 K 线、seed close 和 T+1 标记。
+- [改进] Seed Pool 质量页改为固定四席位理由矩阵展示，缺失席位也显示 `missing`；K 线参考线不再从四席位自然语言理由中正则抽取，避免把席位判断误读为交易点位。
+- [改进] Seed Pool 质量页展示快照生成时间、T+1 评估更新时间和缺价/未评估数量，并将评估按钮明确为“手动更新 T+1”。
+- [改进] 四席位候选发现将动量席升级为“趋势/形态延续席”并提高趋势市默认配额；`early_turn_desk` 业务语义降级为“结构反转席”，低位必须叠加明确转强证据才参与，防守 regime 会跳过零配额动量席以减少无效 LLM 超时。
+- [修复] Agent Runner 对 `discover_watchlist_candidates` 和 `detect_market_regime` 采用重工具外层等待预算，避免内部已有结构化诊断的候选发现/市场状态工具被统一 30 秒壳超时截断。
+- [修复] Agent Trace 在注入持仓账户上下文时，明确“选股/下周可入手股票/候选池”请求会覆盖组合上下文默认的 `position_review`，确保进入 `watchlist_scan` 五阶段候选池 + 四席位链路。
+- [修复] 修复 Agent Trace 跳转 Seed Pool 质量页时 `YYYYMMDD` 日期参数未规范化导致页面请求失败并显示空状态的问题。
+- [修复] 修复 Seed Pool 质量页直接渲染四席位 `risks` 对象导致 React 运行时崩溃、整页空白的问题。
+- [改进] Seed Pool 质量页手动更新 T+1 前改为先检查评估日是否应有行情，并优先使用本地数据库；缺少指数或 Seed 股票 OHLC 时返回结构化错误，不再静默写入空评估。
+- [修复] Seed Pool 质量 API 对上游只给代码或占位名称的 seed 自动从股票索引补齐中文名，避免页面显示 `000050 / 000050`。
+- [修复] Seed Pool 质量评估和 K 线复盘在主库缺少 OHLC 时读取 Sequoia `stock_daily(symbol, date, open, high, low, close, volume, turnover)`；上证基准仅使用 `000001.SH`，避免误用平安银行 `000001`。
+- [修复] Seed Pool 质量页将选择日期同步到 URL；周末 seed 的 K 线窗口按最近交易日锚定并保证包含 T+1，主库只有部分行情时会合并 Sequoia 历史 K 线，K 线 hover 精简为日期和开收高低。
+- [修复] Seed Pool 质量评估改为 Sequoia K 线窗口优先，避免主库 Tushare 原始价与 Sequoia 复权/策略价混用导致 Alpha 错算；手动更新 T+1 会刷新当天全部 seed，质量页不再展示 MFE/MAE 买卖点式口径。
+- [修复] Seed Pool 质量快照幂等键加入 `seed_date`，并为默认 `selection-run` 快照 ID 增加日期后缀，避免新一天 seed pool 覆盖前一天快照但页面仍显示旧日期。
+- [修复] Seed Pool 质量页改为 A 股红涨绿跌显示，并将同一 `seed_date` 的候选池保存语义改为最新池替换旧池，T+1 评估只针对当天最新池。
+- [改进] Seed Pool 质量快照的默认归属日改为北京时间 09:00 前归前一自然日，避免次日开盘前生成的候选池误计入新交易日。
+- [修复] `start_all.sh` 后端启动改用 `uvicorn server:app`，避免本地脚本报告 ready 后 `main.py --serve-only` 后台进程退出导致 8000 不可访问。
+- [新功能] 新增 `get_stock_disclosure_events` 底层工具，通过巨潮公开公告检索公司年报、投资者关系记录和公告标题，结构化返回文档类型、URL、命中词、source_chain 与失败诊断，为主题催化席后续做“行业主题 × 公司公开资料”匹配提供基础证据。
+- [新功能] 新增 `search_stock_prompt_intel` 单股用户问题检索工具，将股票代码/名称与用户原始 prompt 合成搜索查询，复用现有搜索引擎返回公告、消息、走势背景等结构化结果，支持 Agent 在单股问答中按用户问题主动查证。
+- [新功能] 持仓管理新增单账户“重设持仓基准”能力，可清空旧流水并按指定日期、本金/现金余额、持仓数量和成本价重建基准流水，方便补录或校准未及时更新的账户持仓。
+- [改进] 持仓基准重设从自由文本解析改为逐行字段录入，分别填写代码、数量、成本价、市场和币种，降低补录持仓时的格式误填风险。
+- [修复] 修复 DatabaseManager 半初始化单例被复用时导致持仓流水列表请求失败的问题。
+- [改进] 四席位 seed pool 默认上限从 20 扩到 32，提升 AlphaSift、Sequoia、资金、主题等多来源召回覆盖；逐股深挖上限仍保持默认 4。
 - [新功能] 四席位 seed pool 新增 `news_theme_daily` 盘前日报主题来源，接入东方财富财经早餐 `stock_info_cjzc_em`，按 `trade_date` 匹配当天 6 点日报，并通过本地概念字典、可选 `jieba` 分词和规则引擎映射主题成分股；日报直接点名公司仅做诊断与避雷，不直接生成 seed。
-- [文档] 重写根 README 为专业化项目首页，突出账户感知 AI 投资研究、四席位选股、Meta 约束、点位计算、组合配置、Judge 和 Trace 复盘；新增 `docs/stock-selection-pipeline.md` 专题文档说明选股链路输入输出、机会首选/执行首选双轴语义和 Trace artifact。
-- [文档] 在 README 与 `docs/stock-selection-pipeline.md` 的 L1 seed pool 说明中显式列出 `AlphaSift` 与 `Sequoia` 本地主干候选源，避免把两者泛化成“本地价量与形态”。
+- [文档] 重写根 README 为专业化项目首页，突出账户感知 AI 投资研究、四席位选股、Meta 约束、点位计算、组合配置、Judge 和 Trace 复盘；新增 `docs/architecture/stock-selection-pipeline.md` 专题文档说明选股链路输入输出、机会首选/执行首选双轴语义和 Trace artifact。
+- [文档] 在 README 与 `docs/architecture/stock-selection-pipeline.md` 的 L1 seed pool 说明中显式列出 `AlphaSift` 与 `Sequoia` 本地主干候选源，避免把两者泛化成“本地价量与形态”。
 - [新功能] 四席位委员会新增 `theme_catalyst_desk` 主题催化席，专门判断日报/当日主题是否与个股业务归属匹配、是否已有板块或资金验证，并输出 `theme_catalyst` setup；聚合默认名额表同步给主题席保留 2 个常规名额、事件驱动 regime 保留 4 个名额。
 - [修复] `news_theme_daily` 不再只读取东方财富财经早餐列表摘要；工具会根据文章链接抓取东财原文 `ContentBody`，按 `每日精选/热点题材/公司新闻` 分区抽取主题并在 Trace 暴露 `article_fetch_status/article_sections/evidence_section`，避免摘要漏掉 MLCC 等正文主题。
 - [改进] `news_theme_daily` 主题评分新增高影响产业催化词加权，命中 `英伟达/NVIDIA/黄仁勋/CUDA/Blackwell` 等词的非公司新闻主题会提高 `theme_score` 并在 Trace 暴露 `high_impact_terms`；公司新闻否认/澄清仍只做诊断不产 seed。
@@ -46,7 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充选股链路重构方案的深入探究层设计：将选股候选深挖从通用 `planning_prompts.py`/个股分析 prompt 中拆出，明确最多 3 只、最少 1 只的深挖目标选择、默认 3 次单股 prompt 调用、输入 payload、输出 schema 与报告消费规则。
 - [修复] 放宽 `get_stock_info` 默认超时预算：基本面阶段总预算从 1.5s 调整为 8s，单源 fetch 从 0.8s 调整为 3s，所属板块补充从 1s 调整为 3s，降低 AkShare/efinance 慢响应导致的 `partial` 与板块缺失。
 - [修复] 四席位最终输出收紧为 JSON contract + Few-shot JSON 示例，并在席位 LLM 调用中启用 `response_format={"type":"json_object"}`，减少工具调用后回灌阶段输出自然语言导致的 `final_output_not_json`。
-- [文档] 补充 `docs/选股链路重构-实施方案.md` 的端到端链路总览，明确种子池多来源、三打法席位输出、聚合层和后续 screening/deep dive/judge 的传递关系。
+- [文档] 补充 `docs/architecture/选股链路重构-实施方案.md` 的端到端链路总览，明确种子池多来源、三打法席位输出、聚合层和后续 screening/deep dive/judge 的传递关系。
 - [修复] 四席位单 seed LLM 默认超时从 20s 调整为 60s，并将外层 per-seed guard 上限提高到 180s、整体 committee 预算按「首轮 LLM + 工具 + 后续 LLM」同步放宽；实测工具本身多为 1-8s，主要耗时来自工具结果回灌后的 LLM 二/三轮。
 - [修复] 四席位候选发现的 LLM 调用增加 adapter 级硬超时并关闭限时调用内的 LiteLLM 重试拖延；LLM provider 超时/错误会作为逐 seed `failed` 暴露并触发连续失败熔断，不再被外层 seed guard 提前吞成无原因 `timeout`。
 - [chore] 新增 `scripts/probe_thesis_desks_from_trace.py`，可从保存的 Agent Trace 复用 seed preview 直接驱动四席位，隔离验证 seed/recall/desk loop、工具 schema 和真实 LLM 首轮调用耗时。
@@ -100,13 +201,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 前端 `AgentTracePage` 在配置面板新增"候选发现模式"下拉，选项 `deterministic`（默认）/`llm_expert_committee`（实验），选择会持久化到 `localStorage.dsa.candidateDiscoveryMode` 并按当次随 `traceStream` payload 提交。
 - [测试] 新增 `tests/test_candidate_committee.py`，覆盖 committee facade 的 schema 兼容、资金面证据 attach 与 deterministic 异常 coerce 路径；`tests/test_agent_stock_selection.py` 补充 `SelectionRunContext.candidate_discovery_mode` 默认值、`_resolve_candidate_discovery_mode` fallback 与 `_run_candidate_discovery_tool` LLM 分流/降级用例；`tests/test_agent_models_api.py` 补充 `AgentTraceRunRequest.candidate_discovery_mode` 合法/非法/默认值 Pydantic 校验。
 - [新功能] 新增 macOS 一键部署：`scripts/install-mac.sh`（自动检测 Intel / Apple Silicon，装 Xcode CLT + Homebrew + `python@3.11` + `node@22` + `uv` + 项目依赖，剔除 graphiti / neo4j 并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB），并提供 `scripts/start-backend.command` / `scripts/start-web.command` 双击启动器（内部 `eval brew shellenv` 兼容 Finder 启动）。
-- [文档] 新增 `docs/deploy-to-new-mac.md`，覆盖从空白 Mac -> Homebrew -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
+- [文档] 新增 `docs/deployment/deploy-to-new-mac.md`，覆盖从空白 Mac -> Homebrew -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
 
 - [新功能] 资金面候选专家新增 per-dimension 工具手册 (`src/agent/candidate_experts_v2/tools_manifest/capital.yaml`)，覆盖 11 个白名单工具的 priority / when_to_use / typical_args / returns_summary / key_fields / combo_hints / cost / failure_modes 9 字段业务语义；YAML 在 `CapitalFlowExpert.__init__` 阶段加载并按 priority 渲染进 SYSTEM prompt，并对 whitelist / ToolRegistry / typical_args 参数名做三层一致性校验，typical_args 支持 `{today}` / `{seed_codes}` 运行时占位符替换；`get_tushare_moneyflow_ths` 保留为手动工具但不在主链路主动调用。
 - [测试] 新增 `tests/test_tools_manifest.py`，覆盖 manifest 加载、白名单与 registry 交叉校验、参数名子集校验、占位符替换、Markdown 渲染顺序和最终 SYSTEM prompt 注入路径，共 16 个用例。
 
 - [新功能] 新增新机器部署脚本：`scripts/install-windows.ps1`（Windows 宿主启用 WSL2 并安装 Ubuntu）、`scripts/bootstrap-wsl.sh`（WSL 内一键装 Python 3.11 / Node 22 / uv / 依赖，自动剔除 graphiti、neo4j 行并强制 `GRAPHITI_ENABLED=false`，可选 `SEQUOIA_DB_URL` 下载候选 DB）、`scripts/start-backend.sh` 与 `scripts/start-web.sh`（前台启动器）。
-- [文档] 新增 `docs/deploy-to-new-windows.md`，覆盖从空白 Windows -> WSL2 -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
+- [文档] 新增 `docs/deployment/deploy-to-new-windows.md`，覆盖从空白 Windows -> WSL2 -> 项目源码 -> 一键装依赖 -> 启动后端/前端的完整迁移流程，并说明数据库与 graphiti 不在迁移范围内。
 - [新功能] 新增 `src/agent/candidate_experts_v2` 多专家选股委员会骨架（LLM 驱动 + 工具白名单 enforcement + 跨 session 文件缓存），首发资金面专家 `capital_flow_expert`；默认开关 `AGENT_CANDIDATE_DISCOVERY_MODE=deterministic` 不影响现网，需显式切换 `llm_expert_committee` 才会启用。
 - [文档] 新增 Agent 选股阶段当前实现说明，梳理 `watchlist_scan` 阶段流水线、底层工具取证、Trace artifact 和 `NaN` 非标准 JSON 排障路径。
 - [改进] Agent Trace 最终报告新增 Markdown 导出按钮，便于保存和复盘本轮分析结果。
@@ -426,7 +527,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 文档
 
-- 📘 **DEPLOY.md 补充 UI 元素异常变大排查步骤** — 新增重建 Docker 镜像或手动执行 `npm run build` 的排查指南；`deploy-webui-cloud.md` 同步更新。
+- 📘 **DEPLOY.md 补充 UI 元素异常变大排查步骤** — 新增重建 Docker 镜像或手动执行 `npm run build` 的排查指南；`deployment/deploy-webui-cloud.md` 同步更新。
 - 📨 **飞书 Webhook 配置说明补全** — 强调 `FEISHU_WEBHOOK_URL` 是群通知必填项、签名校验须两端同时启用或关闭、`FEISHU_APP_SECRET` 仅用于应用/Stream Bot 模式；`.env.example` 补充内联注释；同步英文指南。
 - 🤝 **FAQ 补充 Ollama 连接失败排障条目（Q12c）** — 覆盖服务未启动、URL 配置错误、模型前缀缺失、模型未下载、远程防火墙等 5 个检查点（fixes #854）。
 - 🌉 **README 补充长桥数据源使用说明** — 中/英/繁 README 明确长桥"首选 / 兜底 / 未配置不调用"边界；`docs/` 内相对路径链接修复；`LONGBRIDGE_PRINT_QUOTE_PACKAGES` 配置与代码及 `.env.example` 对齐。
@@ -553,7 +654,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### 新功能
 
 - 💾 **桌面端 `.env` 备份/恢复入口**（#754）— 桌面模式下的系统设置页新增 `导出 .env` / `导入 .env` 按钮，可直接备份当前已保存配置，或把备份文件中的键值合并恢复到当前桌面端 `.env`；导入沿用现有 `config_version` 冲突保护与运行时重载链路，不改变现有桌面端便携模式路径。
-- 📊 **Tushare 股票列表获取工具** — 新增 `scripts/fetch_tushare_stock_list.py`，支持从 Tushare Pro 获取 A股、港股、美股列表信息并保存为 CSV，配有分页读取、智能限流、错误处理和进度提示；新增对应使用文档 `docs/TUSHARE_STOCK_LIST_GUIDE.md`。
+- 📊 **Tushare 股票列表获取工具** — 新增 `scripts/fetch_tushare_stock_list.py`，支持从 Tushare Pro 获取 A股、港股、美股列表信息并保存为 CSV，配有分页读取、智能限流、错误处理和进度提示；新增对应使用文档 `docs/modules/TUSHARE_STOCK_LIST_GUIDE.md`。
 - 🔎 **索引生成脚本多市场支持** — `generate_index_from_csv.py` 重构为支持 Tushare 和 AkShare 双数据源，同时覆盖 A股、港股、美股三个市场；新增按市场分类的别名映射（A股、港股常见别名，美股常用股票英文缩写）；添加 `--source` 参数切换数据源、`--test` 参数验证模式；严格过滤美股 DUMMY 记录。
 - 🔎 **索引生成脚本增强** — `generate_stock_index.py` 新增 `--test`/`-t` 测试模式和 `--verbose`/`-v` 详细输出模式，添加市场分布统计，优化 JSON 输出格式。
 - 📋 **首页完整报告支持双模式复制** — 历史报告详情头部新增“复制 Markdown 源码”和“复制纯文本”工具按钮；前者保留原始 Markdown 结构，后者去除常见 Markdown 格式符号，方便分享、归档和跨报告比对。复制按钮文案会跟随 `REPORT_LANGUAGE` 保持中英文一致，避免英文报告页出现中文固定文案。
@@ -585,7 +686,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 文档
 
-- 📘 **新增 Tushare 股票列表工具文档** — 新增 `docs/TUSHARE_STOCK_LIST_GUIDE.md`，说明股票列表抓取工具的使用方法、数据格式和常见问题。
+- 📘 **新增 Tushare 股票列表工具文档** — 新增 `docs/modules/TUSHARE_STOCK_LIST_GUIDE.md`，说明股票列表抓取工具的使用方法、数据格式和常见问题。
 - 🌍 **补齐定时模式与关联板块的双语说明** — `docs/full-guide.md` / `docs/full-guide_EN.md` 现在明确说明 scheduled mode 会在每次执行前重新读取 `STOCK_LIST`，并同步补充个股关联板块展示能力说明，减少配置预期偏差。
 - 🧭 **调整 Agent 术语兼容文案** — README、双语文档、设置页与问股界面继续以“策略”作为用户入口主称呼，同时补充 `skill` 作为内部统一命名，降低迁移期理解成本。
 
@@ -627,7 +728,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 文档
 
-- 新增 Ollama 本地模型配置说明，同步更新 `README.md` 与 `docs/README_EN.md`（Fixes #690）
+- 新增 Ollama 本地模型配置说明，同步更新 `README.md` 与 `docs/i18n/README_EN.md`（Fixes #690）
 - 完善 Ollama 配置说明：`docs/full-guide.md` / `docs/full-guide_EN.md` 环境变量表与 Note 补充 `OLLAMA_API_BASE`，避免英文用户误以为 Ollama 不能作为独立配置入口；合并重复的 `OLLAMA_API_BASE` 条目为单一条目
 - 明确文档同步治理边界：补充 `README.md`、专题文档、双语文档与交付说明之间的默认同步规则，减少后续文档漂移
 
@@ -730,7 +831,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 📊 **UI Components Refactoring** — integrated `clsx` and `tailwind-merge` for robust class composition across Web UI
 - 🗑️ **History batch deletion** — Web UI now supports multi-selection and batch deletion of analysis history; added `POST /api/v1/history/batch-delete` endpoint and `ConfirmDialog` component.
 - 🔐 **Auth settings API** — new `POST /api/v1/auth/settings` endpoint to enable or disable Web authentication at runtime and set the initial admin password when needed
-- openclaw Skill 集成指南 — 新增 [docs/openclaw-skill-integration.md](openclaw-skill-integration.md)，说明如何通过 openclaw Skill 调用 DSA API
+- openclaw Skill 集成指南 — 新增 [docs/integrations/openclaw-skill-integration.md](integrations/openclaw-skill-integration.md)，说明如何通过 openclaw Skill 调用 DSA API
 - ⚙️ **LLM channel protocol/test UX** — `.env` and Web settings now share the same channel shape (`LLM_CHANNELS` + `LLM_<NAME>_PROTOCOL/BASE_URL/API_KEY/MODELS/ENABLED`); settings page adds per-channel connection testing, primary/fallback/vision model selection, and protocol-aware model prefixing
 - 🤖 **Agent architecture Phase 0+1** — shared protocols (`AgentContext`, `AgentOpinion`, `StageResult`), extracted `run_agent_loop()` runner, `AGENT_ARCH` switch (`single`/`multi`), config registry entries
 - 🔍 **Bot NL routing** — two-layer natural-language routing: cheap regex pre-filter (stock codes + finance keywords) → lightweight LLM intent parsing; controlled by `AGENT_NL_ROUTING=true`; supports multi-stock and strategy extraction
@@ -848,7 +949,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Docs
 
 - 📖 LLM config guide refactored for clarity (#583)
-- 📖 `image-extract-prompt.md` with full prompt documentation
+- 📖 `modules/image-extract-prompt.md` with full prompt documentation
 - 📖 AkShare fallback cache TTL documentation
 
 ## [3.4.10](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.4.9...v3.4.10) - 2026-03-07
@@ -1486,7 +1587,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### 文档
 
 - 📝 重构 README 布局
-- 🌐 新增繁体中文翻译 (README_CHT.md)
+- 🌐 新增繁体中文翻译 (i18n/README_CHT.md)
 
 ### 修复
 

@@ -12,12 +12,16 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.evidence import build_evidence_cards_for_stock
 from src.agent.evidence.adapter import cards_to_json
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
+from src.agent.judge_sanity import apply_judge_sanity
 from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
+from src.agent.llm_telemetry import llm_telemetry_scope
 from src.agent.multi_expert import AgentState, ExpertOrchestrator
 from src.agent.runner import try_parse_json
 from src.data.stock_index_loader import get_index_stock_name
@@ -254,6 +258,8 @@ def run_stock_selection_pipeline(
     run_id: str = "selection-run",
     orchestration_mode: Optional[str] = None,
     candidate_discovery_mode: Optional[str] = None,
+    resume_artifact_dir: Optional[str] = None,
+    resume_from_run_id: Optional[str] = None,
 ) -> StockSelectionResult:
     """Run the staged stock-selection pipeline.
 
@@ -278,8 +284,23 @@ def run_stock_selection_pipeline(
     )
     result = StockSelectionResult(enabled=True, context=ctx)
     base_evidence: Dict[str, Any] = {}
+    resume_state = _load_stock_selection_resume_state(resume_artifact_dir)
     try:
         _emit(progress_callback, "selection_start", message="开始五阶段选股流水线。")
+        if resume_state.get("requested"):
+            _emit(
+                progress_callback,
+                "selection_resume_loaded",
+                message=_selection_resume_message(resume_state),
+                payload={
+                    "source_run_id": resume_from_run_id,
+                    "artifact_dir": resume_state.get("artifact_dir"),
+                    "available_stages": resume_state.get("available_stages", []),
+                    "resumable_stages": resume_state.get("resumable_stages", []),
+                    "reused_stages": [],
+                    "warnings": resume_state.get("warnings", []),
+                },
+            )
 
         if ctx.candidate_discovery_mode != "thesis_desk_committee":
             ctx.next_step = "stop_non_thesis_desk_mode"
@@ -309,46 +330,70 @@ def run_stock_selection_pipeline(
             _finalize_result(result)
             return result
 
-        discovery_seed = _run_candidate_discovery_tool(
-            ctx=ctx,
-            tool_registry=tool_registry,
-            target_symbols=list(agent_user_context.report.target_symbols or []),
-            llm_adapter=llm_adapter,
-        )
-        if ctx.candidate_discovery_mode in {"llm_expert_committee", "thesis_desk_committee"}:
-            discovery_payload = discovery_seed
+        reused_stages: List[str] = []
+        resumed_candidate_discovery = _resume_stage_payload(resume_state, "candidate_discovery")
+        if resumed_candidate_discovery:
+            discovery_payload = resumed_candidate_discovery
+            reused_stages.append("candidate_discovery")
+            _emit_resumed_stage(progress_callback, "candidate_discovery", ctx, discovery_payload, reused_stages)
         else:
-            discovery_payload = _call_stage_json(
+            discovery_seed = _run_candidate_discovery_tool(
                 ctx=ctx,
+                tool_registry=tool_registry,
+                target_symbols=list(agent_user_context.report.target_symbols or []),
                 llm_adapter=llm_adapter,
-                stage_name="candidate_discovery",
-                prompt=build_candidate_discovery_prompt({
-                    "user_message": task,
-                    "market": ctx.market,
-                    "account_summary": ctx.account_summary,
-                    "investor_profile": ctx.investor_profile,
-                    "target_symbols": list(agent_user_context.report.target_symbols or []),
-                    "candidate_strategy": ctx.candidate_strategy,
-                    "strategy_thresholds": ctx.strategy_thresholds,
-                    "tool_seed_result": _compact_candidate_seed(discovery_seed),
-                    "available_tools": tool_registry.list_names(),
-                }),
-                fallback=_fallback_candidate_discovery(ctx, discovery_seed),
-                timeout_seconds=timeout_seconds,
             )
-            _merge_discovery_candidates(discovery_payload, discovery_seed)
-        _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
-        ctx.set_stage("candidate_discovery", discovery_payload)
-        _emit(progress_callback, "selection_candidate_discovery_done", payload=ctx.stages["candidate_discovery"].to_dict(include_full=False))
+            if ctx.candidate_discovery_mode in {"llm_expert_committee", "thesis_desk_committee"}:
+                discovery_payload = discovery_seed
+            else:
+                discovery_payload = _call_stage_json(
+                    ctx=ctx,
+                    llm_adapter=llm_adapter,
+                    stage_name="candidate_discovery",
+                    prompt=build_candidate_discovery_prompt({
+                        "user_message": task,
+                        "market": ctx.market,
+                        "account_summary": ctx.account_summary,
+                        "investor_profile": ctx.investor_profile,
+                        "target_symbols": list(agent_user_context.report.target_symbols or []),
+                        "candidate_strategy": ctx.candidate_strategy,
+                        "strategy_thresholds": ctx.strategy_thresholds,
+                        "tool_seed_result": _compact_candidate_seed(discovery_seed),
+                        "available_tools": tool_registry.list_names(),
+                    }),
+                    fallback=_fallback_candidate_discovery(ctx, discovery_seed),
+                    timeout_seconds=timeout_seconds,
+                )
+                _merge_discovery_candidates(discovery_payload, discovery_seed)
+            _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
+            ctx.set_stage("candidate_discovery", discovery_payload)
+            _emit_stage_done(progress_callback, "selection_candidate_discovery_done", ctx, "candidate_discovery")
         if ctx.stages["candidate_discovery"].status == "failed":
             error = _candidate_discovery_failure_message(ctx.stage_full("candidate_discovery"))
-            _complete_failed_candidate_discovery_result(ctx=ctx, result=result, error=error)
+            _complete_failed_candidate_discovery_result(
+                ctx=ctx,
+                result=result,
+                error=error,
+                progress_callback=progress_callback,
+            )
             _finalize_result(result)
             _emit(progress_callback, "selection_error", message=error, payload=result.final_report_json)
             return result
 
-        ctx.market_regime = _run_market_regime_tool(ctx=ctx, tool_registry=tool_registry)
-        _emit(progress_callback, "selection_market_regime_done", payload=_summarize_market_regime(ctx.market_regime))
+        resumed_market_regime = _resume_market_regime(resume_state)
+        if resumed_market_regime:
+            ctx.market_regime = resumed_market_regime
+            reused_stages.append("market_regime")
+            _emit(
+                progress_callback,
+                "selection_market_regime_done",
+                message="已复用历史 Trace 的市场环境识别结果。",
+                payload=_summarize_market_regime(ctx.market_regime),
+            )
+        else:
+            ctx.market_regime = _run_market_regime_tool(ctx=ctx, tool_registry=tool_registry)
+            _attach_regime_forward_probability(ctx=ctx, tool_registry=tool_registry)
+            _emit(progress_callback, "selection_market_regime_done", payload=_summarize_market_regime(ctx.market_regime))
 
         candidates = _candidate_codes(ctx.stage_full("candidate_discovery"), limit=DEFAULT_CANDIDATE_LIMIT)
         if not candidates:
@@ -367,220 +412,287 @@ def run_stock_selection_pipeline(
             _finalize_result(result)
             return result
 
-        balanced_payload = _build_balanced_candidate_evidence_stage(
-            ctx=ctx,
-            tool_registry=tool_registry,
-            discovery_full=ctx.stage_full("candidate_discovery"),
-            canonical_codes=candidates,
-        )
-        _enforce_stage_stock_identity(ctx, balanced_payload, "balanced_candidate_evidence")
-        ctx.set_stage("balanced_candidate_evidence", balanced_payload)
-        _emit(
-            progress_callback,
-            "selection_balanced_candidate_evidence_done",
-            payload=ctx.stages["balanced_candidate_evidence"].to_dict(include_full=False),
-        )
+        balanced_payload = _resume_stage_payload(resume_state, "balanced_candidate_evidence")
+        if balanced_payload:
+            reused_stages.append("balanced_candidate_evidence")
+            _emit_resumed_stage(progress_callback, "balanced_candidate_evidence", ctx, balanced_payload, reused_stages)
+        else:
+            balanced_payload = _build_balanced_candidate_evidence_stage(
+                ctx=ctx,
+                tool_registry=tool_registry,
+                discovery_full=ctx.stage_full("candidate_discovery"),
+                canonical_codes=candidates,
+            )
+            _enforce_stage_stock_identity(ctx, balanced_payload, "balanced_candidate_evidence")
+            ctx.set_stage("balanced_candidate_evidence", balanced_payload)
+            _emit_stage_done(progress_callback, "selection_balanced_candidate_evidence_done", ctx, "balanced_candidate_evidence")
 
         base_evidence = _collect_base_evidence(ctx, tool_registry, candidates)
-        screening_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="candidate_screening",
-            prompt=build_candidate_screening_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "candidate_pool_summary": ctx.stage_summary("candidate_discovery"),
-                "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "candidate_evidence_table": _screening_candidate_evidence_table(ctx),
-                "candidate_evidence_data": _screening_candidate_evidence_data(ctx),
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-                "base_evidence": _compact_base_evidence(base_evidence),
-            }),
-            fallback=_fallback_candidate_screening(ctx, base_evidence),
-            timeout_seconds=timeout_seconds,
-        )
-        _enforce_stage_stock_identity(ctx, screening_payload, "candidate_screening")
-        ctx.set_stage("candidate_screening", screening_payload)
-        _emit(progress_callback, "selection_candidate_screening_done", payload=ctx.stages["candidate_screening"].to_dict(include_full=False))
-
-        deep_dive_limit = _selection_deep_dive_limit()
-        deep_targets, deep_dive_provenance = _select_deep_dive_targets(
-            candidates=candidates,
-            screening_summary=ctx.stage_summary("candidate_screening"),
-            screening_full=ctx.stage_full("candidate_screening"),
-            limit=deep_dive_limit,
-        )
-        setup_router_enabled = _deep_dive_setup_router_enabled()
-        candidate_records = (
-            _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
-            if setup_router_enabled
-            else {}
-        )
-        deep_dive_outputs: List[Dict[str, Any]] = []
-        for code in deep_targets:
-            detailed_evidence = _balanced_raw_evidence_for_code(ctx, code)
-            if detailed_evidence is None:
-                detailed_evidence = _collect_deep_dive_evidence(ctx, tool_registry, code)
-            stock_name = _stock_name_from_evidence(code, detailed_evidence)
-            evidence_cards = build_evidence_cards_for_stock(
-                run_id=ctx.run_id,
-                stock_code=code,
-                stock_name=stock_name,
-                market=ctx.market,
-                evidence=detailed_evidence,
-            )
-            prompt_evidence = _deep_dive_prompt_evidence(
-                ctx=ctx,
-                code=code,
-                stock_name=stock_name,
-                detailed_evidence=detailed_evidence,
-                evidence_cards=evidence_cards,
-            )
-            deep_dive_payload_in: Dict[str, Any] = {
-                "user_message": task,
-                "stock_code": code,
-                "stock_name": stock_name,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "screening_summary": ctx.stage_summary("candidate_screening"),
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-                "stock_evidence": prompt_evidence,
-            }
-            if setup_router_enabled:
-                deep_dive_payload_in.update(
-                    _deep_dive_setup_fields(candidate_records.get(code), market=ctx.market)
-                )
-            deep_payload = _call_stage_json(
+        screening_payload = _resume_stage_payload(resume_state, "candidate_screening")
+        if screening_payload:
+            reused_stages.append("candidate_screening")
+            _emit_resumed_stage(progress_callback, "candidate_screening", ctx, screening_payload, reused_stages)
+        else:
+            screening_payload = _call_stage_json(
                 ctx=ctx,
                 llm_adapter=llm_adapter,
-                stage_name=f"single_stock_deep_dive:{code}",
-                prompt=build_deep_dive_prompt(deep_dive_payload_in),
-                fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
+                stage_name="candidate_screening",
+                prompt=build_candidate_screening_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "candidate_pool_summary": ctx.stage_summary("candidate_discovery"),
+                    "candidate_pool_full_ref": ctx.stages["candidate_discovery"].full_ref,
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "candidate_evidence_table": _screening_candidate_evidence_table(ctx),
+                    "candidate_evidence_data": _screening_candidate_evidence_data(ctx),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                    "base_evidence": _compact_base_evidence(base_evidence),
+                }),
+                fallback=_fallback_candidate_screening(ctx, base_evidence),
                 timeout_seconds=timeout_seconds,
             )
-            _attach_evidence_cards(deep_payload, evidence_cards)
-            if deep_dive_provenance.get(code) == "pool_fallback":
-                _mark_deep_dive_pool_fallback(deep_payload)
-            _enforce_stage_stock_identity(ctx, deep_payload, f"single_stock_deep_dive:{code}")
-            deep_dive_outputs.append(deep_payload)
+            _enforce_stage_stock_identity(ctx, screening_payload, "candidate_screening")
+            ctx.set_stage("candidate_screening", screening_payload)
+            _emit_stage_done(progress_callback, "selection_candidate_screening_done", ctx, "candidate_screening")
 
-        deep_dive_stage = _combine_deep_dive_outputs(deep_dive_outputs)
-        _enforce_stage_stock_identity(ctx, deep_dive_stage, "single_stock_deep_dive")
-        ctx.set_stage("single_stock_deep_dive", deep_dive_stage)
-        _emit(progress_callback, "selection_deep_dive_done", payload=ctx.stages["single_stock_deep_dive"].to_dict(include_full=False))
+        deep_dive_stage = _resume_stage_payload(resume_state, "single_stock_deep_dive")
+        if deep_dive_stage:
+            reused_stages.append("single_stock_deep_dive")
+            _emit_resumed_stage(progress_callback, "single_stock_deep_dive", ctx, deep_dive_stage, reused_stages)
+        else:
+            deep_dive_limit = _selection_deep_dive_limit()
+            deep_targets, deep_dive_provenance = _select_deep_dive_targets(
+                candidates=candidates,
+                screening_summary=ctx.stage_summary("candidate_screening"),
+                screening_full=ctx.stage_full("candidate_screening"),
+                limit=deep_dive_limit,
+            )
+            setup_router_enabled = _deep_dive_setup_router_enabled()
+            candidate_records = (
+                _candidate_records_by_code(ctx.stage_full("candidate_discovery"))
+                if setup_router_enabled
+                else {}
+            )
+            deep_dive_outputs: List[Dict[str, Any]] = []
+            for code in deep_targets:
+                detailed_evidence = _balanced_raw_evidence_for_code(ctx, code)
+                if detailed_evidence is None:
+                    detailed_evidence = _collect_deep_dive_evidence(ctx, tool_registry, code)
+                _attach_symbol_regime_probability(
+                    ctx=ctx,
+                    tool_registry=tool_registry,
+                    code=code,
+                    evidence=detailed_evidence,
+                    scope="deep_dive",
+                )
+                stock_name = _stock_name_from_evidence(code, detailed_evidence)
+                evidence_cards = build_evidence_cards_for_stock(
+                    run_id=ctx.run_id,
+                    stock_code=code,
+                    stock_name=stock_name,
+                    market=ctx.market,
+                    evidence=detailed_evidence,
+                )
+                prompt_evidence = _deep_dive_prompt_evidence(
+                    ctx=ctx,
+                    code=code,
+                    stock_name=stock_name,
+                    detailed_evidence=detailed_evidence,
+                    evidence_cards=evidence_cards,
+                )
+                deep_dive_payload_in: Dict[str, Any] = {
+                    "user_message": task,
+                    "stock_code": code,
+                    "stock_name": stock_name,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "screening_summary": ctx.stage_summary("candidate_screening"),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                    "stock_evidence": prompt_evidence,
+                }
+                if setup_router_enabled:
+                    deep_dive_payload_in.update(
+                        _deep_dive_setup_fields(candidate_records.get(code), market=ctx.market)
+                    )
+                deep_payload = _call_stage_json(
+                    ctx=ctx,
+                    llm_adapter=llm_adapter,
+                    stage_name=f"single_stock_deep_dive:{code}",
+                    prompt=build_deep_dive_prompt(deep_dive_payload_in),
+                    fallback=_fallback_deep_dive(code, stock_name, detailed_evidence),
+                    timeout_seconds=timeout_seconds,
+                )
+                _attach_evidence_cards(deep_payload, evidence_cards)
+                _attach_symbol_regime_to_deep_payload(deep_payload, detailed_evidence.get("get_symbol_regime_probability"))
+                if deep_dive_provenance.get(code) == "pool_fallback":
+                    _mark_deep_dive_pool_fallback(deep_payload)
+                _enforce_stage_stock_identity(ctx, deep_payload, f"single_stock_deep_dive:{code}")
+                deep_dive_outputs.append(deep_payload)
 
-        meta_payload = _call_stage_json(
+            deep_dive_stage = _combine_deep_dive_outputs(deep_dive_outputs)
+            _enforce_stage_stock_identity(ctx, deep_dive_stage, "single_stock_deep_dive")
+            ctx.set_stage("single_stock_deep_dive", deep_dive_stage)
+            _emit_stage_done(progress_callback, "selection_deep_dive_done", ctx, "single_stock_deep_dive")
+
+        _build_symbol_regime_probability_stage(ctx)
+        _attach_holding_symbol_regime_probabilities(
             ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="meta_orchestrator",
-            prompt=build_meta_orchestrator_prompt(_build_meta_orchestrator_input(ctx)),
-            fallback=_fallback_meta_orchestrator(ctx),
-            timeout_seconds=timeout_seconds,
+            tool_registry=tool_registry,
+            positions=_positions_summary(agent_user_context),
         )
-        _enforce_stage_stock_identity(ctx, meta_payload, "meta_orchestrator")
-        ctx.set_stage("meta_orchestrator", meta_payload)
-        _emit(progress_callback, "selection_meta_orchestrator_done", payload=ctx.stages["meta_orchestrator"].to_dict(include_full=False))
 
-        pricing_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="pricing_agent",
-            prompt=build_pricing_agent_prompt(_build_pricing_agent_input(ctx)),
-            fallback=_fallback_pricing_agent(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        _enforce_stage_stock_identity(ctx, pricing_payload, "pricing_agent")
-        ctx.set_stage("pricing_agent", pricing_payload)
-        _emit(progress_callback, "selection_pricing_agent_done", payload=ctx.stages["pricing_agent"].to_dict(include_full=False))
+        meta_payload = _resume_stage_payload(resume_state, "meta_orchestrator")
+        if meta_payload:
+            reused_stages.append("meta_orchestrator")
+            _emit_resumed_stage(progress_callback, "meta_orchestrator", ctx, meta_payload, reused_stages)
+        else:
+            meta_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="meta_orchestrator",
+                prompt=build_meta_orchestrator_prompt(_build_meta_orchestrator_input(ctx)),
+                fallback=_fallback_meta_orchestrator(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _enforce_stage_stock_identity(ctx, meta_payload, "meta_orchestrator")
+            ctx.set_stage("meta_orchestrator", meta_payload)
+            _emit_stage_done(progress_callback, "selection_meta_orchestrator_done", ctx, "meta_orchestrator")
 
-        allocation_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="portfolio_allocation",
-            prompt=build_portfolio_allocation_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
-                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
-                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
-                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
-                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "positions": _positions_summary(agent_user_context),
-                "available_cash": ctx.account_summary.get("available_cash"),
-            }),
-            fallback=_fallback_portfolio_allocation(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        allocation_payload = _apply_market_regime_constraints(ctx, allocation_payload)
-        _enforce_stage_stock_identity(ctx, allocation_payload, "portfolio_allocation")
-        ctx.set_stage("portfolio_allocation", allocation_payload)
-        _emit(progress_callback, "selection_allocation_done", payload=ctx.stages["portfolio_allocation"].to_dict(include_full=False))
+        pricing_payload = _resume_stage_payload(resume_state, "pricing_agent")
+        if pricing_payload:
+            reused_stages.append("pricing_agent")
+            _emit_resumed_stage(progress_callback, "pricing_agent", ctx, pricing_payload, reused_stages)
+        else:
+            pricing_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="pricing_agent",
+                prompt=build_pricing_agent_prompt(_build_pricing_agent_input(ctx)),
+                fallback=_fallback_pricing_agent(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _enforce_stage_stock_identity(ctx, pricing_payload, "pricing_agent")
+            ctx.set_stage("pricing_agent", pricing_payload)
+            _emit_stage_done(progress_callback, "selection_pricing_agent_done", ctx, "pricing_agent")
 
-        adversarial_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="adversarial_review",
-            prompt=build_adversarial_review_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "candidate_discovery_summary": ctx.stage_summary("candidate_discovery"),
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "screening_summary": ctx.stage_summary("candidate_screening"),
-                "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
-                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
-                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
-                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
-                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
-                "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-            }),
-            fallback=_fallback_adversarial_review(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        _enforce_stage_stock_identity(ctx, adversarial_payload, "adversarial_review")
-        ctx.set_stage("adversarial_review", adversarial_payload)
-        _emit(progress_callback, "selection_adversarial_done", payload=ctx.stages["adversarial_review"].to_dict(include_full=False))
+        allocation_payload = _resume_stage_payload(resume_state, "portfolio_allocation")
+        if allocation_payload:
+            reused_stages.append("portfolio_allocation")
+            _emit_resumed_stage(progress_callback, "portfolio_allocation", ctx, allocation_payload, reused_stages)
+        else:
+            allocation_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="portfolio_allocation",
+                prompt=build_portfolio_allocation_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                    "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                    "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                    "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                    "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "symbol_regime_probabilities": _compact_symbol_regime_stage_for_prompt(ctx),
+                    "positions": _positions_summary(agent_user_context),
+                    "available_cash": ctx.account_summary.get("available_cash"),
+                }),
+                fallback=_fallback_portfolio_allocation(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            allocation_payload = _apply_market_regime_constraints(ctx, allocation_payload)
+            _enforce_stage_stock_identity(ctx, allocation_payload, "portfolio_allocation")
+            ctx.set_stage("portfolio_allocation", allocation_payload)
+            _emit_stage_done(progress_callback, "selection_allocation_done", ctx, "portfolio_allocation")
 
-        judge_payload = _call_stage_json(
-            ctx=ctx,
-            llm_adapter=llm_adapter,
-            stage_name="judge_decision",
-            prompt=build_judge_decision_prompt({
-                "user_message": task,
-                "account_summary": ctx.account_summary,
-                "investor_profile": ctx.investor_profile,
-                "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
-                "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
-                "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
-                "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
-                "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
-                "opposing_review_summary": ctx.stage_summary("adversarial_review"),
-                "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
-                "balanced_candidate_evidence_ref": "candidate_evidence.md",
-                "market_regime": _summarize_market_regime(ctx.market_regime),
-                "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
-            }),
-            fallback=_fallback_judge_decision(ctx),
-            timeout_seconds=timeout_seconds,
-        )
-        _stabilize_judge_decision(ctx, judge_payload)
-        _apply_judge_position_overrides(ctx, judge_payload)
-        _enforce_stage_stock_identity(ctx, judge_payload, "judge_decision")
-        ctx.set_stage("judge_decision", judge_payload)
+        adversarial_payload = _resume_stage_payload(resume_state, "adversarial_review")
+        if adversarial_payload:
+            reused_stages.append("adversarial_review")
+            _emit_resumed_stage(progress_callback, "adversarial_review", ctx, adversarial_payload, reused_stages)
+        else:
+            adversarial_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="adversarial_review",
+                prompt=build_adversarial_review_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "candidate_discovery_summary": ctx.stage_summary("candidate_discovery"),
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "screening_summary": ctx.stage_summary("candidate_screening"),
+                    "deep_dive_results_summary": ctx.stage_summary("single_stock_deep_dive"),
+                    "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                    "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                    "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                    "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
+                    "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                }),
+                fallback=_fallback_adversarial_review(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _enforce_stage_stock_identity(ctx, adversarial_payload, "adversarial_review")
+            ctx.set_stage("adversarial_review", adversarial_payload)
+            _emit_stage_done(progress_callback, "selection_adversarial_done", ctx, "adversarial_review")
+
+        judge_payload = _resume_stage_payload(resume_state, "judge_decision")
+        if judge_payload:
+            reused_stages.append("judge_decision")
+            _emit_resumed_stage(progress_callback, "judge_decision", ctx, judge_payload, reused_stages)
+        else:
+            judge_payload = _call_stage_json(
+                ctx=ctx,
+                llm_adapter=llm_adapter,
+                stage_name="judge_decision",
+                prompt=build_judge_decision_prompt({
+                    "user_message": task,
+                    "account_summary": ctx.account_summary,
+                    "investor_profile": ctx.investor_profile,
+                    "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
+                    "meta_orchestrator_summary": ctx.stage_summary("meta_orchestrator"),
+                    "meta_constraint_packages": _compact_meta_packages_for_prompt(ctx),
+                    "pricing_agent_summary": ctx.stage_summary("pricing_agent"),
+                    "if_then_order_matrix": _compact_pricing_matrix_for_prompt(ctx),
+                    "opposing_review_summary": ctx.stage_summary("adversarial_review"),
+                    "balanced_candidate_evidence_summary": ctx.stage_summary("balanced_candidate_evidence"),
+                    "balanced_candidate_evidence_ref": "candidate_evidence.md",
+                    "market_regime": _summarize_market_regime(ctx.market_regime),
+                    "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                }),
+                fallback=_fallback_judge_decision(ctx),
+                timeout_seconds=timeout_seconds,
+            )
+            _stabilize_judge_decision(ctx, judge_payload)
+            judge_payload = apply_judge_sanity(
+                judge_payload,
+                allocation_payload=ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
+                market_regime=ctx.market_regime,
+                investor_profile=ctx.investor_profile,
+            )
+            sanitized_allocation = (
+                judge_payload.get("full", {}).get("sanitized_allocation")
+                if isinstance(judge_payload.get("full"), dict)
+                else None
+            )
+            if isinstance(sanitized_allocation, dict):
+                judge_payload["full"].pop("sanitized_allocation", None)
+                ctx.set_stage("portfolio_allocation", sanitized_allocation)
+            _apply_judge_position_overrides(ctx, judge_payload)
+            _enforce_stage_stock_identity(ctx, judge_payload, "judge_decision")
+            ctx.set_stage("judge_decision", judge_payload)
         ctx.next_step = (judge_payload.get("summary") or {}).get("next_step") or "render_final_report"
-        _emit(progress_callback, "selection_judge_done", payload=ctx.stages["judge_decision"].to_dict(include_full=False))
+        if "judge_decision" not in reused_stages:
+            _emit_stage_done(progress_callback, "selection_judge_done", ctx, "judge_decision")
         _maybe_run_expert_graph(
             ctx=ctx,
             task=task,
@@ -673,7 +785,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     ]
     headline_watch_items = _headline_watch_items(
         displayed_recommendations=displayed_recommendations,
-        primary_items=execution_recommendations or headline_opportunity_items,
+        primary_items=execution_recommendations[:1] + headline_opportunity_items[:1],
     )
     observation_items = [
         item for item in recommendations
@@ -687,8 +799,8 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         "",
         "| 项目 | 结论 |",
         "| --- | --- |",
-        f"| 最终动作 | {judge.get('final_action') or allocation.get('portfolio_action') or '-'} |",
-        f"| 裁决 | {judge.get('primary_plan_verdict') or '-'} |",
+        f"| 最终动作 | {_markdown_cell(_final_action_label(judge.get('final_action') or allocation.get('portfolio_action')))} |",
+        f"| 裁决 | {_markdown_cell(_plan_verdict_label(judge.get('primary_plan_verdict')))} |",
         f"| 机会首选 | {_markdown_cell(_opportunity_candidate_label(headline_opportunity_items))} |",
         f"| 执行首选 | {_markdown_cell(_execution_candidate_label(execution_recommendations))} |",
         f"| 可观察标的 | {_markdown_cell(_watch_candidate_labels(headline_watch_items))} |",
@@ -698,10 +810,8 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         "",
     ]
 
-    lines.extend(_render_meta_agent_chain_section(report, recommendations=displayed_recommendations))
-
     lines.extend([
-        "## 三、推荐排序与入场决策" if execution_recommendations else "## 三、深挖结果与等待/排除决策",
+        "## 二、推荐排序与入场决策" if execution_recommendations else "## 二、深挖结果与等待/排除决策",
         "",
     ])
 
@@ -741,24 +851,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 四、Execute 证据摘要",
-        "",
-        "| 证据项 | 状态 | 关键结果 | 对选股结论的影响 |",
-        "| --- | --- | --- | --- |",
-    ])
-    for row in _evidence_summary_rows(report, candidates, deep_results):
-        lines.append(
-            "| {name} | {status} | {result} | {impact} |".format(
-                name=_markdown_cell(row.get("name") or "-"),
-                status=_markdown_cell(row.get("status") or "-"),
-                result=_markdown_cell(row.get("result") or "-"),
-                impact=_markdown_cell(row.get("impact") or "-"),
-            )
-        )
-
-    lines.extend([
-        "",
-        "## 五、关键风险与等待确认",
+        "## 三、关键风险与等待确认",
         "",
     ])
     risk_lines = _final_risk_lines(recommendations, adversarial, all_missing)
@@ -769,38 +862,35 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     lines.extend([
         "",
-        "## 六、组合配置表",
+        "## 四、组合配置简表",
         "",
-        "| 排名 | 股票 | 动作 | 首仓比例 | 入场条件 | 止损条件 | 复查触发 |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| 排名 | 股票 | 动作 | 首仓比例 | 必要条件 | 复查触发 |",
+        "| --- | --- | --- | --- | --- | --- |",
     ])
     if positions:
         for item in positions:
             lines.append(
-                "| {rank} | {stock} | {action} | {pct} | {entry} | {stop} | {review} |".format(
+                "| {rank} | {stock} | {action} | {pct} | {entry} | {review} |".format(
                     rank=item.get("rank") or "-",
                     stock=_markdown_cell(f"{item.get('code') or '-'} {item.get('name') or ''}".strip()),
-                    action=_markdown_cell(item.get("action") or "-"),
+                    action=_markdown_cell(_final_action_label(item.get("action"))),
                     pct=_markdown_cell(_format_pct(item.get("initial_position_pct"))),
-                    entry=_markdown_cell(item.get("entry_condition") or "-"),
-                    stop=_markdown_cell(item.get("stop_loss_condition") or "-"),
+                    entry=_markdown_cell(_necessary_conditions_text(_entry_condition_source_from_plan(item))),
                     review=_markdown_cell(item.get("review_trigger") or "-"),
                 )
             )
     else:
-        lines.append("| - | - | wait | - | 候选不足或证据不足 | - | 补充候选或等待数据 |")
+        lines.append("| - | - | 等待 | - | 候选不足或证据不足 | 补充候选或等待数据 |")
 
     lines.extend([
         "",
-        "## 七、辅助审查摘要",
+        "## 五、风控复查摘要",
         "",
-        "反方审查和 Judge 裁决只作为主方案的校验层，完整原始输出保留在 Trace artifact 中。",
+        "以下内容只保留会影响执行的复查点，完整系统链路保留在 Trace 调试信息中。",
         "",
         "| 审查项 | 摘要 |",
         "| --- | --- |",
         f"| 辅助审查 | {_markdown_cell(review_note)} |",
-        f"| Meta 场景约束 | {_markdown_cell(_brief_markdown_text(_meta_report_note(meta_summary), 180))} |",
-        f"| 点位计算条件单 | {_markdown_cell(_brief_markdown_text(_pricing_report_note(pricing_summary), 180))} |",
         f"| 反方提醒 | {_markdown_cell(_brief_markdown_text(adversarial.get('opposing_summary') or '-', 180))} |",
         f"| Judge 调整 | {_markdown_cell(_brief_markdown_text(judge.get('decision_summary') or '-', 180))} |",
     ])
@@ -816,7 +906,13 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         "",
         "<!-- APPENDIX_SEPARATOR -->",
         "",
-        "## 附录一、候选池来源与入池理由",
+    ])
+
+    lines.extend(_render_meta_agent_chain_section(report, recommendations=displayed_recommendations))
+
+    lines.extend([
+        "",
+        "## 附录二、候选池来源与入池理由",
         "",
         "这部分用于追溯候选为什么进池，不代表买入结论。",
         "",
@@ -856,7 +952,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     if deep_results:
         lines.extend([
             "",
-            "## 附录二、逐股维度证据展开",
+            "## 附录三、逐股维度证据展开",
         ])
         for result in deep_results:
             if not isinstance(result, dict):
@@ -905,7 +1001,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
 
     risk_controls = report.get("judge_decision", {}).get("full", {}).get("risk_controls", [])
     if risk_controls:
-        lines.extend(["", "## 附录三、风控条件"])
+        lines.extend(["", "## 附录四、风控条件"])
         lines.extend([f"- {item}" for item in risk_controls])
     return "\n".join(lines).strip()
 
@@ -922,6 +1018,7 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
         else []
     )
     desk_by_code = _desk_opinions_by_code(report)
+    negative_reasons_by_code = _negative_conclusion_reasons_by_code(report)
     package_by_code = {
         _normalize_stock_identity_code((item.get("stock") or {}).get("code")): item
         for item in packages
@@ -954,21 +1051,9 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
                 break
 
     lines = [
-        "## 二、Meta-Agent 链路对齐（非推荐排序）",
+        "## 附录一、系统推理链路（调试用）",
         "",
-        "本节只解释每只深挖标的如何从三席位传到 Meta-Agent 和点位计算层，不代表另一套推荐排序。字段缺失会直接标为缺失，不用隐含假设补齐。",
-        "",
-        "### 字段说明",
-        "",
-        "| 字段 | 在报告中的作用 |",
-        "| --- | --- |",
-        "| 三席位意见 | 展示低位启动、动量、质量修复三个打法对同一股票的支持、观察、反对或拒绝。 |",
-        "| `meta_analysis.factual_consensus` | Meta-Agent 从三席位和深挖结果里抽出的事实共识，只陈述事实。 |",
-        "| `meta_analysis.strategic_divergence` | 三席位之间的主观分歧，说明为什么不能把单一席位意见直接当买入结论。 |",
-        "| `asset_regime` | Meta-Agent 给股票打的机会类型标签，用来决定后续点位计算层要算哪类剧本。 |",
-        "| `hard_constraints_for_pricing_agent` | 传给点位计算层的硬约束包，包括失效位、均值回归锚点、禁追高和风险边界。 |",
-        "| `required_pricing_scenarios` | Meta-Agent 强制点位计算层必算的顺势、衰竭、回归等场景。 |",
-        "| `if_then_order_matrix` | 点位计算层按硬约束生成的 If-Then 条件单矩阵，Judge 必须按它降级或采纳。 |",
+        "本节用于复盘系统为什么给出这些等待条件，不是另一套推荐排序；普通用户只看正文即可。",
         "",
     ]
 
@@ -988,7 +1073,7 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
         rec = recommendation_by_code.get(code) or {}
         name = stock.get("name") or pricing.get("name") or rec.get("name") or ""
         lines.extend([
-            f"### 链路对齐：{_markdown_cell(f'{code} {name}'.strip())}",
+            f"### {_markdown_cell(f'{code} {name}'.strip())}",
             "",
             "#### 三席位意见",
             "",
@@ -1001,23 +1086,35 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
                 lines.append(
                     "| {desk} | {stance} | {status} | {reason} |".format(
                         desk=_markdown_cell(row.get("desk") or "-"),
-                        stance=_markdown_cell(row.get("stance") or "-"),
+                        stance=_markdown_cell(_stance_label(row.get("stance"))),
                         status=_markdown_cell(row.get("status") or "-"),
                         reason=_markdown_cell(_brief_markdown_text(row.get("reason") or "-", 180)),
                     )
                 )
         else:
-            lines.append("| - | 缺失 | 缺失 | 本轮 candidate_discovery 未落盘 thesis_desk_packets。 |")
+            reason_rows = negative_reasons_by_code.get(code) or []
+            if reason_rows:
+                for row in reason_rows[:4]:
+                    lines.append(
+                        "| {desk} | {conclusion} | {status} | {reason} |".format(
+                            desk=_markdown_cell(row.get("desk") or "-"),
+                            conclusion=_markdown_cell(row.get("conclusion") or "未进入最终候选"),
+                            status=_markdown_cell(row.get("status") or "-"),
+                            reason=_markdown_cell(_brief_markdown_text(row.get("reason") or "-", 180)),
+                        )
+                    )
+            else:
+                lines.append("| - | 缺失 | 缺失 | 本轮 candidate_discovery 未落盘 thesis_desk_packets，且没有记录负面原因。 |")
 
         meta = package.get("meta_analysis") if isinstance(package.get("meta_analysis"), dict) else {}
         market = package.get("market_context") if isinstance(package.get("market_context"), dict) else {}
         lines.extend([
             "",
-            "#### Meta-Agent 约束包",
+            "#### 系统约束摘要",
             "",
             "| 项目 | 内容 |",
             "| --- | --- |",
-            f"| 资产定性 | {_markdown_cell(meta.get('asset_regime') or pricing.get('asset_regime') or '缺失：asset_regime 未返回')} |",
+            f"| 机会类型 | {_markdown_cell(_asset_regime_label(meta.get('asset_regime') or pricing.get('asset_regime')))} |",
             f"| 事实共识 | {_markdown_cell(_join_limited(meta.get('factual_consensus'), 3, '缺失：factual_consensus 未返回'))} |",
             f"| 策略分歧 | {_markdown_cell(meta.get('strategic_divergence') or '缺失：strategic_divergence 未返回')} |",
             f"| 市场环境 | {_markdown_cell(_market_context_text(market))} |",
@@ -1029,7 +1126,7 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
         if scenarios:
             lines.extend([
                 "",
-                "Meta 必算场景：",
+                "系统要求点位层检查的场景：",
             ])
             for scenario in scenarios[:5]:
                 if not isinstance(scenario, dict):
@@ -1044,7 +1141,7 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
 
         lines.extend([
             "",
-            "#### 点位计算 If-Then 条件单",
+            "#### 点位条件单",
             "",
             "| 场景 | 条件 | 动作 | 入场区间 | 止盈目标 | 止损/失效 | 备注 |",
             "| --- | --- | --- | --- | --- | --- | --- |",
@@ -1058,7 +1155,7 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
                     "| {name} | {condition} | {action} | {entry} | {target} | {stop} | {comment} |".format(
                         name=_markdown_cell(scenario.get("scenario_name") or "-"),
                         condition=_markdown_cell(scenario.get("condition") or "-"),
-                        action=_markdown_cell(scenario.get("action") or "-"),
+                        action=_markdown_cell(_final_action_label(scenario.get("action"))),
                         entry=_markdown_cell(_pricing_entry_text(scenario, rec)),
                         target=_markdown_cell(_pricing_take_profit_text(scenario, rec)),
                         stop=_markdown_cell(_pricing_stop_text(scenario, rec)),
@@ -1071,6 +1168,9 @@ def _render_meta_agent_chain_section(report: Dict[str, Any], *, recommendations:
         if warnings:
             lines.extend(["", "点位计算警告："])
             lines.extend([f"- {_markdown_cell(_brief_markdown_text(item, 180))}" for item in warnings[:4]])
+        regime_probability_note = _regime_probability_report_note(pricing)
+        if regime_probability_note:
+            lines.extend(["", "Regime 概率证据：", f"- {_markdown_cell(regime_probability_note)}"])
         lines.append("")
     return lines
 
@@ -1104,6 +1204,36 @@ def _desk_opinions_by_code(report: Dict[str, Any]) -> Dict[str, List[Dict[str, A
     return by_code
 
 
+def _stance_label(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    labels = {
+        "support": "支持",
+        "watch": "观察",
+        "neutral": "中性",
+        "oppose": "反对",
+        "invalid": "无效",
+    }
+    return labels.get(raw, str(value or "-"))
+
+
+def _negative_conclusion_reasons_by_code(report: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    discovery_full = report.get("candidate_discovery", {}).get("full", {})
+    rows = (
+        discovery_full.get("negative_conclusion_reasons")
+        if isinstance(discovery_full, dict) and isinstance(discovery_full.get("negative_conclusion_reasons"), list)
+        else []
+    )
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = _normalize_stock_identity_code(row.get("code") or row.get("stock_code"))
+        if not code:
+            continue
+        by_code.setdefault(code, []).append(row)
+    return by_code
+
+
 def _join_limited(value: Any, limit: int, missing_text: str) -> str:
     items = _as_text_list(value)
     return "；".join(items[:limit]) if items else missing_text
@@ -1113,9 +1243,9 @@ def _market_context_text(market: Dict[str, Any]) -> str:
     if not isinstance(market, dict) or not market:
         return "缺失：market_context 未返回"
     parts = [
-        f"regime={market.get('market_regime')}" if market.get("market_regime") else "",
-        f"volatility={market.get('volatility_bucket')}" if market.get("volatility_bucket") else "",
-        f"risk={market.get('risk_level')}" if market.get("risk_level") else "",
+        f"市场状态：{_market_regime_label(market.get('market_regime'))}" if market.get("market_regime") else "",
+        f"波动：{_volatility_label(market.get('volatility_bucket'))}" if market.get("volatility_bucket") else "",
+        f"风险：{_risk_level_label(market.get('risk_level'))}" if market.get("risk_level") else "",
         str(market.get("regime_weight_adjustment") or ""),
     ]
     text = "；".join(part for part in parts if part)
@@ -1153,6 +1283,64 @@ def _constraint_text(value: Dict[str, Any], missing_text: str) -> str:
     if value.get("source"):
         bits.append(f"source={value.get('source')}")
     return "；".join(bits) if bits else missing_text
+
+
+def _asset_regime_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    labels = {
+        "Right_Side_Momentum_High_Exhaustion_Risk": "右侧动量，但短线过热",
+        "Right_Side_Momentum": "右侧动量",
+        "Quality_Repair_Price_Not_Fully_Reflected": "基本面修复，价格未完全反映",
+        "Early_Turn_Low_Base_Confirmation": "低位转强，等待确认",
+        "Event_Theme_Watch": "事件/主题观察",
+    }
+    return labels.get(raw, raw or "缺失：机会类型未返回")
+
+
+def _final_action_label(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    labels = {
+        "open": "开仓",
+        "buy": "买入",
+        "add": "加仓",
+        "hold": "持有",
+        "reduce": "减仓",
+        "take_profit": "止盈",
+        "stop_loss": "止损",
+        "wait": "等待",
+        "monitor": "观察",
+        "watch": "观察",
+        "reject": "放弃",
+        "avoid": "回避",
+        "plain_wait": "等待",
+        "conditional_open": "条件触发后试仓",
+        "immediate_open": "可执行开仓",
+        "strong_watch": "强观察",
+        "wait_for_more_data": "等待更多证据",
+    }
+    return labels.get(raw, str(value or "-"))
+
+
+def _plan_verdict_label(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    labels = {
+        "accept": "采纳",
+        "accept_with_changes": "有条件采纳",
+        "reject": "驳回",
+        "wait_for_more_data": "等待更多证据",
+    }
+    return labels.get(raw, str(value or "-"))
+
+
+def _action_strength_label(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    labels = {
+        "none": "无",
+        "weak": "弱",
+        "medium": "中",
+        "strong": "强",
+    }
+    return labels.get(raw, str(value or "-"))
 
 
 def _premium_constraint_text(value: Any) -> str:
@@ -1200,6 +1388,35 @@ def _pricing_stop_text(scenario: Dict[str, Any], rec: Dict[str, Any]) -> str:
                 values.append(str(rec.get(key)))
     text = "；".join(dict.fromkeys(values))
     return _brief_markdown_text(text, 260) if text else "缺失：未给出止损/失效条件"
+
+
+def _regime_probability_report_note(pricing: Dict[str, Any]) -> str:
+    if not isinstance(pricing, dict):
+        return ""
+    payload = pricing.get("regime_probability") if isinstance(pricing.get("regime_probability"), dict) else {}
+    if not payload:
+        return ""
+    status = str(payload.get("status") or "")
+    brief = str(payload.get("brief") or "").strip()
+    windows = payload.get("windows") if isinstance(payload.get("windows"), dict) else {}
+    window_30 = windows.get("30") if isinstance(windows.get("30"), dict) else {}
+    reentry = pricing.get("reentry_reference") if isinstance(pricing.get("reentry_reference"), dict) else payload.get("reentry_reference")
+    reentry = reentry if isinstance(reentry, dict) else {}
+    low_confidence = (
+        bool(window_30.get("low_confidence"))
+        or bool(reentry.get("low_confidence"))
+        or status not in {"ok", "partial"}
+    )
+    parts = []
+    if brief:
+        parts.append(brief)
+    elif status:
+        parts.append(f"forward_probability status={status}")
+    if reentry.get("reentry_price") not in (None, ""):
+        parts.append(f"买回/回踩参考价={reentry.get('reentry_price')}")
+    if low_confidence:
+        parts.append("样本或有效样本不足，仅作弱证据，不能单独支持开仓。")
+    return "；".join(parts)
 
 
 APPENDIX_SEPARATOR = "<!-- APPENDIX_SEPARATOR -->"
@@ -1318,6 +1535,15 @@ def _candidate_discovery_failure_message(discovery_full: Dict[str, Any]) -> str:
 
     base = str(discovery_full.get("error") or "").strip()
     errors: List[str] = []
+    for row in discovery_full.get("negative_conclusion_reasons") or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        desk = str(row.get("desk") or "").strip()
+        reason = str(row.get("reason") or "").strip()
+        if reason:
+            prefix = " ".join(part for part in (code, desk) if part)
+            errors.append(f"{prefix}: {reason}" if prefix else reason)
     for packet in discovery_full.get("thesis_desk_packets") or []:
         if not isinstance(packet, dict):
             continue
@@ -1337,6 +1563,7 @@ def _complete_failed_candidate_discovery_result(
     ctx: SelectionRunContext,
     result: StockSelectionResult,
     error: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """Fail fast when thesis desks do not produce candidates."""
 
@@ -1360,6 +1587,15 @@ def _complete_failed_candidate_discovery_result(
         },
         "full_ref": "judge_decision.json",
     })
+    try:
+        _maybe_run_expert_graph(
+            ctx=ctx,
+            task=ctx.user_message,
+            base_evidence={},
+            progress_callback=progress_callback,
+        )
+    except Exception as expert_exc:
+        logger.exception("Expert graph failed during candidate-discovery failure finalization: %s", expert_exc)
     result.success = False
     result.error = error
     result.final_report_json = _build_final_report_json(ctx)
@@ -1418,16 +1654,21 @@ def _call_stage_json(
     parsed: Dict[str, Any] = {}
     stage_error: Optional[str] = None
     try:
-        response = llm_adapter.call_text(
-            [
-                {
-                    "role": "system",
-                    "content": "你是账户感知股票选股流水线中的阶段 Agent。只输出 JSON，不输出 Markdown。",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            timeout=timeout_seconds,
-        )
+        with llm_telemetry_scope(
+            stage=stage_name.split(":", 1)[0],
+            agent_role=_telemetry_role_for_stage(stage_name),
+            symbol=_telemetry_symbol_for_stage(ctx, stage_name),
+        ):
+            response = llm_adapter.call_text(
+                [
+                    {
+                        "role": "system",
+                        "content": "你是账户感知股票选股流水线中的阶段 Agent。只输出 JSON，不输出 Markdown。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                timeout=timeout_seconds,
+            )
         _accumulate_usage(ctx, response)
         raw_text = response.content or ""
         parsed = try_parse_json(raw_text) or {}
@@ -1457,6 +1698,30 @@ def _call_stage_json(
                 "raw": _truncate(json.dumps(original, ensure_ascii=False, default=str), 1000),
             })
     return _normalize_stage_payload(parsed, fallback=fallback)
+
+
+def _telemetry_role_for_stage(stage_name: str) -> str:
+    stage = stage_name.split(":", 1)[0]
+    return {
+        "candidate_discovery": "candidate_discovery",
+        "candidate_screening": "screening",
+        "single_stock_deep_dive": "deep_dive",
+        "meta_orchestrator": "meta",
+        "pricing_agent": "pricing",
+        "portfolio_allocation": "portfolio",
+        "adversarial_review": "adversarial",
+        "judge_decision": "judge",
+    }.get(stage, "unknown")
+
+
+def _telemetry_symbol_for_stage(ctx: SelectionRunContext, stage_name: str) -> Optional[str]:
+    if ":" in stage_name:
+        return stage_name.split(":", 1)[1] or None
+    discovery = ctx.stage_full("candidate_discovery")
+    symbols = discovery.get("target_symbols") if isinstance(discovery, dict) else None
+    if isinstance(symbols, list) and len(symbols) == 1:
+        return str(symbols[0])
+    return None
 
 
 def _normalize_stage_payload(payload: Dict[str, Any], *, fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -1644,7 +1909,7 @@ def _apply_quote_snapshot_to_deep_dive(
         price_text = f"{price:g}" if isinstance(price, (int, float)) else str(price)
         if summary.get("action_bias") == "reject":
             if not entry_quality.get("no_chase_line"):
-                entry_quality["no_chase_line"] = f"当前价位（约{price_text}）为禁止追高区域"
+                entry_quality["no_chase_line"] = f"当前价位（约{price_text}）已超过回踩型合理区间；除非重新出现承接确认，否则不追"
         elif not entry_quality.get("no_chase_line"):
             entry_quality["no_chase_line"] = _default_no_chase_condition()
 
@@ -1857,17 +2122,15 @@ def _run_candidate_discovery_tool(
             if call_with_tools_fn is not None and not callable(llm_adapter):
                 from src.agent.candidate_experts_v2.experts.base import LLMToolCall, LLMTurn
 
-                def _committee_llm_callable(messages, tool_decls_inner):
-                    response_format = (
-                        {"type": "json_object"}
-                        if any(str(msg.get("role") or "") == "tool" for msg in messages or [])
-                        else None
-                    )
+                def _committee_llm_callable(messages, tool_decls_inner, **kwargs):
+                    response_format = kwargs.get("response_format")
+                    max_tokens = kwargs.get("max_tokens")
                     resp = call_with_tools_fn(
                         messages,
                         tool_decls_inner,
                         timeout=per_desk_llm_timeout,
                         response_format=response_format,
+                        max_tokens=max_tokens,
                     )
                     tc_list = []
                     for tc in (getattr(resp, "tool_calls", None) or []):
@@ -1881,7 +2144,11 @@ def _run_candidate_discovery_tool(
                     content = str(getattr(resp, "content", "") or "")
                     if getattr(resp, "provider", "") == "error" and not tc_list:
                         raise RuntimeError(content or "LLM provider returned error")
-                    return LLMTurn(tool_calls=tc_list, text=content)
+                    return LLMTurn(
+                        tool_calls=tc_list,
+                        text=content,
+                        usage=dict(getattr(resp, "usage", {}) or {}),
+                    )
 
                 committee_llm = _committee_llm_callable
             tool_decls = []
@@ -1915,10 +2182,10 @@ def _run_candidate_discovery_tool(
             today_str = datetime.now().strftime("%Y%m%d")
             try:
                 seed_pool_total_limit = int(
-                    getattr(Config.get_instance(), "agent_seed_pool_total_limit", 20) or 20
+                    getattr(Config.get_instance(), "agent_seed_pool_total_limit", 32) or 32
                 )
             except Exception:
-                seed_pool_total_limit = 20
+                seed_pool_total_limit = 32
             seed_pool_result = _build_seed_pool_result(
                 market=ctx.market,
                 seed_symbols=target_symbols,
@@ -1939,24 +2206,26 @@ def _run_candidate_discovery_tool(
                     per_desk_llm_timeout * seed_count_for_timeout * 3,
                 ),
             )
-            payload = run_committee_discovery(
-                market=ctx.market,
-                seed_symbols=target_symbols,
-                limit=DISCOVERY_RECALL_LIMIT,
-                tool_registry=committee_tool_registry,
-                llm_adapter=committee_llm,
-                today=today_str,
-                tool_decls=tool_decls,
-                seed_pool_result=seed_pool_result,
-                overall_timeout_s=committee_timeout_s,
-                seed_fact_tools=getattr(Config.get_instance(), "agent_seed_fact_tools", None),
-                seed_fact_max_workers=int(
-                    getattr(Config.get_instance(), "agent_seed_fact_max_workers", 12) or 12
-                ),
-                seed_fact_tool_timeout_seconds=float(
-                    getattr(Config.get_instance(), "agent_seed_fact_tool_timeout_seconds", 12.0) or 12.0
-                ),
-            )
+            with llm_telemetry_scope(stage="candidate_discovery", agent_role="thesis_desk_committee"):
+                payload = run_committee_discovery(
+                    market=ctx.market,
+                    seed_symbols=target_symbols,
+                    limit=DISCOVERY_RECALL_LIMIT,
+                    tool_registry=committee_tool_registry,
+                    llm_adapter=committee_llm,
+                    today=today_str,
+                    tool_decls=tool_decls,
+                    seed_pool_result=seed_pool_result,
+                    overall_timeout_s=committee_timeout_s,
+                    seed_fact_tools=getattr(Config.get_instance(), "agent_seed_fact_tools", None),
+                    seed_fact_max_workers=int(
+                        getattr(Config.get_instance(), "agent_seed_fact_max_workers", 12) or 12
+                    ),
+                    seed_fact_tool_timeout_seconds=float(
+                        getattr(Config.get_instance(), "agent_seed_fact_tool_timeout_seconds", 30.0) or 30.0
+                    ),
+                    per_seed_timeout_budget_s=per_desk_llm_timeout,
+                )
             if not isinstance(payload, dict):
                 raise RuntimeError(f"committee discovery returned {type(payload).__name__}")
             seed_fact_summary = payload.get("seed_fact_summary")
@@ -1969,6 +2238,7 @@ def _run_candidate_discovery_tool(
                         "packets": payload.get("seed_fact_packets") if isinstance(payload.get("seed_fact_packets"), list) else [],
                     },
                 )
+            _persist_seed_pool_quality_snapshot(ctx=ctx, payload=payload, today=today_str)
             _emit(
                 ctx.progress_callback,
                 "selection_seed_gate_done",
@@ -2031,6 +2301,157 @@ def _run_market_regime_tool(
         {"market": ctx.market, "persist": True},
     )
     return result if isinstance(result, dict) else {"status": "unknown", "raw": result}
+
+
+def _attach_regime_forward_probability(
+    *,
+    ctx: SelectionRunContext,
+    tool_registry: ToolRegistry,
+) -> None:
+    if tool_registry.get("get_regime_forward_probability") is None:
+        ctx.market_regime["forward_probability"] = {
+            "status": "missing",
+            "tool": "get_regime_forward_probability",
+            "note": "Regime 概率工具未注册，点位层退回现有市场状态约束。",
+        }
+        return
+    regime = str(ctx.market_regime.get("regime") or "").strip()
+    result = _execute_tool(
+        ctx,
+        tool_registry,
+        "get_regime_forward_probability",
+        {
+            "market": ctx.market,
+            "regime": regime or None,
+            "lookback_days": 900,
+            "windows": [7, 30, 60, 90],
+        },
+    )
+    ctx.market_regime["forward_probability"] = (
+        result if isinstance(result, dict) else {"status": "unknown", "raw": result}
+    )
+
+
+def _attach_symbol_regime_probability(
+    *,
+    ctx: SelectionRunContext,
+    tool_registry: ToolRegistry,
+    code: str,
+    evidence: Dict[str, Any],
+    scope: str,
+) -> None:
+    if not isinstance(evidence, dict) or tool_registry.get("get_symbol_regime_probability") is None:
+        return
+    if evidence.get("get_symbol_regime_probability"):
+        return
+    quote = evidence.get("get_realtime_quote") if isinstance(evidence.get("get_realtime_quote"), dict) else {}
+    current_price = quote.get("price") or quote.get("current_price") or quote.get("close")
+    regime = str(ctx.market_regime.get("regime") or "").strip()
+    result = _execute_tool(
+        ctx,
+        tool_registry,
+        "get_symbol_regime_probability",
+        {
+            "stock_code": code,
+            "market": ctx.market,
+            "regime": regime or None,
+            "current_price": current_price,
+            "lookback_days": 900,
+            "windows": [7, 30, 60, 90],
+        },
+    )
+    if isinstance(result, dict):
+        payload = dict(result)
+        payload["calculation_scope"] = scope
+    else:
+        payload = {"status": "unknown", "raw": result, "calculation_scope": scope}
+    evidence["get_symbol_regime_probability"] = payload
+
+
+def _attach_holding_symbol_regime_probabilities(
+    *,
+    ctx: SelectionRunContext,
+    tool_registry: ToolRegistry,
+    positions: List[Dict[str, Any]],
+) -> None:
+    if tool_registry.get("get_symbol_regime_probability") is None:
+        return
+    existing = {
+        _normalize_stock_identity_code(item.get("stock_code") or item.get("code"))
+        for item in _symbol_regime_stage_items(ctx)
+        if isinstance(item, dict)
+    }
+    for position in positions or []:
+        code = _normalize_stock_identity_code(position.get("symbol"))
+        if not code or code in existing:
+            continue
+        evidence: Dict[str, Any] = {"get_realtime_quote": {"price": position.get("last_price")}}
+        _attach_symbol_regime_probability(
+            ctx=ctx,
+            tool_registry=tool_registry,
+            code=code,
+            evidence=evidence,
+            scope="holding",
+        )
+        payload = evidence.get("get_symbol_regime_probability")
+        if isinstance(payload, dict):
+            payload["position"] = position
+            _append_symbol_regime_stage_item(ctx, payload, scope="holding")
+            existing.add(code)
+
+
+def _build_symbol_regime_probability_stage(ctx: SelectionRunContext) -> None:
+    items: List[Dict[str, Any]] = []
+    deep = ctx.stage_full("single_stock_deep_dive")
+    for payload in deep.get("results") or [] if isinstance(deep, dict) else []:
+        if not isinstance(payload, dict):
+            continue
+        full = payload.get("full") if isinstance(payload.get("full"), dict) else {}
+        symbol_regime = full.get("symbol_regime_probability")
+        if isinstance(symbol_regime, dict):
+            item = dict(symbol_regime)
+            item.setdefault("calculation_scope", "deep_dive")
+            items.append(item)
+    if items:
+        ctx.set_stage("symbol_regime_probability", _symbol_regime_probability_stage_payload(items))
+
+
+def _append_symbol_regime_stage_item(ctx: SelectionRunContext, payload: Dict[str, Any], *, scope: str) -> None:
+    stage = ctx.stages.get("symbol_regime_probability")
+    items = _symbol_regime_stage_items(ctx)
+    item = dict(payload)
+    item["calculation_scope"] = scope
+    items.append(item)
+    ctx.set_stage("symbol_regime_probability", _symbol_regime_probability_stage_payload(items))
+    if stage is not None:
+        ctx.stages["symbol_regime_probability"].full_ref = stage.full_ref
+
+
+def _symbol_regime_stage_items(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    stage = ctx.stages.get("symbol_regime_probability")
+    if stage is None:
+        return []
+    items = stage.full.get("results") if isinstance(stage.full, dict) else []
+    return [item for item in items or [] if isinstance(item, dict)]
+
+
+def _symbol_regime_probability_stage_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    compact_items = [_compact_symbol_regime_probability(item) for item in items if isinstance(item, dict)]
+    scopes: Dict[str, int] = {}
+    for item in compact_items:
+        scope = str(item.get("calculation_scope") or "unknown")
+        scopes[scope] = scopes.get(scope, 0) + 1
+    return {
+        "stage": "symbol_regime_probability",
+        "status": "ok" if items else "insufficient_data",
+        "summary": {
+            "target_count": len(items),
+            "scope_counts": scopes,
+            "results_brief": compact_items,
+        },
+        "full": {"results": items},
+        "full_ref": "symbol_regime_probability.json",
+    }
 
 
 def _collect_base_evidence(
@@ -2454,10 +2875,16 @@ def _candidate_capital_schema(evidence: Dict[str, Any]) -> Dict[str, Any]:
         }
     return {
         "status": "ok",
-        "summary": f"主力净流入={flow.get('main_net_inflow')}",
+        "summary": f"主力净流入={flow.get('main_net_inflow')}；全口径净流入={flow.get('net_inflow')}",
         "main_net_inflow": flow.get("main_net_inflow"),
-        "inflow_5d": flow.get("inflow_5d"),
-        "inflow_10d": flow.get("inflow_10d"),
+        "main_inflow_5d": flow.get("main_inflow_5d", flow.get("inflow_5d")),
+        "main_inflow_10d": flow.get("main_inflow_10d", flow.get("inflow_10d")),
+        "net_inflow": flow.get("net_inflow"),
+        "net_inflow_5d": flow.get("net_inflow_5d"),
+        "net_inflow_10d": flow.get("net_inflow_10d"),
+        "amount_unit": flow.get("amount_unit", "CNY"),
+        "main_inflow_definition": flow.get("main_inflow_definition"),
+        "net_inflow_definition": flow.get("net_inflow_definition"),
         "latest_date": flow.get("latest_date"),
         "source_update": flow.get("source_update"),
     }
@@ -2599,13 +3026,15 @@ def _is_failed_tool_result(result: Any) -> bool:
     status = str(result.get("status") or "").strip().lower()
     if status in FAILED_TOOL_STATUSES:
         return True
-    if status != "not_supported" and _result_has_errors(result):
-        return True
     if result.get("timeout") is True:
         return True
     if result.get("success") is False:
         return True
-    return bool(result.get("error")) and status != "not_supported"
+    if bool(result.get("error")) and status != "not_supported":
+        return True
+    if status != "not_supported" and _result_has_errors(result):
+        return not (status in {"ok", "partial"} and _has_effective_tool_data(result))
+    return False
 
 
 def _result_has_errors(result: Dict[str, Any]) -> bool:
@@ -2618,7 +3047,21 @@ def _result_has_errors(result: Dict[str, Any]) -> bool:
 
 
 def _has_effective_tool_data(result: Dict[str, Any]) -> bool:
-    ignored_keys = {"status", "errors", "error", "note", "message", "stock_code", "code"}
+    ignored_keys = {
+        "status",
+        "errors",
+        "error",
+        "error_summary",
+        "note",
+        "message",
+        "stock_code",
+        "code",
+        "query",
+        "source_chain",
+        "amount_unit",
+        "raw_amount_unit",
+        "context_policy",
+    }
     for key, value in result.items():
         if key in ignored_keys:
             continue
@@ -2727,6 +3170,9 @@ def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT
         "seed_market_regime": seed_result.get("seed_market_regime"),
         "seed_fact_summary": seed_result.get("seed_fact_summary"),
         "seed_fact_packets": _compact_seed_fact_packets(seed_result.get("seed_fact_packets")),
+        "negative_conclusion_reasons": _compact_negative_conclusion_reasons(
+            seed_result.get("negative_conclusion_reasons")
+        ),
         "candidates": compact_candidates,
         "expert_packets": compact_expert_packets,
         "quality_summary": seed_result.get("quality_summary"),
@@ -2741,6 +3187,24 @@ def _compact_candidate_seed(seed_result: Dict[str, Any], *, limit: int = DEFAULT
 def _compact_seed_fact_packets(value: Any, *, limit: int = DEFAULT_CANDIDATE_LIMIT) -> List[Dict[str, Any]]:
     packets = value if isinstance(value, list) else []
     return compact_seed_fact_packets_for_model(packets, limit=limit)
+
+
+def _compact_negative_conclusion_reasons(value: Any, *, limit: int = 40) -> List[Dict[str, Any]]:
+    rows = value if isinstance(value, list) else []
+    compact: List[Dict[str, Any]] = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+        compact.append({
+            "code": row.get("code"),
+            "name": row.get("name"),
+            "desk": row.get("desk"),
+            "stage": row.get("stage"),
+            "status": row.get("status"),
+            "conclusion": row.get("conclusion"),
+            "reason": _truncate(str(row.get("reason") or ""), 260),
+        })
+    return compact
 
 
 def _compact_seed_pool_build_result(build_result: Any) -> Dict[str, Any]:
@@ -2778,6 +3242,51 @@ def _compact_seed_gate_result(seed_result: Dict[str, Any]) -> Dict[str, Any]:
         "candidate_count": seed_result.get("candidate_count"),
         "candidate_source": seed_result.get("candidate_source"),
     })
+
+
+def _persist_seed_pool_quality_snapshot(*, ctx: SelectionRunContext, payload: Dict[str, Any], today: str) -> None:
+    """Persist seed-pool quality snapshot without breaking the selection chain."""
+    try:
+        from src.services.seed_pool_quality_service import (
+            SeedPoolQualityService,
+            effective_seed_pool_date,
+            infer_seed_pool_snapshot_date,
+        )
+
+        generated_at = datetime.now()
+        try:
+            today_date = datetime.strptime(str(today), "%Y%m%d").date()
+        except Exception:
+            today_date = None
+        seed_date = infer_seed_pool_snapshot_date(payload)
+        if seed_date is None:
+            seed_date = today_date or effective_seed_pool_date(generated_at)
+            if today_date is not None:
+                effective_date = effective_seed_pool_date(generated_at)
+                if seed_date == generated_at.date() and effective_date < seed_date:
+                    seed_date = effective_date
+        snapshot_run_id = f"{ctx.run_id}:{seed_date.isoformat()}" if seed_date else ctx.run_id
+        if str(ctx.run_id or "").startswith("trace-"):
+            snapshot_trace_id = str(ctx.run_id)
+        else:
+            snapshot_trace_id = snapshot_run_id
+        result = SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id=snapshot_run_id,
+            trace_id=snapshot_trace_id,
+            seed_date=seed_date,
+            generated_at=generated_at,
+            market=ctx.market,
+            candidate_discovery_mode=ctx.candidate_discovery_mode,
+        )
+        _emit(ctx.progress_callback, "selection_seed_pool_quality_snapshot", payload=result)
+    except Exception as exc:
+        logger.warning("seed pool quality snapshot persistence failed: %s", exc)
+        _emit(
+            ctx.progress_callback,
+            "selection_seed_pool_quality_snapshot",
+            payload={"status": "failed", "error": str(exc)},
+        )
 
 
 def _summarize_seed_items(seeds: Sequence[Any], *, total_limit: int) -> Dict[str, Any]:
@@ -3071,6 +3580,9 @@ def _deep_dive_prompt_evidence(
         "stock": {"code": code, "name": stock_name, "market": ctx.market},
         "evidence_cards": card_view,
         "dimension_summary": _dimension_summary_from_cards(card_view),
+        "symbol_regime_probability": _compact_symbol_regime_probability(
+            detailed_evidence.get("get_symbol_regime_probability")
+        ),
         "tool_failures": _tool_failures_from_evidence(detailed_evidence),
         "raw_refs": [card.get("raw_ref") for card in card_view if card.get("raw_ref")],
         "protocol": {
@@ -3219,6 +3731,7 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
             "thesis_desk_committee",
             "thesis_desk_committee_elapsed_ms",
             "llm_expert_committee",
+            "negative_conclusion_reasons",
             "error",
         ):
             value = seed_result.get(key)
@@ -3306,6 +3819,7 @@ def _merge_discovery_candidates(payload: Dict[str, Any], seed_result: Dict[str, 
             "thesis_desk_diagnostics",
             "thesis_desk_committee",
             "llm_expert_committee",
+            "negative_conclusion_reasons",
         ):
             if key in seed_result and key not in full:
                 full[key] = seed_result.get(key)
@@ -3372,6 +3886,9 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             quote_basis = "latest_trading_day"
     bias = trend.get("bias_ma5") if isinstance(trend, dict) else None
     trend_status = trend.get("trend_status") if isinstance(trend, dict) else None
+    symbol_regime_probability = _compact_symbol_regime_probability(
+        evidence.get("get_symbol_regime_probability") if isinstance(evidence, dict) else None
+    )
     action = "wait"
     strength = "weak"
     risks: List[str] = []
@@ -3396,6 +3913,7 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             "main_supporting_evidence": [f"当前价={price}" if price is not None else "行情价格缺失"],
             "main_risks": risks,
             "main_missing_evidence": _missing_from_evidence(evidence),
+            "symbol_regime_probability": symbol_regime_probability,
         },
         "full": {
             "stock": {"code": code, "name": name, "market": "cn", "data_status": "partial"},
@@ -3410,7 +3928,7 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
                 "pullback_trigger": "回踩关键支撑或均线不破后重新放量",
                 "no_chase_line": "高于关键压力位且乖离扩大时不追",
                 "stop_loss": "跌破关键支撑或账户止损线",
-                "failure_condition": "跌破关键支撑、资金转弱或出现重大利空",
+                "failure_condition": "跌破关键支撑、资金转弱、突破后无承接或出现重大利空",
                 "target_1": "前高或筹码压力位",
                 "target_2": "趋势延伸位",
                 "risk_reward_comment": "证据不足时只给条件型计划。",
@@ -3418,9 +3936,10 @@ def _fallback_deep_dive(code: str, name: str, evidence: Dict[str, Any]) -> Dict[
             "dimension_summary": _dimension_summary_from_evidence(evidence),
             "key_evidence": [],
             "risk_flags": risks,
-            "failure_conditions": ["跌破关键支撑", "出现重大利空", "价格高于追高线且无回踩确认"],
+            "failure_conditions": ["跌破关键支撑", "出现重大利空", "价格高于追高线且既无回踩确认也无承接确认"],
             "missing_evidence": _missing_from_evidence(evidence),
             "tool_failures": _tool_failures_from_evidence(evidence),
+            "symbol_regime_probability": symbol_regime_probability,
         },
         "full_ref": f"single_stock_deep_dive_{code}.json",
     }
@@ -3593,7 +4112,7 @@ def _meta_risk_constraints(record: Dict[str, Any], item: Dict[str, Any], market:
     for risk in _short_list(item.get("main_risks") or record.get("risks"), 5):
         constraints.append({"constraint": str(risk), "source": "desk_or_deep_dive_risk"})
     if item.get("no_chase_line"):
-        constraints.append({"constraint": f"超过追高线不得追高: {item.get('no_chase_line')}", "source": "deep_dive"})
+        constraints.append({"constraint": f"超过追高线后必须有回踩或承接确认: {item.get('no_chase_line')}", "source": "deep_dive"})
     regime = str(market.get("regime") or "")
     if regime in {"risk_off", "panic", "trending_down"}:
         constraints.append({"constraint": f"市场状态 {regime} 下不得主动追高或无条件开仓", "source": "detect_market_regime"})
@@ -3779,12 +4298,28 @@ def _pricing_action_for_scenario(name: str, asset_regime: str, market_regime: Di
     return "monitor", "plain_wait"
 
 
-def _pricing_entry_zone(name: str, constraints: Dict[str, Any]) -> str:
+def _pricing_entry_zone(
+    name: str,
+    constraints: Dict[str, Any],
+    *,
+    regime_probability: Optional[Dict[str, Any]] = None,
+) -> str:
     if name == "Mean_Reversion_Pullback":
+        reentry = (regime_probability or {}).get("reentry_reference") if isinstance(regime_probability, dict) else {}
+        if isinstance(reentry, dict) and reentry.get("reentry_price") not in (None, ""):
+            suffix = "（low_confidence，仅作弱参考）" if reentry.get("low_confidence") else ""
+            return f"参考回踩/买回价 {reentry.get('reentry_price')}{suffix}，触发后仍需量价确认"
         return _constraint_reason(constraints.get("mean_reversion_anchor")) or "回踩均值锚点附近确认"
     if name == "Breakout_Continuation":
         return "结构失效位上方回踩确认或放量续强"
     return "跌破结构位时不入场,只执行退出/回避"
+
+
+def _pricing_risk_reward_comment(regime_probability: Dict[str, Any]) -> str:
+    note = _regime_probability_report_note({"regime_probability": regime_probability})
+    if note:
+        return f"fallback 只生成条件型矩阵；Regime 概率层提示：{note}"
+    return "fallback 只生成条件型矩阵，需结合实时价/ATR/盘口复核。"
 
 
 def _constraint_reason(value: Any) -> str:
@@ -3969,7 +4504,7 @@ def _fallback_meta_orchestrator(ctx: SelectionRunContext) -> Dict[str, Any]:
         asset_regime = _asset_regime_from_setup(setup_type, item, market)
         invalidation_text = item.get("stop_loss") or item.get("failure_condition") or "跌破关键结构位则论点失效"
         mean_anchor_text = item.get("ideal_entry_zone") or item.get("no_chase_line") or "等待回踩确认"
-        no_chase_text = item.get("no_chase_line") or "高于追高线且无回踩确认时禁止追高"
+        no_chase_text = item.get("no_chase_line") or "高于追高线且无回踩/承接确认时不追"
         package = {
             "stock": {"code": code, "name": item.get("name") or code, "market": item.get("market") or ctx.market},
             "meta_analysis": {
@@ -4034,6 +4569,9 @@ def _fallback_meta_orchestrator(ctx: SelectionRunContext) -> Dict[str, Any]:
 
 def _fallback_pricing_agent(ctx: SelectionRunContext) -> Dict[str, Any]:
     packages = _meta_packages(ctx)
+    regime_probability = _compact_regime_forward_probability(
+        (ctx.market_regime or {}).get("forward_probability")
+    )
     matrix = []
     for package in packages:
         stock = package.get("stock") if isinstance(package.get("stock"), dict) else {}
@@ -4050,10 +4588,10 @@ def _fallback_pricing_agent(ctx: SelectionRunContext) -> Dict[str, Any]:
                 "condition": scenario.get("condition") or "等待条件触发",
                 "action": action,
                 "execution_mode": execution_mode,
-                "entry_zone": _pricing_entry_zone(name, constraints),
+                "entry_zone": _pricing_entry_zone(name, constraints, regime_probability=regime_probability),
                 "stop_loss": _constraint_reason(constraints.get("invalidation_level")) or "跌破结构失效位",
                 "failure_condition": _constraint_reason(constraints.get("invalidation_level")) or "右侧/低吸论点被证伪",
-                "risk_reward_comment": "fallback 只生成条件型矩阵，需结合实时价/ATR 复核。",
+                "risk_reward_comment": _pricing_risk_reward_comment(regime_probability),
                 "constraints_used": _constraints_used(constraints),
             })
         matrix.append({
@@ -4063,6 +4601,8 @@ def _fallback_pricing_agent(ctx: SelectionRunContext) -> Dict[str, Any]:
             "data_status": "partial",
             "scenarios": scenarios,
             "selected_scenario": "Breakout_Continuation" if "Avoid" not in asset_regime else "Mean_Reversion_Pullback",
+            "regime_probability": regime_probability,
+            "reentry_reference": regime_probability.get("reentry_reference"),
             "pricing_warnings": ["点位计算 fallback 未使用实时盘口/ATR，只保留条件型计划。"],
         })
     tradable_count = sum(
@@ -4083,6 +4623,7 @@ def _fallback_pricing_agent(ctx: SelectionRunContext) -> Dict[str, Any]:
         "full": {
             "if_then_order_matrix": matrix,
             "constraints_echo": _main_meta_constraints(packages),
+            "regime_probability": regime_probability,
             "missing_evidence": ["realtime_orderbook", "atr"] if matrix else ["meta_orchestrator"],
         },
         "full_ref": "pricing_agent.json",
@@ -4121,7 +4662,7 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
             "stop_loss_condition": (selected_scenario or {}).get("stop_loss") or summary.get("stop_loss") or "跌破关键支撑",
             "take_profit_condition": "到达第一压力位分批止盈",
             "review_trigger": "下一交易日开盘或关键价格触发",
-            "auto_downgrade_rules": ["如果价格高于 no_chase_line，降级为 wait"],
+            "auto_downgrade_rules": ["如果价格高于 no_chase_line 且无回踩/承接确认，降级为 wait"],
             "reason": "来自单股深度分析和 Meta/点位计算条件矩阵的条件型计划。",
             "risk_flags": summary.get("main_risks") or [],
             "pricing_scenario": (selected_scenario or {}).get("scenario_name"),
@@ -4154,7 +4695,7 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
             "positions_plan": plans,
             "execution_matrix": pricing_matrix,
             "cash_plan": {"reserved_cash_pct": max(0, 100 - total_pct), "reason": "保留现金等待确认和回撤机会。"},
-            "risk_controls": ["价格高于追高线不买", "工具证据缺失时降低动作强度"],
+            "risk_controls": ["价格高于追高线且无回踩/承接确认时不买", "工具证据缺失时降低动作强度"],
             "missing_evidence": [],
         },
         "full_ref": "portfolio_allocation.json",
@@ -4175,7 +4716,61 @@ def _summarize_market_regime(regime: Dict[str, Any]) -> Dict[str, Any]:
         "strategy_hints": list(regime.get("strategy_hints") or [])[:5],
         "data_quality": regime.get("data_quality"),
         "conflicts": list(regime.get("conflicts") or [])[:5],
+        "forward_probability": _compact_regime_forward_probability(regime.get("forward_probability")),
     }
+
+
+def _compact_regime_forward_probability(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    windows = payload.get("windows") if isinstance(payload.get("windows"), dict) else {}
+    compact_windows: Dict[str, Any] = {}
+    for key in ("7", "30", "60", "90"):
+        item = windows.get(key) or windows.get(f"{key}d")
+        if not isinstance(item, dict):
+            continue
+        compact_windows[key] = {
+            "n": item.get("n"),
+            "effective_n": item.get("effective_n"),
+            "median_return_pct": item.get("median_return_pct"),
+            "p_up": item.get("p_up"),
+            "p_below_current": item.get("p_below_current"),
+            "p20_return_pct": item.get("p20_return_pct"),
+            "low_confidence": item.get("low_confidence"),
+        }
+    return {
+        "status": payload.get("status"),
+        "source": payload.get("source"),
+        "sample_count": payload.get("sample_count"),
+        "brief": payload.get("brief"),
+        "windows": compact_windows,
+        "path_profile": payload.get("path_profile"),
+        "reentry_reference": payload.get("reentry_reference"),
+    }
+
+
+def _compact_symbol_regime_probability(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compact = _compact_regime_forward_probability(payload)
+    compact.update({
+        "stock_code": payload.get("stock_code"),
+        "index_symbol": payload.get("index_symbol"),
+        "regime": payload.get("regime"),
+        "matched_anchor_count": payload.get("matched_anchor_count"),
+        "symbol_history_records": payload.get("symbol_history_records"),
+        "calculation_scope": payload.get("calculation_scope"),
+        "source": payload.get("source"),
+    })
+    return compact
+
+
+def _compact_symbol_regime_stage_for_prompt(ctx: SelectionRunContext) -> List[Dict[str, Any]]:
+    stage = ctx.stages.get("symbol_regime_probability")
+    items = stage.summary.get("results_brief") if stage and isinstance(stage.summary, dict) else []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)][:8]
 
 
 def _apply_market_regime_constraints(
@@ -4264,7 +4859,7 @@ def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
         "status": "ok",
         "summary": {
             "opposing_summary": "反方认为当前选股和仓位配置仍需防范追高、证据缺口和账户风险。",
-            "top_risk_points": ["候选可能依赖热点板块", "资金面或消息面可能缺失", "价格高于追高线时不宜开仓"],
+            "top_risk_points": ["候选可能依赖热点板块", "资金面或消息面可能缺失", "价格高于追高线且无回踩/承接确认时不宜开仓"],
             "top_evidence_gaps": _all_missing_evidence(ctx),
             "recommended_verdict": "accept_with_changes",
         },
@@ -4274,7 +4869,7 @@ def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
                 "risk_points": ["追高风险", "数据缺口", "仓位执行风险"],
                 "evidence_gaps": _all_missing_evidence(ctx),
                 "failure_scenarios": ["热点退潮", "开盘跳高后回落", "重大利空出现"],
-                "plan_changes_required": ["高于 no_chase_line 时降级为 wait"],
+                "plan_changes_required": ["高于 no_chase_line 且无回踩/承接确认时降级为 wait"],
             },
             "missing_evidence": _all_missing_evidence(ctx),
         },
@@ -4301,7 +4896,7 @@ def _fallback_judge_decision(ctx: SelectionRunContext) -> Dict[str, Any]:
             "winner": "mixed",
             "accepted_arguments": ["保留条件型执行计划"],
             "rejected_arguments": ["证据不足时立即开仓"],
-            "required_plan_changes": ["高于 no_chase_line 降级为 wait"],
+            "required_plan_changes": ["高于 no_chase_line 且无回踩/承接确认时降级为 wait"],
             "risk_controls": ["不追高", "先确认行情口径", "资金/消息缺失时降低仓位"],
             "fallback_path": {
                 "when": "wait_for_more_data",
@@ -4485,6 +5080,7 @@ def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
         "balanced_candidate_evidence": ctx.stages.get("balanced_candidate_evidence", SelectionStage()).to_dict(include_full=True),
         "candidate_screening": ctx.stages.get("candidate_screening", SelectionStage()).to_dict(include_full=True),
         "single_stock_deep_dive": ctx.stages.get("single_stock_deep_dive", SelectionStage()).to_dict(include_full=True),
+        "symbol_regime_probability": ctx.stages.get("symbol_regime_probability", SelectionStage()).to_dict(include_full=True),
         "meta_orchestrator": ctx.stages.get("meta_orchestrator", SelectionStage()).to_dict(include_full=True),
         "pricing_agent": ctx.stages.get("pricing_agent", SelectionStage()).to_dict(include_full=True),
         "portfolio_allocation": ctx.stages.get("portfolio_allocation", SelectionStage()).to_dict(include_full=True),
@@ -4509,6 +5105,25 @@ def _combine_deep_dive_outputs(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "full": {"results": outputs},
         "full_ref": "deep_dive_results.json",
     }
+
+
+def _attach_symbol_regime_to_deep_payload(payload: Dict[str, Any], symbol_regime: Any) -> None:
+    compact = _compact_symbol_regime_probability(symbol_regime)
+    if not compact:
+        return
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary["symbol_regime_probability"] = compact
+        reentry = compact.get("reentry_reference") if isinstance(compact.get("reentry_reference"), dict) else {}
+        if reentry.get("reentry_price") is not None:
+            summary.setdefault("reentry_reference", reentry)
+    full = payload.get("full")
+    if not isinstance(full, dict):
+        full = {}
+        payload["full"] = full
+    full["symbol_regime_probability"] = symbol_regime if isinstance(symbol_regime, dict) else compact
+    if isinstance(symbol_regime, dict) and isinstance(symbol_regime.get("reentry_reference"), dict):
+        full.setdefault("reentry_reference", symbol_regime["reentry_reference"])
 
 
 def _attach_evidence_cards(payload: Dict[str, Any], cards: List[Any]) -> None:
@@ -5316,7 +5931,7 @@ def _execution_mode(item: Dict[str, Any]) -> str:
 
 
 def _default_no_chase_condition() -> str:
-    return f"高开超过默认阈值 {_format_score(_no_chase_pct_default())}% 且无回踩确认不追；缩量冲高或板块分化不追。"
+    return f"高开超过默认阈值 {_format_score(_no_chase_pct_default())}% 时只作为条件边界；无回踩确认、无承接确认、缩量冲高或板块分化时不追。"
 
 
 def _is_observable_item(item: Dict[str, Any]) -> bool:
@@ -5368,15 +5983,19 @@ def _headline_watch_items(
 
     if not displayed_recommendations:
         return []
-    primary_code = (
-        _normalize_stock_identity_code(primary_items[0].get("code"))
-        if primary_items and isinstance(primary_items[0], dict)
-        else None
-    )
+    primary_codes = {
+        code
+        for code in (
+            _normalize_stock_identity_code(item.get("code"))
+            for item in primary_items
+            if isinstance(item, dict)
+        )
+        if code
+    }
     items: List[Dict[str, Any]] = []
     for item in displayed_recommendations:
         code = _normalize_stock_identity_code(item.get("code"))
-        if primary_code and code == primary_code:
+        if code in primary_codes:
             continue
         if _is_observable_item(item):
             items.append(item)
@@ -5554,10 +6173,10 @@ def _render_conditional_entry_table(item: Dict[str, Any]) -> List[str]:
         "| 项目 | 决策 |",
         "| --- | --- |",
         "| 看盘动作 | 条件入场，不是无条件追买 |",
-        f"| 动作强度 | {_markdown_cell(item.get('action_strength') or '-')} |",
+        f"| 动作强度 | {_markdown_cell(_action_strength_label(item.get('action_strength')))} |",
         f"| 行情口径 | {_markdown_cell(_quote_basis_label(item.get('quote_basis')))} |",
-        f"| 明日触发条件 | {_markdown_cell(_conditional_entry_trigger(item))} |",
-        f"| 入场区间 | {_markdown_cell(item.get('entry_condition') or item.get('ideal_entry_zone') or item.get('pullback_trigger') or '缺失：未给出可执行入场区间')} |",
+        f"| 必要条件 | {_markdown_cell(_necessary_conditions_text(item))} |",
+        f"| 加分条件 | {_markdown_cell(_bonus_conditions_text(item))} |",
         f"| 止盈目标 | {_markdown_cell(_take_profit_condition_text(item))} |",
         f"| 止损位 | {_markdown_cell(item.get('stop_loss_condition') or item.get('stop_loss') or '缺失：未给出止损位')} |",
         f"| 可试探仓位 | {_markdown_cell(_conditional_position_text(item))} |",
@@ -5594,6 +6213,113 @@ def _conditional_entry_trigger(item: Dict[str, Any]) -> str:
     ]
     text = "；".join(str(value).strip() for value in triggers if _has_text_value(value))
     return text or "等待竞价承接、放量突破或回踩不破后再小仓试探。"
+
+
+def _entry_condition_source_from_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "entry_condition": plan.get("entry_condition"),
+        "ideal_entry_zone": plan.get("ideal_entry_zone"),
+        "pullback_trigger": plan.get("pullback_trigger"),
+    }
+
+
+def _split_condition_clauses(text: Any) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    raw = raw.replace("，且", "；").replace("，并", "；").replace("，同时", "；")
+    clauses = re.split(r"[；;，,]\s*", raw)
+    return [clause.strip(" ，。") for clause in clauses if clause.strip(" ，。")]
+
+
+def _condition_is_price_gate(clause: str) -> bool:
+    return any(marker in clause for marker in ("价格", "股价", "回踩", "入场区间", "区间", "附近"))
+
+
+def _condition_is_volume_gate(clause: str) -> bool:
+    if any(marker in clause for marker in ("K线", "下影", "小阳线", "十字星")):
+        return False
+    return any(marker in clause for marker in ("成交量", "量能")) and any(
+        marker in clause for marker in ("萎缩", "缩量", "80%", "70%", "60%")
+    )
+
+
+def _condition_is_bonus(clause: str) -> bool:
+    bonus_markers = (
+        "MACD",
+        "金叉",
+        "长下影",
+        "下影线",
+        "小阳线",
+        "十字星",
+        "主力",
+        "资金",
+        "净流入",
+        "分时",
+        "不快速跌破",
+        "放量反弹",
+    )
+    return any(marker in clause for marker in bonus_markers)
+
+
+def _necessary_conditions_text(item: Dict[str, Any]) -> str:
+    values = [
+        item.get("ideal_entry_zone"),
+        item.get("entry_zone"),
+        item.get("pullback_trigger"),
+        item.get("entry_condition"),
+    ]
+    clauses: List[str] = []
+    for value in values:
+        clauses.extend(_split_condition_clauses(value))
+    necessary: List[str] = []
+    price_gate = next((clause for clause in clauses if _condition_is_price_gate(clause)), "")
+    volume_gate = next((clause for clause in clauses if _condition_is_volume_gate(clause)), "")
+    for clause in (price_gate, volume_gate):
+        if clause:
+            necessary.append(clause)
+    if necessary:
+        if price_gate and not volume_gate:
+            necessary.append("成交量缩至20日均量80%以下，或至少明显低于前一放量日")
+        return "；".join(dict.fromkeys(necessary))
+    for clause in clauses:
+        if _condition_is_bonus(clause):
+            continue
+        necessary.append(clause)
+        if len(necessary) >= 2:
+            break
+    if not necessary and _has_text_value(item.get("entry_condition")):
+        necessary.append(str(item.get("entry_condition")).strip())
+    return "；".join(dict.fromkeys(necessary)) or "价格回到计划入场区，并出现缩量回踩或支撑不破。"
+
+
+def _bonus_conditions_text(item: Dict[str, Any]) -> str:
+    values = [
+        item.get("entry_condition"),
+        item.get("auction_trigger"),
+        item.get("breakout_trigger"),
+        item.get("pullback_trigger"),
+        item.get("ideal_entry_zone"),
+    ]
+    clauses: List[str] = []
+    for value in values:
+        clauses.extend(_split_condition_clauses(value))
+    bonus = [
+        clause for clause in clauses
+        if _condition_is_bonus(clause)
+        and not _condition_is_price_gate(clause)
+        and not _condition_is_volume_gate(clause)
+    ]
+    if not bonus:
+        bonus = [
+            "MACD 收窄或金叉",
+            "出现长下影线/小阳线等止跌 K 线",
+            "主力资金重新净流入",
+        ]
+    unique = list(dict.fromkeys(bonus))[:3]
+    if len(unique) == 1:
+        return unique[0]
+    return "满足其一即可：" + " / ".join(unique)
 
 
 def _conditional_position_text(item: Dict[str, Any]) -> str:
@@ -5988,6 +6714,10 @@ def _humanize_kv_patterns(text: str) -> str:
 
     text = _DICT_PATTERN.sub(_replace_dict, text)
     text = _RAW_METRIC_DICT.sub("基本面指标", text)
+    text = re.sub(r"\bregime\s*=\s*([^,，;；\s]+)", lambda m: f"市场状态为{_market_regime_label(m.group(1))}", text)
+    text = re.sub(r"\bvolatility\s*=\s*([^,，;；\s]+)", lambda m: f"波动为{_volatility_label(m.group(1))}", text)
+    text = re.sub(r"\brisk\s*=\s*([^,，;；\s]+)", lambda m: f"风险为{_risk_level_label(m.group(1))}", text)
+    text = text.replace(", 波动", "，波动").replace(", 风险", "，风险")
     return text
 
 
@@ -6183,6 +6913,230 @@ def _emit(callback: Optional[Callable[[Dict[str, Any]], None]], event_type: str,
         logger.debug("Selection progress callback failed", exc_info=True)
 
 
+def _emit_stage_done(
+    callback: Optional[Callable[[Dict[str, Any]], None]],
+    event_type: str,
+    ctx: SelectionRunContext,
+    stage_name: str,
+    *,
+    message: Optional[str] = None,
+) -> None:
+    stage = ctx.stages.get(stage_name)
+    if not stage:
+        return
+    event_payload: Dict[str, Any] = {
+        "payload": stage.to_dict(include_full=False),
+        "__artifact_payload": stage.to_dict(include_full=True),
+    }
+    if message:
+        event_payload["message"] = message
+    _emit(callback, event_type, **event_payload)
+
+
+def _emit_resumed_stage(
+    callback: Optional[Callable[[Dict[str, Any]], None]],
+    stage_name: str,
+    ctx: SelectionRunContext,
+    payload: Dict[str, Any],
+    reused_stages: Sequence[str],
+) -> None:
+    _enforce_stage_stock_identity(ctx, payload, stage_name)
+    ctx.set_stage(stage_name, payload)
+    _emit(
+        callback,
+        "selection_resume_reused_stage",
+        message=f"已复用历史 Trace 的 {stage_name} 阶段结果。",
+        payload={
+            "stage": stage_name,
+            "reused_stages": list(reused_stages),
+            "full_ref": ctx.stages[stage_name].full_ref,
+        },
+    )
+    _emit_stage_done(
+        callback,
+        _resume_stage_event_type(stage_name),
+        ctx,
+        stage_name,
+        message=f"已复用历史 Trace 的 {stage_name} 阶段结果。",
+    )
+
+
+def _resume_stage_event_type(stage_name: str) -> str:
+    mapping = {
+        "candidate_discovery": "selection_candidate_discovery_done",
+        "balanced_candidate_evidence": "selection_balanced_candidate_evidence_done",
+        "candidate_screening": "selection_candidate_screening_done",
+        "single_stock_deep_dive": "selection_deep_dive_done",
+        "meta_orchestrator": "selection_meta_orchestrator_done",
+        "pricing_agent": "selection_pricing_agent_done",
+        "portfolio_allocation": "selection_allocation_done",
+        "adversarial_review": "selection_adversarial_done",
+        "judge_decision": "selection_judge_done",
+    }
+    return mapping.get(stage_name, f"selection_{stage_name}_done")
+
+
+def _load_stock_selection_resume_state(resume_artifact_dir: Optional[str]) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "requested": bool(str(resume_artifact_dir or "").strip()),
+        "artifact_dir": str(resume_artifact_dir or "").strip(),
+        "stages": {},
+        "available_stages": [],
+        "resumable_stages": [],
+        "warnings": [],
+    }
+    artifact_dir_text = str(resume_artifact_dir or "").strip()
+    if not artifact_dir_text:
+        return state
+    artifact_dir = Path(artifact_dir_text).expanduser()
+    if not artifact_dir.exists() or not artifact_dir.is_dir():
+        state["warnings"].append("resume artifact directory not found")
+        return state
+
+    selection_context = _read_resume_json(artifact_dir / "selection_context.json")
+    if isinstance(selection_context, dict):
+        stages = selection_context.get("stages") if isinstance(selection_context.get("stages"), dict) else {}
+        for stage_name, stage_payload in stages.items():
+            if isinstance(stage_payload, dict):
+                state["stages"][str(stage_name)] = _stage_payload_from_trace_stage(str(stage_name), stage_payload)
+
+    for stage_name in (
+        "candidate_discovery",
+        "balanced_candidate_evidence",
+        "candidate_screening",
+        "single_stock_deep_dive",
+        "meta_orchestrator",
+        "pricing_agent",
+        "portfolio_allocation",
+        "adversarial_review",
+        "judge_decision",
+    ):
+        payload = _read_resume_json(artifact_dir / f"{stage_name}.json")
+        if isinstance(payload, dict):
+            state["stages"][stage_name] = _stage_payload_from_trace_stage(stage_name, payload)
+
+    market_regime = _read_resume_json(artifact_dir / "market_regime.json")
+    if isinstance(market_regime, dict):
+        state["market_regime"] = market_regime
+    else:
+        events = _read_resume_events(artifact_dir / "events.ndjson")
+        for event in events:
+            if event.get("type") == "selection_market_regime_done" and isinstance(event.get("payload"), dict):
+                state["market_regime"] = event["payload"]
+        if events:
+            state["available_events"] = [
+                str(event.get("type"))
+                for event in events
+                if str(event.get("type") or "").startswith("selection_")
+            ]
+
+    state["available_stages"] = sorted(state["stages"].keys())
+    state["resumable_stages"] = [
+        name
+        for name in state["available_stages"]
+        if _resume_stage_payload(state, name) is not None
+    ]
+    if state.get("available_events") and not state["resumable_stages"]:
+        state["warnings"].append("old trace has selection events but no complete reusable stage artifacts")
+    return state
+
+
+def _read_resume_json(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("resume artifact JSON read failed for %s: %s", path, exc)
+        return None
+
+
+def _read_resume_events(path: Path) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    try:
+        if not path.exists():
+            return events
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                events.append(item)
+    except Exception as exc:
+        logger.debug("resume artifact events read failed for %s: %s", path, exc)
+    return events
+
+
+def _stage_payload_from_trace_stage(stage_name: str, stage_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if "status" in stage_payload and "summary" in stage_payload and "full" in stage_payload:
+        return {
+            "stage": stage_payload.get("stage") or stage_name,
+            "status": stage_payload.get("status") or "partial",
+            "summary": stage_payload.get("summary") if isinstance(stage_payload.get("summary"), dict) else {},
+            "full": stage_payload.get("full") if isinstance(stage_payload.get("full"), dict) else {},
+            "full_ref": stage_payload.get("full_ref") or f"{stage_name}.json",
+        }
+    payload = dict(stage_payload)
+    payload.setdefault("stage", stage_name)
+    payload.setdefault("status", payload.get("status") or "partial")
+    payload.setdefault("summary", payload.get("summary") if isinstance(payload.get("summary"), dict) else {})
+    payload.setdefault("full", payload.get("full") if isinstance(payload.get("full"), dict) else dict(stage_payload))
+    payload.setdefault("full_ref", payload.get("full_ref") or f"{stage_name}.json")
+    return payload
+
+
+def _resume_stage_payload(resume_state: Dict[str, Any], stage_name: str) -> Optional[Dict[str, Any]]:
+    stages = resume_state.get("stages") if isinstance(resume_state.get("stages"), dict) else {}
+    payload = stages.get(stage_name)
+    if not isinstance(payload, dict) or not _is_resumable_stage_payload(stage_name, payload):
+        return None
+    return payload
+
+
+def _is_resumable_stage_payload(stage_name: str, payload: Dict[str, Any]) -> bool:
+    full = payload.get("full") if isinstance(payload.get("full"), dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    if str(payload.get("status") or "").lower() in {"failed", "error"}:
+        return False
+    if stage_name == "candidate_discovery":
+        candidates = full.get("candidates")
+        return isinstance(candidates, list) and len(candidates) > 0
+    if stage_name == "balanced_candidate_evidence":
+        candidates = full.get("candidates")
+        return isinstance(candidates, list) and len(candidates) > 0
+    if stage_name == "candidate_screening":
+        return bool(summary.get("deep_dive_targets") or full.get("shortlist"))
+    if stage_name == "single_stock_deep_dive":
+        results = full.get("results")
+        return isinstance(results, list) and len(results) > 0
+    if stage_name == "meta_orchestrator":
+        return isinstance(full.get("packages"), list)
+    if stage_name == "pricing_agent":
+        return isinstance(full.get("if_then_order_matrix"), list)
+    if stage_name == "portfolio_allocation":
+        return isinstance(full.get("positions_plan"), list)
+    if stage_name == "adversarial_review":
+        return bool(summary or full)
+    if stage_name == "judge_decision":
+        return bool(summary.get("final_action") or full)
+    return bool(summary or full)
+
+
+def _resume_market_regime(resume_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    value = resume_state.get("market_regime")
+    return value if isinstance(value, dict) and value else None
+
+
+def _selection_resume_message(resume_state: Dict[str, Any]) -> str:
+    resumable = resume_state.get("resumable_stages") or []
+    if resumable:
+        return "已找到历史 Trace，可复用阶段：" + "、".join(str(item) for item in resumable)
+    return "已找到历史 Trace，但没有完整可复用的阶段文件，将沿用原请求重新继续运行。"
+
+
 def _format_pct(value: Any) -> str:
     if value is None:
         return "-"
@@ -6202,8 +7156,91 @@ def _markdown_cell(value: Any) -> str:
             or str(value)
         )
     text = str(value if value is not None else "-")
+    text = _translate_machine_tokens(text)
     text = _humanize_kv_patterns(text)
     return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _translate_machine_tokens(text: str) -> str:
+    token_labels = {
+        "accept_with_changes": "有条件采纳",
+        "wait_for_more_data": "等待更多证据",
+        "immediate_open": "可执行开仓",
+        "conditional_open": "条件触发后试仓",
+        "strong_watch": "强观察",
+        "plain_wait": "等待",
+        "open": "开仓",
+        "wait": "等待",
+        "reject": "放弃",
+        "monitor": "观察",
+        "watch": "观察",
+        "support": "支持",
+        "oppose": "反对",
+        "neutral": "中性",
+        "weak": "弱",
+        "medium": "中",
+        "strong": "强",
+        "none": "无",
+        "after_close": "盘后数据",
+        "intraday": "盘中实时数据",
+        "latest_trading_day": "最近有效交易日",
+        "unknown": "未知",
+        "high_volatility": "高波动",
+        "range_bound": "震荡市",
+        "uptrend": "上行趋势",
+        "downtrend": "下行趋势",
+        "extreme": "极端",
+        "high": "高",
+        "low": "低",
+    }
+    for raw in sorted(token_labels, key=len, reverse=True):
+        text = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(raw)}(?![A-Za-z0-9_])",
+            token_labels[raw],
+            text,
+        )
+    return text
+
+
+def _market_regime_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    labels = {
+        "high_volatility": "高波动",
+        "range_bound": "震荡市",
+        "uptrend": "上行趋势",
+        "downtrend": "下行趋势",
+        "bull": "牛市",
+        "bear": "熊市",
+        "neutral": "中性",
+        "panic": "恐慌",
+        "risk_off": "避险",
+    }
+    return labels.get(raw, raw or "-")
+
+
+def _volatility_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    labels = {
+        "extreme": "极端",
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "normal": "正常",
+    }
+    return labels.get(raw, raw or "-")
+
+
+def _risk_level_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    labels = {
+        "extreme": "极高",
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "normal": "正常",
+        "risk_off": "避险",
+    }
+    return labels.get(raw, raw or "-")
 
 
 def _brief_markdown_text(value: Any, max_chars: int) -> str:

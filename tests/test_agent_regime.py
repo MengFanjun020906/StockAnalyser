@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from src.agent.regime import (
     WyckoffPhase,
     detect_market_regime,
 )
+from src.agent.tools import market_tools
 from src.agent.tools.market_tools import _handle_detect_market_regime, detect_market_regime_tool
 from src.storage import DatabaseManager
 
@@ -69,6 +71,32 @@ def test_regime_confirmation_requires_consecutive_bars_before_switching():
     assert state.confirmation["state"] == "pending"
     assert state.confirmation["pending_regime"] == MarketRegime.TRENDING_UP.value
     assert state.regime == MarketRegime.RANGE_BOUND
+
+
+def test_high_volatility_uptrend_keeps_directional_regime():
+    bars = _bars(220, drift=0.35, vol=0.5)
+    widened = []
+    for idx, bar in enumerate(bars):
+        if idx < len(bars) - 30:
+            widened.append(bar)
+            continue
+        widened.append(
+            MarketBar(
+                date=bar.date,
+                open=bar.open,
+                high=bar.close + 10.0,
+                low=max(1.0, bar.close - 10.0),
+                close=bar.close,
+                volume=bar.volume * 1.5,
+                amount=bar.amount,
+            )
+        )
+
+    state = detect_market_regime(widened)
+
+    assert state.volatility_bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}
+    assert state.regime == MarketRegime.TRENDING_UP
+    assert any("波动不是开仓否决项" in item for item in state.strategy_hints)
 
 
 def test_sentiment_and_wyckoff_are_structured():
@@ -270,6 +298,84 @@ def test_market_history_skips_stock_fallback_for_supported_index():
     assert history == []
     assert source == "tushare:index_daily_failed;db_cache_miss"
     fallback_loader.assert_called_once_with("000300", days=260, fallback_to_network=False)
+
+
+def test_market_history_uses_local_index_cache_when_tushare_fails(tmp_path):
+    from src.agent.tools import market_tools
+
+    cache_path = tmp_path / "000300.SH.json"
+    cache_path.write_text(
+        json.dumps({
+            "ts_code": "000300.SH",
+            "source": "tushare:index_daily",
+            "rows": [
+                {
+                    "date": "2026-05-14",
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100.5,
+                    "volume": 1000,
+                    "amount": 10000,
+                },
+                {
+                    "date": "2026-05-15",
+                    "open": 101,
+                    "high": 103,
+                    "low": 100,
+                    "close": 102,
+                    "volume": 1200,
+                    "amount": 12000,
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    class FailingTushareHttpClient:
+        def query(self, *args, **kwargs):
+            raise RuntimeError("gateway unavailable")
+
+    with patch("data_provider.tushare_client.get_tushare_token", return_value="token"), \
+         patch("data_provider.tushare_client.build_tushare_http_client", return_value=FailingTushareHttpClient()), \
+         patch("src.agent.tools.market_tools._index_history_cache_path", return_value=cache_path), \
+         patch("src.services.history_loader.load_history_df") as fallback_loader:
+        history, source = market_tools._load_market_history("000300", 1)
+
+    assert source == "tushare:index_daily_cache:after_http_error"
+    assert len(history) == 1
+    assert history[0]["date"] == "2026-05-15"
+    assert history[0]["close"] == 102
+    fallback_loader.assert_not_called()
+
+
+def test_regime_forward_probability_uses_cache_first_market_history():
+    seen_cache_first = []
+    history_rows = [
+        {
+            "date": str(row.date),
+            "open": row.open,
+            "high": row.high,
+            "low": row.low,
+            "close": row.close,
+            "volume": row.volume,
+            "amount": row.amount,
+        }
+        for row in _bars(420)
+    ]
+
+    def fake_load_market_history(_index_code, _lookback_days, *, cache_first=False):
+        seen_cache_first.append(cache_first)
+        return history_rows, "unit_test"
+
+    with patch("src.agent.tools.market_tools._load_market_history", side_effect=fake_load_market_history):
+        result = market_tools._handle_get_regime_forward_probability(
+            lookback_days=260,
+            windows=[7, 30],
+        )
+
+    assert result["status"] in {"ok", "insufficient_data"}
+    assert seen_cache_first == [True]
 
 
 def test_detect_market_regime_tool_returns_structured_timeout_diagnostics():

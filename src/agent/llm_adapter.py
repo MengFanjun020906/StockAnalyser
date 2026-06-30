@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 import litellm
 from litellm import Router
 
+from src.agent.llm_telemetry import record_llm_telemetry
 from src.config import (
     extra_litellm_params,
     get_api_keys_for_model,
@@ -110,6 +111,7 @@ _AUTO_THINKING_MODELS: List[str] = ["deepseek-reasoner", "deepseek-r1", "qwq"]
 # Models that need explicit opt-in via extra_body; payload decoupled from model name.
 _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
+    "glm-5.2": {"thinking": {"type": "enabled"}, "reasoning_effort": "max"},
 }
 
 # Custom model pricing for models not in LiteLLM's built-in price list
@@ -168,7 +170,7 @@ def get_thinking_extra_body(model: str) -> Optional[dict]:
       These models automatically return reasoning_content in API responses; sending
       extra_body would cause 400 because the API already enables thinking by default.
       Return None to avoid duplicate activation.
-    - Opt-in models (_OPT_IN_THINKING_MODELS: deepseek-chat): Return the activation
+    - Opt-in models (_OPT_IN_THINKING_MODELS: deepseek-chat, glm-5.2): Return the activation
       payload to explicitly enable thinking mode.
     - All other models: Return None (no thinking mode).
     """
@@ -305,6 +307,7 @@ class LLMToolAdapter:
         provider: Optional[str] = None,
         timeout: Optional[float] = None,
         response_format: Optional[dict] = None,
+        max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -323,6 +326,7 @@ class LLMToolAdapter:
             provider=provider,
             timeout=timeout,
             response_format=response_format,
+            max_tokens=max_tokens,
         )
 
     def call_text(
@@ -359,6 +363,7 @@ class LLMToolAdapter:
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
+        messages = self._ensure_json_output_prompt(messages, response_format)
         models_to_try = get_effective_agent_models_to_try(config)
         if not models_to_try:
             error_msg = (
@@ -373,6 +378,7 @@ class LLMToolAdapter:
         last_error = None
         hit_rate_limit = False
         for idx, model in enumerate(models_to_try):
+            call_started = time.time()
             remaining_timeout = timeout
             model_timeout = timeout
             if timeout is not None and timeout > 0:
@@ -382,10 +388,9 @@ class LLMToolAdapter:
                         f"LLM completion timed out before trying fallback model {model}"
                     )
                     break
-                remaining_models = max(1, len(models_to_try) - idx)
-                model_timeout = remaining_timeout / remaining_models
+                model_timeout = remaining_timeout
             try:
-                return self._call_litellm_model_with_hard_timeout(
+                response = self._call_litellm_model_with_hard_timeout(
                     messages,
                     tools or [],
                     model,
@@ -394,7 +399,25 @@ class LLMToolAdapter:
                     timeout=model_timeout,
                     response_format=response_format,
                 )
+                record_llm_telemetry(
+                    model=response.model or model,
+                    provider=response.provider or self._get_model_provider(model),
+                    usage=response.usage,
+                    latency_ms=(time.time() - call_started) * 1000,
+                    tool_calls=len(response.tool_calls or []),
+                    ok=True,
+                )
+                return response
             except Exception as e:
+                record_llm_telemetry(
+                    model=model,
+                    provider=self._get_model_provider(model),
+                    usage={},
+                    latency_ms=(time.time() - call_started) * 1000,
+                    tool_calls=0,
+                    ok=False,
+                    error=str(e),
+                )
                 if isinstance(e, _resolve_litellm_exception("RateLimitError")):
                     logger.warning("Agent LLM rate-limited on %s: %s", model, e)
                     last_error = e
@@ -606,6 +629,28 @@ class LLMToolAdapter:
                     "content": msg["content"],
                 })
         return openai_messages
+
+    @staticmethod
+    def _ensure_json_output_prompt(
+        messages: List[Dict[str, Any]],
+        response_format: Optional[dict],
+    ) -> List[Dict[str, Any]]:
+        """DeepSeek JSON Output requires the prompt to mention JSON explicitly."""
+
+        if not isinstance(response_format, dict) or response_format.get("type") != "json_object":
+            return messages
+        combined = "\n".join(str(msg.get("content") or "") for msg in messages if isinstance(msg, dict))
+        if "json" in combined.lower():
+            return messages
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你必须只输出合法 JSON object，不要输出 Markdown、代码块、解释或自然语言前后缀。"
+                ),
+            },
+            *messages,
+        ]
 
     def _parse_litellm_response(self, response: Any, model: str) -> LLMResponse:
         """Parse litellm OpenAI-compatible response into LLMResponse."""

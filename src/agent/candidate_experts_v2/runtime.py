@@ -9,6 +9,7 @@ ExpertPacketV2 with the appropriate status so the aggregator stays uniform.
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import logging
 import time
 from typing import Callable, Dict, List
@@ -68,7 +69,10 @@ def run_experts_parallel(
     packets: Dict[str, ExpertPacketV2] = {}
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(tasks)))
     try:
-        futures = {pool.submit(task): name for name, task in tasks.items()}
+        futures = {
+            pool.submit(contextvars.copy_context().run, task): name
+            for name, task in tasks.items()
+        }
         for future in concurrent.futures.as_completed(futures, timeout=overall_timeout_s):
             name = futures[future]
             try:
@@ -93,12 +97,39 @@ def run_experts_parallel(
         for name in tasks:
             if name in packets:
                 continue
+            elapsed_ms = int((time.time() - started) * 1000)
             packets[name] = ExpertPacketV2(
                 expert=name,
                 dimension=_dimension_for(name),
                 status="timeout",
-                errors=[f"{name} timeout after {per_expert_timeout_s:.1f}s"],
-                elapsed_ms=int((time.time() - started) * 1000),
+                data_quality=ExpertDataQualityV2(
+                    warnings=[
+                        (
+                            f"expert did not finish before committee overall timeout; "
+                            f"configured expert budget {per_expert_timeout_s:.1f}s, "
+                            f"overall budget {overall_timeout_s:.1f}s"
+                        )
+                    ],
+                ),
+                diagnostics=[
+                    {
+                        "source": "expert_parallel_runtime",
+                        "status": "timeout",
+                        "reason": "overall_timeout_exhausted_before_expert_returned",
+                        "expert": name,
+                        "elapsed_ms": elapsed_ms,
+                        "configured_per_expert_timeout_s": round(float(per_expert_timeout_s), 3),
+                        "configured_overall_timeout_s": round(float(overall_timeout_s), 3),
+                    }
+                ],
+                errors=[
+                    (
+                        f"{name} did not return before committee overall timeout "
+                        f"after {elapsed_ms / 1000.0:.1f}s "
+                        f"(expert budget {per_expert_timeout_s:.1f}s, overall budget {overall_timeout_s:.1f}s)"
+                    )
+                ],
+                elapsed_ms=elapsed_ms,
             )
         pool.shutdown(wait=False, cancel_futures=True)
 

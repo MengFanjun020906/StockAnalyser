@@ -20,11 +20,13 @@ import logging
 import re
 import time
 import contextvars
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.llm_adapter import LLMToolAdapter
+from src.agent.metric_semantics import apply_metric_semantics
 from src.agent.tools.registry import ToolRegistry
 from src.storage import persist_llm_usage as _persist_usage
 
@@ -51,6 +53,19 @@ _THINKING_TOOL_LABELS: Dict[str, str] = {
     "get_skill_backtest_summary": "技能回测概览",
     "get_strategy_backtest_summary": "策略回测概览",
     "get_stock_backtest_summary": "个股回测数据",
+}
+
+
+_HEAVY_TOOL_TIMEOUT_FLOOR_SECONDS: Dict[str, float] = {
+    # These tools already run multiple bounded inner components and return
+    # structured diagnostics. A flat 30s runner shell can kill them before that
+    # diagnostic payload is produced.
+    "detect_market_regime": 60.0,
+    "discover_watchlist_candidates": 70.0,
+    "get_capital_flow": 45.0,
+    "get_chip_distribution": 75.0,
+    "get_tushare_financial_indicators": 45.0,
+    "get_volume_analysis": 45.0,
 }
 
 
@@ -109,6 +124,590 @@ def _preview_tool_result(result_str: str, max_chars: int = 1200) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"...[truncated {len(text) - max_chars} chars]"
+
+
+def compact_tool_result_for_model(tool_name: str, result_str: str) -> str:
+    """Return a bounded, evidence-preserving tool payload for the next LLM turn.
+
+    The trace keeps the raw result preview/length; the model only needs a compact
+    fact card. This prevents long OHLC arrays, raw articles, and transport logs
+    from diluting attention in single-stock ReAct runs.
+    """
+    text = result_str if isinstance(result_str, str) else str(result_str)
+    digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        compact_payload: Any = _truncate_text(text, 3000)
+    else:
+        compact_payload = apply_metric_semantics(tool_name, _compact_tool_payload(tool_name, payload))
+
+    wrapper = {
+        "tool": tool_name,
+        "context_policy": "compact_tool_fact_card",
+        "raw_result": {
+            "sha256_16": digest,
+            "length": len(text),
+            "omitted_from_model": len(text) > 0,
+        },
+        "result": compact_payload,
+    }
+    return json.dumps(wrapper, ensure_ascii=False, default=str)
+
+
+def _compact_tool_payload(tool_name: str, payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return _compact_value_for_model(payload)
+
+    profile = resolve_tool_etl_profile(tool_name)
+    if profile == "quote":
+        return _compact_keep_fields(payload, _QUOTE_FIELDS)
+    if profile == "history":
+        return _compact_history_payload(payload)
+    if profile == "technical":
+        return _compact_keep_fields(payload, _TECHNICAL_FIELDS, include_errors=True)
+    if profile == "price_structure":
+        return _compact_price_structure_payload(payload)
+    if profile == "chip":
+        return _compact_keep_fields(payload, _CHIP_FIELDS, include_errors=True)
+    if profile == "stock_info":
+        return _compact_stock_info_payload(payload)
+    if profile == "business_context":
+        return _compact_keep_fields(payload, _BUSINESS_CONTEXT_FIELDS, include_errors=True)
+    if profile == "portfolio":
+        return _compact_portfolio_payload(payload)
+    if profile == "capital_flow":
+        return _compact_capital_flow_payload(payload)
+    if profile == "market_flow":
+        return _compact_table_payload(payload, item_keys=("items", "data", "top", "bottom", "top_inflow_sectors", "top_outflow_sectors"))
+    if profile == "tushare_table":
+        return _compact_table_payload(payload)
+    if profile == "news":
+        return _compact_news_payload(payload, item_keys=("results", "items", "news", "events", "announcements", "alerts", "sections"))
+    if profile == "market_indices":
+        return _compact_table_payload(payload, item_keys=("indices", "items", "data"))
+    if profile == "market_regime":
+        return _compact_market_regime_payload(payload)
+    if profile == "candidate_discovery":
+        return _compact_candidate_payload(payload)
+    if profile == "backtest":
+        return _compact_backtest_payload(payload)
+    if profile == "knowledge_graph":
+        return _compact_table_payload(payload, item_keys=("results", "items", "nodes", "episodes"))
+
+    payload = dict(payload)
+    payload["etl_warning"] = f"unprofiled tool: {tool_name}"
+    return _compact_mapping_for_model(payload, depth=0)
+
+
+_QUOTE_FIELDS = (
+    "code", "name", "price", "change_pct", "change_amount", "volume", "amount",
+    "volume_ratio", "turnover_rate", "amplitude", "open", "high", "low",
+    "pre_close", "pe_ratio", "pb_ratio", "total_mv", "circ_mv", "change_60d",
+    "market_state", "trade_date", "quote_time", "is_trading", "error", "status",
+)
+_TECHNICAL_FIELDS = (
+    "code", "trend_status", "ma_alignment", "trend_strength", "current_price",
+    "ma5", "ma10", "ma20", "ma30", "ma60", "ma120", "ma250", "bias_ma5",
+    "bias_ma10", "bias_ma20", "volume_status", "volume_ratio_5d", "volume_trend",
+    "support_ma5", "support_ma10", "support_levels", "resistance_levels",
+    "macd_dif", "macd_dea", "macd_bar", "macd_status", "macd_signal",
+    "rsi_6", "rsi_12", "rsi_14", "rsi14", "rsi_24", "rsi_status", "rsi_signal",
+    "bollinger", "buy_signal", "signal_score", "signal_reasons", "risk_factors",
+    "periods", "ma", "data_points", "above_ma_count", "total_ma_count",
+    "period_days", "latest_volume", "avg_volume_5d", "avg_volume_20d",
+    "volume_ratio_vs_5d", "volume_ratio_vs_20d", "volume_trend_pct",
+    "price_volume_relation", "patterns", "summary", "error", "status",
+)
+_CHIP_FIELDS = (
+    "stock_code", "code", "status", "as_of", "latest_date", "profit_ratio",
+    "avg_cost", "concentration", "chip_concentration", "cost_90", "cost_70",
+    "winner_rate", "support_price", "pressure_price", "error_summary", "error",
+)
+_BUSINESS_CONTEXT_FIELDS = (
+    "status", "code", "name", "industry", "boards", "business_summary",
+    "theme_clues", "broad_industries", "confidence", "as_of", "error",
+)
+
+
+def resolve_tool_etl_profile(tool_name: str) -> str:
+    """Map every registered tool to a model-context ETL profile."""
+    explicit = {
+        "get_realtime_quote": "quote",
+        "get_daily_history": "history",
+        "get_chip_distribution": "chip",
+        "get_analysis_context": "stock_info",
+        "get_stock_info": "stock_info",
+        "get_stock_business_context": "business_context",
+        "get_portfolio_snapshot": "portfolio",
+        "get_capital_flow": "capital_flow",
+        "analyze_trend": "technical",
+        "calculate_ma": "technical",
+        "get_volume_analysis": "technical",
+        "analyze_pattern": "technical",
+        "analyze_price_structure": "price_structure",
+        "search_stock_news": "news",
+        "search_stock_prompt_intel": "news",
+        "score_stock_news_sentiment": "news",
+        "search_comprehensive_intel": "news",
+        "detect_market_regime": "market_regime",
+        "get_regime_forward_probability": "market_regime",
+        "get_symbol_regime_probability": "market_regime",
+        "get_market_indices": "market_indices",
+        "get_board_capital_flow": "market_flow",
+        "get_sector_rankings": "market_flow",
+        "discover_watchlist_candidates": "candidate_discovery",
+        "get_skill_backtest_summary": "backtest",
+        "get_strategy_backtest_summary": "backtest",
+        "get_stock_backtest_summary": "backtest",
+        "search_knowledge_graph": "knowledge_graph",
+        "search_openinvest_news": "news",
+    }
+    if tool_name in explicit:
+        return explicit[tool_name]
+    if tool_name.startswith("get_tushare_today_news") or tool_name in {
+        "get_eastmoney_cjzc_daily",
+        "get_tushare_announcements",
+        "get_tushare_stock_alerts",
+        "get_stock_disclosure_events",
+        "get_tushare_reference_events",
+    }:
+        return "news"
+    if tool_name.startswith("get_tushare_moneyflow") or tool_name in {
+        "get_market_capital_flow",
+        "get_northbound_capital_flow",
+        "get_margin_trading_summary",
+        "get_stockapi_hot_money_activity",
+    }:
+        return "market_flow"
+    if tool_name.startswith("get_stockapi_"):
+        return "market_flow"
+    if tool_name.startswith("get_tushare_"):
+        return "tushare_table"
+    return "generic"
+
+
+def _compact_keep_fields(
+    payload: Dict[str, Any],
+    fields: tuple[str, ...],
+    *,
+    include_errors: bool = False,
+) -> Dict[str, Any]:
+    out = {
+        key: _compact_value_for_model(payload.get(key), depth=1)
+        for key in fields
+        if key in payload and payload.get(key) not in (None, "", [], {})
+    }
+    if include_errors:
+        _copy_error_fields(payload, out)
+    return _drop_empty(out)
+
+
+def _copy_error_fields(payload: Dict[str, Any], out: Dict[str, Any]) -> None:
+    for key in ("status", "error", "error_summary", "note", "message"):
+        if payload.get(key) not in (None, "", [], {}):
+            out[key] = _truncate_text(str(payload.get(key)), 360) if key in {"error", "error_summary", "note", "message"} else payload.get(key)
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        out["errors"] = [_truncate_text(str(item), 240) for item in errors[:3] if str(item).strip()]
+
+
+def _compact_history_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), list) else []
+    closes = [_safe_number(item.get("close")) for item in data if isinstance(item, dict)]
+    closes = [item for item in closes if item is not None]
+    out = {
+        "status": payload.get("status", "ok") if not payload.get("error") else "error",
+        "code": payload.get("code"),
+        "actual_records": payload.get("actual_records") or len(data),
+        "partial_cache": payload.get("partial_cache") if payload.get("partial_cache") else None,
+        "first_date": _pick_record_field(data, 0, "date"),
+        "last_date": _pick_record_field(data, -1, "date"),
+        "latest_bars": [_compact_market_row(item) for item in data[-8:] if isinstance(item, dict)],
+        "close_summary": _numeric_series_summary(closes),
+    }
+    _copy_error_fields(payload, out)
+    return _drop_empty(out)
+
+
+def _compact_capital_flow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only decision-bearing capital-flow facts for model context."""
+    result = {
+        "stock_code": payload.get("stock_code") or payload.get("code"),
+        "status": payload.get("status"),
+        "main_net_inflow": payload.get("main_net_inflow"),
+        "main_inflow_5d": payload.get("main_inflow_5d") if payload.get("main_inflow_5d") is not None else payload.get("inflow_5d"),
+        "main_inflow_10d": payload.get("main_inflow_10d") if payload.get("main_inflow_10d") is not None else payload.get("inflow_10d"),
+        "net_inflow": payload.get("net_inflow"),
+        "net_inflow_5d": payload.get("net_inflow_5d"),
+        "net_inflow_10d": payload.get("net_inflow_10d"),
+        "amount_unit": payload.get("amount_unit", "CNY"),
+        "latest_date": payload.get("latest_date"),
+    }
+    if payload.get("main_inflow_definition"):
+        result["main_inflow_definition"] = payload.get("main_inflow_definition")
+    if payload.get("net_inflow_definition"):
+        result["net_inflow_definition"] = payload.get("net_inflow_definition")
+    if payload.get("error"):
+        result["error"] = payload.get("error")
+    if payload.get("error_summary"):
+        result["error_summary"] = payload.get("error_summary")
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        result["errors"] = [_truncate_text(str(item), 240) for item in errors[:3] if str(item).strip()]
+    return _drop_empty(result)
+
+
+def _compact_price_structure_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "code": payload.get("code"),
+        "status": payload.get("status"),
+        "period_days": payload.get("period_days"),
+        "latest_bar": _compact_value_for_model(payload.get("latest_bar"), depth=1),
+    }
+    chan = payload.get("chan") if isinstance(payload.get("chan"), dict) else {}
+    smc = payload.get("smc") if isinstance(payload.get("smc"), dict) else {}
+    if chan:
+        out["chan"] = _compact_keep_fields(
+            chan,
+            ("status", "pen_count", "center_count", "structure_summary", "latest_centers", "latest_pens", "unfinished_pen"),
+        )
+    if smc:
+        out["smc"] = _compact_keep_fields(
+            smc,
+            ("status", "swing_count", "structure_summary", "bos", "choch", "latest_swings", "order_blocks", "fair_value_gaps"),
+        )
+    _copy_error_fields(payload, out)
+    return _drop_empty(out)
+
+
+def _compact_stock_info_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fields = (
+        "status", "code", "name", "industry", "area", "market", "list_date",
+        "pe_ratio", "pb_ratio", "total_mv", "circ_mv", "belong_boards",
+        "fundamental_context", "sector_rankings", "history_count", "latest_analysis",
+        "error",
+    )
+    out = _compact_keep_fields(payload, fields, include_errors=True)
+    boards = out.get("belong_boards")
+    if isinstance(boards, list):
+        out["belong_boards"] = [
+            _compact_keep_fields(item, ("name", "code", "type", "change_pct", "rank")) if isinstance(item, dict) else item
+            for item in boards[:8]
+        ]
+    return _drop_empty(out)
+
+
+def _compact_table_payload(
+    payload: Dict[str, Any],
+    item_keys: tuple[str, ...] = ("items", "data", "records", "rows", "top", "bottom"),
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in (
+        "status", "api_name", "stock_code", "code", "ts_code", "trade_date",
+        "ann_date", "start_date", "end_date", "latest_date", "date", "total",
+        "count", "summary", "error", "error_summary",
+    ):
+        if key in payload and payload.get(key) not in (None, "", [], {}):
+            out[key] = _compact_value_for_model(payload.get(key), depth=1)
+    _copy_error_fields(payload, out)
+    for key in item_keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            out[key] = {
+                "total": len(value),
+                "items": [_compact_table_item(item) for item in value[:8] if isinstance(item, dict)],
+            }
+        elif isinstance(value, dict):
+            compact_dict = {}
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, list):
+                    compact_dict[sub_key] = {
+                        "total": len(sub_value),
+                        "items": [_compact_table_item(item) for item in sub_value[:5] if isinstance(item, dict)],
+                    }
+                else:
+                    compact_dict[sub_key] = _compact_value_for_model(sub_value, depth=1)
+            out[key] = _drop_empty(compact_dict)
+    return _drop_empty(out)
+
+
+def _compact_table_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    skip = {"query", "params", "source_chain", "raw", "raw_text", "raw_html", "content_body"}
+    compact: Dict[str, Any] = {}
+    for key, value in item.items():
+        if key in skip:
+            continue
+        if len(compact) >= 18:
+            break
+        compact[key] = _compact_value_for_model(value, depth=2)
+    return _drop_empty(compact)
+
+
+def _compact_news_payload(payload: Dict[str, Any], *, item_keys: tuple[str, ...]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in (
+        "status", "error", "errors", "stock_code", "code", "stock_name",
+        "overall_sentiment", "sentiment", "summary", "risk_summary",
+        "positive_summary", "latest_date", "as_of",
+    ):
+        if key in payload:
+            out[key] = _compact_value_for_model(payload.get(key), depth=1)
+
+    for key in item_keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            out[key] = {
+                "total": len(value),
+                "items": [_compact_news_item(item) for item in value[:8] if isinstance(item, dict)],
+            }
+        elif isinstance(value, dict):
+            out[key] = _compact_mapping_for_model(value, depth=1)
+    return _drop_empty(out)
+
+
+def _compact_market_regime_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fields = (
+        "status", "market", "index_code", "regime", "regime_label", "confidence",
+        "trend", "volatility", "breadth", "liquidity", "risk_level", "as_of",
+        "stock_code", "windows", "forward_probability", "path_profile",
+        "reentry_reference", "sample_quality_summary", "low_confidence",
+        "summary", "signals", "warnings", "error",
+    )
+    return _compact_keep_fields(payload, fields, include_errors=True)
+
+
+def _compact_candidate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = _compact_keep_fields(
+        payload,
+        ("stage", "status", "candidate_count", "mode", "summary", "diagnostics", "error"),
+        include_errors=True,
+    )
+    candidates = payload.get("candidates")
+    if candidates is None and isinstance(payload.get("full"), dict):
+        candidates = payload["full"].get("candidates")
+    if isinstance(candidates, list):
+        out["candidates"] = {
+            "total": len(candidates),
+            "items": [
+                _compact_keep_fields(
+                    item,
+                    ("code", "name", "market", "setup_type", "primary_desk", "desks", "reason", "confidence", "flags", "risks"),
+                )
+                for item in candidates[:10]
+                if isinstance(item, dict)
+            ],
+        }
+    return _drop_empty(out)
+
+
+def _compact_portfolio_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = _compact_keep_fields(
+        payload,
+        ("status", "account_id", "account_name", "as_of", "total_equity", "cash", "market_value", "pnl", "risk", "summary", "error"),
+        include_errors=True,
+    )
+    positions = payload.get("positions")
+    if isinstance(positions, list):
+        out["positions"] = {
+            "total": len(positions),
+            "items": [
+                _compact_keep_fields(
+                    item,
+                    ("symbol", "stock_code", "stock_name", "quantity", "cost_price", "market_price", "market_value", "pnl", "pnl_pct", "weight"),
+                )
+                for item in positions[:12]
+                if isinstance(item, dict)
+            ],
+        }
+    return _drop_empty(out)
+
+
+def _compact_backtest_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = _compact_keep_fields(
+        payload,
+        ("status", "skill_id", "stock_code", "eval_window_days", "sample_count", "win_rate", "avg_return", "median_return", "max_drawdown", "summary", "error"),
+        include_errors=True,
+    )
+    for key in ("items", "trades", "results", "top", "bottom"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            out[key] = {
+                "total": len(value),
+                "items": [_compact_table_item(item) for item in value[:8] if isinstance(item, dict)],
+            }
+    return _drop_empty(out)
+
+
+def _compact_mapping_for_model(value: Dict[str, Any], *, depth: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, item in value.items():
+        if _is_diagnostic_payload_key(key) and not _has_error_signal(key, item):
+            continue
+        if _is_raw_payload_key(key):
+            out[key] = _raw_payload_marker(item)
+            continue
+        if key in {"data", "records", "rows", "items", "results", "sections", "tool_calls", "source_chain"}:
+            out[key] = _compact_large_container(key, item, depth=depth + 1)
+        else:
+            out[key] = _compact_value_for_model(item, depth=depth + 1)
+    return _drop_empty(out)
+
+
+def _compact_large_container(key: str, value: Any, *, depth: int) -> Any:
+    if isinstance(value, list):
+        if all(isinstance(item, dict) for item in value):
+            return {
+                "total": len(value),
+                "sample_head": [_compact_value_for_model(item, depth=depth + 1) for item in value[:3]],
+                "sample_tail": [_compact_value_for_model(item, depth=depth + 1) for item in value[-3:]] if len(value) > 3 else [],
+            }
+        return {
+            "total": len(value),
+            "sample_head": [_compact_value_for_model(item, depth=depth + 1) for item in value[:5]],
+        }
+    if isinstance(value, dict):
+        return _compact_mapping_for_model(value, depth=depth)
+    return _compact_value_for_model(value, depth=depth)
+
+
+def _compact_value_for_model(value: Any, depth: int = 0) -> Any:
+    if depth > 4:
+        return _truncate_text(value, 240)
+    if isinstance(value, str):
+        return _truncate_text(value, 700 if depth <= 1 else 360)
+    if isinstance(value, dict):
+        return _compact_mapping_for_model(value, depth=depth)
+    if isinstance(value, list):
+        if len(value) <= 8:
+            return [_compact_value_for_model(item, depth=depth + 1) for item in value]
+        return {
+            "total": len(value),
+            "sample_head": [_compact_value_for_model(item, depth=depth + 1) for item in value[:4]],
+            "sample_tail": [_compact_value_for_model(item, depth=depth + 1) for item in value[-2:]],
+        }
+    return value
+
+
+def _compact_market_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    keep = (
+        "date", "time", "open", "high", "low", "close", "volume", "amount",
+        "turnover_rate", "pct_chg", "change_pct", "ma5", "ma10", "ma20", "ma60",
+    )
+    return _drop_empty({key: row.get(key) for key in keep if key in row})
+
+
+def _compact_news_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    keep = (
+        "date", "publish_time", "time", "title", "summary", "source", "url",
+        "sentiment", "risk_level", "event_type", "ann_date", "name",
+    )
+    return _drop_empty({
+        key: _truncate_text(item.get(key), 260 if key in {"title", "summary", "name"} else 180)
+        for key in keep
+        if key in item
+    })
+
+
+def _numeric_series_summary(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {}
+    first = values[0]
+    last = values[-1]
+    return {
+        "count": len(values),
+        "first": round(first, 4),
+        "last": round(last, 4),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+        "change_pct": round((last - first) / first * 100, 4) if first else None,
+    }
+
+
+def _pick_record_field(records: List[Any], index: int, field: str) -> Any:
+    if not records:
+        return None
+    try:
+        item = records[index]
+    except IndexError:
+        return None
+    return item.get(field) if isinstance(item, dict) else None
+
+
+def _safe_number(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed else None
+
+
+def _truncate_text(value: Any, max_chars: int) -> Any:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"...[truncated {len(value) - max_chars} chars]"
+
+
+def _is_raw_payload_key(key: Any) -> bool:
+    text = str(key or "").strip().lower()
+    return text in {
+        "blob",
+        "raw_blob",
+        "raw",
+        "raw_text",
+        "raw_html",
+        "html",
+        "content_body",
+        "full_text",
+        "article",
+        "body",
+    }
+
+
+def _is_diagnostic_payload_key(key: Any) -> bool:
+    text = str(key or "").strip().lower()
+    return text in {
+        "query",
+        "params",
+        "source_chain",
+        "source_update",
+        "cache_hit",
+        "requested_days",
+        "effective_days",
+        "tool_calls",
+        "transport",
+        "provider",
+        "duration_ms",
+        "elapsed_ms",
+    }
+
+
+def _has_error_signal(key: Any, value: Any) -> bool:
+    text = str(key or "").strip().lower()
+    if text not in {"errors", "error", "error_summary"}:
+        return False
+    if isinstance(value, list):
+        return any(str(item).strip() for item in value)
+    return bool(value)
+
+
+def _raw_payload_marker(value: Any) -> Dict[str, Any]:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return {
+        "omitted_from_model": True,
+        "length": len(text),
+        "sha256_16": hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16],
+    }
+
+
+def _drop_empty(value: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: item
+        for key, item in value.items()
+        if item not in (None, "", [], {})
+    }
 
 
 def _structured_trace_result(tool_name: str, result_str: str) -> Any:
@@ -190,17 +789,21 @@ def _is_failed_tool_result(result: Any) -> bool:
     """Return True when a tool returned a structured failure payload."""
     if not isinstance(result, dict):
         return False
+    if result.get("context_policy") == "compact_tool_fact_card" and isinstance(result.get("result"), dict):
+        return _is_failed_tool_result(result["result"])
 
     status = str(result.get("status") or "").strip().lower()
     if status in {"failed", "error", "tool_failed", "timeout"}:
-        return True
-    if status != "not_supported" and _result_has_errors(result):
         return True
     if result.get("timeout") is True:
         return True
     if result.get("success") is False:
         return True
-    return bool(result.get("error")) and result.get("status") != "not_supported"
+    if bool(result.get("error")) and result.get("status") != "not_supported":
+        return True
+    if status != "not_supported" and _result_has_errors(result):
+        return not (status in {"ok", "partial"} and _has_effective_tool_data(result))
+    return False
 
 
 def _result_has_errors(result: Dict[str, Any]) -> bool:
@@ -214,7 +817,21 @@ def _result_has_errors(result: Dict[str, Any]) -> bool:
 
 def _has_effective_tool_data(result: Dict[str, Any]) -> bool:
     """Return True when a partial payload still contains usable evidence."""
-    ignored_keys = {"status", "errors", "error", "note", "message", "stock_code", "code"}
+    ignored_keys = {
+        "status",
+        "errors",
+        "error",
+        "error_summary",
+        "note",
+        "message",
+        "stock_code",
+        "code",
+        "query",
+        "source_chain",
+        "amount_unit",
+        "raw_amount_unit",
+        "context_policy",
+    }
     for key, value in result.items():
         if key in ignored_keys:
             continue
@@ -489,6 +1106,110 @@ def _is_watchlist_scan_without_candidates(messages: List[Dict[str, Any]]) -> boo
     )
 
 
+def _planned_tools_missing_before_final(messages: List[Dict[str, Any]]) -> List[str]:
+    """Return planned core tools that have not produced a tool result yet."""
+    planned = _extract_planned_core_tools(messages)
+    if not planned:
+        return []
+
+    completed: set[str] = set()
+    attempted: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        name = str(message.get("name") or "").strip()
+        if not name:
+            continue
+        attempted.add(name)
+        result = _parse_tool_content(message.get("content"))
+        if not _is_failed_tool_result(result):
+            completed.add(name)
+
+    return [name for name in planned if name not in completed and name not in attempted]
+
+
+def _extract_planned_core_tools(messages: List[Dict[str, Any]]) -> List[str]:
+    """Extract must-run core tools from the deterministic planner block."""
+    combined = "\n".join(str(message.get("content") or "") for message in messages[:3] if isinstance(message, dict))
+    planner = _extract_json_object_after_marker(combined, "Planner 工具执行计划")
+    if not isinstance(planner, dict):
+        return []
+
+    core_capabilities = {
+        "realtime_quote",
+        "technical_analysis",
+        "fundamental_analysis",
+        "chip_distribution",
+        "capital_flow",
+        "news_event",
+        "regime_detection",
+    }
+    optional_tools = {
+        "get_market_capital_flow",
+        "get_northbound_capital_flow",
+        "get_margin_trading_summary",
+        "search_comprehensive_intel",
+        "get_market_indices",
+        "get_sector_rankings",
+    }
+
+    tools: List[str] = []
+    for item in planner.get("tool_execution_plan") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("capability") or "").strip() not in core_capabilities:
+            continue
+        for tool in item.get("tools") or []:
+            name = str(tool or "").strip()
+            if name and name not in optional_tools and name not in tools:
+                tools.append(name)
+    return tools
+
+
+def _extract_json_object_after_marker(text: str, marker: str) -> Optional[Dict[str, Any]]:
+    index = text.find(marker)
+    if index < 0:
+        return None
+    start = text.find("{", index)
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for pos in range(start, len(text)):
+        ch = text[pos]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(text[start:pos + 1])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _parse_tool_content(content: Any) -> Any:
+    if not isinstance(content, str):
+        return content
+    try:
+        return json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return content
+
+
 def _build_watchlist_discovery_guard_result(
     *,
     step: int,
@@ -537,6 +1258,25 @@ def _tool_budget_phase(step: int, max_steps: int) -> str:
     if progress >= 0.6:
         return "conserve"
     return "normal"
+
+
+def _effective_tool_wait_timeout(tool_calls, configured_timeout: Optional[float]) -> Optional[float]:
+    """Return runner wait timeout, widening only known diagnostic-heavy tools."""
+    try:
+        timeout = float(configured_timeout) if configured_timeout and configured_timeout > 0 else None
+    except Exception:
+        timeout = None
+    required_floor = 0.0
+    for call in tool_calls or []:
+        required_floor = max(
+            required_floor,
+            _HEAVY_TOOL_TIMEOUT_FLOOR_SECONDS.get(str(getattr(call, "name", "") or ""), 0.0),
+        )
+    if required_floor <= 0:
+        return timeout
+    if timeout is None:
+        return required_floor
+    return max(timeout, required_floor)
 
 
 def _build_tool_budget_message(
@@ -787,11 +1527,14 @@ def run_agent_loop(
             messages.append(assistant_msg)
 
             # Execute tools (parallel when > 1)
-            effective_tool_timeout = tool_call_timeout_seconds
+            effective_tool_timeout = _effective_tool_wait_timeout(
+                response.tool_calls,
+                tool_call_timeout_seconds,
+            )
             if remaining_timeout is not None:
                 effective_tool_timeout = min(
                     remaining_timeout,
-                    tool_call_timeout_seconds if tool_call_timeout_seconds and tool_call_timeout_seconds > 0 else remaining_timeout,
+                    effective_tool_timeout if effective_tool_timeout and effective_tool_timeout > 0 else remaining_timeout,
                 )
             tool_results = _execute_tools(
                 response.tool_calls,
@@ -813,7 +1556,7 @@ def run_agent_loop(
                         "role": "tool",
                         "name": tr["tc"].name,
                         "tool_call_id": tr["tc"].id,
-                        "content": tr["result_str"],
+                        "content": tr["model_result_str"],
                     }
                 )
 
@@ -853,6 +1596,39 @@ def run_agent_loop(
                         total_tokens=total_tokens,
                         provider_used=provider_used,
                         models_used=models_used,
+                        messages=messages,
+                    )
+                continue
+
+            missing_planned_tools = _planned_tools_missing_before_final(messages)
+            if missing_planned_tools:
+                logger.warning(
+                    "Agent tried to finish before planned core tools ran at step %d: %s",
+                    step + 1,
+                    missing_planned_tools,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统审计] Planner 工具执行计划中的核心工具尚未执行："
+                        f"{', '.join(missing_planned_tools)}。"
+                        "请继续调用这些工具补齐证据；如果某个工具不可用或失败，必须先获得工具失败结果，"
+                        "再在最终报告中明确缺失原因、影响和保守降级结论。"
+                    ),
+                })
+                if step + 1 >= max_steps:
+                    return RunLoopResult(
+                        success=False,
+                        content="",
+                        tool_calls_log=tool_calls_log,
+                        total_steps=step + 1,
+                        total_tokens=total_tokens,
+                        provider=provider_used,
+                        models_used=models_used,
+                        error=(
+                            "planning_execute requires planned core tools before final answer: "
+                            + ", ".join(missing_planned_tools)
+                        ),
                         messages=messages,
                     )
                 continue
@@ -1024,10 +1800,13 @@ def _execute_tools(
                     log_entry["timeout"] = True
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+        model_result_str = compact_tool_result_for_model(tc.name, result_str)
+        log_entry["model_result_length"] = len(model_result_str)
+        log_entry["context_policy"] = "compact_tool_fact_card"
         tool_calls_log.append(log_entry)
         if progress_callback:
             progress_callback({"type": "tool_done", **log_entry})
-        results.append({"tc": tc, "result_str": result_str})
+        results.append({"tc": tc, "result_str": result_str, "model_result_str": model_result_str})
     else:
         for tc in tool_calls:
             if progress_callback:
@@ -1042,12 +1821,11 @@ def _execute_tools(
         timeout_triggered = False
         try:
             futures = {pool.submit(contextvars.copy_context().run, _exec_single, tc): tc for tc in tool_calls}
-            pending = set(futures)
-            for future in as_completed(
-                futures,
-                timeout=tool_wait_timeout_seconds if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 else None,
-            ):
-                pending.discard(future)
+            if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0:
+                done, pending = wait(futures, timeout=tool_wait_timeout_seconds)
+            else:
+                done, pending = wait(futures)
+            for future in done:
                 tc_item, result_str, success, dur, cached = future.result()
                 log_entry = {
                     "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
@@ -1057,50 +1835,46 @@ def _execute_tools(
                 structured_result = _structured_trace_result(tc_item.name, result_str)
                 if structured_result is not None:
                     log_entry["result_json"] = structured_result
+                model_result_str = compact_tool_result_for_model(tc_item.name, result_str)
+                log_entry["model_result_length"] = len(model_result_str)
+                log_entry["context_policy"] = "compact_tool_fact_card"
                 tool_calls_log.append(log_entry)
                 if progress_callback:
                     progress_callback({"type": "tool_done", **log_entry})
-                results.append({"tc": tc_item, "result_str": result_str})
-        except FuturesTimeoutError:
-            timeout_triggered = True
-            timeout_label = (
-                f"{tool_wait_timeout_seconds:.2f}s"
-                if tool_wait_timeout_seconds is not None
-                else "the configured limit"
-            )
-            logger.warning("Tool batch timed out after %s at step %d", timeout_label, step)
-            for future, tc_item in futures.items():
-                if future in pending:
+                results.append({"tc": tc_item, "result_str": result_str, "model_result_str": model_result_str})
+            if pending:
+                timeout_triggered = True
+                timeout_label = (
+                    f"{tool_wait_timeout_seconds:.2f}s"
+                    if tool_wait_timeout_seconds is not None
+                    else "the configured limit"
+                )
+                logger.warning("Tool batch timed out after %s at step %d", timeout_label, step)
+                for future in pending:
+                    tc_item = futures[future]
                     future.cancel()
                     result_str = json.dumps({
                         "error": f"Tool execution timed out after {timeout_label}",
                         "timeout": True,
                     })
-                    if progress_callback:
-                        progress_callback({
-                            "type": "tool_done",
-                            "step": step,
-                            "tool": tc_item.name,
-                            "arguments": tc_item.arguments,
-                            "success": False,
-                            "duration": round(tool_wait_timeout_seconds or 0.0, 2),
-                            "result_length": len(result_str),
-                            "cached": False,
-                            "timeout": True,
-                            "result_preview": _preview_tool_result(result_str),
-                        })
-                    tool_calls_log.append({
+                    model_result_str = compact_tool_result_for_model(tc_item.name, result_str)
+                    log_entry = {
                         "step": step,
                         "tool": tc_item.name,
                         "arguments": tc_item.arguments,
                         "success": False,
                         "duration": round(tool_wait_timeout_seconds or 0.0, 2),
                         "result_length": len(result_str),
+                        "model_result_length": len(model_result_str),
+                        "context_policy": "compact_tool_fact_card",
                         "cached": False,
                         "timeout": True,
                         "result_preview": _preview_tool_result(result_str),
-                    })
-                    results.append({"tc": tc_item, "result_str": result_str})
+                    }
+                    if progress_callback:
+                        progress_callback({"type": "tool_done", **log_entry})
+                    tool_calls_log.append(log_entry)
+                    results.append({"tc": tc_item, "result_str": result_str, "model_result_str": model_result_str})
         finally:
             pool.shutdown(wait=not timeout_triggered, cancel_futures=timeout_triggered)
 

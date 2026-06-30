@@ -10,7 +10,7 @@
 #   - Does not install Python / Node / project deps inside WSL
 #     -> run scripts/bootstrap-wsl.sh inside Ubuntu for that
 #   - Does not transfer .env or databases
-#     -> see docs/deploy-to-new-windows.md
+#     -> see docs/deployment/deploy-to-new-windows.md
 #
 # Usage (open PowerShell as Administrator):
 #   Set-ExecutionPolicy -Scope Process Bypass -Force
@@ -88,7 +88,7 @@ Write-Host "     cp -r /mnt/c/path/to/daily_stock_analysis ./" -ForegroundColor 
 Write-Host "4. Inside WSL, run the bootstrap:" -ForegroundColor White
 Write-Host "     cd ~/code/daily_stock_analysis" -ForegroundColor Gray
 Write-Host "     bash scripts/bootstrap-wsl.sh" -ForegroundColor Gray
-Write-Host "5. Follow docs/deploy-to-new-windows.md for .env and DB notes." -ForegroundColor White
+Write-Host "5. Follow docs/deployment/deploy-to-new-windows.md for .env and DB notes." -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Green
 
 if (-not $SkipReboot) {

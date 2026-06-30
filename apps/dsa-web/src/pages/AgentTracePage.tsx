@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   BrainCircuit,
+  ChartCandlestick,
   Check,
   ChevronDown,
   Circle,
@@ -9,6 +10,7 @@ import {
   History,
   Loader2,
   Play,
+  RotateCcw,
   Trash2,
   Wrench,
 } from 'lucide-react';
@@ -89,6 +91,34 @@ type TraceHistoryItem = {
 const formatDuration = (duration?: number): string => {
   if (typeof duration !== 'number' || !Number.isFinite(duration)) return '-';
   return `${duration.toFixed(2)}s`;
+};
+
+const toFiniteNumber = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
+const formatCount = (value: unknown): string => {
+  const numberValue = toFiniteNumber(value);
+  if (numberValue == null) return '-';
+  return Math.round(numberValue).toLocaleString();
+};
+
+const formatLatencyMs = (value: unknown): string => {
+  const numberValue = toFiniteNumber(value);
+  if (numberValue == null) return '-';
+  if (numberValue >= 1000) return `${(numberValue / 1000).toFixed(2)}s`;
+  return `${numberValue.toFixed(0)}ms`;
+};
+
+const formatCost = (value: unknown): string => {
+  const numberValue = toFiniteNumber(value);
+  if (numberValue == null || numberValue <= 0) return '-';
+  return `$${numberValue.toFixed(6)}`;
 };
 
 const formatPercent = (value: unknown): string => {
@@ -179,12 +209,19 @@ const asRecord = (value: unknown): Record<string, unknown> | null => (
     : null
 );
 
+const normalizeSeedDateForUrl = (value?: string | null): string => {
+  const text = String(value || '').trim();
+  const compact = /^(\d{4})(\d{2})(\d{2})$/.exec(text);
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
+  return text;
+};
+
 const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   success: false, session_id: '', content: '', error: null,
   total_steps: 0, total_tokens: 0, provider: '', model: '', mode: 'planning_execute',
   events: [], tool_calls: [], planner: null, agent_user_context: null,
   context_summary: null, debate: null, stock_selection: null, risk_gate: null, artifact_dir: null,
-  runtime_config: null,
+  llm_telemetry: null, judge_sanity: null, runtime_config: null,
 });
 
 const eventToToolCall = (event: TraceStreamEvent): AgentTraceToolCall => ({
@@ -211,6 +248,21 @@ const mergeSelectionProgress = (
   event: TraceStreamEvent,
 ): Record<string, unknown> | null | undefined => {
   const type = String(event.type || '');
+  if (type.startsWith('selection_') && type !== 'selection_expert_graph_done') {
+    const payload = asRecord(event.payload);
+    const existing = normalizeStockSelectionPayload(stockSelection) || {};
+    const selectionContext = asRecord(existing.selection_context) || {};
+    const stages = asRecord(selectionContext.stages) || {};
+    const stageName = selectionStageNameFromEvent(type, payload);
+    return {
+      ...existing,
+      enabled: existing.enabled ?? true,
+      selection_context: {
+        ...selectionContext,
+        stages: stageName && payload ? { ...stages, [stageName]: payload } : stages,
+      },
+    };
+  }
   if (type !== 'selection_expert_graph_done') return stockSelection;
   const payload = asRecord(event.payload) || {};
   const mode = String(payload.orchestration_mode || 'expert_graph');
@@ -231,6 +283,26 @@ const mergeSelectionProgress = (
       expert_state: selectionContext.expert_state || payload.expert_state || null,
     },
   };
+};
+
+const selectionStageNameFromEvent = (
+  type: string,
+  payload: Record<string, unknown> | null,
+): string | null => {
+  const explicitStage = typeof payload?.stage === 'string' ? payload.stage : '';
+  if (explicitStage && !explicitStage.startsWith('selection_')) return explicitStage;
+  const mapping: Record<string, string> = {
+    selection_candidate_discovery_done: 'candidate_discovery',
+    selection_balanced_candidate_evidence_done: 'balanced_candidate_evidence',
+    selection_candidate_screening_done: 'candidate_screening',
+    selection_deep_dive_done: 'single_stock_deep_dive',
+    selection_meta_orchestrator_done: 'meta_orchestrator',
+    selection_pricing_agent_done: 'pricing_agent',
+    selection_allocation_done: 'portfolio_allocation',
+    selection_adversarial_done: 'adversarial_review',
+    selection_judge_done: 'judge_decision',
+  };
+  return mapping[type] || null;
 };
 
 const looksLikeFinalReport = (value: Record<string, unknown>): boolean => (
@@ -382,6 +454,8 @@ const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
       debate: null,
       stock_selection: compactStockSelection,
       risk_gate: null,
+      llm_telemetry: asRecord(result.llm_telemetry) || null,
+      judge_sanity: asRecord(result.judge_sanity) || null,
       artifact_dir: result.artifact_dir || null,
       runtime_config: result.runtime_config || null,
     },
@@ -490,6 +564,7 @@ type SeedPoolPreviewItem = {
 };
 
 type SeedPoolDisplay = {
+  seedDate?: string;
   seedCount: number;
   totalLimit?: number;
   sourceCounts: Record<string, number>;
@@ -516,6 +591,7 @@ type ThesisDeskPacketDisplay = {
   rejected: Array<{ code: string; name: string; reason: string }>;
   diagnostics: string[];
   errors: string[];
+  reason: string;
   toolCallCount: number;
   perSeedPackets: Array<{
     code: string;
@@ -527,6 +603,7 @@ type ThesisDeskPacketDisplay = {
     toolCallCount: number;
     errors: string[];
     diagnostics: string[];
+    reason: string;
   }>;
 };
 
@@ -1140,6 +1217,7 @@ type DeskCommitteeStatus = {
   mode: string;
   status: string;
   degraded: boolean;
+  fallbackUsed: boolean;
   error: string;
   dimensionsCovered: string[];
   deskDiagnostics: Array<{ desk: string; status: string; picks: number }>;
@@ -1183,6 +1261,7 @@ const extractSeedPoolDisplay = (
       .filter(Boolean),
   })).filter((item) => item.code);
   return {
+    seedDate: String(summary.seed_date || summary.trade_date || '').trim() || undefined,
     seedCount: Number(summary.seed_count || preview.length || 0),
     totalLimit: typeof summary.total_limit === 'number' ? summary.total_limit : undefined,
     sourceCounts: Object.fromEntries(Object.entries(asRecord(summary.seed_sources) || {}).map(([key, value]) => [key, Number(value || 0)])),
@@ -1210,6 +1289,12 @@ const extractThesisDeskPackets = (
         .find(Boolean) || '';
       const firstCandidate = asRecord(seedCandidates[0]) || {};
       const firstRejected = asRecord(seedRejected[0]) || {};
+      const seedReason = [
+        ...toStringList(seedPacket.errors),
+        ...seedDiagnostics
+          .map((item) => [item.reason, item.error, item.note, item.source, item.status].filter(Boolean).join(' · '))
+          .filter(Boolean),
+      ].find(Boolean) || '';
       return {
         code: String(firstCandidate.code || firstRejected.code || diagnosticCode || ''),
         name: String(firstCandidate.name || firstRejected.name || ''),
@@ -1222,8 +1307,14 @@ const extractThesisDeskPackets = (
         diagnostics: seedDiagnostics
           .map((item) => [item.source, item.status, item.reason, item.error].filter(Boolean).join(' · '))
           .filter(Boolean),
+        reason: displayReasonText(seedReason),
       };
     });
+    const packetDiagnostics = toRecordList(packet.diagnostics)
+      .map((item) => [item.source, item.status, item.reason, item.note, item.error].filter(Boolean).join(' · '))
+      .filter(Boolean);
+    const packetErrors = toStringList(packet.errors);
+    const packetReason = [...packetErrors, ...packetDiagnostics].find(Boolean) || '';
     return {
       expert,
       label: displayCandidateExpertName(expert || String(packet.dimension || '')),
@@ -1245,10 +1336,9 @@ const extractThesisDeskPackets = (
         name: String(item.name || ''),
         reason: String(item.reason || item.summary || ''),
       })).filter((item) => item.code || item.reason),
-      diagnostics: toRecordList(packet.diagnostics)
-        .map((item) => [item.source, item.status, item.note, item.error].filter(Boolean).join(' · '))
-        .filter(Boolean),
-      errors: toStringList(packet.errors),
+      diagnostics: packetDiagnostics,
+      errors: packetErrors,
+      reason: displayReasonText(packetReason),
       toolCallCount: toRecordList(packet.tool_calls).length,
       perSeedPackets,
     };
@@ -1273,6 +1363,8 @@ const extractDeskCommitteeStatus = (
     mode,
     status: String(desk.status || ''),
     degraded: Boolean(desk.degraded) || Boolean(discovery.degraded),
+    fallbackUsed: Boolean(full.fallback_used || discovery.fallback_used)
+      || String(full.candidate_source || discovery.candidate_source || '') === 'fallback',
     error: String(desk.error || ''),
     dimensionsCovered: toStringList(desk.dimensions_covered),
     deskDiagnostics: diags
@@ -1720,6 +1812,8 @@ const extractExpertState = (stockSelection: Record<string, unknown> | null): Rec
 
 const SELECTION_STAGE_LABELS: Record<string, string> = {
   selection_start: '选股流水线启动',
+  selection_resume_loaded: '断点信息已加载',
+  selection_resume_reused_stage: '历史阶段已复用',
   selection_candidate_discovery_done: '候选发现完成',
   selection_market_regime_done: '市场环境识别完成',
   selection_candidate_screening_done: '候选筛选完成',
@@ -1887,6 +1981,11 @@ const AgentTracePage: React.FC = () => {
   const [runtimeConfig, setRuntimeConfig] = useState<Record<string, unknown> | null>(null);
   const activeRunSessionIdRef = useRef<string | null>(null);
   const runtimeConfigRef = useRef<Record<string, unknown> | null>(null);
+  const activeRunMetaRef = useRef<{
+    message: string;
+    stockCode: string;
+    accountId?: number;
+  }>({ message: DEFAULT_PROMPT, stockCode: DEFAULT_STOCK_CODE });
 
   const hydrateTraceSessionFromBackend = useCallback((sessionId: string, fallback?: TraceHistoryItem) => {
     const placeholder = fallback?.result || createEmptyTraceResult();
@@ -1988,11 +2087,21 @@ const AgentTracePage: React.FC = () => {
 
   const selectedTool = result?.tool_calls[selectedToolIndex] ?? null;
 
-  const handleRun = async () => {
+  const handleRun = async (options?: {
+    resumeFromSessionId?: string;
+    messageOverride?: string;
+    stockCodeOverride?: string;
+    accountIdOverride?: number | null;
+  }) => {
     const sessionId = createTraceSessionId();
     activeRunSessionIdRef.current = sessionId;
-    const stockCodeToSend = shouldSendStockCode(message, stockCode) ? stockCode.trim() : undefined;
-    const selectedAccountNumber = selectedAccountId ? Number(selectedAccountId) : undefined;
+    const runMessage = options?.messageOverride ?? message;
+    const runStockCode = options?.stockCodeOverride ?? stockCode;
+    const selectedAccountNumber = options?.accountIdOverride !== undefined
+      ? (options.accountIdOverride ?? undefined)
+      : (selectedAccountId ? Number(selectedAccountId) : undefined);
+    const stockCodeToSend = shouldSendStockCode(runMessage, runStockCode) ? runStockCode.trim() : undefined;
+    activeRunMetaRef.current = { message: runMessage, stockCode: runStockCode, accountId: selectedAccountNumber };
     const shouldInjectPortfolioContext = injectPortfolioContext || selectedAccountNumber != null;
     navigate(`/agent-trace/${encodeURIComponent(sessionId)}`, { replace: false });
     setRunning(true);
@@ -2004,7 +2113,7 @@ const AgentTracePage: React.FC = () => {
     try {
       const response = await agentApi.traceStream({
         session_id: sessionId,
-        message,
+        message: runMessage,
         account_id: selectedAccountNumber,
         stock_code: stockCodeToSend,
         inject_portfolio_context: shouldInjectPortfolioContext,
@@ -2018,6 +2127,7 @@ const AgentTracePage: React.FC = () => {
         default_stop_loss_pct: parseOptionalPercent(defaultStopLossPct),
         investor_notes: investorNotes.trim() || undefined,
         candidate_discovery_mode: candidateDiscoveryMode,
+        resume_from_session_id: options?.resumeFromSessionId,
       });
       await consumeTraceStream(response);
     } catch (err) {
@@ -2028,6 +2138,23 @@ const AgentTracePage: React.FC = () => {
       activeRunSessionIdRef.current = null;
       setRunning(false);
     }
+  };
+
+  const handleResumeCurrentTrace = async () => {
+    const sourceSessionId = result?.session_id || normalizeTraceSessionId(routeSessionId);
+    if (!sourceSessionId || running) return;
+    await handleRun({ resumeFromSessionId: sourceSessionId });
+  };
+
+  const handleResumeHistory = async (item: TraceHistoryItem) => {
+    const sourceSessionId = item.result.session_id || item.id;
+    if (!sourceSessionId || running) return;
+    await handleRun({
+      resumeFromSessionId: sourceSessionId,
+      messageOverride: item.message,
+      stockCodeOverride: item.stockCode,
+      accountIdOverride: item.accountId ?? null,
+    });
   };
 
   const handleSelectHistory = (item: TraceHistoryItem) => {
@@ -2164,13 +2291,18 @@ const AgentTracePage: React.FC = () => {
           debate: asRecord(event.debate) || cur.debate,
           stock_selection: mergeStockSelectionResult(asRecord(cur.stock_selection), asRecord(event.stock_selection)) || cur.stock_selection,
           risk_gate: asRecord(event.risk_gate) || cur.risk_gate,
+          llm_telemetry: asRecord(event.llm_telemetry) || cur.llm_telemetry || null,
+          judge_sanity: asRecord(event.judge_sanity) || cur.judge_sanity || null,
           artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : cur.artifact_dir,
           runtime_config: asRecord(event.runtime_config) || cur.runtime_config || runtimeConfig,
         };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
-          message, stockCode: shouldSendStockCode(message, stockCode) ? stockCode.trim() : '',
-          accountId: selectedAccountId ? Number(selectedAccountId) : undefined,
+          message: activeRunMetaRef.current.message,
+          stockCode: shouldSendStockCode(activeRunMetaRef.current.message, activeRunMetaRef.current.stockCode)
+            ? activeRunMetaRef.current.stockCode.trim()
+            : '',
+          accountId: activeRunMetaRef.current.accountId,
           status: next.success ? 'success' : 'error', result: next,
         }));
         return next;
@@ -2185,8 +2317,13 @@ const AgentTracePage: React.FC = () => {
         const next = { ...cur, success: false, error: event.message || 'Trace 运行失败', events: [...cur.events, eventToTraceEvent(event)] };
         setHistoryItems((items) => persistTraceHistory(items, {
           id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
-          message, stockCode: shouldSendStockCode(message, stockCode) ? stockCode.trim() : '',
-          accountId: selectedAccountId ? Number(selectedAccountId) : undefined, status: 'error', result: next,
+          message: activeRunMetaRef.current.message,
+          stockCode: shouldSendStockCode(activeRunMetaRef.current.message, activeRunMetaRef.current.stockCode)
+            ? activeRunMetaRef.current.stockCode.trim()
+            : '',
+          accountId: activeRunMetaRef.current.accountId,
+          status: 'error',
+          result: next,
         }));
         return next;
       });
@@ -2197,6 +2334,8 @@ const AgentTracePage: React.FC = () => {
   const planner = useMemo(() => asRecord(result?.planner), [result?.planner]);
   const debate = useMemo(() => asRecord(result?.debate), [result?.debate]);
   const riskPayload = useMemo(() => asRecord(result?.risk_gate), [result?.risk_gate]);
+  const llmTelemetry = useMemo(() => asRecord(result?.llm_telemetry), [result?.llm_telemetry]);
+  const judgeSanity = useMemo(() => asRecord(result?.judge_sanity), [result?.judge_sanity]);
   const stockSelection = useMemo(() => normalizeStockSelectionPayload(asRecord(result?.stock_selection)), [result?.stock_selection]);
   const failedToolCount = useMemo(() => result?.tool_calls.filter((t) => !t.success).length ?? 0, [result]);
   const hasDiscoveryCandidates = useMemo(
@@ -2217,8 +2356,24 @@ const AgentTracePage: React.FC = () => {
       <div className="mx-auto max-w-[1100px] px-6 py-10">
         {/* Header */}
         <header className="mb-8">
-          <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
-          <p className="mt-1 text-sm text-muted-text">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
+              <p className="mt-1 text-sm text-muted-text">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const rawSeedDate = result ? extractSeedPoolDisplay(result, stockSelection)?.seedDate : undefined;
+                const seedDate = normalizeSeedDateForUrl(rawSeedDate);
+                navigate(seedDate ? `/seed-pool-quality?seed_date=${encodeURIComponent(seedDate)}` : '/seed-pool-quality');
+              }}
+              className="inline-flex h-9 items-center gap-2 border border-border bg-card px-3 text-sm text-secondary-text transition-colors hover:bg-hover hover:text-foreground"
+            >
+              <ChartCandlestick className="h-4 w-4" />
+              种子池质量
+            </button>
+          </div>
         </header>
 
         {/* Input area */}
@@ -2235,6 +2390,19 @@ const AgentTracePage: React.FC = () => {
                 <Play className="h-3.5 w-3.5" />
                 运行
               </Button>
+              {result?.session_id && traceStatus !== 'running' ? (
+                <Button
+                  type="button"
+                  onClick={() => void handleResumeCurrentTrace()}
+                  isLoading={running}
+                  loadingText="继续中"
+                  size="sm"
+                  variant="secondary"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  继续此 Trace
+                </Button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setShowConfig(!showConfig)}
@@ -2342,14 +2510,32 @@ const AgentTracePage: React.FC = () => {
             </div>
             <div className="flex max-h-64 flex-col gap-2 overflow-y-auto pr-1">
               {historyItems.map((item) => (
-                <button key={`${item.id}-${item.createdAt}`} type="button" onClick={() => handleSelectHistory(item)}
-                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-left text-xs transition-all hover:border-border hover:shadow-sm">
-                  <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
-                    <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
-                  </span>
-                </button>
+                <div
+                  key={`${item.id}-${item.createdAt}`}
+                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs transition-all hover:border-border hover:shadow-sm"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleSelectHistory(item)}
+                    className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                  >
+                    <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
+                      <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={running}
+                    onClick={() => void handleResumeHistory(item)}
+                    className="inline-flex h-7 shrink-0 items-center gap-1 border border-border px-2 text-label text-secondary-text transition-colors hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    title={`从 ${item.result.session_id || item.id} 继续运行`}
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    继续
+                  </button>
+                </div>
               ))}
             </div>
           </div>
@@ -2437,6 +2623,16 @@ const AgentTracePage: React.FC = () => {
 
             <TimelineStep
               label="L8"
+              title="可观测性"
+              status={getLayerStatus(Boolean(llmTelemetry || judgeSanity))}
+              narrative={buildObservabilityNarrative(llmTelemetry, judgeSanity)}
+              defaultOpen={Boolean(llmTelemetry || judgeSanity)}
+            >
+              <ObservabilityDetail llmTelemetry={llmTelemetry} judgeSanity={judgeSanity} />
+            </TimelineStep>
+
+            <TimelineStep
+              label="L9"
               title="复盘进化"
               status={getLayerStatus(Boolean(result.artifact_dir))}
               narrative={result.artifact_dir ? `Trace 已落盘：${result.artifact_dir}` : '等待 Trace 完成后落盘。'}
@@ -2679,7 +2875,7 @@ const L1Detail: React.FC<{
             <p className="text-label font-medium uppercase tracking-wider text-muted-text">P4 四席位可观察性</p>
             {seedPool ? (
               <span className="rounded-full bg-surface-2 px-2 py-0.5 text-xxs text-secondary-text">
-                Seed {seedPool.seedCount}{seedPool.totalLimit != null ? ` / ${seedPool.totalLimit}` : ''}
+                Seed {seedPool.seedCount}{seedPool.totalLimit != null && seedPool.totalLimit >= seedPool.seedCount ? ` / ${seedPool.totalLimit}` : ''}
               </span>
             ) : null}
             {thesisDeskPackets.length ? (
@@ -2709,7 +2905,9 @@ const L1Detail: React.FC<{
               </div>
               {seedPool.preview.length ? (
                 <div>
-                  <p className="mb-2 text-xxs uppercase tracking-wider text-muted-text">Seed Preview ({seedPool.preview.length})</p>
+                  <p className="mb-2 text-xxs uppercase tracking-wider text-muted-text">
+                    Seed Preview ({seedPool.preview.length}{seedPool.seedCount > seedPool.preview.length ? ` / ${seedPool.seedCount}` : ''})
+                  </p>
                   <div className="grid max-h-[360px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2 xl:grid-cols-4">
                     {seedPool.preview.slice(0, 20).map((seed) => (
                       <div key={`seed-${seed.code}-${seed.source}`} className="min-h-[92px] rounded-md border border-border/70 bg-surface-2 px-3 py-2">
@@ -2762,7 +2960,10 @@ const L1Detail: React.FC<{
                       ))}
                     </div>
                   ) : (
-                    <p className="rounded-md bg-card/80 px-2.5 py-2 text-xxs text-muted-text">本席位未输出候选。</p>
+                    <div className="rounded-md bg-card/80 px-2.5 py-2 text-xxs leading-relaxed text-muted-text">
+                      <p>本席位未输出候选。</p>
+                      {packet.reason ? <p className="mt-1 text-secondary-text">{packet.reason}</p> : null}
+                    </div>
                   )}
                   {packet.errors.length || packet.diagnostics.length ? (
                     <p className="mt-2 line-clamp-2 text-xxs leading-relaxed text-muted-text">
@@ -2784,7 +2985,7 @@ const L1Detail: React.FC<{
                           </div>
                           {seed.errors.length || seed.diagnostics.length ? (
                             <p className="mt-1 line-clamp-1 text-xxs leading-relaxed text-muted-text">
-                              {[...seed.errors, ...seed.diagnostics].slice(0, 1).join('；')}
+                              {seed.reason || [...seed.errors, ...seed.diagnostics].slice(0, 1).join('；')}
                             </p>
                           ) : null}
                         </div>
@@ -2979,8 +3180,10 @@ const L1Detail: React.FC<{
           </div>
           {deskStatus.error ? (
             <p className="mt-1.5 text-xxs leading-relaxed text-amber-300">席位运行异常：{deskStatus.error}</p>
-          ) : deskStatus.degraded ? (
+          ) : deskStatus.degraded && deskStatus.fallbackUsed ? (
             <p className="mt-1.5 text-xxs leading-relaxed text-amber-300">席位收敛降级，候选池回退到召回结果，请核对 trace candidate_discovery。</p>
+          ) : deskStatus.degraded ? (
+            <p className="mt-1.5 text-xxs leading-relaxed text-amber-300">席位收敛降级，已保留可用席位候选；请查看 trace candidate_discovery 的 partial_errors。</p>
           ) : null}
         </div>
       ) : null}
@@ -3299,6 +3502,107 @@ const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ r
   );
 };
 
+const ObservabilityDetail: React.FC<{
+  llmTelemetry: Record<string, unknown> | null;
+  judgeSanity: Record<string, unknown> | null;
+}> = ({ llmTelemetry, judgeSanity }) => {
+  const stages = toRecordList(llmTelemetry?.by_stage);
+  const sanityChecks = toRecordList(judgeSanity?.sanity_checks);
+  const requiredChanges = toRecordList(judgeSanity?.required_plan_changes);
+  const totalCalls = toFiniteNumber(llmTelemetry?.total_calls) || 0;
+  const finalAction = String(judgeSanity?.final_action || '-');
+  const primaryPlanVerdict = String(judgeSanity?.primary_plan_verdict || '-');
+
+  if (!llmTelemetry && !judgeSanity) {
+    return <p className="text-xs text-muted-text">本次 Trace 尚未返回 LLM telemetry 或 Judge sanity 汇总。</p>;
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 sm:grid-cols-4">
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">LLM 调用</p>
+          <p className="mt-1 text-lg font-semibold text-foreground">{formatCount(llmTelemetry?.total_calls)}</p>
+        </div>
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">Token</p>
+          <p className="mt-1 text-lg font-semibold text-foreground">{formatCount(llmTelemetry?.total_tokens)}</p>
+        </div>
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">延迟</p>
+          <p className="mt-1 text-lg font-semibold text-foreground">{formatLatencyMs(llmTelemetry?.total_latency_ms)}</p>
+        </div>
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">估算成本</p>
+          <p className="mt-1 text-lg font-semibold text-foreground">{formatCost(llmTelemetry?.estimated_cost)}</p>
+        </div>
+      </div>
+
+      {stages.length ? (
+        <div className="rounded-lg border border-border p-4">
+          <p className="mb-3 text-label font-semibold uppercase tracking-wider text-muted-text">按阶段统计</p>
+          <div className="space-y-2">
+            {stages.map((stage, index) => (
+              <div key={`${String(stage.stage || 'stage')}-${index}`} className="grid gap-2 rounded-md bg-surface-2 px-3 py-2 text-xs sm:grid-cols-[1fr_auto_auto_auto] sm:items-center">
+                <span className="min-w-0 truncate font-medium text-foreground">{String(stage.stage || 'unknown')}</span>
+                <span className="text-secondary-text">调用 {formatCount(stage.calls)}</span>
+                <span className="text-secondary-text">Token {formatCount(stage.total_tokens)}</span>
+                <span className={cn('text-secondary-text', toFiniteNumber(stage.failed_calls) ? 'text-danger' : '')}>
+                  失败 {formatCount(stage.failed_calls)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : totalCalls ? null : (
+        <div className="rounded-lg border border-border p-4 text-xs text-muted-text">本次运行没有记录到 LLM 调用。</div>
+      )}
+
+      {judgeSanity ? (
+        <div className="rounded-lg border border-border p-4">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <p className="text-label font-semibold uppercase tracking-wider text-muted-text">Judge Sanity</p>
+            <span className="rounded-full bg-surface-2 px-2.5 py-0.5 text-xxs text-secondary-text">动作 {finalAction}</span>
+            <span className={cn(
+              'rounded-full px-2.5 py-0.5 text-xxs font-medium',
+              primaryPlanVerdict === 'accepted' && 'bg-success/10 text-success',
+              primaryPlanVerdict === 'downgraded' && 'bg-warning/10 text-warning',
+              primaryPlanVerdict === 'rejected' && 'bg-danger/10 text-danger',
+              !['accepted', 'downgraded', 'rejected'].includes(primaryPlanVerdict) && 'bg-surface-2 text-secondary-text',
+            )}>
+              {primaryPlanVerdict}
+            </span>
+          </div>
+          <p className="text-xs leading-relaxed text-foreground">
+            {String(judgeSanity.decision_summary || judgeSanity.reason || 'Judge sanity 未返回摘要。')}
+          </p>
+          {sanityChecks.length ? (
+            <div className="mt-3 space-y-2">
+              {sanityChecks.map((check, index) => (
+                <div key={`${String(check.rule_id || 'rule')}-${index}`} className="rounded-md bg-surface-2 px-3 py-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-xxs font-semibold text-foreground">{String(check.rule_id || '-')}</span>
+                    {check.action ? <span className="rounded-full bg-card px-2 py-0.5 text-xxs text-secondary-text">{String(check.action)}</span> : null}
+                    {(check.from_action || check.to_action) ? (
+                      <span className="text-xxs text-muted-text">{String(check.from_action || '-')} → {String(check.to_action || '-')}</span>
+                    ) : null}
+                  </div>
+                  {check.reason ? <p className="mt-1 text-secondary-text">{String(check.reason)}</p> : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {requiredChanges.length ? (
+            <Collapsible title={`要求修正 (${requiredChanges.length})`} defaultOpen={false} className="mt-3">
+              <JsonViewer data={{ required_plan_changes: requiredChanges }} maxHeight="220px" />
+            </Collapsible>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 /* ═══════════════════════════════════════════════
    Narrative Builders
    ═══════════════════════════════════════════════ */
@@ -3357,6 +3661,27 @@ function buildL6Narrative(riskPayload: Record<string, unknown> | null): string {
   const tradePlan = asRecord(riskPayload?.trade_plan);
   if (!tradePlan) return '等待风控通过后生成交易方案。';
   return `已生成 ${String(tradePlan.symbol || '-')} 的「${String(tradePlan.action || '-')}」方案，目标仓位 ${formatPercent(tradePlan.target_position_pct)}。`;
+}
+
+function buildObservabilityNarrative(
+  llmTelemetry: Record<string, unknown> | null,
+  judgeSanity: Record<string, unknown> | null,
+): string {
+  const totalCalls = toFiniteNumber(llmTelemetry?.total_calls) || 0;
+  const totalTokens = toFiniteNumber(llmTelemetry?.total_tokens) || 0;
+  const failedCalls = toFiniteNumber(llmTelemetry?.failed_calls) || 0;
+  const checkCount = toFiniteNumber(judgeSanity?.check_count) || 0;
+  const requiredChangeCount = toFiniteNumber(judgeSanity?.required_change_count) || 0;
+  if (totalCalls || judgeSanity) {
+    const llmText = totalCalls
+      ? `LLM ${formatCount(totalCalls)} 次，Token ${formatCount(totalTokens)}${failedCalls ? `，失败 ${formatCount(failedCalls)} 次` : ''}`
+      : '未记录 LLM 调用';
+    const sanityText = judgeSanity
+      ? `Judge sanity ${formatCount(checkCount)} 条校验，要求修正 ${formatCount(requiredChangeCount)} 项`
+      : '未返回 Judge sanity';
+    return `${llmText}；${sanityText}。`;
+  }
+  return '等待 Trace 汇总 LLM 调用、成本、延迟和 Judge sanity 修正。';
 }
 
 export default AgentTracePage;

@@ -1,7 +1,8 @@
 dimension: theme_catalyst_desk
 description: >-
-  主题催化席位可调用的工具集。目标是核实「盘前/当日高质量主题催化 + 业务归属匹配
-  + 资金或板块验证」，避免把泛概念、澄清公告或已透支高位票误判为利好。
+  主题催化席位可调用的工具集。目标是只核实 AI/科技产业链里的「产品品类出口消息
+  + 国产替代政策 + 业务归属匹配 + 资金或板块验证」，避免把泛概念、澄清公告、
+  原文堆砌或已透支高位票误判为利好。
 
 tools:
   - tool: get_eastmoney_cjzc_daily
@@ -13,7 +14,8 @@ tools:
       target_date: "{today}"
       allow_previous: false
     returns_summary: >-
-      返回当天财经早餐标题、链接、原文抓取状态、主题列表、公司新闻诊断和映射股票。
+      返回当天财经早餐标题、链接、原文抓取状态、主题列表、公司新闻诊断和映射股票；
+      只允许把原文压缩成 evidence_section、matched_keywords、high_impact_terms 等摘要证据。
     key_fields:
       - themes
       - article_fetch_status
@@ -24,6 +26,7 @@ tools:
     combo_hints:
       - 与 get_stock_business_context 联动：日报主题与业务归属一致才是有效催化。
       - 与 get_stockapi_hot_sectors 联动：盘前主题若盘中成为强板块，优先级提高。
+      - 优先抽取 product_export / domestic_substitution_policy / business_fit 三类摘要，不要复制长原文。
     cost: cheap
     failure_modes:
       - 盘前 6 点前当天日报可能 missing。
@@ -44,10 +47,58 @@ tools:
       - source
     combo_hints:
       - 业务归属与日报主题不匹配时，不得仅凭热门词 support。
-      - 宽口径映射可以 watch，但 reason 必须写清产业链角色。
+      - 宽口径映射可以 watch，但 reason 必须写清「产品品类 -> 产业链环节 -> 公司角色」。
+      - 公司生产某产品不等于品类出口或国产替代政策受益，必须等待新闻/政策或披露交叉验证。
     cost: cheap
     failure_modes:
       - 所属板块缺失时只能作为业务不明，不能臆测主营。
+
+  - tool: get_stock_disclosure_events
+    priority: 9
+    when_to_use: >-
+      当主题需要公司级原始披露验证时调用，例如产能、订单、技术路线、投资者关系或年报关键词。
+      它用于防止把泛概念映射误判成真实主题催化。
+    typical_args:
+      stock_code: "{code}"
+      stock_name: "{name}"
+      limit: 20
+    returns_summary: >-
+      返回公告/IR 条目、事件候选、匹配词、证据摘要和 source_chain。
+    key_fields:
+      - events
+      - event_count
+      - matched_terms
+      - evidence_summary
+      - source_chain
+    combo_hints:
+      - 日报主题 + 业务上下文 + 披露事件三者一致，才是高质量公司级催化。
+      - 披露只能验证公司是否属于品类/产业链，不能代替品类出口或国产替代政策新闻。
+      - 披露中出现澄清、减持、处罚、问询等负面信号时必须降级。
+    cost: expensive
+    failure_modes:
+      - PDF 正文可能跳过；标题和元数据仍可用，但结论要降级。
+
+  - tool: get_tushare_announcements
+    priority: 9
+    when_to_use: >-
+      补查近期上市公司公告标题，快速验证主题催化是否来自公司公告或是否存在负面公告。
+    typical_args:
+      stock_code: "{code}"
+      limit: 20
+    returns_summary: >-
+      返回公告日期、标题、链接和来源链路。
+    key_fields:
+      - ann_date
+      - title
+      - url
+      - errors
+    combo_hints:
+      - 近期公告与主题关键词一致 = 公司级催化证据增强。
+      - 近期澄清/减持/处罚公告优先于热点强度。
+      - 若公告只证明业务归属，不得直接推导产品出口或国产替代政策受益。
+    cost: medium
+    failure_modes:
+      - 公告列表为空不代表无公告，需结合搜索或 CNInfo 披露降级判断。
 
   - tool: get_stockapi_hot_sectors
     priority: 10
@@ -66,12 +117,158 @@ tools:
     combo_hints:
       - 日报主题 + 热点板块强 = 主题催化被资金验证。
       - 板块净流出时，主题只保留观察或剔除。
+      - 热点板块强只代表 funding_validation，不能替代 product_export 或 domestic_substitution_policy 证据。
     cost: medium
     failure_modes:
       - StockAPI 网络失败或当天无数据时返回 empty/failed。
 
-  - tool: get_stockapi_hot_sector_leaders
+  - tool: get_stockapi_sector_constituents
+    priority: 10
+    when_to_use: >-
+      当 hot_sectors 返回明确 bk_code 且需要展开板块成分股时调用，
+      用于判断候选在板块中的位置、资金排名和龙头/跟随关系。
+    typical_args:
+      bk_code: "{bk_code}"
+      page_no: 1
+      page_size: 50
+    returns_summary: >-
+      返回板块成分股、代码名称、资金字段和分页信息。
+    key_fields:
+      - code
+      - name
+      - main_net_inflow
+      - page_no
+      - page_size
+    combo_hints:
+      - 候选在成分股资金前排 = 主题资金落地更强。
+      - 候选不在成分列表或资金靠后 = 只能 watch 或剔除。
+      - 板块成分只验证 business_fit / funding_validation，不验证出口或政策本身。
+    cost: medium
+    failure_modes:
+      - 需要 hot_sectors 给出 bk_code；没有 bk_code 时不要臆造参数。
+
+  - tool: get_stockapi_sector_flow_history
+    priority: 10
+    when_to_use: >-
+      当主题板块当日很强但需要判断是否连续净流入时调用，
+      用于区分一天脉冲和持续主题。
+    typical_args:
+      bk_code: "{bk_code}"
+      limit: 10
+    returns_summary: >-
+      返回指定板块近几日资金流历史。
+    key_fields:
+      - date
+      - main_net_inflow
+      - strength
+      - items
+    combo_hints:
+      - 板块连续净流入 + 候选业务匹配 = 主题持续性更强。
+      - 只有单日冲高且历史转弱 = 情绪脉冲，需等待分歧。
+      - 连续净流入仍只是交易验证，新闻结论必须回到摘要化的品类出口/国产替代政策证据。
+    cost: medium
+    failure_modes:
+      - 需要有效 bk_code；StockAPI 失败或无历史时只能降级。
+
+  - tool: get_board_capital_flow
+    priority: 11
+    when_to_use: >-
+      统一查看行业、概念、地域板块资金流向，交叉观察 DC 与 THS 板块资金是否支持主题。
+      这是板块资金的优先入口，避免模型自行混读不同来源字段。
+    typical_args:
+      trade_date: "{today}"
+      content_type: "行业"
+      limit: 20
+    returns_summary: >-
+      返回 selected_flow_source、source_definitions、flow_sources，以及板块净流入前后排名。
+      金额统一为 CNY，但 DC/THS 口径分别保留。
+    key_fields:
+      - selected_flow_source
+      - source_definitions
+      - selected_top_boards
+      - flow_sources
+      - main_net_inflow
+    combo_hints:
+      - 日报主题 + 统一板块资金前排 = 主题被资金验证。
+      - 必须查看 source_definitions，不能把 DC 行业/概念/地域与 THS 行业/概念金额相加。
+    cost: medium
+    failure_modes:
+      - 单个来源失败时 flow_sources 中会缺失该来源；不能据此判断板块无资金。
+      - 不同来源统计方法不同，排名方向比绝对金额更适合交叉验证。
+
+  - tool: get_tushare_moneyflow_ind_dc
     priority: 12
+    when_to_use: >-
+      单独查看东财行业/概念/地域板块资金流，拆源复核 get_board_capital_flow 的 DC 口径。
+    typical_args:
+      trade_date: "{today}"
+      content_type: "行业"
+      limit: 30
+    returns_summary: >-
+      返回 DC 板块资金排名、涨跌幅、净流入和大/超大单拆分。
+    key_fields:
+      - name
+      - content_type
+      - net_inflow
+      - rank
+      - source
+    combo_hints:
+      - DC 行业/概念资金前排 + 日报主题一致 = 主题被资金验证。
+      - DC 和 THS 口径冲突时必须写明，只能并列比较。
+    cost: medium
+    failure_modes:
+      - 盘后更新，盘中不能当实时板块资金。
+
+  - tool: get_tushare_moneyflow_ind_ths
+    priority: 13
+    when_to_use: >-
+      需要单独核查同花顺行业资金流向时调用，读取行业板块净额、流入/流出资金、领涨股和行业涨跌幅。
+      当候选来自行业主题而非概念主题时，用它验证行业层面的资金承接。
+    typical_args:
+      trade_date: "{today}"
+      limit: 20
+    returns_summary: >-
+      返回 THS 行业资金流向列表；net_buy_amount/net_sell_amount/net_inflow 已从亿元转为 CNY。
+    key_fields:
+      - ts_code
+      - industry
+      - lead_stock
+      - pct_change
+      - net_inflow
+      - net_buy_amount
+      - net_sell_amount
+    combo_hints:
+      - 行业净流入前排 + 候选业务归属匹配 = 主题资金支持增强。
+      - 行业净流出但个股上涨，需警惕孤立拉升或补涨兑现。
+    cost: medium
+    failure_modes:
+      - 每日盘后更新，盘中可能没有当日完整数据。
+      - 与 DC 行业资金统计口径不同，只能并列比较，不能相加。
+
+  - tool: get_tushare_moneyflow_cnt_ths
+    priority: 13
+    when_to_use: >-
+      单独查看同花顺概念板块资金流，适合主题催化来自概念而非申万/行业分类时使用。
+    typical_args:
+      trade_date: "{today}"
+      limit: 30
+    returns_summary: >-
+      返回 THS 概念板块涨跌、领涨股、公司数和净流入。
+    key_fields:
+      - name
+      - lead_stock
+      - pct_change
+      - net_inflow
+      - company_num
+    combo_hints:
+      - 概念净流入 + 领涨股/候选业务匹配 = 主题强度更可信。
+      - 概念净流出时，单票上涨更可能是孤立补涨或兑现。
+    cost: medium
+    failure_modes:
+      - 盘后更新，且与行业资金口径不同，不能相加。
+
+  - tool: get_stockapi_hot_sector_leaders
+    priority: 14
     when_to_use: >-
       查看热点板块龙头股，判断候选是龙头、跟随补涨还是弱相关边缘票。
     typical_args:
@@ -93,7 +290,7 @@ tools:
       - 板块代码缺失时只能看全量龙头列表。
 
   - tool: get_stockapi_hot_money_activity
-    priority: 14
+    priority: 16
     when_to_use: >-
       补充个股或全市场热门资金活跃数据，观察主题票是否已有资金关注。
     typical_args:
@@ -113,6 +310,78 @@ tools:
     cost: medium
     failure_modes:
       - 部分日期或个股可能无活跃记录。
+
+  - tool: get_stockapi_limit_up_pool
+    priority: 16
+    when_to_use: >-
+      查看当日涨停池和涨停原因，判断主题是否已经被短线资金以涨停形式确认。
+      用于主题热度和连板梯队验证，不替代业务匹配。
+    typical_args:
+      date: "{today}"
+      limit: 30
+    returns_summary: >-
+      返回涨停池股票、连板数、封板强度、换手、概念和涨停原因。
+    key_fields:
+      - code
+      - name
+      - limit_up_days
+      - reason
+      - concepts
+    combo_hints:
+      - 日报主题 + 相关涨停池扩散 = 主题发酵更强。
+      - 多数相关票高位连板 = 追高风险上升。
+    cost: medium
+    failure_modes:
+      - 日期非交易日或 StockAPI 失败时为空。
+
+  - tool: get_stockapi_popularity_rank
+    priority: 16
+    when_to_use: >-
+      查看人气榜和 AI 归因，确认主题票是否进入市场关注前排。
+      用于情绪热度辅助，不替代公司级催化。
+    typical_args:
+      limit: 30
+    returns_summary: >-
+      返回人气排名、股票代码名称、标签和热度理由。
+    key_fields:
+      - rank
+      - code
+      - name
+      - reason
+      - tags
+    combo_hints:
+      - 主题匹配 + 人气上升 + 资金流入 = 情绪与资金共振。
+      - 人气极高但业务/公告不匹配 = 泛概念风险。
+    cost: medium
+    failure_modes:
+      - StockAPI 失败时为空，不代表没有关注度。
+
+  - tool: get_tushare_moneyflow_mkt_dc
+    priority: 17
+    when_to_use: >-
+      查看东财大盘主力资金流向，判断主题扩散是否处在市场资金支持环境中。
+      用于大盘水位背景，不替代板块或个股资金验证。
+    typical_args:
+      trade_date: "{today}"
+      limit: 5
+    returns_summary: >-
+      返回上证/深证涨跌、全市场主力净流入和超大单/大单/中单/小单净流入。
+      金额为 CNY。
+    key_fields:
+      - trade_date
+      - pct_change_sh
+      - pct_change_sz
+      - net_amount
+      - net_amount_rate
+      - extra_large_net_inflow
+      - large_net_inflow
+    combo_hints:
+      - 大盘主力净流入 + 主题板块资金前排 = 主题扩散环境较好。
+      - 大盘资金净流出时，主题票即使上涨也要降低追高结论强度。
+    cost: medium
+    failure_modes:
+      - 每日盘后更新，盘中不能当实时资金。
+      - 大盘口径不能和个股或板块资金直接相加。
 
   - tool: get_capital_flow
     priority: 18
@@ -172,6 +441,34 @@ tools:
     failure_modes:
       - 停牌或历史数据不足时结论弱化。
 
+  - tool: get_tushare_stk_factor
+    priority: 26
+    when_to_use: >-
+      主题票已经异动时，用 Tushare 技术因子检查是否过热或仍有趋势延续空间。
+      重点看 MACD、KDJ、RSI、BOLL、CCI 与量能是否一致。
+    typical_args:
+      stock_code: "{code}"
+      limit: 20
+    returns_summary: >-
+      返回最近交易日技术因子 latest 和历史 items；指标基于前复权价格计算。
+    key_fields:
+      - latest
+      - macd_dif
+      - macd_dea
+      - macd
+      - kdj_j
+      - rsi_6
+      - rsi_12
+      - boll_upper
+      - cci
+    combo_hints:
+      - 主题强 + 技术因子温和转强 = 可继续跟踪。
+      - 主题强但 RSI/KDJ 极端过热且贴近 BOLL 上轨 = 追高风险，最多 watch。
+    cost: medium
+    failure_modes:
+      - Tushare stk_factor 基于前复权价格，可能与 pro_bar 动态前复权或本地行情计算不完全一致。
+      - 技术因子不能替代主题真实性和业务匹配验证。
+
   - tool: analyze_price_structure
     priority: 28
     when_to_use: >-
@@ -190,11 +487,36 @@ tools:
     failure_modes:
       - 新股或历史不足时 position_zone 可能 unknown。
 
+  - tool: get_symbol_regime_probability
+    priority: 30
+    when_to_use: >-
+      对主题候选补充当前市场 regime 下的单股历史路径画像和 reentry_reference。
+      只用于校准追高/等待回踩条件，不能把概率结果当主题催化证据。
+    typical_args:
+      stock_code: "{code}"
+      market: "cn"
+      lookback_days: 900
+      windows: [7, 30, 60, 90]
+    returns_summary: >-
+      返回 forward-return 概率、路径画像、样本质量和买回参考。
+    key_fields:
+      - status
+      - regime
+      - windows
+      - reentry_reference
+      - low_confidence
+    combo_hints:
+      - 主题强但点位透支时，用 reentry_reference 写等待条件。
+      - low_confidence=true 时只能作为弱证据，不得提高 stance。
+    cost: medium
+    failure_modes:
+      - 仅支持 A 股；样本不足、本地 K 线不足时会低置信返回。
+
   - tool: search_stock_news
     priority: 35
     when_to_use: >-
       当 SeedFactPacket 的消息证据缺失或冲突时，补查个股最新新闻摘要。
-      只用于补证，不替代盘前日报主题。
+      只用于公司级补证、负面排雷和业务匹配确认，不替代盘前日报主题或品类/政策证据。
     typical_args:
       stock_code: "{code}"
       stock_name: "{name}"
@@ -207,9 +529,59 @@ tools:
       - published_at
     combo_hints:
       - 若查到澄清、减持、处罚等负向新闻，主题催化必须降级或剔除。
+      - 个股新闻只证明公司事件或业务相关性，不能单独证明产品品类出口或国产替代政策。
     cost: expensive
     failure_modes:
       - 搜索源网络失败或中文结果不足。
+
+  - tool: search_openinvest_news
+    priority: 36
+    when_to_use: >-
+      当通用搜索源失败、中文结果不足，或需要 ticker 关联新闻作为补充时调用。
+      默认优先 yfinance ticker news，RSS/DDGS 作为可选降级源；主要用于公司级补证和负面排雷。
+    typical_args:
+      stock_code: "{code}"
+      stock_name: "{name}"
+      max_results: 8
+      timeout_seconds: 12
+    returns_summary: >-
+      返回 openInvest 多源新闻条目、来源、发布时间、source_chain 和缺依赖/失败原因。
+    key_fields:
+      - items
+      - source_chain
+      - errors
+      - provider_status
+    combo_hints:
+      - 与 search_stock_news 结果一致 = 新闻证据更稳。
+      - 仍需回到 product_export / domestic_substitution_policy 摘要证据，不能只凭 ticker 新闻定性主题。
+      - 单源失败只能降级，不能据此判断无新闻。
+    cost: expensive
+    failure_modes:
+      - yfinance/RSS/DDGS 依赖或网络失败时会 partial/failed。
+
+  - tool: search_comprehensive_intel
+    priority: 37
+    when_to_use: >-
+      当主题催化需要补齐产品品类出口、国产替代政策、行业趋势、风险事件和分析摘要时调用。
+      查询方向优先围绕「产品品类 + 出口/订单/海外需求」或「产品品类 + 国产替代/信创/自主可控/政策」，
+      再映射回候选公司的产业链角色。
+    typical_args:
+      stock_code: "{code}"
+      stock_name: "{name}"
+    returns_summary: >-
+      返回多维情报摘要、结构化新闻/风险/行业结果和 source_chain。
+    key_fields:
+      - report
+      - structured_results
+      - source_chain
+      - errors
+    combo_hints:
+      - 综合情报若能直接形成 product_export 或 domestic_substitution_policy 摘要，主题催化证据增强。
+      - 只搜到公司泛新闻但没有品类出口/政策证据时，最多作为 business_fit 或 funding_validation。
+      - 查到澄清、监管、减持或业绩风险时，优先降级。
+    cost: expensive
+    failure_modes:
+      - 搜索源失败或超时时必须保留错误并降低结论强度。
 
   - tool: score_stock_news_sentiment
     priority: 38

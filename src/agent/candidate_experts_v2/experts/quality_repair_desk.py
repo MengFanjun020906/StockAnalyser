@@ -17,14 +17,21 @@ from src.agent.candidate_experts_v2.tools_manifest import load_manifest, validat
 
 QUALITY_REPAIR_DESK_TOOLS: tuple[str, ...] = (
     "get_stock_info",
+    "get_stock_business_context",
     "get_tushare_daily_basic",
     "get_tushare_financial_indicators",
     "get_tushare_financial_statements",
     "get_tushare_forecast",
     "get_tushare_express",
     "get_tushare_dividend",
+    "get_tushare_announcements",
+    "get_stock_disclosure_events",
     "analyze_trend",
+    "get_tushare_stk_factor",
     "analyze_price_structure",
+    "get_capital_flow",
+    "get_chip_distribution",
+    "get_symbol_regime_probability",
 )
 
 # FeatureFlag kinds that signal quality-repair eligibility
@@ -93,3 +100,14 @@ class QualityRepairDeskExpert(BaseDeskExpert):
             return primary
 
         return fallback_candidates[: self._fallback_supplement_n]
+
+    def _ineligible_row_reason(self, row: FeatureRow) -> str:
+        fs = row.fact_sheet
+        flag_kinds = {f.kind for f in row.flags}
+        if flag_kinds & _ELIGIBLE_KINDS:
+            return "质量修复席过滤条件未命中，但 fundamental flag 存在；请检查席位过滤实现。"
+        if fs is None:
+            return "质量修复席要求 fundamental flag 或低估值/低位置事实，当前缺少 FactSheet。"
+        if fs.range_pct_120 is None:
+            return "质量修复席要求 fundamental flag 或 range_pct_120<=0.35，当前缺少 range_pct_120。"
+        return f"质量修复席要求 fundamental flag 或 range_pct_120<=0.35，当前 range_pct_120={fs.range_pct_120:.3f}。"

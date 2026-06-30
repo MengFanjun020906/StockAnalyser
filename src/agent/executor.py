@@ -17,6 +17,7 @@ same implementation.
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,6 +27,7 @@ from src.agent.planner import build_planning_result
 from src.agent.planning_prompts import PromptBuildOptions, build_planning_system_prompt
 from src.agent.runner import run_agent_loop, parse_dashboard_json
 from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
+from src.agent.theme_momentum import build_single_stock_theme_profile
 from src.agent.tools.registry import ToolRegistry
 from src.schemas.agent_context import AgentUserContext
 from src.report_language import normalize_report_language
@@ -88,6 +90,8 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 4. **输出格式** — 最终响应必须是有效的决策仪表盘 JSON。
 5. **风险优先** — 必须排查风险（股东减持、业绩预警、监管问题）。
 6. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
+7. **精确数值证据约束** — 主力资金、筹码分布、均线、市值、营收、利润、股数等精确值必须逐项来自工具返回；缺少工具证据时写 `N/A` 或“数据缺失”，禁止用看起来合理的小数补齐。
+8. **A股交易规则** — A股买入数量必须是 100 股整数倍；不要输出 146 股这类无法下单的买入建议，改用仓位比例或“按100股整数倍”。
 
 {skills_section}
 
@@ -152,6 +156,11 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 }}
 ```
 
+## 精确数值证据约束
+
+- 主力资金、筹码分布、均线、市值、营收、利润、股数等精确值必须逐项来自工具返回；缺少工具证据时写 `N/A` 或“数据缺失”，禁止用看起来合理的小数补齐。
+- A股买入数量必须是 100 股整数倍；不要输出 146 股这类无法下单的买入建议，改用仓位比例或“按100股整数倍”。
+
 ## 评分标准
 
 ### 强烈买入（80-100分）：
@@ -182,7 +191,7 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 
 1. **核心结论先行**：一句话说清该买该卖
 2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **精确狙击点**：必须给出具体价格，不说模糊的话
+3. **证据绑定的狙击点**：具体价格必须来自工具或上游 key_levels，缺失时写 N/A
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出
 
@@ -536,10 +545,12 @@ class AgentExecutor:
         # Build tool declarations in OpenAI format (litellm handles all providers)
         tool_decls = self.tool_registry.to_openai_tools()
 
+        prefetch_context = self._prefetch_single_symbol_regime_context(context)
+
         # Initialize conversation
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self._build_user_message(task, context)},
+            {"role": "user", "content": self._build_user_message(task, context, prefetch_context=prefetch_context)},
         ]
 
         return self._run_loop(
@@ -548,6 +559,7 @@ class AgentExecutor:
             parse_dashboard=True,
             original_task=task,
             context=context,
+            pre_tool_calls_log=prefetch_context.get("tool_calls_log") if prefetch_context else None,
         )
 
     def chat(self, message: str, session_id: str, progress_callback: Optional[Callable] = None, context: Optional[Dict[str, Any]] = None) -> AgentResult:
@@ -604,10 +616,11 @@ class AgentExecutor:
                 messages.append({"role": "assistant", "content": "好的，我已了解该股票的历史分析数据。请告诉我你想了解什么？"})
 
         agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        prefetch_context = self._prefetch_single_symbol_regime_context(context)
         if _is_planning_execute_context(agent_user_context):
-            messages.append({"role": "user", "content": self._build_user_message(message, context)})
+            messages.append({"role": "user", "content": self._build_user_message(message, context, prefetch_context=prefetch_context)})
         else:
-            messages.append({"role": "user", "content": message})
+            messages.append({"role": "user", "content": self._build_user_message(message, context, prefetch_context=prefetch_context) if prefetch_context else message})
 
         # Persist the user turn immediately so the session appears in history during processing
         conversation_manager.add_message(session_id, "user", message)
@@ -619,6 +632,7 @@ class AgentExecutor:
             progress_callback=progress_callback,
             original_task=message,
             context=context,
+            pre_tool_calls_log=prefetch_context.get("tool_calls_log") if prefetch_context else None,
         )
 
         # Persist assistant reply (or error note) for context continuity
@@ -639,6 +653,7 @@ class AgentExecutor:
         *,
         original_task: str = "",
         context: Optional[Dict[str, Any]] = None,
+        pre_tool_calls_log: Optional[List[Dict[str, Any]]] = None,
     ) -> AgentResult:
         """Delegate to the shared runner and adapt the result.
 
@@ -676,6 +691,9 @@ class AgentExecutor:
             tool_call_timeout_seconds=self.tool_call_timeout_seconds,
             tool_argument_guard=_build_context_tool_argument_guard(context),
         )
+        if pre_tool_calls_log:
+            loop_result.tool_calls_log = list(pre_tool_calls_log) + list(loop_result.tool_calls_log or [])
+            loop_result.total_steps = len(loop_result.tool_calls_log)
 
         model_str = loop_result.model
 
@@ -750,6 +768,8 @@ class AgentExecutor:
             run_id=context.get("session_id") or "selection-run",
             orchestration_mode=self.orchestration_mode,
             candidate_discovery_mode=context.get("candidate_discovery_mode"),
+            resume_artifact_dir=context.get("stock_selection_resume_artifact_dir"),
+            resume_from_run_id=context.get("resume_from_session_id"),
         )
 
     def _maybe_run_debate(
@@ -781,7 +801,13 @@ class AgentExecutor:
             progress_callback=progress_callback,
         )
 
-    def _build_user_message(self, task: str, context: Optional[Dict[str, Any]] = None) -> str:
+    def _build_user_message(
+        self,
+        task: str,
+        context: Optional[Dict[str, Any]] = None,
+        *,
+        prefetch_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Build the initial user message."""
         parts = [task]
         if context:
@@ -814,9 +840,81 @@ class AgentExecutor:
                 parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)}")
             if context.get("news_context"):
                 parts.append(f"\n[系统已获取的新闻与舆情情报]\n{context['news_context']}")
+            if prefetch_context and prefetch_context.get("symbol_regime_probability"):
+                parts.append(
+                    "\n[系统已获取的单股 Regime 概率证据]\n"
+                    + json.dumps(prefetch_context["symbol_regime_probability"], ensure_ascii=False, default=str)
+                )
+            if prefetch_context and prefetch_context.get("single_stock_theme_profile"):
+                parts.append(
+                    "\n[系统已获取的单股主线动量分型证据]\n"
+                    + json.dumps(prefetch_context["single_stock_theme_profile"], ensure_ascii=False, default=str)
+                )
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)
+
+    def _prefetch_single_symbol_regime_context(self, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        symbol = _single_symbol_for_regime_prefetch(context)
+        if not symbol:
+            return {}
+        prefetch_context: Dict[str, Any] = {"tool_calls_log": []}
+
+        if self.tool_registry.get("get_symbol_regime_probability") is not None:
+            arguments = {"stock_code": symbol, "market": "cn", "lookback_days": 900, "windows": [7, 30, 60, 90]}
+            result, log_entry = self._execute_prefetch_tool("get_symbol_regime_probability", arguments)
+            prefetch_context["symbol_regime_probability"] = result if isinstance(result, dict) else {"status": "unknown", "raw": result}
+            prefetch_context["tool_calls_log"].append(log_entry)
+
+        theme_payloads: Dict[str, Any] = {}
+        if _should_prefetch_single_symbol_theme(context, symbol):
+            for tool_name, arguments in (
+                ("get_stockapi_hot_sectors", {"date": "", "limit": 20}),
+                ("get_stockapi_limit_up_pool", {"date": "", "limit": 50}),
+                ("get_stockapi_hot_sector_leaders", {"date": "", "bk_code": "", "limit": 50}),
+                ("get_stockapi_popularity_rank", {"limit": 50}),
+            ):
+                if self.tool_registry.get(tool_name) is None:
+                    continue
+                result, log_entry = self._execute_prefetch_tool(tool_name, arguments)
+                theme_payloads[tool_name] = result
+                prefetch_context["tool_calls_log"].append(log_entry)
+
+        if theme_payloads:
+            prefetch_context["single_stock_theme_profile"] = build_single_stock_theme_profile(
+                symbol=symbol,
+                name=_single_symbol_name_for_theme_prefetch(context, symbol),
+                hot_sectors=theme_payloads.get("get_stockapi_hot_sectors"),
+                limit_up_pool=theme_payloads.get("get_stockapi_limit_up_pool"),
+                hot_sector_leaders=theme_payloads.get("get_stockapi_hot_sector_leaders"),
+                popularity_rank=theme_payloads.get("get_stockapi_popularity_rank"),
+            )
+
+        if not prefetch_context.get("tool_calls_log") and not prefetch_context.get("single_stock_theme_profile"):
+            return {}
+        return prefetch_context
+
+    def _execute_prefetch_tool(self, tool_name: str, arguments: Dict[str, Any]) -> tuple[Any, Dict[str, Any]]:
+        started = time.time()
+        try:
+            result = self.tool_registry.execute(tool_name, **arguments)
+            success = _is_successful_prefetch_result(result)
+        except Exception as exc:
+            result = {"status": "tool_failed", "tool": tool_name, "error": str(exc)}
+            success = False
+        result_text = json.dumps(result, ensure_ascii=False, default=str)
+        return result, {
+            "step": 0,
+            "tool": tool_name,
+            "arguments": arguments,
+            "success": success,
+            "result_json": result,
+            "result_preview": result_text[:1200],
+            "result_length": len(result_text),
+            "duration": round(time.time() - started, 3),
+            "prefetch": True,
+            "selection_stage": False,
+        }
 
 
 def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
@@ -861,6 +959,85 @@ def _build_context_tool_argument_guard(
         return guarded
 
     return guard
+
+
+def _single_symbol_for_regime_prefetch(context: Optional[Dict[str, Any]]) -> str:
+    context = context or {}
+    agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+    if agent_user_context is not None:
+        report = agent_user_context.report
+        if report.analysis_mode == "planning_execute" and report.intent == "watchlist_scan":
+            return ""
+        candidates: List[str] = []
+        if report.primary_symbol:
+            candidates.append(report.primary_symbol)
+        candidates.extend(report.target_symbols or [])
+        if len({str(item).strip() for item in candidates if str(item).strip()}) == 1:
+            return str(next(item for item in candidates if str(item).strip())).strip()
+        if not candidates and len(agent_user_context.positions) == 1:
+            return str(agent_user_context.positions[0].symbol or "").strip()
+        return ""
+    return str(context.get("stock_code") or "").strip()
+
+
+def _should_prefetch_single_symbol_theme(context: Optional[Dict[str, Any]], symbol: str) -> bool:
+    if not _looks_like_cn_a_share_symbol(symbol):
+        return False
+    agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+    if agent_user_context is None:
+        return True
+    report = agent_user_context.report
+    return report.intent in {"auto", "entry_analysis", "position_review", "risk_review"}
+
+
+def _looks_like_cn_a_share_symbol(symbol: str) -> bool:
+    normalized = _normalize_prefetch_symbol(symbol)
+    return len(normalized) == 6 and normalized[0] in {"0", "3", "6", "8", "4"}
+
+
+def _normalize_prefetch_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if "." in text:
+        head, tail = text.split(".", 1)
+        if tail in {"SH", "SZ", "BJ"}:
+            text = head
+    for prefix in ("SH", "SZ", "BJ"):
+        if text.startswith(prefix) and len(text) > len(prefix):
+            text = text[len(prefix):]
+    return re.sub(r"[^0-9A-Z]", "", text)
+
+
+def _single_symbol_name_for_theme_prefetch(context: Optional[Dict[str, Any]], symbol: str) -> str:
+    context = context or {}
+    for key in ("stock_name", "name"):
+        value = context.get(key)
+        if value:
+            return str(value).strip()
+    quote = context.get("realtime_quote")
+    if isinstance(quote, dict):
+        for key in ("stock_name", "name", "stockName"):
+            value = quote.get(key)
+            if value:
+                return str(value).strip()
+    agent_user_context = _coerce_agent_user_context(context.get("agent_user_context"))
+    if agent_user_context is not None:
+        normalized = _normalize_prefetch_symbol(symbol)
+        for position in agent_user_context.positions:
+            if _normalize_prefetch_symbol(position.symbol) != normalized:
+                continue
+            raw_name = getattr(position, "stock_name", None) or getattr(position, "name", None)
+            if not raw_name and getattr(position, "model_extra", None):
+                raw_name = position.model_extra.get("stock_name") or position.model_extra.get("name")
+            if raw_name:
+                return str(raw_name).strip()
+    return ""
+
+
+def _is_successful_prefetch_result(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return True
+    status = str(result.get("status") or "").strip().lower()
+    return status not in {"failed", "error", "tool_failed", "timeout"}
 
 
 def _position_name_lookup(agent_user_context: AgentUserContext) -> Dict[str, str]:

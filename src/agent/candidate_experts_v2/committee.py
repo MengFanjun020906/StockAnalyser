@@ -46,8 +46,13 @@ from src.agent.candidate_experts_v2.schemas import (
     ExpertPacketV2,
     FeatureRow,
     SeedItem,
+    SeedSummaryV2,
 )
 from src.agent.candidate_experts_v2.runtime import ExpertTask  # noqa: F401 — re-export for callers
+from src.agent.theme_momentum import (
+    apply_theme_profile_to_seed,
+    build_theme_momentum_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,15 +79,19 @@ SEED_SOURCE_CAPS: Dict[str, int] = {
     "block_trade": 6,
     "dragon_tiger": 6,
     "valuation_liquidity": 6,
-    "alphasift": 10,
-    "sequoia": 8,
-    "low_base_structure": 8,
+    "alphasift": 14,
+    "sequoia": 12,
     "fallback": 4,
+}
+SEED_SOURCE_WEIGHTS: Dict[str, int] = {
+    "alphasift": 2,
+    "sequoia": 2,
 }
 SEED_SOURCE_ORDER = [
     "user_watchlist",
     "daily_screener",
-    "low_base_structure",
+    "alphasift",
+    "sequoia",
     "limit_up_pool",
     "hot_rank",
     "sector_theme",
@@ -92,11 +101,9 @@ SEED_SOURCE_ORDER = [
     "block_trade",
     "dragon_tiger",
     "valuation_liquidity",
-    "alphasift",
-    "sequoia",
     "fallback",
 ]
-SEED_BUILD_LIMIT = 20
+SEED_BUILD_LIMIT = 32
 SEED_GATE_INPUT_LIMIT = 20
 SEED_GATE_OUTPUT_LIMIT = 12
 SEED_GATE_MIN_KEEP = 6
@@ -123,6 +130,7 @@ class SeedPoolBuildResult:
     source_quality: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     total_limit: int = 40
     market_regime: Dict[str, Any] = field(default_factory=dict)
+    theme_momentum: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -155,12 +163,34 @@ def _format_stockapi_date(value: Any) -> str:
     return text
 
 
+def _annotate_seed_buckets_with_theme(
+    seeds_by_source: Dict[str, List[SeedItem]],
+    theme_momentum: Dict[str, Any],
+) -> None:
+    for bucket in seeds_by_source.values():
+        for seed in bucket:
+            try:
+                apply_theme_profile_to_seed(seed, theme_momentum)
+            except Exception as exc:
+                logger.debug("theme profile annotation failed for %s: %s", getattr(seed, "code", ""), exc)
+
+
 def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[str, Any]:
     source_counts: Dict[str, int] = {}
     preview: List[Dict[str, Any]] = []
     dimension_counts: Dict[str, int] = {}
+    theme_regime_counts: Dict[str, int] = {}
+    stock_role_counts: Dict[str, int] = {}
     for seed in seeds:
         source_counts[seed.source] = source_counts.get(seed.source, 0) + 1
+        theme_profile = seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None
+        if isinstance(theme_profile, dict):
+            theme_regime = str(theme_profile.get("theme_regime") or "").strip()
+            stock_role = str(theme_profile.get("stock_role") or "").strip()
+            if theme_regime:
+                theme_regime_counts[theme_regime] = theme_regime_counts.get(theme_regime, 0) + 1
+            if stock_role:
+                stock_role_counts[stock_role] = stock_role_counts.get(stock_role, 0) + 1
         for signal in seed.trigger_signals or []:
             if not isinstance(signal, dict):
                 continue
@@ -177,12 +207,15 @@ def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[s
                     "priority_score": seed.priority_score,
                     "freshness": seed.freshness,
                     "trigger_signals": seed.trigger_signals[:4],
+                    "theme_profile": theme_profile if isinstance(theme_profile, dict) else None,
                 }
             )
     return {
         "seed_count": len(seeds),
         "seed_sources": source_counts,
         "signal_dimensions": dimension_counts,
+        "theme_regime_counts": theme_regime_counts,
+        "stock_role_counts": stock_role_counts,
         "total_limit": total_limit,
         "preview": preview,
     }
@@ -208,6 +241,199 @@ def _compact_desk_packet_for_trace(packet: ExpertPacketV2) -> Dict[str, Any]:
     return payload
 
 
+def _first_diag_code(diagnostics: Sequence[Dict[str, Any]]) -> str:
+    for item in diagnostics or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("code", "stock_code", "symbol", "expected_code"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _packet_reason(packet: Dict[str, Any], *, fallback: str) -> str:
+    for error in packet.get("errors") or []:
+        text = str(error or "").strip()
+        if text:
+            return text
+    for diag in packet.get("diagnostics") or []:
+        if not isinstance(diag, dict):
+            continue
+        parts = [
+            str(diag.get(key) or "").strip()
+            for key in ("reason", "error", "note", "source", "status")
+            if str(diag.get(key) or "").strip()
+        ]
+        if parts:
+            return " · ".join(parts)
+    return fallback
+
+
+def _build_negative_conclusion_reasons(
+    *,
+    rows: Sequence[FeatureRow],
+    desk_packets: Sequence[ExpertPacketV2],
+    final_candidates: Optional[Sequence[AggregatedCandidate]] = None,
+) -> List[Dict[str, Any]]:
+    """Explain trace-negative outcomes instead of only recording the outcome.
+
+    The list is intentionally trace-facing: it says why a seed did not become a
+    final candidate, why a desk did not produce a row, and why a desk packet
+    timed out or failed.
+    """
+
+    row_by_code = {str(row.code): row for row in rows or [] if str(row.code or "").strip()}
+    final_codes = {
+        str(candidate.code)
+        for candidate in (final_candidates or [])
+        if str(getattr(candidate, "code", "") or "").strip()
+    }
+    reasons_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def _add(
+        *,
+        code: str,
+        name: str = "",
+        desk: str = "",
+        conclusion: str,
+        reason: str,
+        status: str = "",
+        stage: str = "thesis_desk_committee",
+        evidence: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        code_text = str(code or "").strip()
+        if not code_text:
+            return
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            reason_text = "未记录具体原因。"
+        key = (code_text, str(desk or ""), str(conclusion or ""))
+        row = row_by_code.get(code_text)
+        reasons_by_key[key] = {
+            "code": code_text,
+            "name": name or (row.name if row is not None else ""),
+            "desk": desk,
+            "stage": stage,
+            "status": status,
+            "conclusion": conclusion,
+            "reason": reason_text,
+            "evidence": evidence or [],
+        }
+
+    for packet_model in desk_packets or []:
+        packet = _compact_desk_packet_for_trace(packet_model)
+        desk = str(packet.get("expert") or packet.get("desk") or "unknown")
+        packet_status = str(packet.get("status") or "unknown")
+        packet_errors = [str(item) for item in (packet.get("errors") or []) if str(item)]
+        if packet_status in {"failed", "timeout", "unavailable"}:
+            packet_reason = _packet_reason(packet, fallback=f"{desk} 未返回可用席位结论。")
+            _add(
+                code=_first_diag_code(packet.get("diagnostics") or []) or "__committee__",
+                desk=desk,
+                conclusion="desk_packet_failed",
+                status=packet_status,
+                reason=packet_reason,
+                evidence=packet.get("diagnostics") or [],
+            )
+
+        for diag in packet.get("diagnostics") or []:
+            if not isinstance(diag, dict):
+                continue
+            if str(diag.get("source") or "") != "desk_filter_excluded_seed":
+                continue
+            code = str(diag.get("code") or "").strip()
+            _add(
+                code=code,
+                desk=desk,
+                conclusion="not_entered_desk",
+                status=str(diag.get("status") or "not_in_scope"),
+                reason=str(diag.get("reason") or "").strip()
+                or f"{desk} 过滤后未进入本席位评估范围。",
+                evidence=[diag],
+            )
+
+        for row in packet.get("rejected") or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("code") or row.get("stock_code") or "").strip()
+            _add(
+                code=code,
+                name=str(row.get("name") or ""),
+                desk=desk,
+                conclusion="rejected_by_desk",
+                status=packet_status,
+                reason=str(row.get("reason") or row.get("summary") or row.get("reject_reason") or "").strip()
+                or f"{desk} 明确拒绝但未写 reason。",
+                evidence=row.get("evidence") if isinstance(row.get("evidence"), list) else [],
+            )
+
+        for seed_packet in packet.get("per_seed_packets") or []:
+            if not isinstance(seed_packet, dict):
+                continue
+            nested_codes = {
+                str(item.get("code") or item.get("stock_code") or "").strip()
+                for bucket in ("candidates", "rejected")
+                for item in (seed_packet.get(bucket) or [])
+                if isinstance(item, dict)
+            }
+            code = _first_diag_code(seed_packet.get("diagnostics") or [])
+            if not code:
+                code = next((item for item in nested_codes if item), "")
+            if not code:
+                continue
+            seed_status = str(seed_packet.get("status") or packet_status or "unknown")
+            if seed_status in {"timeout", "failed", "unavailable"}:
+                _add(
+                    code=code,
+                    desk=desk,
+                    conclusion="desk_seed_no_structured_output",
+                    status=seed_status,
+                    reason=_packet_reason(
+                        seed_packet,
+                        fallback=f"{desk} 对 {code} 未产出 candidates/rejected 结构化结论。",
+                    ),
+                    evidence=seed_packet.get("diagnostics") or [],
+                )
+            elif seed_status == "empty" and code not in nested_codes:
+                _add(
+                    code=code,
+                    desk=desk,
+                    conclusion="desk_seed_empty",
+                    status=seed_status,
+                    reason=f"{desk} 对 {code} 运行完成，但没有输出候选或拒绝明细。",
+                    evidence=seed_packet.get("diagnostics") or [],
+                )
+            if seed_status in {"timeout", "failed", "unavailable"} and packet_errors:
+                _add(
+                    code=code,
+                    desk=desk,
+                    conclusion="desk_seed_error",
+                    status=seed_status,
+                    reason=packet_errors[0],
+                    evidence=seed_packet.get("diagnostics") or [],
+                )
+
+    for code, row in row_by_code.items():
+        if final_codes and code in final_codes:
+            continue
+        existing = [item for item in reasons_by_key.values() if item.get("code") == code]
+        if existing:
+            reason = "；".join(str(item.get("reason") or "") for item in existing[:3] if item.get("reason"))
+        else:
+            sources = ", ".join(row.recall_sources or []) or "unknown"
+            reason = f"召回层进入种子池但四席位未给出支持票，recall_sources={sources}。"
+        _add(
+            code=code,
+            name=row.name,
+            conclusion="not_promoted_to_final_candidates",
+            status="not_selected",
+            reason=reason,
+        )
+
+    return list(reasons_by_key.values())
+
+
 def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
     """Wrap ``llm_adapter`` into the ``LLMCallable`` signature.
 
@@ -228,8 +454,12 @@ def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
             "llm_adapter must be callable or expose a .chat(messages, tools=...) method"
         )
 
-    def _call(messages: List[Dict[str, Any]], tool_decls: List[Dict[str, Any]]) -> LLMTurn:
-        raw = chat(messages, tools=tool_decls)
+    def _call(
+        messages: List[Dict[str, Any]],
+        tool_decls: List[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> LLMTurn:
+        raw = chat(messages, tools=tool_decls, **kwargs)
         if isinstance(raw, LLMTurn):
             return raw
         if isinstance(raw, dict):
@@ -250,6 +480,16 @@ def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
         return LLMTurn(tool_calls=[], text=str(raw))
 
     return _call
+
+
+def _market_regime_key(regime: Any) -> str:
+    """Normalize a MarketRegime payload into the enum key used by allocation."""
+    if isinstance(regime, dict):
+        value = regime.get("regime") or regime.get("market_regime") or regime.get("name")
+    else:
+        value = regime
+    key = str(value or "unknown").strip().lower()
+    return key or "unknown"
 
 
 def _to_seed_items(seed_symbols: Sequence[str], market: str) -> List[SeedItem]:
@@ -1081,16 +1321,26 @@ def _assemble_seed_pool(
             break
 
         remaining_slots = total_limit - len(result_pool)
-        base_quota = remaining_slots // len(active_sources)
-        remainder = remaining_slots % len(active_sources)
-        target_additions: Dict[str, int] = {}
-        for index, source in enumerate(active_sources):
-            if base_quota <= 0:
-                target = 1 if index < remaining_slots else 0
-            else:
-                target = base_quota + (1 if index < remainder else 0)
-            capacity = max(0, caps.get(source, 0) - taken_by_source.get(source, 0))
-            target_additions[source] = min(target, capacity)
+        order_rank = {source: index for index, source in enumerate(SEED_SOURCE_ORDER)}
+        target_additions: Dict[str, int] = {source: 0 for source in active_sources}
+        allocated = 0
+        while allocated < remaining_slots:
+            candidates = [
+                source
+                for source in active_sources
+                if target_additions.get(source, 0) < max(0, caps.get(source, 0) - taken_by_source.get(source, 0))
+            ]
+            if not candidates:
+                break
+            source = max(
+                candidates,
+                key=lambda item: (
+                    float(SEED_SOURCE_WEIGHTS.get(item, 1)) / float(target_additions.get(item, 0) + 1),
+                    -order_rank.get(item, 999),
+                ),
+            )
+            target_additions[source] = target_additions.get(source, 0) + 1
+            allocated += 1
 
         progressed = False
         max_target = max(target_additions.values(), default=0)
@@ -1216,10 +1466,10 @@ def _build_seed_pool_result(
 
     Priority order (first occurrence of each code wins):
     1. User-provided seed_symbols → source="user_watchlist"
-    2. Local price-volume anomaly scan → source="local_price_volume"
-    3. Fundamental / low-base local providers
+    2. Local price-volume anomaly scan → source="daily_screener"
+    3. Online capital / theme / momentum supplements
     4. Daily limit-up + hot-rank online supplements
-    5. AlphaSift quant candidates → source="alphasift"
+    5. AlphaSift quant candidates → source="alphasift" (weighted trunk source)
        Sequoia quant candidates  → source="sequoia"
     """
     seeds_by_source: Dict[str, List[SeedItem]] = {key: [] for key in SEED_SOURCE_CAPS}
@@ -1228,6 +1478,7 @@ def _build_seed_pool_result(
     exclusion_counts: Dict[str, int] = {}
     local_hard_exclusion: Dict[str, Any] = {}
     market_regime: Dict[str, Any] = {}
+    theme_payloads: Dict[str, Dict[str, Any]] = {}
     started = time.time()
 
     def _collect(item: SeedItem) -> None:
@@ -1264,6 +1515,8 @@ def _build_seed_pool_result(
             freshness="request",
         )
     if user_seed_count >= max(1, int(total_limit or 1)):
+        theme_momentum = build_theme_momentum_snapshot()
+        _annotate_seed_buckets_with_theme(seeds_by_source, theme_momentum)
         result_pool = _assemble_seed_pool(
             seeds_by_source,
             total_limit=total_limit,
@@ -1289,6 +1542,7 @@ def _build_seed_pool_result(
             source_quality=source_quality,
             total_limit=total_limit,
             market_regime=market_regime,
+            theme_momentum=theme_momentum,
         )
 
     # Use the most recent trading day for limit-up/hot-rank so weekend/holiday
@@ -1549,6 +1803,7 @@ def _build_seed_pool_result(
             tool_registry, "get_tushare_limit_list_d",
             trade_date=trade_date, limit=limit_per_source,
         )
+        theme_payloads["limit_up_pool"] = result if isinstance(result, dict) else {}
         items = _extract_payload_items(result)
         for item in items:
             if not isinstance(item, dict):
@@ -1579,6 +1834,19 @@ def _build_seed_pool_result(
                 priority_score=78.0 + min(float(_safe_float(streak) or 1.0), 5.0) * 2.0,
                 freshness=trade_date or "latest_trade_date",
                 context_hint="涨停池在线来源，只代表短线关注度上升，后续必须核验流动性和可参与空间。",
+                extras={
+                    "metrics": {
+                        "limit_up_streak": _safe_float(streak) or 1.0,
+                        "bomb_num": _safe_float(item.get("bomb_num") or item.get("open_times") or item.get("open_num")),
+                        "concepts": item.get("concepts"),
+                        "industry": item.get("industry"),
+                        "stock_reason": item.get("stock_reason") or item.get("reason"),
+                        "plate_reason": item.get("plate_reason"),
+                        "plate_name": item.get("plate_name"),
+                        "ceiling_amount": item.get("ceiling_amount"),
+                        "turnover_ratio": item.get("turnover_ratio") or item.get("turnover_rate"),
+                    }
+                },
             ))
         status = str(result.get("status") or ("ok" if items else "empty")).lower()
         diagnostic = _source_diagnostic("limit_up_pool", status, count=len(items), detail={"trade_date": trade_date})
@@ -1599,6 +1867,7 @@ def _build_seed_pool_result(
             tool_registry, "get_stockapi_popularity_rank",
             limit=limit_per_source,
         )
+        theme_payloads["popularity_rank"] = result if isinstance(result, dict) else {}
         items = _extract_payload_items(result)
         for item in items:
             if not isinstance(item, dict):
@@ -1655,12 +1924,14 @@ def _build_seed_pool_result(
             date=stockapi_date,
             limit=max(3, min(limit_per_source, 10)),
         )
+        theme_payloads["hot_sectors"] = sectors_result if isinstance(sectors_result, dict) else {}
         leaders_result = _safe_tool_call(
             tool_registry,
             "get_stockapi_hot_sector_leaders",
             date=stockapi_date,
             limit=limit_per_source,
         )
+        theme_payloads["hot_sector_leaders"] = leaders_result if isinstance(leaders_result, dict) else {}
         leaders = _extract_payload_items(leaders_result)
         accepted = 0
         for rank, item in enumerate(leaders, start=1):
@@ -1910,24 +2181,7 @@ def _build_seed_pool_result(
         _log_seed_source_diagnostic(diagnostic)
         source_quality["sequoia"] = _source_quality("failed", error=message)
 
-    # --- Source 5: low-base structure seeds from shared daily DB ---
-    try:
-        structure_candidates = _build_low_base_structure_seeds(limit=limit_per_source)
-        for seed in structure_candidates:
-            _collect(seed)
-        diagnostic = _source_diagnostic("low_base_structure", "ok" if structure_candidates else "empty", count=len(structure_candidates))
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["low_base_structure"] = _source_quality("ok" if structure_candidates else "empty", freshness="latest_local")
-    except Exception as exc:
-        logger.debug("seed pool: low_base_structure failed: %s", exc)
-        message = f"{type(exc).__name__}: {exc}"
-        diagnostic = _source_diagnostic("low_base_structure", "failed", error=message)
-        diagnostics.append(diagnostic)
-        _log_seed_source_diagnostic(diagnostic)
-        source_quality["low_base_structure"] = _source_quality("failed", error=message)
-
-    # --- Source 6: deterministic auto candidates as richness supplement ---
+    # --- Source 5: deterministic auto candidates as richness supplement ---
     # This reuses the broader existing L1 discovery stack as a best-effort sector
     # supplement, but event/news/fundamental buckets are intentionally not admitted
     # into this committee seed builder because their historical precision was low.
@@ -2032,6 +2286,31 @@ def _build_seed_pool_result(
         _log_seed_source_diagnostic(diagnostic)
         source_quality["discover_watchlist_candidates_auto"] = _source_quality("failed", freshness="online_or_cached", error=message)
 
+    theme_momentum = build_theme_momentum_snapshot(
+        hot_sectors=theme_payloads.get("hot_sectors"),
+        limit_up_pool=theme_payloads.get("limit_up_pool"),
+        hot_sector_leaders=theme_payloads.get("hot_sector_leaders"),
+        popularity_rank=theme_payloads.get("popularity_rank"),
+    )
+    diagnostics.append(
+        _source_diagnostic(
+            "theme_momentum_snapshot",
+            str(theme_momentum.get("data_quality") or "unknown"),
+            count=int((theme_momentum.get("matched_counts") or {}).get("total") or 0),
+            detail={
+                "theme": theme_momentum.get("theme"),
+                "regime": theme_momentum.get("regime"),
+                "confidence": theme_momentum.get("confidence"),
+                "source_status": theme_momentum.get("source_status"),
+            },
+        )
+    )
+    source_quality["theme_momentum_snapshot"] = _source_quality(
+        "ok" if theme_momentum.get("regime") not in {None, "", "unknown"} else "partial",
+        freshness=trade_date or today or "latest_trade_date",
+    )
+    _annotate_seed_buckets_with_theme(seeds_by_source, theme_momentum)
+
     for source, bucket in list(seeds_by_source.items()):
         seeds_by_source[source] = _dedupe_by_code(bucket)
 
@@ -2064,6 +2343,7 @@ def _build_seed_pool_result(
         source_quality=source_quality,
         total_limit=total_limit,
         market_regime=market_regime,
+        theme_momentum=theme_momentum,
     )
 
 def _build_daily_screener_seeds(*, trade_date: str, limit: int) -> Tuple[List[SeedItem], Dict[str, Any]]:
@@ -2884,6 +3164,7 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         })
     recall_sources = seed.extras.get("recall_sources") if isinstance(seed.extras, dict) else None
     metrics = dict(seed.extras.get("metrics", {}) if isinstance(seed.extras, dict) else {})
+    theme_profile = seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None
     source_diagnostics = dict(metrics.get("source_diagnostics") or {})
     source_diagnostics.update({
         "source": seed.source,
@@ -2908,6 +3189,7 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         "trigger_signals": seed.trigger_signals,
         "freshness": seed.freshness,
         "context_hint": seed.context_hint,
+        "theme_profile": theme_profile if isinstance(theme_profile, dict) else None,
         "metrics": metrics,
         "seed_gate": seed.extras.get("seed_gate") if isinstance(seed.extras, dict) else None,
     }
@@ -3055,7 +3337,8 @@ def run_committee_discovery(
     enable_seed_gate: bool = True,
     seed_fact_tools: Optional[Sequence[str]] = None,
     seed_fact_max_workers: int = 12,
-    seed_fact_tool_timeout_seconds: float = 12.0,
+    seed_fact_tool_timeout_seconds: float = 30.0,
+    per_seed_timeout_budget_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run the LLM expert committee and return a discover-compatible payload.
 
@@ -3106,12 +3389,19 @@ def run_committee_discovery(
         seeds = list(prebuilt_seeds)
     else:
         seeds = _to_seed_items(seed_symbols, market_value)
-    deterministic_payload["seed_pool_summary"] = _seed_pool_summary(seeds, total_limit=SEED_GATE_OUTPUT_LIMIT)
+    summary_total_limit = int(
+        getattr(build_result, "total_limit", None)
+        or len(seeds)
+        or limit
+        or SEED_BUILD_LIMIT
+    )
+    deterministic_payload["seed_pool_summary"] = _seed_pool_summary(seeds, total_limit=summary_total_limit)
     if build_result is not None:
         deterministic_payload["seed_pool_diagnostics"] = build_result.diagnostics
         deterministic_payload["seed_pool_hard_exclusion"] = build_result.hard_exclusion
         deterministic_payload["seed_source_quality"] = build_result.source_quality
         deterministic_payload["seed_market_regime"] = build_result.market_regime
+        deterministic_payload["theme_momentum"] = build_result.theme_momentum
     deterministic_payload["candidates"] = []
     deterministic_payload["candidate_count"] = 0
     logger.info(
@@ -3149,6 +3439,7 @@ def run_committee_discovery(
             seed_fact_tools=seed_fact_tools,
             seed_fact_max_workers=seed_fact_max_workers,
             seed_fact_tool_timeout_seconds=seed_fact_tool_timeout_seconds,
+            per_seed_timeout_budget_s=per_seed_timeout_budget_s,
         )
         # Merge thesis result into payload while preserving seed-pool diagnostics.
         # Empty desk output is a hard candidate-discovery failure, not permission
@@ -3163,6 +3454,8 @@ def run_committee_discovery(
         if thesis_candidates:
             deterministic_payload["candidates"] = thesis_candidates
             deterministic_payload["candidate_count"] = len(thesis_candidates)
+            if thesis_result.get("status") in {"partial", "failed"}:
+                deterministic_payload["status"] = str(thesis_result.get("status"))
         else:
             deterministic_payload["candidates"] = []
             deterministic_payload["candidate_count"] = 0
@@ -3206,7 +3499,7 @@ def run_committee_discovery(
             "status": thesis_result.get("status", "ok"),
             "seed_count": len(seeds),
             "candidate_count": len(thesis_candidates),
-            "degraded": not bool(thesis_candidates),
+            "degraded": bool(thesis_result.get("degraded")) or thesis_result.get("status") == "partial",
             "dimensions_covered": [
                 "early_turn_desk",
                 "momentum_desk",
@@ -3214,15 +3507,17 @@ def run_committee_discovery(
                 "theme_catalyst_desk",
             ],
             "delegate": "thesis_desk_committee",
+            "partial_errors": thesis_result.get("partial_errors") or [],
         }
         deterministic_payload["thesis_desk_committee"] = {
             "status": thesis_result.get("status", "ok"),
             "candidate_count": len(thesis_candidates),
-            "degraded": not bool(thesis_candidates),
+            "degraded": bool(thesis_result.get("degraded")) or thesis_result.get("status") == "partial",
             "diagnostics": thesis_result.get("thesis_desk_diagnostics") or [],
             "recall_total_in": thesis_result.get("recall_total_in"),
             "recall_total_kept": thesis_result.get("recall_total_kept"),
             "elapsed_ms": thesis_result.get("thesis_desk_committee_elapsed_ms"),
+            "partial_errors": thesis_result.get("partial_errors") or [],
         }
         deterministic_payload["candidate_source"] = "llm_expert_committee"
     except Exception as exc:
@@ -3267,7 +3562,7 @@ def run_thesis_desk_committee(
     seed_symbols: Sequence[str],
     tool_registry: Any,
     llm_adapter: Any,
-    regime: str = "unknown",
+    regime: Any = "unknown",
     today: Optional[str] = None,
     tool_decls: Optional[Sequence[Dict[str, Any]]] = None,
     overall_timeout_s: float = CommitteeOverallTimeoutSeconds,
@@ -3282,7 +3577,8 @@ def run_thesis_desk_committee(
     backfill_max: int = 3,
     seed_fact_tools: Optional[Sequence[str]] = None,
     seed_fact_max_workers: int = 12,
-    seed_fact_tool_timeout_seconds: float = 12.0,
+    seed_fact_tool_timeout_seconds: float = 30.0,
+    per_seed_timeout_budget_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
 
@@ -3295,6 +3591,7 @@ def run_thesis_desk_committee(
     from src.agent.candidate_experts_v2.aggregator import (
         aggregate_desk_picks,
         allocate_slots,
+        _parse_allocation,
     )
     from src.agent.candidate_experts_v2.experts.early_turn_desk import EarlyTurnDeskExpert
     from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
@@ -3309,6 +3606,7 @@ def run_thesis_desk_committee(
 
     started = time.time()
     market_value = (market or "cn").strip().lower() or "cn"
+    regime_key = _market_regime_key(regime)
     tdecls = list(tool_decls or [])
 
     payload: Dict[str, Any] = {
@@ -3456,47 +3754,81 @@ def run_thesis_desk_committee(
 
     budget = max(10.0, overall_timeout_s - (time.time() - started))
     desk_deadline_s = time.time() + max(1.0, budget - 1.0)
-    per_seed_timeout_s = max(
-        3.0,
-        min(180.0, (budget - 5.0) / max(1, len(rows))),
+    # Each row can require: first LLM turn -> several data tools -> final JSON
+    # turn.  Dividing the shared desk budget by the full recall pool made small
+    # desks inherit the 32-row pool size and produced opaque ~100s single-row
+    # timeouts even in development traces.  Keep a generous per-row ceiling while
+    # the shared desk_deadline_s still bounds the whole committee run.
+    configured_per_seed_timeout = float(per_seed_timeout_budget_s or 300.0)
+    effective_per_seed_timeout_s = max(
+        60.0,
+        min(configured_per_seed_timeout, max(240.0, (budget - 5.0) / max(1, len(rows)))),
     )
+    active_allocation = _parse_allocation(allocation_json, regime_key)
+    if regime_key in {"risk_off", "panic", "trending_down"}:
+        active_allocation["momentum_desk"] = 0
 
     desk_tasks: Dict[str, Any] = {
         "early_turn_desk": lambda: early_turn_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
         "momentum_desk": lambda: momentum_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
         "quality_repair_desk": lambda: quality_repair_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
         "theme_catalyst_desk": lambda: theme_catalyst_desk.run_desk(
             rows,
             market=market_value,
-            regime=regime,
+            regime=regime_key,
             deadline_s=desk_deadline_s,
-            per_seed_timeout_s=per_seed_timeout_s,
+            per_seed_timeout_s=effective_per_seed_timeout_s,
         ),
     }
+    skipped_desk_packets: List[ExpertPacketV2] = []
+    for desk_key in list(desk_tasks.keys()):
+        if int(active_allocation.get(desk_key, 0)) > 0:
+            continue
+        del desk_tasks[desk_key]
+        skipped_desk_packets.append(
+            ExpertPacketV2(
+                expert=desk_key,
+                dimension=desk_key,
+                status="empty",
+                seed_summary=SeedSummaryV2(seed_count=0),
+                candidates=[],
+                rejected=[],
+                diagnostics=[
+                    {
+                        "source": "desk_allocation",
+                        "status": "skipped_zero_quota",
+                        "regime": regime_key,
+                    }
+                ],
+            )
+        )
 
-    desk_packets = run_experts_parallel(
-        desk_tasks,
-        per_expert_timeout_s=budget * 0.8,
-        overall_timeout_s=budget,
-    )
+    desk_packets = [
+        *skipped_desk_packets,
+        *run_experts_parallel(
+            desk_tasks,
+            per_expert_timeout_s=budget * 0.8,
+            overall_timeout_s=budget,
+        ),
+    ]
     payload["thesis_desk_packets"] = [
         _compact_desk_packet_for_trace(packet)
         for packet in desk_packets
@@ -3505,17 +3837,25 @@ def run_thesis_desk_committee(
         packet for packet in desk_packets
         if packet.status in {"failed", "timeout", "unavailable"}
     ]
-    if failed_packets:
-        errors = []
-        for packet in failed_packets:
-            errors.extend([str(err) for err in (packet.errors or []) if err])
+    failed_packet_errors: List[str] = []
+    for packet in failed_packets:
+        failed_packet_errors.extend([str(err) for err in (packet.errors or []) if err])
+    has_candidate_outputs = any(packet.candidates for packet in desk_packets)
+    if failed_packets and not has_candidate_outputs:
+        negative_reasons = _build_negative_conclusion_reasons(
+            rows=rows,
+            desk_packets=desk_packets,
+        )
         payload["status"] = "failed"
         payload["error"] = "thesis desk timeout or failure"
+        payload["negative_conclusion_reasons"] = negative_reasons
         payload["thesis_desk_diagnostics"] = [
             {
                 "desk": packet.expert,
                 "status": packet.status,
                 "errors": list(packet.errors or []),
+                "warnings": list(packet.data_quality.warnings or []),
+                "diagnostics": list(packet.diagnostics or []),
             }
             for packet in desk_packets
         ]
@@ -3525,18 +3865,38 @@ def run_thesis_desk_committee(
                 "source": "thesis_desk_committee",
                 "status": "failed",
                 "dimension": "committee",
-                "error": "; ".join(errors) or "thesis desk timeout or failure",
+                "error": "; ".join(failed_packet_errors) or "thesis desk timeout or failure",
+                "negative_reason_count": len(negative_reasons),
             }
         )
         return payload
+    if failed_packets:
+        negative_reasons = _build_negative_conclusion_reasons(
+            rows=rows,
+            desk_packets=desk_packets,
+        )
+        payload["status"] = "partial"
+        payload["degraded"] = True
+        payload["partial_errors"] = failed_packet_errors
+        payload["negative_conclusion_reasons"] = negative_reasons
+        payload["discovery_steps"].append(
+            {
+                "source": "thesis_desk_committee",
+                "status": "partial",
+                "dimension": "committee",
+                "error": "; ".join(failed_packet_errors) or "one or more thesis desks failed",
+                "degraded": True,
+                "negative_reason_count": len(negative_reasons),
+            }
+        )
 
     # ── Step 3: aggregate + allocate ─────────────────────────────────────
     try:
         agg_pool = aggregate_desk_picks(desk_packets, rows)
-        agg_pool.regime = regime
+        agg_pool.regime = regime_key
         final_candidates: List[AggregatedCandidate] = allocate_slots(
             agg_pool,
-            regime,
+            regime_key,
             total=total_slots,
             allocation_json=allocation_json,
             backfill_rules_json=backfill_rules_json,
@@ -3603,9 +3963,28 @@ def run_thesis_desk_committee(
 
     payload["candidates"] = candidate_dicts
     payload["candidate_count"] = len(candidate_dicts)
+    negative_reasons = _build_negative_conclusion_reasons(
+        rows=rows,
+        desk_packets=desk_packets,
+        final_candidates=final_candidates,
+    )
+    payload["negative_conclusion_reasons"] = negative_reasons
+    payload["status"] = "partial" if failed_packets else payload.get("status", "ok")
+    payload["degraded"] = bool(failed_packets)
+    if failed_packets:
+        payload["error"] = "partial thesis desk failure"
+        payload["partial_errors"] = failed_packet_errors
     payload["regime"] = regime
     payload["thesis_desk_diagnostics"] = agg_pool.diagnostics
     payload["thesis_desk_committee_elapsed_ms"] = int((time.time() - started) * 1000)
+    payload["discovery_steps"].append(
+        {
+            "source": "thesis_desk_committee",
+            "status": payload.get("status") or "ok",
+            "dimension": "negative_reason_summary",
+            "negative_reason_count": len(negative_reasons),
+        }
+    )
     return payload
 
 

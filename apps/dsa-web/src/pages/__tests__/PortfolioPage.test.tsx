@@ -19,6 +19,7 @@ const {
   deleteCashLedger,
   createCorporateAction,
   deleteCorporateAction,
+  resetBaseline,
   parseCsvImport,
   commitCsvImport,
   createAccount,
@@ -37,6 +38,7 @@ const {
   deleteCashLedger: vi.fn(),
   createCorporateAction: vi.fn(),
   deleteCorporateAction: vi.fn(),
+  resetBaseline: vi.fn(),
   parseCsvImport: vi.fn(),
   commitCsvImport: vi.fn(),
   createAccount: vi.fn(),
@@ -58,6 +60,7 @@ vi.mock('../../api/portfolio', () => ({
     deleteCashLedger,
     createCorporateAction,
     deleteCorporateAction,
+    resetBaseline,
     parseCsvImport,
     commitCsvImport,
     createAccount,
@@ -223,6 +226,17 @@ describe('PortfolioPage FX refresh', () => {
     deleteCashLedger.mockResolvedValue({ deleted: 1 });
     createCorporateAction.mockResolvedValue({ id: 1 });
     deleteCorporateAction.mockResolvedValue({ deleted: 1 });
+    resetBaseline.mockResolvedValue({
+      accountId: 1,
+      asOf: '2026-03-19',
+      cashAmount: 5000,
+      positionCount: 1,
+      cashLedgerCount: 2,
+      tradeCount: 1,
+      deletedTrades: 1,
+      deletedCashLedger: 1,
+      deletedCorporateActions: 0,
+    });
     parseCsvImport.mockResolvedValue({ broker: 'huatai', recordCount: 0, skippedCount: 0, errorCount: 0, records: [], errors: [] });
     commitCsvImport.mockResolvedValue({
       accountId: 1,
@@ -347,6 +361,36 @@ describe('PortfolioPage FX refresh', () => {
     const aaplRowCells = within(aaplRow as HTMLTableRowElement).getAllByRole('cell');
     expect(hkRowCells.at(-1)).toHaveClass('text-success');
     expect(aaplRowCells.at(-1)).toHaveClass('text-secondary');
+  });
+
+  it('submits a confirmed baseline reset for the selected account', async () => {
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [
+      { symbol: '600519', market: 'cn', currency: 'CNY', quantity: 10, avgCost: 100, totalCost: 1000, lastPrice: 105, marketValueBase: 1050, unrealizedPnlBase: 50, unrealizedPnlPct: 5, valuationCurrency: 'CNY', priceSource: 'history_close', priceDate: '2026-03-19', priceStale: false, priceAvailable: true },
+    ] }));
+
+    render(<PortfolioPage />);
+
+    await waitForInitialLoad();
+
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: '1' } });
+    fireEvent.click(screen.getByRole('button', { name: '重设基准' }));
+
+    fireEvent.change(screen.getByPlaceholderText('重设后现金/本金余额'), { target: { value: '5000' } });
+    fireEvent.change(screen.getByLabelText('重设持仓代码 1'), { target: { value: '600519' } });
+    fireEvent.change(screen.getByLabelText('重设持仓数量 1'), { target: { value: '20' } });
+    fireEvent.change(screen.getByLabelText('重设持仓成本价 1'), { target: { value: '90' } });
+    fireEvent.change(screen.getByLabelText('重设持仓市场 1'), { target: { value: 'cn' } });
+    fireEvent.change(screen.getByLabelText('重设持仓币种 1'), { target: { value: 'CNY' } });
+    fireEvent.click(screen.getByLabelText('确认清空当前账户旧流水后重建'));
+    fireEvent.click(screen.getByRole('button', { name: '提交重设' }));
+
+    await waitFor(() => expect(resetBaseline).toHaveBeenCalledWith(1, {
+      asOf: expect.any(String),
+      cashAmount: 5000,
+      positions: [{ symbol: '600519', quantity: 20, price: 90, market: 'cn', currency: 'CNY' }],
+      note: undefined,
+    }));
+    expect(await screen.findByText(/删除交易 1 条/)).toBeInTheDocument();
   });
 
   it('prefers disabled feedback over empty-pair feedback when refresh is disabled', async () => {

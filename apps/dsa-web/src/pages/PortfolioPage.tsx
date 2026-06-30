@@ -8,6 +8,8 @@ import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } fr
 import { toDateInputValue } from '../utils/format';
 import type {
   PortfolioAccountItem,
+  PortfolioBaselinePositionInput,
+  PortfolioBaselineResetResponse,
   PortfolioCashDirection,
   PortfolioCashLedgerListItem,
   PortfolioCorporateActionListItem,
@@ -56,6 +58,14 @@ type FxRefreshContext = {
 };
 
 type PortfolioAlertVariant = 'info' | 'success' | 'warning' | 'danger';
+type BaselineResetPositionRow = {
+  id: string;
+  symbol: string;
+  quantity: string;
+  price: string;
+  market: '' | 'cn' | 'hk' | 'us';
+  currency: string;
+};
 
 const PORTFOLIO_INPUT_CLASS =
   'input-surface input-focus-glow h-11 w-full rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
@@ -182,6 +192,59 @@ function getCsvCommitVariant(result: PortfolioImportCommitResponse, isDryRun: bo
   return result.failedCount > 0 || result.duplicateCount > 0 ? 'warning' : 'success';
 }
 
+function createEmptyBaselineRow(): BaselineResetPositionRow {
+  const id = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `baseline-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return { id, symbol: '', quantity: '', price: '', market: '', currency: '' };
+}
+
+function baselineRowsFromPositions(rows: FlatPosition[]): BaselineResetPositionRow[] {
+  if (rows.length === 0) return [createEmptyBaselineRow()];
+  return rows.map((row) => ({
+    id: `${row.accountId}-${row.symbol}-${row.market}-${row.currency}`,
+    symbol: row.symbol,
+    quantity: String(Number(row.quantity || 0)),
+    price: String(Number(row.avgCost || 0)),
+    market: (row.market === 'cn' || row.market === 'hk' || row.market === 'us') ? row.market : '',
+    currency: row.currency || '',
+  }));
+}
+
+function parseBaselineRows(rows: BaselineResetPositionRow[]): PortfolioBaselinePositionInput[] {
+  const positions: PortfolioBaselinePositionInput[] = [];
+  const errors: string[] = [];
+  rows.forEach((row, index) => {
+    const symbol = row.symbol.trim();
+    const hasAnyValue = Boolean(symbol || row.quantity.trim() || row.price.trim() || row.market || row.currency.trim());
+    if (!hasAnyValue) {
+      return;
+    }
+    if (!symbol) {
+      errors.push(`第 ${index + 1} 行代码不能为空`);
+    }
+    const quantity = Number(row.quantity);
+    const price = Number(row.price);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      errors.push(`第 ${index + 1} 行数量必须大于 0`);
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      errors.push(`第 ${index + 1} 行成本价必须大于 0`);
+    }
+    positions.push({
+      symbol,
+      quantity,
+      price,
+      market: row.market || undefined,
+      currency: row.currency.trim().toUpperCase() || undefined,
+    });
+  });
+  if (errors.length > 0) {
+    throw new Error(errors.join('；'));
+  }
+  return positions;
+}
+
 const PortfolioPage: React.FC = () => {
   // Set page title
   useEffect(() => {
@@ -209,6 +272,16 @@ const PortfolioPage: React.FC = () => {
   const [error, setError] = useState<ParsedApiError | null>(null);
   const [riskWarning, setRiskWarning] = useState<string | null>(null);
   const [writeWarning, setWriteWarning] = useState<string | null>(null);
+  const [showBaselineReset, setShowBaselineReset] = useState(false);
+  const [baselineResetting, setBaselineResetting] = useState(false);
+  const [baselineResetConfirm, setBaselineResetConfirm] = useState(false);
+  const [baselineResetFeedback, setBaselineResetFeedback] = useState<PortfolioBaselineResetResponse | null>(null);
+  const [baselineResetForm, setBaselineResetForm] = useState({
+    asOf: getTodayIso(),
+    cashAmount: '',
+    note: '',
+  });
+  const [baselineResetRows, setBaselineResetRows] = useState<BaselineResetPositionRow[]>(() => [createEmptyBaselineRow()]);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -468,6 +541,11 @@ const PortfolioPage: React.FC = () => {
     return rows;
   }, [snapshot]);
 
+  const selectedAccountSnapshot = useMemo(() => {
+    if (!snapshot || !writableAccountId) return null;
+    return (snapshot.accounts || []).find((account) => account.accountId === writableAccountId) || null;
+  }, [snapshot, writableAccountId]);
+
   const sectorPieData = useMemo(() => {
     const sectors = risk?.sectorConcentration?.topSectors || [];
     return sectors
@@ -566,6 +644,80 @@ const PortfolioPage: React.FC = () => {
       setCorpForm((prev) => ({ ...prev, symbol: '', note: '' }));
     } catch (err) {
       setError(getParsedApiError(err));
+    }
+  };
+
+  const fillBaselineResetFromCurrent = () => {
+    if (!selectedAccountSnapshot) return;
+    const rows = positionRows.filter((row) => row.accountId === selectedAccountSnapshot.accountId);
+    setBaselineResetForm((prev) => ({
+      ...prev,
+      cashAmount: String(Number(selectedAccountSnapshot.totalCash || 0)),
+    }));
+    setBaselineResetRows(baselineRowsFromPositions(rows));
+    setBaselineResetFeedback(null);
+  };
+
+  const updateBaselineResetRow = (rowId: string, patch: Partial<BaselineResetPositionRow>) => {
+    setBaselineResetRows((prev) => prev.map((row) => (row.id === rowId ? { ...row, ...patch } : row)));
+    setBaselineResetFeedback(null);
+  };
+
+  const addBaselineResetRow = () => {
+    setBaselineResetRows((prev) => [...prev, createEmptyBaselineRow()]);
+    setBaselineResetFeedback(null);
+  };
+
+  const removeBaselineResetRow = (rowId: string) => {
+    setBaselineResetRows((prev) => {
+      const next = prev.filter((row) => row.id !== rowId);
+      return next.length > 0 ? next : [createEmptyBaselineRow()];
+    });
+    setBaselineResetFeedback(null);
+  };
+
+  const handleBaselineResetSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!writableAccountId) {
+      setWriteWarning('请先在右上角选择具体账户，再重设持仓基准。');
+      return;
+    }
+    if (!baselineResetConfirm) {
+      setWriteWarning('请先勾选确认清空当前账户流水。');
+      return;
+    }
+    const cashAmount = Number(baselineResetForm.cashAmount || 0);
+    if (!Number.isFinite(cashAmount) || cashAmount < 0) {
+      setWriteWarning('本金/现金余额必须是大于等于 0 的数字。');
+      return;
+    }
+    let positions: PortfolioBaselinePositionInput[];
+    try {
+      positions = parseBaselineRows(baselineResetRows);
+    } catch (parseErr) {
+      setWriteWarning(parseErr instanceof Error ? parseErr.message : '持仓格式不正确。');
+      return;
+    }
+    try {
+      setBaselineResetting(true);
+      setWriteWarning(null);
+      setBaselineResetFeedback(null);
+      const result = await portfolioApi.resetBaseline(writableAccountId, {
+        asOf: baselineResetForm.asOf,
+        cashAmount,
+        positions,
+        note: baselineResetForm.note || undefined,
+      });
+      setBaselineResetFeedback(result);
+      setBaselineResetConfirm(false);
+      await refreshPortfolioData(1);
+      if (eventPage !== 1) {
+        setEventPage(1);
+      }
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setBaselineResetting(false);
     }
   };
 
@@ -1085,6 +1237,172 @@ const PortfolioPage: React.FC = () => {
           className="rounded-lg px-3 py-2 text-xs shadow-none"
           message="当前处于“全部账户”视图。为避免误写，请先选择一个具体账户后再进行手工录入或 CSV 提交。"
         />
+      ) : null}
+
+      {hasAccounts ? (
+        <Card padding="md">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-foreground">重设持仓基准</h2>
+              <p className="mt-1 text-xs text-secondary">
+                选择单账户后可重建本金、持仓数量和成本价。
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="btn-secondary text-sm"
+                disabled={!writableAccountId}
+                onClick={() => {
+                  setShowBaselineReset((prev) => !prev);
+                  setBaselineResetFeedback(null);
+                  setWriteWarning(null);
+                }}
+              >
+                {showBaselineReset ? '收起' : '重设基准'}
+              </button>
+              {showBaselineReset ? (
+                <button
+                  type="button"
+                  className="btn-secondary text-sm"
+                  disabled={!selectedAccountSnapshot}
+                  onClick={fillBaselineResetFromCurrent}
+                >
+                  填入当前
+                </button>
+              ) : null}
+            </div>
+          </div>
+          {showBaselineReset ? (
+            <form className="mt-4 space-y-3" onSubmit={handleBaselineResetSubmit}>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                <input
+                  className={PORTFOLIO_INPUT_CLASS}
+                  type="date"
+                  value={baselineResetForm.asOf}
+                  onChange={(e) => setBaselineResetForm((prev) => ({ ...prev, asOf: e.target.value }))}
+                  required
+                />
+                <input
+                  className={PORTFOLIO_INPUT_CLASS}
+                  type="number"
+                  min="0"
+                  step="0.0001"
+                  placeholder="重设后现金/本金余额"
+                  value={baselineResetForm.cashAmount}
+                  onChange={(e) => setBaselineResetForm((prev) => ({ ...prev, cashAmount: e.target.value }))}
+                />
+                <input
+                  className={PORTFOLIO_INPUT_CLASS}
+                  placeholder="备注（可选）"
+                  value={baselineResetForm.note}
+                  onChange={(e) => setBaselineResetForm((prev) => ({ ...prev, note: e.target.value }))}
+                />
+              </div>
+              <div className="space-y-2">
+                <div className="hidden grid-cols-[minmax(120px,1.2fr)_minmax(100px,1fr)_minmax(100px,1fr)_110px_110px_72px] gap-2 text-xs text-secondary md:grid">
+                  <span>代码</span>
+                  <span>数量</span>
+                  <span>成本价</span>
+                  <span>市场</span>
+                  <span>币种</span>
+                  <span className="text-right">操作</span>
+                </div>
+                {baselineResetRows.map((row, index) => (
+                  <div
+                    key={row.id}
+                    className="grid grid-cols-1 gap-2 rounded-xl border border-white/10 bg-white/[0.02] p-2 md:grid-cols-[minmax(120px,1.2fr)_minmax(100px,1fr)_minmax(100px,1fr)_110px_110px_72px] md:border-none md:bg-transparent md:p-0"
+                  >
+                    <input
+                      className={PORTFOLIO_INPUT_CLASS}
+                      aria-label={`重设持仓代码 ${index + 1}`}
+                      placeholder={`代码 ${index + 1}`}
+                      value={row.symbol}
+                      onChange={(e) => updateBaselineResetRow(row.id, { symbol: e.target.value.trim().toUpperCase() })}
+                    />
+                    <input
+                      className={PORTFOLIO_INPUT_CLASS}
+                      aria-label={`重设持仓数量 ${index + 1}`}
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      placeholder="数量"
+                      value={row.quantity}
+                      onChange={(e) => updateBaselineResetRow(row.id, { quantity: e.target.value })}
+                    />
+                    <input
+                      className={PORTFOLIO_INPUT_CLASS}
+                      aria-label={`重设持仓成本价 ${index + 1}`}
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      placeholder="成本价"
+                      value={row.price}
+                      onChange={(e) => updateBaselineResetRow(row.id, { price: e.target.value })}
+                    />
+                    <select
+                      className={PORTFOLIO_SELECT_CLASS}
+                      aria-label={`重设持仓市场 ${index + 1}`}
+                      value={row.market}
+                      onChange={(e) => updateBaselineResetRow(row.id, { market: e.target.value as BaselineResetPositionRow['market'] })}
+                    >
+                      <option value="">默认</option>
+                      <option value="cn">A 股</option>
+                      <option value="hk">港股</option>
+                      <option value="us">美股</option>
+                    </select>
+                    <input
+                      className={PORTFOLIO_INPUT_CLASS}
+                      aria-label={`重设持仓币种 ${index + 1}`}
+                      placeholder="币种"
+                      value={row.currency}
+                      onChange={(e) => updateBaselineResetRow(row.id, { currency: e.target.value.toUpperCase() })}
+                    />
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs"
+                      onClick={() => removeBaselineResetRow(row.id)}
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="btn-secondary text-xs"
+                  onClick={addBaselineResetRow}
+                >
+                  新增持仓
+                </button>
+              </div>
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <label className="flex items-center gap-2 text-xs text-warning">
+                  <input
+                    type="checkbox"
+                    checked={baselineResetConfirm}
+                    onChange={(e) => setBaselineResetConfirm(e.target.checked)}
+                  />
+                  确认清空当前账户旧流水后重建
+                </label>
+                <button
+                  type="submit"
+                  className="btn-secondary text-sm"
+                  disabled={!writableAccountId || !baselineResetConfirm || baselineResetting}
+                >
+                  {baselineResetting ? '重设中...' : '提交重设'}
+                </button>
+              </div>
+              {baselineResetFeedback ? (
+                <InlineAlert
+                  variant="success"
+                  title="重设完成"
+                  message={`删除交易 ${baselineResetFeedback.deletedTrades} 条、资金流水 ${baselineResetFeedback.deletedCashLedger} 条、公司行为 ${baselineResetFeedback.deletedCorporateActions} 条；新建持仓 ${baselineResetFeedback.positionCount} 项。`}
+                  className="rounded-lg px-3 py-2 text-xs shadow-none"
+                />
+              ) : null}
+            </form>
+          ) : null}
+        </Card>
       ) : null}
 
       <section className="grid grid-cols-1 md:grid-cols-3 gap-3">

@@ -19,6 +19,10 @@ from api.v1.endpoints import (
     agent,
     usage,
     portfolio,
+    candidate_pool,
+    seed_pool_quality,
+    agent_verdict_reviews,
+    agent_entry_execution_backtests,
 )
 __all__ = [
     "health",
@@ -31,4 +35,8 @@ __all__ = [
     "agent",
     "usage",
     "portfolio",
+    "candidate_pool",
+    "seed_pool_quality",
+    "agent_verdict_reviews",
+    "agent_entry_execution_backtests",
 ]

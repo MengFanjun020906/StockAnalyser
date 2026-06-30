@@ -49,7 +49,23 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
 GEMINI_API_KEY=AIzac...
 ```
 
-### Example 4: Using Ollama Local Models
+### Example 4: Using the Official Zhipu GLM API
+```env
+# Zhipu GLM uses an OpenAI-compatible Chat Completions endpoint
+GLM_API_KEY=your-api-key
+LLM_CHANNELS=glm
+LLM_GLM_PROTOCOL=openai
+LLM_GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+LLM_GLM_API_KEY=${GLM_API_KEY}
+LLM_GLM_MODELS=glm-5.2
+LITELLM_MODEL=openai/glm-5.2
+AGENT_LITELLM_MODEL=openai/glm-5.2
+LLM_TEMPERATURE=1.0
+```
+
+`glm-5.2` is routed through the OpenAI-compatible channel. Agent calls automatically attach `thinking={"type":"enabled"}` and `reasoning_effort="max"` for this model.
+
+### Example 5: Using Ollama Local Models
 ```env
 # Ollama requires no API Key; works after running ollama serve locally
 OLLAMA_API_BASE=http://localhost:11434
@@ -108,6 +124,7 @@ The backend exposes a read-only status endpoint at `GET /api/v1/system/config/se
 - OpenAI-compatible routing in LiteLLM: <https://docs.litellm.ai/docs/providers/openai_compatible>
 - OpenAI official API docs: <https://platform.openai.com/docs/api-reference/chat>
 - DeepSeek official API docs: <https://api-docs.deepseek.com/>
+- Zhipu GLM official site: <https://open.bigmodel.cn/>
 - DashScope OpenAI-compatible mode: <https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope>
 - Moonshot / Kimi official compatibility docs: <https://platform.moonshot.ai/docs/guide/compatibility>
 - Anthropic official Messages API: <https://docs.anthropic.com/en/api/messages>

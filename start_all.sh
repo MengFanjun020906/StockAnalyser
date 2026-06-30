@@ -169,7 +169,7 @@ start_backend() {
     nohup env \
       AGENT_MODE="${AGENT_MODE:-true}" \
       AGENT_ANALYSIS_MODE="${AGENT_ANALYSIS_MODE:-planning_execute}" \
-      "$python_bin" main.py --serve-only --host "$BACKEND_HOST" --port "$BACKEND_PORT" \
+      "$python_bin" -m uvicorn server:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" \
       >"$BACKEND_LOG" 2>&1 &
     printf '%s\n' "$!" > "$BACKEND_PID_FILE"
   )

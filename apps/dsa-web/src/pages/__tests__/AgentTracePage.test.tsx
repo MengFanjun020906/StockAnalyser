@@ -340,6 +340,63 @@ describe('AgentTracePage', () => {
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
   });
 
+  it('continues a local history trace from the history row button', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb');
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        content: '历史继续后的结论',
+        tool_calls: [],
+        stock_selection: { enabled: true, success: true },
+      },
+    ]));
+    window.localStorage.setItem('dsa.agentTrace.history.v1', JSON.stringify([
+      {
+        id: 'trace-row-old',
+        createdAt: '2026-06-15T10:00:00.000Z',
+        message: '历史选股问题',
+        stockCode: '',
+        accountId: 9,
+        status: 'error',
+        result: {
+          success: false,
+          session_id: 'trace-row-old',
+          content: '',
+          error: 'interrupted',
+          total_steps: 3,
+          total_tokens: 0,
+          provider: 'agent',
+          model: '',
+          mode: 'planning_execute',
+          events: [],
+          tool_calls: [],
+          planner: { intent: 'watchlist_scan' },
+          context_summary: { account_count: 0, position_count: 0 },
+          stock_selection: { enabled: true, success: false },
+        },
+      },
+    ]));
+
+    renderPage();
+
+    expect(await screen.findByText('历史')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^继续$/ }));
+
+    await waitFor(() => {
+      expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        session_id: 'trace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        resume_from_session_id: 'trace-row-old',
+        message: '历史选股问题',
+        account_id: 9,
+      }));
+    });
+    expect(await screen.findByText('历史继续后的结论')).toBeInTheDocument();
+    vi.spyOn(crypto, 'randomUUID').mockRestore();
+  });
+
   it('loads a completed trace from backend artifact when URL session is not in local history', async () => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
@@ -381,6 +438,71 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('已从后端加载 Trace')).toBeInTheDocument();
     expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-remote');
     expect(JSON.parse(window.localStorage.getItem('dsa.agentTrace.history.v1') || '[]')[0].id).toBe('trace-remote');
+  });
+
+  it('continues a loaded trace by passing the source session id to trace stream', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'expert_graph' } });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-half-done',
+      createdAt: '2026-06-15T19:21:53',
+      message: '帮我选一下可以入手的股票',
+      stockCode: '',
+      accountId: null,
+      status: 'error',
+      result: {
+        success: false,
+        session_id: 'trace-half-done',
+        content: '',
+        error: 'interrupted',
+        total_steps: 52,
+        total_tokens: 0,
+        provider: 'agent',
+        model: '',
+        mode: 'planning_execute',
+        events: [{ type: 'selection_candidate_screening_done' }],
+        tool_calls: [],
+        planner: { intent: 'watchlist_scan' },
+        context_summary: { account_count: 0, position_count: 0, investor: { risk_preference: 'balanced' } },
+        stock_selection: { enabled: true, success: false, selection_context: { stages: {} } },
+        risk_gate: null,
+        artifact_dir: '/tmp/trace-half-done',
+        runtime_config: { agent_orchestration_mode: 'expert_graph' },
+      },
+    });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'selection_resume_loaded',
+        session_id: 'trace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        message: '已找到历史 Trace，可继续运行',
+        payload: { source_run_id: 'trace-half-done', resumable_stages: [] },
+      },
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        content: '继续运行后的结论',
+        tool_calls: [],
+        stock_selection: { enabled: true, success: true },
+      },
+    ]));
+
+    renderPage('/agent-trace/trace-half-done');
+
+    expect(await screen.findByText('已从后端加载失败记录')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /继续此 Trace/ }));
+
+    await waitFor(() => {
+      expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+        session_id: 'trace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        resume_from_session_id: 'trace-half-done',
+        message: '帮我选一下可以入手的股票',
+        candidate_discovery_mode: 'thesis_desk_committee',
+      }));
+    });
+    expect(await screen.findByText('继续运行后的结论')).toBeInTheDocument();
+    vi.spyOn(crypto, 'randomUUID').mockRestore();
   });
 
   it('does not show OK for get_capital_flow events without explicit success', async () => {
@@ -1007,7 +1129,6 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('测试一').length).toBeGreaterThan(0);
     expect(screen.getAllByText('301183').length).toBeGreaterThan(0);
     expect(screen.getAllByText('东田微').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('92.5').length).toBeGreaterThan(0);
     expect(screen.getAllByText('共振 +7.05').length).toBeGreaterThan(0);
     expect(screen.getAllByText('新进入').length).toBeGreaterThan(0);
     expect(screen.getAllByText('存在反证').length).toBeGreaterThan(0);
@@ -1615,7 +1736,7 @@ describe('AgentTracePage', () => {
                 ],
                 seed_pool_summary: {
                   seed_count: 20,
-                  total_limit: 20,
+                  total_limit: 12,
                   seed_sources: { daily_screener: 12, alphasift: 8 },
                   signal_dimensions: { technical: 11, fundamental: 4 },
                   preview: [
@@ -1659,9 +1780,18 @@ describe('AgentTracePage', () => {
                         elapsed_ms: 1000,
                         candidates: [],
                         rejected: [],
-                        tool_calls: [],
-                        diagnostics: [{ source: 'desk_single_seed_timeout', status: 'timeout', code: '600003' }],
-                        errors: ['momentum_desk seed 600003 timeout after 1.0s'],
+                        tool_calls: [{ tool: 'analyze_trend', status: 'requested_before_timeout', stock_code: '600003' }],
+                        diagnostics: [
+                          {
+                            source: 'desk_single_seed_timeout',
+                            status: 'timeout',
+                            code: '600003',
+                            reason: 'LLM 已返回工具调用，但工具执行未在行级超时前完成；pending_tools=["analyze_trend"]',
+                          },
+                        ],
+                        errors: [
+                          'momentum_desk seed 600003 timeout after 1.0s: LLM 已返回工具调用，但工具执行未在行级超时前完成；pending_tools=["analyze_trend"]',
+                        ],
                       },
                     ],
                     diagnostics: [],
@@ -1694,16 +1824,17 @@ describe('AgentTracePage', () => {
     fireEvent.change(promptInput, { target: { value: '帮我选一下下周可以入手的股票' } });
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
-    expect(await screen.findByText('P4 三席位可观察性')).toBeInTheDocument();
-    expect(screen.getByText('Seed 20 / 20')).toBeInTheDocument();
-    expect(screen.getByText('Seed Preview (2)')).toBeInTheDocument();
+    expect(await screen.findByText('P4 四席位可观察性')).toBeInTheDocument();
+    expect(screen.getByText('Seed 20')).toBeInTheDocument();
+    expect(screen.getByText('Seed Preview (2 / 20)')).toBeInTheDocument();
     expect(screen.getByText('低位启动席')).toBeInTheDocument();
     expect(screen.getByText('动量席')).toBeInTheDocument();
     expect(screen.getByText('质量修复席')).toBeInTheDocument();
     expect(screen.getByText('低位启动确认')).toBeInTheDocument();
     expect(screen.getByText('动量仍在')).toBeInTheDocument();
     expect(screen.getByText('600003')).toBeInTheDocument();
-    expect(screen.getByText('momentum_desk seed 600003 timeout after 1.0s')).toBeInTheDocument();
+    expect(document.body.textContent).toContain('seed 600003 timeout after 1.0s');
+    expect(document.body.textContent).toContain('LLM 已返回工具调用');
     expect(screen.getByText('本席位未输出候选。')).toBeInTheDocument();
   });
 
@@ -1743,6 +1874,67 @@ describe('AgentTracePage', () => {
         candidate_discovery_mode: 'thesis_desk_committee',
       }));
     });
+  });
+
+  it('renders LLM telemetry and judge sanity observability from trace result', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([
+      {
+        type: 'done',
+        success: true,
+        session_id: 'trace-observability',
+        content: '选股结论',
+        error: null,
+        total_steps: 0,
+        total_tokens: 0,
+        provider: 'agent',
+        model: 'mimo-v2.5',
+        mode: 'planning_execute',
+        tool_calls: [],
+        agent_user_context: { report: { intent: 'watchlist_scan', analysis_mode: 'planning_execute' } },
+        context_summary: { account_count: 0, position_count: 0, accounts: [], investor: null },
+        llm_telemetry: {
+          total_calls: 7,
+          total_tokens: 12345,
+          failed_calls: 0,
+          total_latency_ms: 2450,
+          estimated_cost: 0.012345,
+          by_stage: [
+            { stage: 'candidate_screening', calls: 1, total_tokens: 1200, failed_calls: 0 },
+            { stage: 'judge_decision', calls: 1, total_tokens: 1800, failed_calls: 0 },
+          ],
+        },
+        judge_sanity: {
+          final_action: 'watch',
+          primary_plan_verdict: 'downgraded',
+          decision_summary: '等待回踩确认。',
+          check_count: 1,
+          required_change_count: 1,
+          sanity_checks: [
+            {
+              rule_id: 'open_without_position_plan',
+              action: 'downgrade',
+              from_action: 'open',
+              to_action: 'watch',
+              reason: '缺少明确入场条件。',
+            },
+          ],
+        },
+        artifact_dir: '/tmp/trace-observability',
+      },
+    ]));
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
+
+    expect(await screen.findByText('可观测性')).toBeInTheDocument();
+    expect(screen.getByText('LLM 调用')).toBeInTheDocument();
+    expect(screen.getByText('12,345')).toBeInTheDocument();
+    expect(screen.getByText('candidate_screening')).toBeInTheDocument();
+    expect(screen.getByText('judge_decision')).toBeInTheDocument();
+    expect(screen.getByText('Judge Sanity')).toBeInTheDocument();
+    expect(screen.getByText('open_without_position_plan')).toBeInTheDocument();
+    expect(screen.getByText('等待回踩确认。')).toBeInTheDocument();
   });
 });
 

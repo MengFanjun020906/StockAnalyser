@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tests for Agent get_daily_history DB cache reuse."""
 
+import os
+import tempfile
 from datetime import date, timedelta
 from types import SimpleNamespace
 from typing import Optional
@@ -77,6 +79,19 @@ class _FakeDb:
 
 
 class DailyHistoryCacheToolTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._env_patch = patch.dict(
+            os.environ,
+            {
+                "SEQUOIA_CANDIDATE_DB_PATH": os.path.join(tempfile.gettempdir(), "missing-daily-history-cache.db"),
+                "ALPHASIFT_CANDIDATE_DB_PATH": "",
+            },
+        )
+        self._env_patch.start()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+
     def _run_with_frozen_date(self, target: date, stock_code: str, days: int):
         token = set_frozen_target_date(target)
         try:
@@ -140,7 +155,7 @@ class DailyHistoryCacheToolTest(unittest.TestCase):
 
     def test_fetches_and_persists_when_cache_is_stale(self) -> None:
         target = date(2026, 4, 24)
-        db = _FakeDb({"600519": _rows("600519", target - timedelta(days=1), 30)})
+        db = _FakeDb({"600519": _rows("600519", target - timedelta(days=10), 30)})
         df = pd.DataFrame(
             [
                 {"date": target, "open": 1, "high": 2, "low": 0.5, "close": 1.5},

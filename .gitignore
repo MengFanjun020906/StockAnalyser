@@ -74,6 +74,11 @@ verify_*.py
 /alphasift/
 /.agents/
 /skills-lock.json
+/openInvest/
+
+# Local runtime cache and stray dependencies
+/.cache/
+/node_modules/
 
 # ignore Claude workspace artifacts, but keep shared repo skills versioned
 .claude/*

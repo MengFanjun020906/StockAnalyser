@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Early-turn thesis desk expert (低位启动席)."""
+"""Reversal-structure thesis desk expert (结构反转席, code key early_turn_desk)."""
 
 from __future__ import annotations
 
@@ -21,21 +21,27 @@ EARLY_TURN_DESK_TOOLS: tuple[str, ...] = (
     "analyze_price_structure",
     "analyze_pattern",
     "calculate_ma",
+    "get_tushare_stk_factor",
     "get_volume_analysis",
     "get_capital_flow",
+    "get_tushare_moneyflow_mkt_dc",
+    "get_market_capital_flow",
+    "get_northbound_capital_flow",
+    "get_margin_trading_summary",
     "get_chip_distribution",
+    "get_symbol_regime_probability",
     "get_stock_info",
 )
 
-# FactSheet flag kinds that mark a row as early-turn eligible
-_ELIGIBLE_KINDS = {"position", "pattern", "capital"}
-_ELIGIBLE_SOURCES = {"low_base_structure", "alphasift", "sequoia"}
+# FactSheet flag/source kinds that mark a row as having explicit turn evidence.
+_TURN_EVIDENCE_KINDS = {"pattern", "capital"}
+_TURN_EVIDENCE_SOURCES = {"low_base_structure"}
 # range_pct_120 ceiling (None = data missing → eligible via fallback)
 _LOW_BASE_RANGE_PCT_MAX = 0.45
 
 
 class EarlyTurnDeskExpert(BaseDeskExpert):
-    """低位启动席 — identifies low-base stocks with an early turn signal."""
+    """结构反转席 — low range only participates with explicit turn evidence."""
 
     expert_name = "early_turn_desk"
     dimension = "early_turn"
@@ -72,34 +78,43 @@ class EarlyTurnDeskExpert(BaseDeskExpert):
         self._low_base_range_pct_max = low_base_range_pct_max
 
     def _filter_eligible_rows(self, rows: List[FeatureRow]) -> List[FeatureRow]:
-        """Eligibility: low-base position OR low-base-type source flag OR fallback."""
+        """Eligibility: range_pct_120 low AND explicit turn evidence.
+
+        Low position alone no longer qualifies.  The code key stays
+        early_turn_desk for compatibility, while the business role is
+        reversal_structure_desk.
+        """
         primary: List[FeatureRow] = []
-        fallback_candidates: List[FeatureRow] = []
 
         for row in rows:
             fs = row.fact_sheet
-            # Criterion 1: position low by FactSheet range
-            if fs is not None and fs.range_pct_120 is not None:
-                if fs.range_pct_120 <= self._low_base_range_pct_max:
-                    primary.append(row)
-                    continue
-
-            # Criterion 2: has low-base source or position/pattern/capital flag
-            sources = set(row.recall_sources)
-            if sources & _ELIGIBLE_SOURCES:
-                primary.append(row)
-                continue
-            flag_kinds = {f.kind for f in row.flags}
-            if flag_kinds & _ELIGIBLE_KINDS:
-                primary.append(row)
-                continue
-
-            # Criterion 3: range_pct_120 missing → data gap, keep as fallback
             if fs is None or fs.range_pct_120 is None:
-                fallback_candidates.append(row)
+                continue
+            if fs.range_pct_120 > self._low_base_range_pct_max:
+                continue
 
-        if primary:
-            return primary
+            sources = set(row.recall_sources)
+            flag_kinds = {f.kind for f in row.flags}
+            has_turn_evidence = bool(
+                sources & _TURN_EVIDENCE_SOURCES
+                or flag_kinds & _TURN_EVIDENCE_KINDS
+            )
+            if has_turn_evidence:
+                primary.append(row)
 
-        # Nothing passed primary filters → use fallback supplement
-        return fallback_candidates[: self._fallback_supplement_n]
+        return primary
+
+    def _ineligible_row_reason(self, row: FeatureRow) -> str:
+        fs = row.fact_sheet
+        if fs is None or fs.range_pct_120 is None:
+            return "低位启动席需要 range_pct_120 位置分位，当前事实包缺少该字段。"
+        if fs.range_pct_120 > self._low_base_range_pct_max:
+            return (
+                "低位启动席只看低位反转，当前 range_pct_120="
+                f"{fs.range_pct_120:.3f} 高于阈值 {self._low_base_range_pct_max:.3f}。"
+            )
+        sources = set(row.recall_sources)
+        flag_kinds = {f.kind for f in row.flags}
+        if not (sources & _TURN_EVIDENCE_SOURCES or flag_kinds & _TURN_EVIDENCE_KINDS):
+            return "低位启动席要求低位且有反转证据，当前缺少 pattern/capital 或 low_base_structure 证据。"
+        return "低位启动席过滤条件未命中。"

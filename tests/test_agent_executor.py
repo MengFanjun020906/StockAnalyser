@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Keep this test runnable when optional LLM runtime deps are not installed.
 try:
     import litellm  # noqa: F401
-except ModuleNotFoundError:
+except Exception:
     sys.modules["litellm"] = MagicMock()
 try:
     import json_repair  # noqa: F401
@@ -35,7 +35,15 @@ except ModuleNotFoundError:
 
 from src.agent.executor import AgentExecutor, AgentResult, _build_context_tool_argument_guard
 from src.agent.llm_adapter import LLMResponse, ToolCall
-from src.agent.runner import parse_dashboard_json, run_agent_loop, serialize_tool_result
+from src.agent.runner import (
+    _is_failed_tool_result,
+    compact_tool_result_for_model,
+    parse_dashboard_json,
+    resolve_tool_etl_profile,
+    run_agent_loop,
+    serialize_tool_result,
+)
+from src.agent.metric_semantics import registered_metric_semantics
 from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter
 from src.schemas.agent_context import AgentUserContext, PositionContext, ReportContext
 
@@ -56,6 +64,83 @@ def _make_registry_with_echo():
         handler=lambda message: {"echo": message},
     )
     registry.register(tool)
+    return registry
+
+
+def _make_registry_with_symbol_regime():
+    registry = _make_registry_with_echo()
+    registry.register(
+        ToolDefinition(
+            name="get_symbol_regime_probability",
+            description="symbol regime probability",
+            parameters=[ToolParameter(name="stock_code", type="string", description="code")],
+            handler=lambda stock_code, **kwargs: {
+                "status": "ok",
+                "stock_code": stock_code,
+                "regime": "trending_up",
+                "sample_count": 16,
+                "windows": {"30": {"n": 16, "p_up": 0.6, "p_below_current": 0.4, "low_confidence": False}},
+                "reentry_reference": {"reentry_price": 98.5, "low_confidence": False},
+            },
+        )
+    )
+    return registry
+
+
+def _make_registry_with_theme_prefetch_tools():
+    registry = _make_registry_with_echo()
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_hot_sectors",
+            description="hot sectors",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "sectors": [
+                    {"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 92}
+                ],
+            },
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_limit_up_pool",
+            description="limit up pool",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "items": [
+                    {"code": "300001", "name": "光模块龙头", "concepts": "CPO 光模块", "limit_up_streak": 2, "bomb_num": 0}
+                ],
+            },
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_hot_sector_leaders",
+            description="hot sector leaders",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "items": [
+                    {"code": "300001", "name": "光模块龙头", "bk_name": "CPO 光模块", "rank": 1, "net_inflow": 500_000_000}
+                ],
+            },
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_stockapi_popularity_rank",
+            description="popularity rank",
+            parameters=[],
+            handler=lambda **kwargs: {
+                "status": "partial",
+                "items": [
+                    {"code": "300001", "name": "光模块龙头", "concepts": ["CPO"], "rank": 2}
+                ],
+            },
+        )
+    )
     return registry
 
 
@@ -336,6 +421,247 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(len(result.tool_calls_log), 2)
 
+    def test_large_tool_result_is_compacted_before_next_llm_turn(self):
+        """Raw OHLC arrays should stay out of the LLM-visible tool message."""
+        registry = ToolRegistry()
+        rows = [
+            {
+                "date": f"2026-01-{(idx % 28) + 1:02d}",
+                "open": 10 + idx,
+                "high": 11 + idx,
+                "low": 9 + idx,
+                "close": 10.5 + idx,
+                "volume": 100000 + idx,
+                "raw_blob": "RAW_ROW_SHOULD_NOT_REACH_MODEL_" + ("x" * 80),
+            }
+            for idx in range(240)
+        ]
+        registry.register(
+            ToolDefinition(
+                name="get_daily_history",
+                description="history",
+                parameters=[ToolParameter(name="stock_code", type="string", description="stock")],
+                handler=lambda stock_code: {
+                    "code": stock_code,
+                    "source": "unit-test",
+                    "actual_records": len(rows),
+                    "data": rows,
+                },
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Need history.",
+                tool_calls=[ToolCall(id="h1", name="get_daily_history", arguments={"stock_code": "600519"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[{"role": "user", "content": "Analyze 600519"}],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+        )
+
+        self.assertTrue(result.success)
+        second_call_messages = adapter.call_with_tools.call_args_list[1].args[0]
+        tool_message = next(msg for msg in second_call_messages if msg.get("role") == "tool")
+        visible = json.loads(tool_message["content"])
+        self.assertEqual(visible["context_policy"], "compact_tool_fact_card")
+        self.assertEqual(visible["result"]["actual_records"], 240)
+        self.assertEqual(len(visible["result"]["latest_bars"]), 8)
+        self.assertIn("close_summary", visible["result"])
+        self.assertNotIn("RAW_ROW_SHOULD_NOT_REACH_MODEL", tool_message["content"])
+        self.assertLess(len(tool_message["content"]), result.tool_calls_log[0]["result_length"])
+        self.assertEqual(result.tool_calls_log[0]["context_policy"], "compact_tool_fact_card")
+        self.assertLess(result.tool_calls_log[0]["model_result_length"], result.tool_calls_log[0]["result_length"])
+
+    def test_repeated_cached_tool_result_still_uses_compact_context(self):
+        """Cache reuse should not reintroduce raw payloads into messages."""
+        executions = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="echo",
+                description="large echo",
+                parameters=[ToolParameter(name="message", type="string", description="message")],
+                handler=lambda message: executions.append(message) or {
+                    "message": message,
+                    "items": [{"idx": idx, "blob": "RAW_CACHED_BLOB_" + ("y" * 80)} for idx in range(80)],
+                },
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="first",
+                tool_calls=[ToolCall(id="e1", name="echo", arguments={"message": "same"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content="repeat",
+                tool_calls=[ToolCall(id="e2", name="echo", arguments={"message": "same"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[{"role": "user", "content": "Analyze cached result"}],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=4,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(executions, ["same"])
+        tool_messages = [msg for msg in result.messages if msg.get("role") == "tool"]
+        self.assertEqual(len(tool_messages), 2)
+        self.assertTrue(result.tool_calls_log[1]["cached"])
+        for msg in tool_messages:
+            self.assertNotIn("RAW_CACHED_BLOB", msg["content"])
+            self.assertEqual(json.loads(msg["content"])["context_policy"], "compact_tool_fact_card")
+
+    def test_compact_failed_tool_result_still_detects_failure(self):
+        """Failure checks must inspect compact wrapper.result, not only wrapper status."""
+        compact = json.loads(
+            compact_tool_result_for_model(
+                "get_realtime_quote",
+                json.dumps({"status": "failed", "error": "quote unavailable"}),
+            )
+        )
+
+        self.assertTrue(_is_failed_tool_result(compact))
+        self.assertEqual(compact["result"]["status"], "failed")
+
+    def test_capital_flow_compact_context_keeps_only_effective_fields(self):
+        raw = {
+            "stock_code": "002156",
+            "status": "ok",
+            "query": {"start_date": None, "end_date": None, "page_no": 1, "page_size": 50},
+            "main_net_inflow": 38125300.0,
+            "main_inflow_5d": -48161100.0,
+            "main_inflow_10d": -771445800.0,
+            "net_inflow": -538865000.0,
+            "net_inflow_5d": -3548161100.0,
+            "net_inflow_10d": -7716445800.0,
+            "amount_unit": "CNY",
+            "main_inflow_definition": "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000",
+            "net_inflow_definition": "net_mf_amount * 10000",
+            "latest_date": "2026-06-08",
+            "source_update": "tushare_moneyflow_after_market_close",
+            "source_chain": [
+                {
+                    "provider": "capital_stock:tushare_moneyflow",
+                    "result": "ok",
+                    "duration_ms": 2071,
+                }
+            ],
+            "sector_rankings": {"top_inflow_sectors": [], "top_outflow_sectors": []},
+            "error_summary": None,
+            "errors": [],
+        }
+
+        compact = json.loads(
+            compact_tool_result_for_model("get_capital_flow", json.dumps(raw, ensure_ascii=False))
+        )
+
+        self.assertEqual(
+            compact["result"],
+            {
+                "stock_code": "002156",
+                "status": "ok",
+                "main_net_inflow": 38125300.0,
+                "main_inflow_5d": -48161100.0,
+                "main_inflow_10d": -771445800.0,
+                "net_inflow": -538865000.0,
+                "net_inflow_5d": -3548161100.0,
+                "net_inflow_10d": -7716445800.0,
+                "amount_unit": "CNY",
+                "semantic_ref": "capital_flow.v1",
+                "semantic_risk_level": "P0",
+                "field_semantics": {
+                    "main_net_inflow": "主力口径=(buy_lg_amount+buy_elg_amount-sell_lg_amount-sell_elg_amount)*10000, CNY",
+                    "main_inflow_5d": "5日主力口径累计, CNY",
+                    "main_inflow_10d": "10日主力口径累计, CNY",
+                    "net_inflow": "Tushare net_mf_amount全口径主动净流入*10000, CNY; 不等于主力资金",
+                    "net_inflow_5d": "5日全口径主动净流入累计, CNY; 不等于主力资金",
+                    "net_inflow_10d": "10日全口径主动净流入累计, CNY; 不等于主力资金",
+                },
+                "main_inflow_definition": "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000",
+                "net_inflow_definition": "net_mf_amount * 10000",
+                "latest_date": "2026-06-08",
+            },
+        )
+        visible = json.dumps(compact["result"], ensure_ascii=False)
+        self.assertNotIn("query", visible)
+        self.assertNotIn("source_chain", visible)
+        self.assertNotIn("source_update", visible)
+        self.assertIn("不等于主力资金", visible)
+
+    def test_metric_semantics_registry_only_injects_visible_high_risk_fields(self):
+        compact = json.loads(
+            compact_tool_result_for_model(
+                "get_chip_distribution",
+                json.dumps(
+                    {
+                        "stock_code": "002156",
+                        "status": "ok",
+                        "profit_ratio": 0.115,
+                        "avg_cost": 67.26,
+                        "source_chain": [{"provider": "mock"}],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+
+        result = compact["result"]
+        self.assertEqual(result["semantic_ref"], "chip_distribution.v1")
+        self.assertEqual(result["semantic_risk_level"], "P0")
+        self.assertEqual(
+            sorted(result["field_semantics"].keys()),
+            ["avg_cost", "profit_ratio"],
+        )
+        self.assertIn("缺失时不能估算", json.dumps(result["field_semantics"], ensure_ascii=False))
+        self.assertNotIn("source_chain", json.dumps(result, ensure_ascii=False))
+
+    def test_metric_semantics_registry_is_intentionally_sparse(self):
+        specs = registered_metric_semantics()
+
+        self.assertIn("get_capital_flow", specs)
+        self.assertIn("get_chip_distribution", specs)
+        self.assertLessEqual(len(specs), 6)
+
+    def test_all_registered_tools_have_explicit_etl_profile(self):
+        from src.agent.factory import get_tool_registry
+
+        registry = get_tool_registry()
+        profiles = {
+            tool.name: resolve_tool_etl_profile(tool.name)
+            for tool in registry.list_tools()
+        }
+
+        missing = sorted(name for name, profile in profiles.items() if profile == "generic")
+        self.assertEqual(missing, [])
+        self.assertGreaterEqual(len(profiles), 70)
+
     def test_max_steps_exceeded(self):
         """Agent keeps calling tools until max_steps is hit."""
         registry = _make_registry_with_echo()
@@ -590,8 +916,8 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertFalse(result.tool_calls_log[0]["success"])
         self.assertIn("capital flow fetch failed", result.tool_calls_log[0]["result_preview"])
 
-    def test_tool_result_with_errors_but_partial_data_is_logged_as_failure(self):
-        """Any explicit errors in tool payloads should mark the call failed."""
+    def test_tool_result_with_errors_but_partial_data_is_logged_as_success(self):
+        """Partial payloads with usable data keep errors as diagnostics."""
         def _partial_with_errors():
             return {
                 "stock_code": "600519",
@@ -637,7 +963,7 @@ class TestAgentExecutor(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(len(result.tool_calls_log), 1)
-        self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertTrue(result.tool_calls_log[0]["success"])
 
     def test_not_supported_tool_result_is_not_logged_as_failure(self):
         """Unsupported-but-valid tool payloads remain visible without being treated as crashes."""
@@ -969,6 +1295,115 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertTrue(result.tool_calls_log[0].get("timeout"))
         self.assertEqual(result.tool_calls_log[0]["arguments"]["message"], "slow")
 
+    def test_heavy_diagnostic_tool_gets_runner_timeout_floor(self):
+        """Known heavy tools should return structured diagnostics instead of runner shell timeout."""
+        registry = ToolRegistry()
+
+        def _regime_tool(market="cn", persist=True):
+            time.sleep(0.05)
+            return {
+                "status": "stale_fallback",
+                "market": market,
+                "regime": "high_volatility",
+                "persisted": bool(persist),
+                "component_diagnostics": {"market_history": {"status": "timeout"}},
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="detect_market_regime",
+                description="Detect market regime",
+                parameters=[],
+                handler=_regime_tool,
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gathering regime.",
+                tool_calls=[ToolCall(id="regime", name="detect_market_regime", arguments={"market": "cn", "persist": True})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Analyze"},
+            ],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+            tool_call_timeout_seconds=0.01,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertFalse(result.tool_calls_log[0].get("timeout"))
+        self.assertTrue(result.tool_calls_log[0]["success"])
+        self.assertIn("stale_fallback", result.tool_calls_log[0]["result_preview"])
+
+    def test_capital_flow_gets_runner_timeout_floor(self):
+        """Capital-flow should return its own timeout/fallback diagnostics."""
+        registry = ToolRegistry()
+
+        def _capital_flow_tool(stock_code="600519"):
+            time.sleep(0.05)
+            return {
+                "stock_code": stock_code,
+                "status": "failed",
+                "source_chain": [{"provider": "capital_stock:tushare_moneyflow_dc", "result": "failed"}],
+                "errors": ["tushare_moneyflow_dc:timeout:budget_exhausted"],
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="get_capital_flow",
+                description="Get capital flow",
+                parameters=[],
+                handler=_capital_flow_tool,
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gathering capital flow.",
+                tool_calls=[ToolCall(id="flow", name="get_capital_flow", arguments={"stock_code": "603667"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Analyze"},
+            ],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+            tool_call_timeout_seconds=0.01,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertFalse(result.tool_calls_log[0].get("timeout"))
+        self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertIn("tushare_moneyflow_dc:timeout", result.tool_calls_log[0]["result_preview"])
+
     def test_llm_call_receives_remaining_timeout_budget(self):
         """LLM tool calls should receive the remaining wall-clock budget."""
         registry = _make_registry_with_echo()
@@ -1182,6 +1617,115 @@ class TestBuildUserMessage(unittest.TestCase):
         prompt = adapter.call_with_tools.call_args.args[0][0]["content"]
         self.assertIn("Planning -> Execute", prompt)
         self.assertIn("账户", prompt)
+
+    def test_single_stock_planning_run_prefetches_symbol_regime_probability(self):
+        registry = _make_registry_with_symbol_regime()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            )
+        )
+
+        result = executor.run(
+            "600519 可以买吗",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        user_message = adapter.call_with_tools.call_args.args[0][1]["content"]
+        self.assertIn("单股 Regime 概率证据", user_message)
+        self.assertIn('"stock_code": "600519"', user_message)
+        self.assertEqual(result.tool_calls_log[0]["tool"], "get_symbol_regime_probability")
+        self.assertTrue(result.tool_calls_log[0]["prefetch"])
+
+    def test_single_stock_planning_run_prefetches_theme_profile(self):
+        registry = _make_registry_with_theme_prefetch_tools()
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.return_value = LLMResponse(
+            content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+            tool_calls=[],
+            usage={"total_tokens": 50},
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="300001",
+                target_symbols=["300001"],
+            )
+        )
+
+        result = executor.run(
+            "300001 可以买吗",
+            context={"stock_code": "300001", "stock_name": "光模块龙头", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        user_message = adapter.call_with_tools.call_args.args[0][1]["content"]
+        self.assertIn("单股主线动量分型证据", user_message)
+        self.assertIn('"symbol": "300001"', user_message)
+        self.assertIn('"stock_role": "core_leader"', user_message)
+        self.assertIn('"chase_permission": "conditional_only"', user_message)
+        prefetch_tools = [call["tool"] for call in result.tool_calls_log if call.get("prefetch")]
+        self.assertIn("get_stockapi_hot_sectors", prefetch_tools)
+        self.assertIn("get_stockapi_limit_up_pool", prefetch_tools)
+        self.assertIn("get_stockapi_hot_sector_leaders", prefetch_tools)
+        self.assertIn("get_stockapi_popularity_rank", prefetch_tools)
+
+    def test_watchlist_scan_does_not_prefetch_symbol_regime_probability(self):
+        registry = _make_registry_with_symbol_regime()
+        adapter = _make_mock_adapter()
+        adapter.call_text.return_value = LLMResponse(
+            content='{"stage":"candidate_discovery","status":"failed","summary":{},"full":{"candidates":[]}}',
+            provider="openai",
+        )
+        executor = AgentExecutor(registry, adapter, max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+                target_symbols=[],
+            )
+        )
+
+        result = executor._run_loop(
+            messages=[],
+            tool_decls=[],
+            parse_dashboard=False,
+            original_task="帮我选股",
+            context={"agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertFalse(any(call.get("tool") == "get_symbol_regime_probability" for call in result.tool_calls_log))
+
+    def test_watchlist_scan_does_not_prefetch_single_stock_theme_profile(self):
+        registry = _make_registry_with_theme_prefetch_tools()
+        executor = AgentExecutor(registry, _make_mock_adapter(), max_steps=2)
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="watchlist_scan",
+                target_symbols=[],
+            )
+        )
+
+        prefetch = executor._prefetch_single_symbol_regime_context({"agent_user_context": context})
+
+        self.assertEqual(prefetch, {})
 
     def test_chat_uses_planning_system_prompt_when_context_requests_it(self):
         registry = _make_registry_with_echo()

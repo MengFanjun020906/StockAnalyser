@@ -41,6 +41,7 @@ from src.agent.protocols import (
     normalize_decision_signal,
 )
 from src.agent.runner import parse_dashboard_json
+from src.agent.fact_guard import sanitize_dashboard_facts
 from src.agent.tools.registry import ToolRegistry
 from src.config import AGENT_MAX_STEPS_DEFAULT
 from src.report_language import normalize_report_language
@@ -402,6 +403,8 @@ class AgentOrchestrator:
             run_id=context.get("session_id") or "selection-run",
             orchestration_mode=getattr(self.config, "agent_orchestration_mode", "legacy"),
             candidate_discovery_mode=context.get("candidate_discovery_mode"),
+            resume_artifact_dir=context.get("stock_selection_resume_artifact_dir"),
+            resume_from_run_id=context.get("resume_from_session_id"),
         )
         return AgentResult(
             success=selection.success,
@@ -1085,6 +1088,13 @@ class AgentOrchestrator:
         payload["key_points"] = key_points
         payload["risk_warning"] = risk_warning
         payload["dashboard"] = dashboard_block
+        payload, warnings = sanitize_dashboard_facts(payload, ctx)
+        if warnings:
+            logger.warning(
+                "[FactGuard] sanitized %s unverified or invalid dashboard facts for %s",
+                len(warnings),
+                ctx.stock_code,
+            )
         return payload
 
     def _collect_key_levels(
@@ -1120,6 +1130,7 @@ class AgentOrchestrator:
         """Build a lightweight data_perspective block from cached market data."""
         realtime = ctx.get_data("realtime_quote")
         chip = ctx.get_data("chip_distribution")
+        capital = ctx.get_data("capital_flow")
         trend = ctx.get_data("trend_result")
         technical = self._latest_opinion(ctx, {"technical"})
         tech_raw = technical.raw_data if technical and isinstance(technical.raw_data, dict) else {}
@@ -1187,6 +1198,22 @@ class AgentOrchestrator:
                 "avg_cost": chip.get("avg_cost", "N/A"),
                 "concentration": concentration if concentration is not None else "N/A",
                 "chip_health": chip.get("chip_health", "一般"),
+                "source": chip.get("source") or _source_chain_label(chip.get("source_chain")),
+            }
+
+        if isinstance(capital, dict):
+            data_perspective["capital_flow"] = {
+                "main_net_inflow": capital.get("main_net_inflow", "N/A"),
+                "main_inflow_5d": capital.get("main_inflow_5d", capital.get("inflow_5d", "N/A")),
+                "main_inflow_10d": capital.get("main_inflow_10d", capital.get("inflow_10d", "N/A")),
+                "net_inflow": capital.get("net_inflow", "N/A"),
+                "net_inflow_5d": capital.get("net_inflow_5d", "N/A"),
+                "net_inflow_10d": capital.get("net_inflow_10d", "N/A"),
+                "latest_date": capital.get("latest_date", "N/A"),
+                "amount_unit": capital.get("amount_unit", "CNY"),
+                "main_inflow_definition": capital.get("main_inflow_definition"),
+                "net_inflow_definition": capital.get("net_inflow_definition"),
+                "source": _source_chain_label(capital.get("source_chain")),
             }
 
         return data_perspective
@@ -1643,6 +1670,21 @@ def _truncate_text(text: Any, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _source_chain_label(source_chain: Any) -> str:
+    if not isinstance(source_chain, list):
+        return "N/A"
+    providers: List[str] = []
+    for item in source_chain:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("result") or item.get("status") or "").lower() != "ok":
+            continue
+        provider = str(item.get("provider") or "").strip()
+        if provider and provider not in providers:
+            providers.append(provider)
+    return " -> ".join(providers) if providers else "N/A"
 
 
 def _extract_latest_news_title(intelligence: Dict[str, Any]) -> str:

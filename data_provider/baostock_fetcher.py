@@ -18,7 +18,7 @@ import logging
 import re
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, Generator
+from typing import Any, Optional, Generator
 
 import pandas as pd
 from tenacity import (
@@ -270,6 +270,67 @@ class BaostockFetcher(BaseFetcher):
         df = df[existing_cols]
         
         return df
+
+    def get_minute_k_data(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        *,
+        frequency: str = "5",
+        adjustflag: str = "3",
+    ) -> pd.DataFrame:
+        """Fetch A-share historical minute bars from baostock.
+
+        Baostock supports minute frequencies 5/15/30/60 for stocks. Minute
+        bars do not include index data, so callers should pass final-report
+        stock symbols only.
+        """
+        normalized_frequency = str(frequency or "5")
+        if normalized_frequency not in {"5", "15", "30", "60"}:
+            raise DataFetchError(f"Baostock 分钟线 frequency 只支持 5/15/30/60，当前为 {frequency}")
+
+        if _is_us_code(stock_code):
+            raise DataFetchError(f"BaostockFetcher 不支持美股 {stock_code}")
+        if _is_hk_market(stock_code):
+            raise DataFetchError(f"BaostockFetcher 不支持港股 {stock_code}")
+        if is_bse_code(stock_code):
+            raise DataFetchError(f"BaostockFetcher 不支持北交所 {stock_code}")
+
+        bs_code = self._convert_stock_code(stock_code)
+        fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
+        logger.debug(
+            "调用 Baostock query_history_k_data_plus(%s, %s, %s, frequency=%s, adjustflag=%s)",
+            bs_code,
+            start_date,
+            end_date,
+            normalized_frequency,
+            adjustflag,
+        )
+
+        with self._baostock_session() as bs:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                fields,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=normalized_frequency,
+                adjustflag=str(adjustflag or "3"),
+            )
+            if rs.error_code != "0":
+                raise DataFetchError(f"Baostock 分钟线查询失败: {rs.error_msg}")
+
+            data_list: list[list[Any]] = []
+            while rs.next():
+                data_list.append(rs.get_row_data())
+            if not data_list:
+                return pd.DataFrame(columns=rs.fields)
+
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            for column in ("open", "high", "low", "close", "volume", "amount"):
+                if column in df.columns:
+                    df[column] = pd.to_numeric(df[column], errors="coerce")
+            return df
 
     def get_stock_name(self, stock_code: str) -> Optional[str]:
         """

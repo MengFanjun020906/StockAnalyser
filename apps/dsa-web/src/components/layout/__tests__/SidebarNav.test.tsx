@@ -72,6 +72,17 @@ describe('SidebarNav', () => {
     expect(screen.getByRole('link', { name: '链路' })).toHaveAttribute('href', '/agent-trace');
   });
 
+  it('replaces the candidate-pool navigation item with entry backtests', () => {
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: '入场' })).toHaveAttribute('href', '/agent-entry-execution-backtests');
+    expect(screen.queryByRole('link', { name: '候选池' })).not.toBeInTheDocument();
+  });
+
   it('opens the logout confirmation and confirms logout', async () => {
     render(
       <MemoryRouter initialEntries={['/chat']}>

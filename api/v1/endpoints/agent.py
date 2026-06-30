@@ -20,6 +20,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
+from src.agent.llm_telemetry import llm_telemetry_scope
 from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
 from src.schemas.agent_signal import TradeAction, TradePlan
 from src.services.agent_model_service import list_agent_model_deployments
@@ -109,6 +110,7 @@ class AgentTraceRunRequest(BaseModel):
     default_stop_loss_pct: Optional[float] = Field(default=None, ge=0, le=100)
     investor_notes: Optional[str] = None
     candidate_discovery_mode: Optional[Literal["deterministic", "llm_expert_committee", "thesis_desk_committee"]] = None
+    resume_from_session_id: Optional[str] = None
 
     @property
     def effective_skills(self) -> Optional[List[str]]:
@@ -133,6 +135,8 @@ class AgentTraceRunResponse(BaseModel):
     debate: Optional[Dict[str, Any]] = None
     stock_selection: Optional[Dict[str, Any]] = None
     risk_gate: Optional[Dict[str, Any]] = None
+    llm_telemetry: Optional[Dict[str, Any]] = None
+    judge_sanity: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
     runtime_config: Optional[Dict[str, Any]] = None
 
@@ -365,7 +369,7 @@ def _infer_stock_code_from_message(message: str) -> str:
     import re
 
     patterns = [
-        r"\b(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ|SS))?\b",
+        r"(?<!\d)(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ|SS))?(?!\d)",
         r"\bHK\s?(\d{1,5})\b",
         r"\b(\d{5})\.HK\b",
         r"\b([A-Z]{1,5}(?:\.[A-Z])?)\b",
@@ -389,6 +393,16 @@ def _build_trace_context(
     config: Any,
 ) -> Dict[str, Any]:
     context = dict(request.context or {})
+    resume_session_id = _normalize_trace_session_id(request.resume_from_session_id)
+    if resume_session_id:
+        resume_artifact_dir = _find_trace_artifact_dir(resume_session_id)
+        if resume_artifact_dir is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "resume_trace_not_found", "message": f"未找到可继续运行的 Trace {resume_session_id}"},
+            )
+        context["resume_from_session_id"] = resume_session_id
+        context["stock_selection_resume_artifact_dir"] = str(resume_artifact_dir)
     stock_code = (request.stock_code or context.get("stock_code") or _infer_stock_code_from_message(request.message) or "").strip()
     if stock_code:
         context["stock_code"] = stock_code
@@ -474,6 +488,21 @@ def _normalize_injected_report_intent(agent_user_context: Any, *, stock_code: st
     if isinstance(report, dict):
         primary_symbol = report.get("primary_symbol")
     target = str(stock_code or primary_symbol or (target_symbols[0] if target_symbols else "") or "").strip()
+    if stock_code:
+        target = stock_code
+        if stock_code not in target_symbols:
+            target_symbols.insert(0, stock_code)
+        else:
+            target_symbols = [stock_code] + [symbol for symbol in target_symbols if symbol != stock_code]
+        if isinstance(report, dict):
+            report["primary_symbol"] = stock_code
+            report["target_symbols"] = target_symbols
+        else:
+            try:
+                setattr(report, "primary_symbol", stock_code)
+                setattr(report, "target_symbols", target_symbols)
+            except Exception:
+                logger.debug("Agent trace report target normalization skipped")
     positions = getattr(agent_user_context, "positions", []) or []
     has_position = bool(target and hasattr(agent_user_context, "has_position_for") and agent_user_context.has_position_for(target))
     has_any_position = any(getattr(position, "quantity", 0) for position in positions)
@@ -495,12 +524,18 @@ def _should_override_injected_report_intent(intent_resolution: TraceIntentResolu
     """Only override portfolio-derived intent when the user or classifier said so.
 
     Portfolio context can already resolve a holding review from real positions.
-    A classifier failure falls back to a generic default; that default must not
-    overwrite an injected ``position_review`` context.
+    A classifier failure can still fall back to a deterministic explicit
+    watchlist request; that user intent must override an injected
+    ``position_review`` context, otherwise the staged stock-selection pipeline
+    never starts.
     """
     return bool(
         intent_resolution.get("requested_intent")
         or (intent_resolution.get("source") == "mimo" and intent_resolution.get("classifier_success"))
+        or (
+            intent_resolution.get("intent") == "watchlist_scan"
+            and intent_resolution.get("explicit_watchlist_request")
+        )
     )
 
 
@@ -896,6 +931,13 @@ def _find_trace_artifact_dir(session_id: str) -> Optional[Path]:
     return max(matches, key=lambda path: path.stat().st_mtime)
 
 
+def _normalize_trace_session_id(session_id: Optional[str]) -> str:
+    normalized = str(session_id or "").strip()
+    if not normalized:
+        return ""
+    return normalized if normalized.startswith("trace-") else f"trace-{normalized}"
+
+
 def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, Any]:
     summary = _read_trace_json_file(path / "summary.json", {}) or {}
     request_payload = _read_trace_json_file(path / "request.json", {}) or {}
@@ -910,6 +952,8 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
     stock_selection = _read_trace_json_file(path / "stock_selection.json", None)
     risk_gate = _read_trace_json_file(path / "risk_gate.json", summary.get("risk_gate"))
     debate = _read_trace_json_file(path / "debate.json", None)
+    llm_telemetry = _read_trace_json_file(path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(path)
+    judge_sanity = _read_trace_json_file(path / "judge_sanity.json", None) or _build_judge_sanity_summary(stock_selection)
     events = _read_trace_events(path / "events.ndjson")
     agent_user_context = context_payload.get("agent_user_context") if isinstance(context_payload, dict) else None
     context_summary = (
@@ -934,6 +978,8 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
         "debate": debate,
         "stock_selection": stock_selection,
         "risk_gate": risk_gate,
+        "llm_telemetry": llm_telemetry,
+        "judge_sanity": judge_sanity,
         "artifact_dir": str(path),
         "runtime_config": None,
     }
@@ -1036,6 +1082,8 @@ def _planner_to_todo_md(
         f"- [x] intent: {planner.get('intent') or '-'}",
         f"- [x] primary_symbol: {planner.get('primary_symbol') or '-'}",
         f"- [x] has_position: {planner.get('has_position')}",
+        f"- [x] main_dimension: {planner.get('main_dimension') or '-'}",
+        f"- [x] supporting_dimensions: {', '.join(str(item) for item in planner.get('supporting_dimensions') or []) or '-'}",
         f"- [x] expected_output: {planner.get('expected_output') or '-'}",
         f"- [x] context_accounts: {account_count if account_count is not None else '-'}",
         f"- [x] context_positions: {position_count if position_count is not None else '-'}",
@@ -1047,11 +1095,30 @@ def _planner_to_todo_md(
             f"- [x] target_position_pct: {target_position.get('position_pct') or '-'}",
         ])
 
+    lines.extend(["", "## 初始假设"])
+    hypotheses = planner.get("hypotheses") or []
+    if hypotheses:
+        for hypothesis in hypotheses:
+            if isinstance(hypothesis, dict):
+                lines.append(f"- [ ] {hypothesis.get('id') or '-'}: {hypothesis.get('text') or '-'}")
+            else:
+                lines.append(f"- [ ] {hypothesis}")
+    else:
+        lines.append("- [ ] 无初始假设")
+
     lines.extend(["", "## 维度计划"])
+    main_dimension = planner.get("main_dimension")
     for capability in planner.get("capabilities") or []:
-        lines.append(f"- [x] capability={capability}")
+        role = "主维度" if capability == main_dimension else "辅助维度"
+        lines.append(f"- [x] {role}: capability={capability}")
     if not planner.get("capabilities"):
         lines.append("- [ ] 无能力域")
+    skipped_dimensions = planner.get("skipped_dimensions") or []
+    for item in skipped_dimensions:
+        if isinstance(item, dict):
+            lines.append(f"- [x] 可省略维度: capability={item.get('capability') or '-'} reason={item.get('reason') or '-'}")
+        else:
+            lines.append(f"- [x] 可省略维度: {item}")
 
     lines.extend(["", "## 工具计划"])
     if tool_plan:
@@ -1061,7 +1128,14 @@ def _planner_to_todo_md(
             tools = ", ".join(str(tool) for tool in item.get("tools") or []) or "-"
             missing = ", ".join(str(tool) for tool in item.get("missing_tools") or []) or "-"
             purpose = item.get("purpose") or "-"
-            lines.append(f"- [ ] capability={item.get('capability') or '-'} -> tools=[{tools}] -> purpose={purpose}")
+            lines.append(
+                f"- [ ] capability={item.get('capability') or '-'} -> tools=[{tools}] "
+                f"-> purpose={purpose}"
+            )
+            lines.append(f"  expected_result={item.get('expected_result') or '-'}")
+            lines.append(f"  downstream_use={item.get('downstream_use') or '-'}")
+            lines.append(f"  fallback_on_failure={item.get('fallback_on_failure') or '-'}")
+            lines.append(f"  next_step={item.get('next_step') or '-'}")
             if missing != "-":
                 lines.append(f"  missing_tools=[{missing}]")
     else:
@@ -1078,6 +1152,35 @@ def _planner_to_todo_md(
     if missing_tools:
         lines.extend(["", "## 缺失工具", *[f"- [ ] {tool}" for tool in missing_tools]])
 
+    lines.extend(["", "## 执行停止条件"])
+    stop_conditions = planner.get("stop_conditions") or []
+    if stop_conditions:
+        lines.extend([f"- [ ] {condition}" for condition in stop_conditions])
+    else:
+        lines.append("- [ ] 无停止条件")
+
+    lines.extend(["", "## Replan 策略"])
+    replan_policy = planner.get("replan_policy") or {}
+    if isinstance(replan_policy, dict) and replan_policy:
+        mode = replan_policy.get("mode")
+        if mode:
+            lines.append(f"- [x] mode={mode}")
+        for title, key in (
+            ("触发条件", "trigger_conditions"),
+            ("允许动作", "allowed_actions"),
+            ("禁止动作", "forbidden_actions"),
+        ):
+            values = replan_policy.get(key) or []
+            if values:
+                lines.append(f"- [ ] {title}:")
+                lines.extend([f"  - {value}" for value in values])
+        if replan_policy.get("artifact_update"):
+            lines.append(f"- [ ] artifact_update={replan_policy.get('artifact_update')}")
+        if replan_policy.get("watchlist_note"):
+            lines.append(f"- [ ] watchlist_note={replan_policy.get('watchlist_note')}")
+    else:
+        lines.append("- [ ] 无 replan 策略")
+
     _append_execute_status_to_todo(lines, tool_plan, tool_calls or [])
 
     return "\n".join(lines) + "\n"
@@ -1089,6 +1192,7 @@ def _append_execute_status_to_todo(
     tool_calls: List[Dict[str, Any]],
 ) -> None:
     executed_tools = _summarize_executed_tools(tool_calls)
+    planned_contracts = _planned_tool_contracts(tool_plan)
     lines.extend(["", "## 执行状态"])
     if tool_calls:
         for call in tool_calls:
@@ -1109,6 +1213,13 @@ def _append_execute_status_to_todo(
             arguments = call.get("arguments")
             if arguments:
                 lines.append(f"  arguments={json.dumps(arguments, ensure_ascii=False, default=str)}")
+            contract = planned_contracts.get(str(tool_name)) if tool_name else None
+            if contract:
+                lines.append(f"  planned_capability={contract.get('capability') or '-'}")
+                lines.append(f"  expected_result={contract.get('expected_result') or '-'}")
+                lines.append(f"  downstream_use={contract.get('downstream_use') or '-'}")
+                lines.append(f"  fallback_on_failure={contract.get('fallback_on_failure') or '-'}")
+                lines.append(f"  next_step={contract.get('next_step') or '-'}")
             preview = call.get("result_preview")
             if preview:
                 lines.append(f"  result_preview={preview}")
@@ -1118,7 +1229,15 @@ def _append_execute_status_to_todo(
     planned_tools = _planned_tool_names(tool_plan)
     not_called = [tool for tool in planned_tools if tool not in executed_tools]
     if not_called:
-        lines.extend(["", "## 未调用计划工具", *[f"- [ ] {tool}" for tool in not_called]])
+        lines.extend(["", "## 未调用计划工具"])
+        for tool in not_called:
+            contract = planned_contracts.get(tool) or {}
+            suffix = f" capability={contract.get('capability')}" if contract.get("capability") else ""
+            lines.append(f"- [ ] {tool}{suffix}")
+            if contract.get("purpose"):
+                lines.append(f"  purpose={contract.get('purpose')}")
+            if contract.get("fallback_on_failure"):
+                lines.append(f"  fallback_on_failure={contract.get('fallback_on_failure')}")
 
     lines.extend(["", "## Execute Protocol 复核"])
     if tool_calls:
@@ -1128,6 +1247,27 @@ def _append_execute_status_to_todo(
         lines.append("- [x] 停止条件已复核")
     else:
         lines.append("- [ ] 等待工具执行后复核")
+
+
+def _planned_tool_contracts(tool_plan: Any) -> Dict[str, Dict[str, Any]]:
+    contracts: Dict[str, Dict[str, Any]] = {}
+    for item in tool_plan or []:
+        if not isinstance(item, dict):
+            continue
+        for tool in item.get("tools") or []:
+            name = str(tool or "").strip()
+            if not name or name in contracts:
+                continue
+            contracts[name] = {
+                "capability": item.get("capability"),
+                "purpose": item.get("purpose"),
+                "expected_result": item.get("expected_result"),
+                "downstream_use": item.get("downstream_use"),
+                "fallback_on_failure": item.get("fallback_on_failure"),
+                "next_step": item.get("next_step"),
+                "required": item.get("required"),
+            }
+    return contracts
 
 
 def _planned_tool_names(tool_plan: Any) -> List[str]:
@@ -1213,8 +1353,48 @@ def _structured_tool_payload_has_errors(payload: Any) -> bool:
         return True
     errors = payload.get("errors")
     if isinstance(errors, list):
-        return any(str(item).strip() for item in errors)
-    return bool(errors)
+        has_errors = any(str(item).strip() for item in errors)
+    else:
+        has_errors = bool(errors)
+    if has_errors:
+        return not (status in {"ok", "partial"} and _structured_tool_payload_has_effective_data(payload))
+    return False
+
+
+def _structured_tool_payload_has_effective_data(payload: Dict[str, Any]) -> bool:
+    ignored_keys = {
+        "status",
+        "errors",
+        "error",
+        "error_summary",
+        "note",
+        "message",
+        "stock_code",
+        "code",
+        "query",
+        "source_chain",
+        "amount_unit",
+        "raw_amount_unit",
+        "context_policy",
+    }
+    for key, value in payload.items():
+        if key in ignored_keys:
+            continue
+        if _structured_tool_value_has_effective_data(value):
+            return True
+    return False
+
+
+def _structured_tool_value_has_effective_data(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value == "":
+        return False
+    if isinstance(value, dict):
+        return any(_structured_tool_value_has_effective_data(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_structured_tool_value_has_effective_data(item) for item in value)
+    return True
 
 
 def _normalize_tool_call_status(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -1725,10 +1905,126 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "是", "涨停", "跌停"}
+
+
+def _read_llm_telemetry_events(path: Path, *, limit: int = 500) -> List[Dict[str, Any]]:
+    return _read_trace_events(path / "llm_usage.jsonl", limit=limit)
+
+
+def _build_llm_telemetry_summary(path: Path) -> Dict[str, Any]:
+    events = _read_llm_telemetry_events(path)
+    by_stage: Dict[str, Dict[str, Any]] = {}
+    ok_calls = 0
+    failed_calls = 0
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    total_latency_ms = 0.0
+    estimated_cost = 0.0
+
+    for event in events:
+        ok = event.get("ok") is True
+        ok_calls += 1 if ok else 0
+        failed_calls += 0 if ok else 1
+        stage = str(event.get("stage") or "unknown")
+        input_value = _to_int(event.get("input_tokens"))
+        output_value = _to_int(event.get("output_tokens"))
+        total_value = _to_int(event.get("total_tokens")) or input_value + output_value
+        latency_value = _to_float(event.get("latency_ms")) or 0.0
+        cost_value = _to_float(event.get("estimated_cost")) or 0.0
+        input_tokens += input_value
+        output_tokens += output_value
+        total_tokens += total_value
+        total_latency_ms += latency_value
+        estimated_cost += cost_value
+        stage_summary = by_stage.setdefault(stage, {
+            "stage": stage,
+            "calls": 0,
+            "ok_calls": 0,
+            "failed_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "latency_ms": 0.0,
+            "estimated_cost": 0.0,
+        })
+        stage_summary["calls"] += 1
+        stage_summary["ok_calls"] += 1 if ok else 0
+        stage_summary["failed_calls"] += 0 if ok else 1
+        stage_summary["input_tokens"] += input_value
+        stage_summary["output_tokens"] += output_value
+        stage_summary["total_tokens"] += total_value
+        stage_summary["latency_ms"] = round(float(stage_summary["latency_ms"]) + latency_value, 2)
+        stage_summary["estimated_cost"] = round(float(stage_summary["estimated_cost"]) + cost_value, 8)
+
+    total_calls = len(events)
+    return {
+        "schema_version": 1,
+        "events": events[-200:],
+        "total_calls": total_calls,
+        "ok_calls": ok_calls,
+        "failed_calls": failed_calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "total_latency_ms": round(total_latency_ms, 2),
+        "avg_latency_ms": round(total_latency_ms / total_calls, 2) if total_calls else 0.0,
+        "estimated_cost": round(estimated_cost, 8),
+        "by_stage": sorted(by_stage.values(), key=lambda item: str(item.get("stage") or "")),
+    }
+
+
+def _build_judge_sanity_summary(stock_selection: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(stock_selection, dict):
+        return None
+    final_report_json = stock_selection.get("final_report_json") if isinstance(stock_selection.get("final_report_json"), dict) else {}
+    selection_context = stock_selection.get("selection_context") if isinstance(stock_selection.get("selection_context"), dict) else {}
+    stages = selection_context.get("stages") if isinstance(selection_context.get("stages"), dict) else {}
+    judge_stage = (
+        final_report_json.get("judge_decision")
+        if isinstance(final_report_json.get("judge_decision"), dict)
+        else stages.get("judge_decision") if isinstance(stages.get("judge_decision"), dict) else {}
+    )
+    if not isinstance(judge_stage, dict) or not judge_stage:
+        return None
+    full = judge_stage.get("full") if isinstance(judge_stage.get("full"), dict) else {}
+    summary = judge_stage.get("summary") if isinstance(judge_stage.get("summary"), dict) else {}
+    sanity_checks = full.get("sanity_checks") if isinstance(full.get("sanity_checks"), list) else []
+    required_plan_changes = (
+        full.get("required_plan_changes")
+        if isinstance(full.get("required_plan_changes"), list)
+        else []
+    )
+    final_action = (
+        summary.get("final_action")
+        or full.get("final_action")
+        or full.get("action")
+        or ""
+    )
+    primary_plan_verdict = full.get("primary_plan_verdict") or summary.get("primary_plan_verdict") or ""
+    return {
+        "schema_version": 1,
+        "final_action": final_action,
+        "primary_plan_verdict": primary_plan_verdict,
+        "decision_summary": summary.get("decision_summary") or full.get("decision_summary") or "",
+        "reason": full.get("reason") or summary.get("reason") or "",
+        "check_count": len(sanity_checks),
+        "required_change_count": len(required_plan_changes),
+        "sanity_checks": sanity_checks,
+        "required_plan_changes": required_plan_changes,
+        "summary": summary,
+    }
 
 
 class TraceArtifactWriter:
@@ -1764,13 +2060,31 @@ class TraceArtifactWriter:
     def append_event(self, event: Dict[str, Any]) -> None:
         if not self._initialized:
             return
-        self._events.append(event)
-        _append_trace_event(self.path / "events.ndjson", event)
+        stored_event = dict(event)
+        stored_event.pop("__artifact_payload", None)
+        self._events.append(stored_event)
+        _append_trace_event(self.path / "events.ndjson", stored_event)
         self._write_incremental_artifact_from_event(event)
 
     def _write_incremental_artifact_from_event(self, event: Dict[str, Any]) -> None:
         event_type = str(event.get("type") or event.get("event") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        artifact_payload = event.get("__artifact_payload") if isinstance(event.get("__artifact_payload"), dict) else None
+        stage_name_by_event = {
+            "selection_candidate_discovery_done": "candidate_discovery",
+            "selection_balanced_candidate_evidence_done": "balanced_candidate_evidence",
+            "selection_candidate_screening_done": "candidate_screening",
+            "selection_deep_dive_done": "single_stock_deep_dive",
+            "selection_meta_orchestrator_done": "meta_orchestrator",
+            "selection_pricing_agent_done": "pricing_agent",
+            "selection_allocation_done": "portfolio_allocation",
+            "selection_adversarial_done": "adversarial_review",
+            "selection_judge_done": "judge_decision",
+        }
+        stage_name = stage_name_by_event.get(event_type)
+        if stage_name and artifact_payload:
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage_name).strip("._") or "stage"
+            _write_trace_json(self.path / f"{safe_name}.json", artifact_payload)
         if event_type == "selection_seed_pool_built":
             _write_trace_json(
                 self.path / "seed_pool.json",
@@ -1877,6 +2191,12 @@ class TraceArtifactWriter:
                     continue
                 safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(stage_name)).strip("._") or "stage"
                 _write_trace_json(self.path / f"{safe_name}.json", stage_payload)
+        llm_telemetry = _build_llm_telemetry_summary(self.path)
+        judge_sanity = _build_judge_sanity_summary(stock_selection)
+        _write_trace_json(self.path / "llm_telemetry.json", llm_telemetry)
+        _write_trace_json(self.path / "judge_sanity.json", judge_sanity)
+        payload["llm_telemetry"] = llm_telemetry
+        payload["judge_sanity"] = judge_sanity
         _write_trace_json(self.path / "summary.json", payload)
         (self.path / "final.md").write_text(final_content or "", encoding="utf-8")
         if context is not None:
@@ -2072,6 +2392,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
     )
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
+    context["session_id"] = session_id
+    context["trace_id"] = session_id
     if skills is not None:
         context["skills"] = skills
     events: List[Dict[str, Any]] = []
@@ -2084,17 +2406,19 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         if event_payload.get("type") in ("tool_start", "tool_done"):
             tool = event_payload.get("tool", "")
             event_payload["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
-        events.append(event_payload)
         _safe_artifact_event(artifact_writer, event_payload)
+        event_payload.pop("__artifact_payload", None)
+        events.append(event_payload)
 
     def run_sync():
         executor = _build_executor(config, skills or None)
-        return executor.chat(
-            message=request.message,
-            session_id=session_id,
-            progress_callback=progress_callback,
-            context=context,
-        )
+        with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+            return executor.chat(
+                message=request.message,
+                session_id=session_id,
+                progress_callback=progress_callback,
+                context=context,
+            )
 
     try:
         loop = asyncio.get_running_loop()
@@ -2120,6 +2444,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         context=context,
         tool_calls=normalized_tool_calls,
     )
+    llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
+    judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
 
     return AgentTraceRunResponse(
         success=result.success,
@@ -2139,6 +2465,8 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         debate=result.debate,
         stock_selection=getattr(result, "stock_selection", None),
         risk_gate=risk_gate,
+        llm_telemetry=llm_telemetry,
+        judge_sanity=judge_sanity,
         artifact_dir=str(artifact_writer.path),
         runtime_config=_build_agent_runtime_config(config),
     )
@@ -2163,6 +2491,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
     queue: asyncio.Queue = asyncio.Queue()
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
+    context["session_id"] = session_id
+    context["trace_id"] = session_id
     if skills is not None:
         context["skills"] = skills
     artifact_writer = TraceArtifactWriter(session_id)
@@ -2170,7 +2500,9 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
 
     def put_event(event: Dict[str, Any]) -> None:
         _safe_artifact_event(artifact_writer, event)
-        asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+        stream_event = dict(event)
+        stream_event.pop("__artifact_payload", None)
+        asyncio.run_coroutine_threadsafe(queue.put(stream_event), loop)
 
     def progress_callback(event: dict):
         event_payload = dict(event)
@@ -2207,12 +2539,13 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "runtime_config": _build_agent_runtime_config(config),
             })
             executor = _build_executor(config, skills or None)
-            result = executor.chat(
-                message=request.message,
-                session_id=session_id,
-                progress_callback=progress_callback,
-                context=context,
-            )
+            with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+                result = executor.chat(
+                    message=request.message,
+                    session_id=session_id,
+                    progress_callback=progress_callback,
+                    context=context,
+                )
             _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
             normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
             risk_gate = _build_trace_risk_gate_payload(
@@ -2220,6 +2553,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 context=context,
                 tool_calls=normalized_tool_calls,
             )
+            llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
+            judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
             put_event({
                 "type": "done",
                 "success": result.success,
@@ -2239,6 +2574,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "debate": result.debate,
                 "stock_selection": getattr(result, "stock_selection", None),
                 "risk_gate": risk_gate,
+                "llm_telemetry": llm_telemetry,
+                "judge_sanity": judge_sanity,
                 "artifact_dir": str(artifact_writer.path),
                 "runtime_config": _build_agent_runtime_config(config),
             })

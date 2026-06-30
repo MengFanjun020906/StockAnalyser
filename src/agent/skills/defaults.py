@@ -28,10 +28,11 @@ CORE_TRADING_SKILL_POLICY_ZH = """## 默认技能基线（必须严格遵守）
 当前激活的 skills 可以补充细化分析视角，但默认风险控制和交易节奏必须遵守以下基线。
 
 ### 1. 严进策略（不追高）
-- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
-- 乖离率 < 2%：最佳买点区间
-- 乖离率 2-5%：可小仓介入
-- 乖离率 > 5%：严禁追高！直接判定为"观望"
+- **按 setup 分层处理追高**：回踩/低吸型机会仍严格控制 MA5 乖离；突破/涨停/强动量型机会不得只因 MA5 乖离 >5% 直接否决。
+- 乖离率 < 2%：回踩型最佳买点区间。
+- 乖离率 2-5%：回踩型可小仓介入。
+- 乖离率 > 5%：回踩型不得无条件买入；强势延续/资金接力型只能给条件型计划，并要求次日竞价承接、分歧转一致、分时不破关键位或回踩不破后再触发。
+- 一字涨停、无换手封死或流动性无法成交时，标记为不可交易，不得当作可买收益。
 
 ### 2. 趋势交易（顺势而为）
 - **多头排列必须条件**：MA5 > MA10 > MA20
@@ -55,7 +56,7 @@ CORE_TRADING_SKILL_POLICY_ZH = """## 默认技能基线（必须严格遵守）
 - PE 明显偏高时需在风险点中说明
 
 ### 7. 强势趋势股放宽
-- 强势趋势股可适当放宽乖离率要求，轻仓追踪但需设止损
+- 强势趋势股可适当放宽乖离率要求，轻仓追踪但需设止损；放宽必须来自 setup 证据（突破有效、资金承接、板块共振、次日可成交），不能只是因为涨幅大。
 """
 
 TECHNICAL_SKILL_RULES_EN = """## Default Skill Baseline
@@ -64,7 +65,9 @@ Treat the currently activated skills as the primary analysis lens, but keep the
 following default risk controls as the shared baseline:
 
 - Bullish alignment: MA5 > MA10 > MA20
-- Bias from MA5 < 2% -> ideal buy zone; 2-5% -> small position; > 5% -> no chase
+- Bias from MA5 < 2% -> ideal pullback zone; 2-5% -> small pullback position.
+- Bias from MA5 > 5% blocks unconditional pullback entries, but it is not a blanket rejection for breakout/limit-up/momentum setups; require conditional confirmation, smaller size, and explicit invalidation.
+- One-price limit-up / no-fill situations are non-tradable and must not be counted as actionable upside.
 - Shrink-pullback to MA5 is the preferred entry rhythm
 - Below MA20 -> hold off unless the active skill explicitly proves a better setup
 """

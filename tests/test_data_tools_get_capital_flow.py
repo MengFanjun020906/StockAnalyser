@@ -39,10 +39,19 @@ class _DummyManagerOk:
             "data": {
                 "stock_flow": {
                     "main_net_inflow": 1500000.0,
+                    "main_inflow_5d": 8000000.0,
+                    "main_inflow_10d": 15000000.0,
                     "inflow_5d": 8000000.0,
                     "inflow_10d": 15000000.0,
+                    "net_inflow": -500000.0,
+                    "net_inflow_5d": -3000000.0,
+                    "net_inflow_10d": -7000000.0,
+                    "amount_unit": "CNY",
+                    "raw_amount_unit": "10k CNY",
                     "latest_date": "2026-05-08",
                     "source_update": "after_market_close",
+                    "selected_flow_source": "tushare_moneyflow_dc",
+                    "flow_sources": {"tushare_moneyflow_dc": {"main_net_inflow": 1500000.0}},
                 },
                 "sector_rankings": {
                     "top": [{"name": "白酒", "inflow": 5e8}, {"name": "半导体", "inflow": 3e8}],
@@ -100,6 +109,11 @@ class _DummyManagerEmptyTushare:
 
 class TestGetCapitalFlowContract(unittest.TestCase):
 
+    def setUp(self) -> None:
+        with data_tools._capital_flow_audit_lock:
+            data_tools._capital_flow_audit_cache.clear()
+            data_tools._capital_flow_audit_inflight.clear()
+
     def test_ok_response_shape(self) -> None:
         """Happy path: key fields are present and values match the source data."""
         manager = _DummyManagerOk()
@@ -113,10 +127,19 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(manager.budget_seconds, 4.2)
         self.assertEqual(result["main_net_inflow"], 1500000.0)
+        self.assertEqual(result["main_inflow_5d"], 8000000.0)
+        self.assertEqual(result["main_inflow_10d"], 15000000.0)
         self.assertEqual(result["inflow_5d"], 8000000.0)
         self.assertEqual(result["inflow_10d"], 15000000.0)
+        self.assertEqual(result["net_inflow"], -500000.0)
+        self.assertEqual(result["net_inflow_5d"], -3000000.0)
+        self.assertEqual(result["net_inflow_10d"], -7000000.0)
+        self.assertEqual(result["amount_unit"], "CNY")
+        self.assertEqual(result["raw_amount_unit"], "10k CNY")
         self.assertEqual(result["latest_date"], "2026-05-08")
         self.assertEqual(result["source_update"], "after_market_close")
+        self.assertEqual(result["selected_flow_source"], "tushare_moneyflow_dc")
+        self.assertIn("tushare_moneyflow_dc", result["flow_sources"])
         self.assertEqual(
             result["query"],
             {"start_date": None, "end_date": None, "page_no": 1, "page_size": 50},
@@ -128,9 +151,74 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertIn("sector_rankings", result)
         self.assertIn("top_inflow_sectors", result["sector_rankings"])
         self.assertIn("top_outflow_sectors", result["sector_rankings"])
+        self.assertEqual(result["capital_flow_audit"]["status"], "unavailable")
         # At most 3 items are returned per ranking list
         self.assertLessEqual(len(result["sector_rankings"]["top_inflow_sectors"]), 3)
         self.assertEqual(result["errors"], [])
+
+    def test_background_audit_is_scheduled_without_waiting_for_result(self) -> None:
+        class _AuditAdapter:
+            def audit_capital_flow_sources(self, *_args, **_kwargs):
+                raise AssertionError("audit body should run in background, not inline")
+
+        manager = _DummyManagerOk()
+        manager._fundamental_adapter = _AuditAdapter()
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=manager,
+        ), patch.object(data_tools, "_ensure_capital_flow_audit_worker") as worker_mock, \
+                patch.object(data_tools._capital_flow_audit_queue, "put_nowait") as put_mock:
+            result = _handle_get_capital_flow("600519")
+
+        worker_mock.assert_called_once()
+        put_mock.assert_called_once()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["capital_flow_audit"]["status"], "pending")
+        self.assertEqual(result["capital_flow_audit"]["mode"], "background")
+        self.assertEqual(result["source_conflicts"], [])
+        self.assertEqual(result["warnings"], [])
+
+    def test_cached_audit_conflict_is_attached_to_capital_flow_response(self) -> None:
+        manager = _DummyManagerOk()
+        key = data_tools._capital_flow_audit_cache_key(
+            "600519",
+            None,
+            None,
+            "tushare_moneyflow_dc",
+            "2026-05-08",
+        )
+        data_tools._store_capital_flow_audit_cache(key, {
+            "status": "conflict",
+            "mode": "background",
+            "selected_flow_source": "tushare_moneyflow_dc",
+            "checked_sources": ["tushare_moneyflow_ths"],
+            "warnings": [
+                "capital_flow_source_conflict:1 conflict(s); keep selected_flow_source=tushare_moneyflow_dc authoritative",
+            ],
+            "source_conflicts": [{
+                "type": "direction_conflict",
+                "field": "main_net_inflow",
+                "selected_source": "tushare_moneyflow_dc",
+                "other_source": "tushare_moneyflow_ths",
+                "selected_value": 1500000.0,
+                "other_value": -800000.0,
+            }],
+            "source_summaries": {
+                "tushare_moneyflow_dc": {"latest_date": "2026-05-08", "main_net_inflow": 1500000.0},
+                "tushare_moneyflow_ths": {"latest_date": "2026-05-08", "main_net_inflow": -800000.0},
+            },
+        })
+
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=manager,
+        ):
+            result = _handle_get_capital_flow("600519")
+
+        self.assertEqual(result["capital_flow_audit"]["status"], "conflict")
+        self.assertEqual(result["capital_flow_audit"]["cache"], "hit")
+        self.assertEqual(result["source_conflicts"][0]["type"], "direction_conflict")
+        self.assertTrue(result["warnings"][0].startswith("capital_flow_source_conflict:1"))
 
     def test_not_supported_for_non_cn_or_etf(self) -> None:
         """ETF / non-CN stocks return status=not_supported with an explanatory note."""
@@ -197,7 +285,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
 
         self.assertEqual(result["stock_code"], "688469")
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_summary"], "Tushare moneyflow capital-flow endpoint failed")
+        self.assertEqual(result["error_summary"], "Tushare moneyflow capital-flow endpoints failed")
         self.assertIn("tushare_moneyflow", result["errors"][0])
 
     def test_tushare_empty_has_clear_error_summary(self) -> None:
@@ -208,7 +296,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
             result = _handle_get_capital_flow("301028")
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_summary"], "Tushare moneyflow returned no capital-flow rows for the queried window")
+        self.assertEqual(result["error_summary"], "Tushare moneyflow endpoints returned no capital-flow rows for the queried window")
         self.assertEqual(result["errors"], ["tushare_moneyflow:empty_data"])
 
     def test_stockapi_empty_is_reported_when_fallback_also_has_no_rows(self) -> None:
@@ -233,8 +321,22 @@ class TestGetCapitalFlowContract(unittest.TestCase):
             return {
                 "status": "ok",
                 "items": [
-                    {"trade_date": "20260515", "net_mf_amount": 1686.43},
-                    {"trade_date": "20260514", "net_mf_amount": -2774.06},
+                    {
+                        "trade_date": "20260515",
+                        "net_mf_amount": 1686.43,
+                        "buy_lg_amount": 20.0,
+                        "sell_lg_amount": 10.0,
+                        "buy_elg_amount": 3.0,
+                        "sell_elg_amount": 5.0,
+                    },
+                    {
+                        "trade_date": "20260514",
+                        "net_mf_amount": -2774.06,
+                        "buy_lg_amount": 8.0,
+                        "sell_lg_amount": 12.0,
+                        "buy_elg_amount": 1.0,
+                        "sell_elg_amount": 2.0,
+                    },
                 ],
                 "source_chain": [{"provider": f"tushare:{api_name}", "result": "ok"}],
                 "errors": [],
@@ -296,7 +398,14 @@ class TestGetCapitalFlowContract(unittest.TestCase):
                 }
             return {
                 "status": "ok",
-                "items": [{"trade_date": "20260515", "net_mf_amount": 1686.43}],
+                "items": [{
+                    "trade_date": "20260515",
+                    "net_mf_amount": 1686.43,
+                    "buy_lg_amount": 20.0,
+                    "sell_lg_amount": 10.0,
+                    "buy_elg_amount": 3.0,
+                    "sell_elg_amount": 5.0,
+                }],
                 "source_chain": [{"provider": "tushare:moneyflow", "result": "ok", "params": params}],
                 "errors": [],
             }
@@ -312,7 +421,12 @@ class TestGetCapitalFlowContract(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(len(calls), 2)
-        self.assertEqual(result["main_net_inflow"], 16864300.0)
+        self.assertEqual(result["net_inflow"], 16864300.0)
+        self.assertEqual(result["main_net_inflow"], 80000.0)
+        self.assertEqual(result["main_inflow_5d"], 80000.0)
+        self.assertEqual(result["net_inflow_5d"], 16864300.0)
+        self.assertEqual(result["amount_unit"], "CNY")
+        self.assertEqual(result["raw_amount_unit"], "10k CNY")
         self.assertEqual(result["source_chain"][0]["result"], "empty")
         self.assertEqual(result["source_chain"][1]["result"], "ok")
 

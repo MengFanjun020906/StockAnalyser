@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.agent.tools.data_tools import (
     ALL_DATA_TOOLS,
     _handle_get_eastmoney_cjzc_daily,
+    _handle_get_stock_disclosure_events,
     _handle_get_stock_business_context,
     _handle_get_stock_info,
 )
@@ -69,6 +70,102 @@ def test_get_eastmoney_cjzc_daily_matches_target_trade_date_not_latest_row():
     assert mlcc["mapped_stocks"][0]["code"] == "300408"
     assert result["mentioned_stocks"] == []
     assert "get_eastmoney_cjzc_daily" in {tool.name for tool in ALL_DATA_TOOLS}
+
+
+class _FakeResponse:
+    def __init__(self, payload=None, text="", content=None, headers=None, status_code=200):
+        self._payload = payload
+        self.text = text
+        self.content = content if content is not None else text.encode("utf-8")
+        self.headers = headers or {"Content-Type": "text/html; charset=utf-8"}
+        self.status_code = status_code
+        self.encoding = "utf-8"
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def test_get_stock_disclosure_events_extracts_cninfo_ir_and_body_terms():
+    payload = {
+        "announcements": [
+            {
+                "secCode": "688126",
+                "secName": "沪硅产业",
+                "announcementTitle": "沪硅产业：投资者关系活动记录表",
+                "announcementTime": 1780070400000,
+                "adjunctUrl": "new/disclosure/detail.html",
+            },
+            {
+                "secCode": "688126",
+                "secName": "沪硅产业",
+                "announcementTitle": "沪硅产业：2025年年度报告",
+                "announcementTime": 1776355200000,
+                "adjunctUrl": "new/disclosure/report.html",
+            },
+        ]
+    }
+
+    def fake_get(url, **_kwargs):
+        return _FakeResponse(text=(
+            "<div>公司存储用抛光片占产品比例约60-65%，"
+            "已建成12英寸SOI硅片中试线，2025年底300mm半导体硅片合计产能达85万片/月。</div>"
+        ))
+
+    with patch("src.agent.tools.data_tools.requests.post", return_value=_FakeResponse(payload=payload)), patch(
+        "src.agent.tools.data_tools.requests.get",
+        side_effect=fake_get,
+    ):
+        result = _handle_get_stock_disclosure_events(
+            "688126",
+            "沪硅产业",
+            start_date="2026-04-01",
+            end_date="2026-06-04",
+            include_body=True,
+        )
+
+    assert result["status"] == "ok"
+    assert result["event_count"] == 2
+    assert result["items"][0]["doc_type"] == "investor_relation"
+    assert {"存储用抛光片", "SOI", "300mm", "85万片/月"}.issubset(set(result["items"][0]["matched_terms"]))
+    assert "storage_material" in result["items"][0]["matched_groups"]
+    assert "soi_silicon_photonics" in result["items"][0]["matched_groups"]
+    assert "capacity_300mm" in result["items"][0]["matched_groups"]
+    assert "get_stock_disclosure_events" in {tool.name for tool in ALL_DATA_TOOLS}
+
+
+def test_get_stock_disclosure_events_keeps_pdf_metadata_when_body_skipped():
+    payload = {
+        "announcements": [
+            {
+                "secCode": "688126",
+                "secName": "沪硅产业",
+                "announcementTitle": "沪硅产业：2025年年度报告",
+                "announcementTime": 1776355200000,
+                "adjunctUrl": "new/disclosure/report.pdf",
+            }
+        ]
+    }
+    with patch("src.agent.tools.data_tools.requests.post", return_value=_FakeResponse(payload=payload)):
+        result = _handle_get_stock_disclosure_events("688126", "沪硅产业", include_body=False)
+
+    assert result["status"] == "ok"
+    assert result["events"][0]["doc_type"] == "annual_report"
+    assert result["events"][0]["body_status"] == "not_requested"
+    assert result["events"][0]["url"].startswith("https://static.cninfo.com.cn/")
+
+
+def test_get_stock_disclosure_events_surfaces_cninfo_failure():
+    with patch("src.agent.tools.data_tools.requests.post", side_effect=RuntimeError("network down")):
+        result = _handle_get_stock_disclosure_events("688126", "沪硅产业")
+
+    assert result["status"] == "failed"
+    assert result["items"] == []
+    assert result["events"] == []
+    assert "network down" in result["errors"][0]
 
 
 def test_get_eastmoney_cjzc_daily_before_6_uses_previous_daily_for_today_request():

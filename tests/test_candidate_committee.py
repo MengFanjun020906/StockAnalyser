@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 try:
     import litellm  # noqa: F401
-except ModuleNotFoundError:
+except Exception:
     sys.modules["litellm"] = MagicMock()
 
 from src.agent.candidate_experts_v2 import committee as committee_module
@@ -23,18 +24,26 @@ from src.agent.candidate_experts_v2.committee import (
     _assemble_seed_pool,
     _build_seed_pool,
     _build_seed_pool_result,
+    _market_regime_key,
     run_committee_discovery,
     run_thesis_desk_committee,
 )
-from src.agent.candidate_experts_v2.experts.base import LLMTurn
+from src.agent.candidate_experts_v2.runtime import run_experts_parallel
+from src.agent.candidate_experts_v2.experts.base import LLMToolCall, LLMTurn
 from src.agent.candidate_experts_v2.experts.desk_base import BaseDeskExpert
+from src.agent.candidate_experts_v2.experts.theme_catalyst_desk import ThemeCatalystDeskExpert
 from src.agent.candidate_experts_v2.schemas import (
+    EvidenceItem,
+    ExpertCandidateV2,
+    ExpertPacketV2,
     FactSheet,
     FeatureFlag,
     FeatureRow,
+    RecallResult,
     SeedFactDataQuality,
     SeedFactPacket,
     SeedFactToolResult,
+    SeedSummaryV2,
 )
 from src.agent.candidate_experts_v2.seed_facts import (
     build_seed_fact_packets_parallel,
@@ -49,7 +58,6 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     seeds_by_source = {
         "daily_screener": [seed(f"60000{i}", "daily_screener", 90 - i) for i in range(5)],
         "news_theme_daily": [seed(f"60010{i}", "news_theme_daily", 90 - i) for i in range(5)],
-        "low_base_structure": [seed(f"60020{i}", "low_base_structure", 90 - i) for i in range(5)],
         "capital_flow_anomaly": [seed(f"60030{i}", "capital_flow_anomaly", 90 - i) for i in range(3)],
         "margin_financing": [seed("600400", "margin_financing", 88)],
         "block_trade": [seed("600500", "block_trade", 87)],
@@ -63,7 +71,8 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     sources = [item.source for item in result]
 
     assert len(result) == 10
-    assert sources[:3] == ["daily_screener", "low_base_structure", "limit_up_pool"]
+    assert set(sources[:3]) == {"daily_screener", "alphasift", "sequoia"}
+    assert "low_base_structure" not in sources
     assert "news_theme_daily" in sources
     assert "capital_flow_anomaly" in sources
     assert "limit_up_pool" in sources
@@ -72,13 +81,35 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     assert sources.count("daily_screener") < 5
 
 
+def test_market_regime_key_accepts_market_regime_payload_dict():
+    assert _market_regime_key({"regime": "risk_off", "volatility": "high"}) == "risk_off"
+    assert _market_regime_key({"market_regime": "TRENDING_UP"}) == "trending_up"
+    assert _market_regime_key({}) == "unknown"
+
+
+def test_parallel_expert_timeout_records_budget_reason():
+    def slow_task():
+        time.sleep(0.05)
+        return ExpertPacketV2(expert="slow_desk", dimension="desk", status="empty")
+
+    packets = run_experts_parallel(
+        {"slow_desk": slow_task},
+        per_expert_timeout_s=120.0,
+        overall_timeout_s=0.01,
+    )
+
+    assert packets[0].status == "timeout"
+    assert "overall timeout" in packets[0].errors[0]
+    assert packets[0].diagnostics[0]["reason"] == "overall_timeout_exhausted_before_expert_returned"
+    assert packets[0].diagnostics[0]["configured_per_expert_timeout_s"] == 120.0
+
+
 def test_seed_pool_assembly_allocates_total_limit_evenly_across_live_sources():
     def seed(code: str, source: str, score: float = 80.0):
         return committee_module.SeedItem(code=code, name=code, source=source, priority_score=score)
 
     live_sources = [
         "daily_screener",
-        "low_base_structure",
         "news_theme_daily",
         "limit_up_pool",
         "capital_flow_anomaly",
@@ -99,9 +130,9 @@ def test_seed_pool_assembly_allocates_total_limit_evenly_across_live_sources():
 
     assert len(result) == 20
     assert set(counts) == set(live_sources)
-    assert max(counts.values()) - min(counts.values()) <= 1
-    assert sum(1 for count in counts.values() if count == 2) == 9
-    assert sum(1 for count in counts.values() if count == 1) == 2
+    assert counts["alphasift"] == 3
+    assert counts["sequoia"] == 3
+    assert max(counts.values()) - min(counts.values()) <= 2
 
 
 def test_seed_fact_packets_run_seed_tool_tasks_once_and_record_failures():
@@ -374,6 +405,312 @@ def test_thesis_desk_init_failure_preserves_seed_fact_payload():
     assert result["discovery_steps"][-1]["dimension"] == "desk_init"
 
 
+def test_thesis_desk_committee_degrades_failed_desk_but_keeps_candidates():
+    row = FeatureRow(
+        code="301161",
+        name="唯万密封",
+        flags=[FeatureFlag(detector="alphasift", kind="pattern", summary="趋势候选")],
+        fact_sheet=FactSheet(code="301161", trend_state="bullish"),
+    )
+    momentum_packet = ExpertPacketV2(
+        expert="momentum_desk",
+        dimension="momentum",
+        status="ok",
+        seed_summary=SeedSummaryV2(seed_count=1, accepted_count=1),
+        candidates=[
+            ExpertCandidateV2(
+                code="301161",
+                name="唯万密封",
+                stance="watch",
+                setup_type="trend_continuation",
+                reason="趋势结构健康但追高风险明确，等待回踩确认。",
+                evidence=[EvidenceItem(tool="analyze_trend", summary="均线多头")],
+            )
+        ],
+    )
+    quality_packet = ExpertPacketV2(
+        expert="quality_repair_desk",
+        dimension="quality",
+        status="failed",
+        seed_summary=SeedSummaryV2(seed_count=1),
+        candidates=[],
+        errors=["quality_repair_desk seed 688721 timeout after 106.7s"],
+    )
+
+    with patch(
+        "src.agent.candidate_experts_v2.recall.build_recall_pool",
+        return_value=RecallResult(rows=[row], all_rows=[row], total_in=1, total_kept=1),
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.build_seed_fact_packets_parallel",
+        return_value=[],
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.summarize_seed_fact_packets",
+        return_value={"total": 1, "ok": 0, "partial": 0, "failed": 0, "elapsed_ms": 0},
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.compact_seed_fact_packets_for_model",
+        return_value=[],
+    ), patch.object(
+        committee_module,
+        "run_experts_parallel",
+        return_value=[
+            ExpertPacketV2(expert="early_turn_desk", dimension="early_turn", status="empty"),
+            momentum_packet,
+            quality_packet,
+            ExpertPacketV2(expert="theme_catalyst_desk", dimension="theme_catalyst", status="empty"),
+        ],
+    ):
+        result = run_thesis_desk_committee(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            overall_timeout_s=30.0,
+        )
+
+    assert result["status"] == "partial"
+    assert result["degraded"] is True
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["code"] == "301161"
+    assert result["candidates"][0]["stance"] == "watch"
+    assert result["candidates"][0]["primary_desk"] == "momentum_desk"
+    assert "quality_repair_desk seed 688721 timeout" in result["partial_errors"][0]
+    assert result["negative_conclusion_reasons"]
+    assert any(item["conclusion"] == "desk_packet_failed" for item in result["negative_conclusion_reasons"])
+    assert any(step.get("status") == "partial" and step.get("degraded") is True for step in result["discovery_steps"])
+
+
+def test_thesis_desk_committee_records_rejection_reason_when_no_final_candidate():
+    row = FeatureRow(
+        code="600123",
+        name="拒绝样本",
+        flags=[FeatureFlag(detector="daily_screener", kind="pattern", summary="放量但位置高")],
+        fact_sheet=FactSheet(code="600123", trend_state="neutral"),
+        recall_sources=["daily_screener"],
+    )
+    rejected_packet = ExpertPacketV2(
+        expert="momentum_desk",
+        dimension="momentum",
+        status="empty",
+        seed_summary=SeedSummaryV2(seed_count=1, rejected_count=1),
+        rejected=[
+            {
+                "code": "600123",
+                "name": "拒绝样本",
+                "stance": "oppose",
+                "reason": "量能放大但趋势未确认，不符合动量席打法。",
+            }
+        ],
+    )
+
+    with patch(
+        "src.agent.candidate_experts_v2.recall.build_recall_pool",
+        return_value=RecallResult(rows=[row], all_rows=[row], total_in=1, total_kept=1),
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.build_seed_fact_packets_parallel",
+        return_value=[],
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.summarize_seed_fact_packets",
+        return_value={"total": 1, "ok": 0, "partial": 0, "failed": 0, "elapsed_ms": 0},
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.compact_seed_fact_packets_for_model",
+        return_value=[],
+    ), patch.object(
+        committee_module,
+        "run_experts_parallel",
+        return_value=[
+            ExpertPacketV2(expert="early_turn_desk", dimension="early_turn", status="empty"),
+            rejected_packet,
+            ExpertPacketV2(expert="quality_repair_desk", dimension="quality", status="empty"),
+            ExpertPacketV2(expert="theme_catalyst_desk", dimension="theme_catalyst", status="empty"),
+        ],
+    ):
+        result = run_thesis_desk_committee(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            overall_timeout_s=30.0,
+        )
+
+    reasons = result["negative_conclusion_reasons"]
+    assert result["candidate_count"] == 0
+    assert any(item["conclusion"] == "rejected_by_desk" for item in reasons)
+    assert any("不符合动量席打法" in item["reason"] for item in reasons)
+    assert any(item["conclusion"] == "not_promoted_to_final_candidates" for item in reasons)
+
+
+def test_desk_filter_explains_why_seed_did_not_enter_desk():
+    rows = [
+        FeatureRow(
+            code="600123",
+            name="高位样本",
+            flags=[FeatureFlag(detector="daily_screener", kind="unknown", summary="普通异动")],
+            fact_sheet=FactSheet(code="600123", range_pct_120=0.80),
+            recall_sources=["daily_screener"],
+        )
+    ]
+    desk = BaseDeskExpert(
+        allowed_tools=[],
+        tool_registry={},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+        system_prompt="test",
+    )
+    desk.expert_name = "test_filter_desk"
+
+    def no_rows(_rows):
+        return []
+
+    desk._filter_eligible_rows = no_rows
+    desk._ineligible_row_reason = lambda row: "测试席位未入席：缺少本席位需要的触发条件。"
+
+    packet = desk.run_desk(rows)
+
+    assert packet.status == "empty"
+    assert any(
+        diag.get("source") == "desk_filter_excluded_seed"
+        and diag.get("code") == "600123"
+        and "缺少本席位需要的触发条件" in diag.get("reason", "")
+        for diag in packet.diagnostics
+    )
+
+
+def test_theme_catalyst_desk_only_accepts_ai_tech_chain_news_rows():
+    desk = ThemeCatalystDeskExpert(
+        tool_registry={},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+    )
+    tech_row = FeatureRow(
+        code="000636",
+        name="风华高科",
+        flags=[
+            FeatureFlag(
+                detector="news_theme_daily",
+                kind="news",
+                summary="MLCC 出口和国产替代政策催化，关注电子元件产业链。",
+            )
+        ],
+        fact_sheet=FactSheet(code="000636", sector_name="电子元件", sector_strength="strong"),
+        recall_sources=["news_theme_daily"],
+    )
+    non_tech_row = FeatureRow(
+        code="600001",
+        name="食品样本",
+        flags=[FeatureFlag(detector="sector_theme", kind="sector", summary="食品饮料板块走强")],
+        fact_sheet=FactSheet(code="600001", sector_name="食品饮料", sector_strength="strong"),
+        recall_sources=["sector_theme"],
+    )
+    hot_rank_row = FeatureRow(
+        code="600002",
+        name="普通热榜",
+        flags=[FeatureFlag(detector="hot_rank", kind="sector", summary="市场关注度提升")],
+        fact_sheet=FactSheet(code="600002", sector_name="基础化工", sector_strength="strong"),
+        recall_sources=["hot_rank"],
+    )
+
+    eligible = desk._filter_eligible_rows([tech_row, non_tech_row, hot_rank_row])
+
+    assert [row.code for row in eligible] == ["000636"]
+    assert "未识别为 AI/科技产业链候选" in desk._ineligible_row_reason(non_tech_row)
+    assert "召回来源未命中 news_theme_daily/sector_theme" in desk._ineligible_row_reason(hot_rank_row)
+
+
+def test_theme_catalyst_tool_result_is_compacted_for_model_context():
+    desk = ThemeCatalystDeskExpert(
+        tool_registry={},
+        tool_decls=[],
+        llm=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+    )
+    compact = desk._tool_result_for_model(
+        "get_eastmoney_cjzc_daily",
+        {
+            "status": "ok",
+            "themes": [
+                {
+                    "theme": "MLCC",
+                    "title": "MLCC 出口改善",
+                    "evidence_section": "海外补库带动 MLCC 品类出口改善。",
+                    "matched_keywords": ["MLCC", "出口"],
+                    "raw_text": "原文正文" * 1000,
+                    "ContentBody": "公告正文" * 1000,
+                }
+            ],
+            "items": [{"title": f"新闻{i}", "summary": "国产替代政策验证"} for i in range(10)],
+        },
+    )
+
+    dumped = json.dumps(compact, ensure_ascii=False)
+    assert compact["context_policy"] == "theme_catalyst_summary_card"
+    assert "product_export" in compact["evidence_focus"]
+    assert "domestic_substitution_policy" in compact["evidence_focus"]
+    assert "海外补库带动 MLCC 品类出口改善" in dumped
+    assert "原文正文" not in dumped
+    assert "raw_text" not in compact["result"]["themes"][0]
+    assert "ContentBody" not in compact["result"]["themes"][0]
+    assert set(compact["omitted_raw_fields"]) >= {"raw_text", "ContentBody"}
+    assert compact["result"]["items"][-1]["omitted_count"] == 4
+
+
+def test_theme_catalyst_loop_feeds_compacted_tool_result_to_next_llm_turn():
+    captured_tool_content = {}
+
+    def llm(messages, tool_decls):
+        tool_messages = [message for message in messages if message.get("role") == "tool"]
+        if not tool_messages:
+            return LLMTurn(
+                tool_calls=[
+                    LLMToolCall(
+                        name="get_eastmoney_cjzc_daily",
+                        arguments={"date": "2026-06-28"},
+                        call_id="call_theme_news",
+                    )
+                ]
+            )
+        captured_tool_content.update(json.loads(tool_messages[-1]["content"]))
+        return LLMTurn(text='{"data_quality":{"freshness":"intraday"},"candidates":[],"rejected":[]}')
+
+    with patch("src.agent.candidate_experts_v2.experts.theme_catalyst_desk.validate_manifest"):
+        desk = ThemeCatalystDeskExpert(
+            tool_registry={
+                "get_eastmoney_cjzc_daily": lambda date: {
+                    "status": "ok",
+                    "themes": [
+                        {
+                            "theme": "MLCC",
+                            "evidence_section": "MLCC 出口改善，国产替代政策继续推进。",
+                            "raw_text": "超长新闻正文" * 1000,
+                        }
+                    ],
+                }
+            },
+            tool_decls=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_eastmoney_cjzc_daily",
+                        "parameters": {"type": "object", "properties": {"date": {"type": "string"}}},
+                    },
+                }
+            ],
+            llm=llm,
+            max_llm_rounds=2,
+            max_tool_calls=1,
+        )
+
+    packet = desk._run_uncached(
+        [committee_module.SeedItem(code="000636", name="风华高科", source="news_theme_daily")],
+        market="cn",
+    )
+
+    dumped = json.dumps(captured_tool_content, ensure_ascii=False)
+    assert packet.status == "empty"
+    assert captured_tool_content["context_policy"] == "theme_catalyst_summary_card"
+    assert captured_tool_content["result"]["themes"][0]["evidence_section"] == "MLCC 出口改善，国产替代政策继续推进。"
+    assert "超长新闻正文" not in dumped
+    assert "raw_text" not in captured_tool_content["result"]["themes"][0]
+
+
 def _deterministic_stub(*, market: str, seed_symbols, limit: int):
     return {
         "status": "ok",
@@ -468,6 +805,97 @@ def test_run_committee_discovery_fails_without_seed_fallback_when_thesis_desk_is
     assert any(step.get("source") == "thesis_desk_committee" for step in result["discovery_steps"])
 
 
+def test_run_committee_discovery_seed_summary_uses_build_total_limit():
+    seed_result = committee_module.SeedPoolBuildResult(
+        seeds=[
+            committee_module.SeedItem(code=f"6000{i:02d}", name=f"测试{i}", source="alphasift")
+            for i in range(32)
+        ],
+        total_limit=32,
+    )
+
+    with patch.object(
+        committee_module,
+        "run_thesis_desk_committee",
+        return_value={
+            "status": "ok",
+            "candidate_source": "thesis_desk_committee",
+            "candidates": [],
+            "candidate_count": 0,
+            "recall_total_in": 32,
+            "recall_total_kept": 0,
+            "thesis_desk_diagnostics": [],
+        },
+    ):
+        result = run_committee_discovery(
+            market="cn",
+            seed_symbols=[],
+            limit=20,
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            today="20260523",
+            seed_pool_result=seed_result,
+        )
+
+    assert result["seed_pool_summary"]["seed_count"] == 32
+    assert result["seed_pool_summary"]["total_limit"] == 32
+    assert len(result["seed_pool_summary"]["preview"]) == 20
+
+
+def test_run_committee_discovery_propagates_partial_thesis_desk_candidates():
+    seed_result = committee_module.SeedPoolBuildResult(
+        seeds=[committee_module.SeedItem(code="301161", name="唯万密封", source="alphasift", priority_score=88)],
+        total_limit=1,
+    )
+
+    with patch.object(
+        committee_module,
+        "run_thesis_desk_committee",
+        return_value={
+            "status": "partial",
+            "degraded": True,
+            "partial_errors": ["quality_repair_desk seed 688721 timeout after 106.7s"],
+            "candidate_source": "thesis_desk_committee",
+            "candidates": [
+                {
+                    "code": "301161",
+                    "name": "唯万密封",
+                    "stance": "watch",
+                    "primary_desk": "momentum_desk",
+                    "candidate_source": "thesis_desk_committee",
+                }
+            ],
+            "candidate_count": 1,
+            "recall_total_in": 1,
+            "recall_total_kept": 1,
+            "thesis_desk_diagnostics": [
+                {"desk": "quality_repair_desk", "status": "failed", "errors": ["timeout"]},
+            ],
+            "thesis_desk_committee_elapsed_ms": 123,
+        },
+    ):
+        result = run_committee_discovery(
+            market="cn",
+            seed_symbols=[],
+            limit=8,
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            today="20260523",
+            seed_pool_result=seed_result,
+        )
+
+    assert result["status"] == "partial"
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["code"] == "301161"
+    assert result["llm_expert_committee"]["status"] == "partial"
+    assert result["llm_expert_committee"]["degraded"] is True
+    assert result["thesis_desk_committee"]["status"] == "partial"
+    assert result["thesis_desk_committee"]["degraded"] is True
+    assert result["thesis_desk_committee"]["partial_errors"] == [
+        "quality_repair_desk seed 688721 timeout after 106.7s",
+    ]
+
+
 def test_run_committee_discovery_coerces_non_dict_deterministic_payload():
     # deterministic_fn is no longer called in V2-only mode.
     # Even if a bad stub is passed, the result is still a valid empty payload.
@@ -489,7 +917,7 @@ def test_run_committee_discovery_coerces_non_dict_deterministic_payload():
     assert result["status"] in ("ok", "failed")
 
 
-def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_sources():
+def test_build_seed_pool_excludes_fundamental_snapshot_and_low_base_sources():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={
@@ -511,7 +939,7 @@ def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_source
     ), patch.object(
         committee_module,
         "_build_low_base_structure_seeds",
-        return_value=[committee_module.SeedItem(code="600002", name="低位结构候选", source="low_base_structure")],
+        side_effect=AssertionError("low_base_structure should not be called by default"),
     ):
         seeds = _build_seed_pool(
             market="cn",
@@ -524,11 +952,12 @@ def test_build_seed_pool_excludes_fundamental_snapshot_but_keeps_low_base_source
 
     by_code = {seed.code: seed for seed in seeds}
     assert "600001" not in by_code
-    assert by_code["600002"].source == "low_base_structure"
+    assert "600002" not in by_code
     assert all(seed.source != "fundamental_snapshot" for seed in seeds)
+    assert all(seed.source != "low_base_structure" for seed in seeds)
 
 
-def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
+def test_build_seed_pool_applies_source_caps_and_weights_strategy_sources():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={
@@ -557,10 +986,7 @@ def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
     ), patch.object(
         committee_module,
         "_build_low_base_structure_seeds",
-        return_value=[
-            committee_module.SeedItem(code=f"6004{i:02d}", name=f"低位{i}", source="low_base_structure")
-            for i in range(12)
-        ],
+        side_effect=AssertionError("low_base_structure should not be called by default"),
     ):
         seeds = _build_seed_pool(
             market="cn",
@@ -579,15 +1005,17 @@ def test_build_seed_pool_applies_source_caps_to_preserve_low_base_sources():
     for seed in seeds:
         source_counts[seed.source] = source_counts.get(seed.source, 0) + 1
 
-    assert source_counts["low_base_structure"] <= 8
-    assert source_counts["alphasift"] <= 10
+    assert "low_base_structure" not in source_counts
+    assert source_counts["alphasift"] <= 14
+    assert source_counts["sequoia"] <= 12
+    assert source_counts["alphasift"] >= source_counts["hot_rank"]
+    assert source_counts["sequoia"] >= source_counts["hot_rank"]
     assert source_counts["hot_rank"] <= 8
     assert source_counts["limit_up_pool"] <= 10
-    assert source_counts["low_base_structure"] > 0
     assert "fundamental_snapshot" not in source_counts
 
 
-def test_build_seed_pool_result_caps_total_limit_to_twenty():
+def test_build_seed_pool_result_caps_total_limit_to_thirty_two():
     with patch(
         "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
         return_value={"status": "ok", "candidates": [{"code": f"6001{i:02d}", "name": f"基本面{i}"} for i in range(20)]},
@@ -604,7 +1032,7 @@ def test_build_seed_pool_result_caps_total_limit_to_twenty():
     ), patch.object(
         committee_module,
         "_build_low_base_structure_seeds",
-        return_value=[committee_module.SeedItem(code=f"6004{i:02d}", name=f"低位{i}", source="low_base_structure") for i in range(20)],
+        side_effect=AssertionError("low_base_structure should not be called by default"),
     ):
         result = committee_module._build_seed_pool_result(
             market="cn",
@@ -615,11 +1043,104 @@ def test_build_seed_pool_result_caps_total_limit_to_twenty():
                 "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
             },
             today="20260523",
-            total_limit=20,
+            total_limit=32,
         )
 
-    assert result.total_limit == 20
-    assert len(result.seeds) <= 20
+    assert result.total_limit == 32
+    assert len(result.seeds) <= 32
+
+
+def test_seed_pool_attaches_theme_momentum_profiles_with_partial_stockapi_sources():
+    with patch(
+        "src.agent.candidate_providers.fundamental_provider.FundamentalCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.alphasift_provider.AlphaSiftCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch(
+        "src.agent.candidate_providers.sequoia_provider.SequoiaCandidateProvider.discover",
+        return_value={"status": "empty", "candidates": []},
+    ), patch.object(
+        committee_module,
+        "_build_daily_screener_seeds",
+        return_value=([], {"source": "daily_screener", "status": "empty", "count": 0}),
+    ), patch.object(
+        committee_module,
+        "_build_low_base_structure_seeds",
+        side_effect=AssertionError("low_base_structure should not be called by default"),
+    ):
+        result = committee_module._build_seed_pool_result(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={
+                "get_tushare_moneyflow_dc": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_margin_detail": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_block_trade": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_dragon_tiger_list": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_daily_basic": lambda **kwargs: {"status": "empty", "items": []},
+                "get_tushare_limit_list_d": lambda **kwargs: {
+                    "status": "ok",
+                    "trade_date": "20260622",
+                    "items": [
+                        {"code": "600001", "name": "光模块龙头", "limit_status": "U", "concepts": "CPO 光模块", "limit_up_streak": 2, "bomb_num": 0},
+                        {"code": "600000", "name": "银行热榜", "limit_status": "U", "concepts": "银行", "limit_up_streak": 1, "bomb_num": 0},
+                    ],
+                },
+                "get_stockapi_popularity_rank": lambda **kwargs: {
+                    "status": "partial",
+                    "date": "2026-06-22",
+                    "items": [
+                        {"code": "600001", "name": "光模块龙头", "rank": 1, "concepts": ["CPO", "光模块"]},
+                        {"code": "600000", "name": "银行热榜", "rank": 2, "concepts": ["银行"]},
+                    ],
+                },
+                "get_stockapi_hot_sectors": lambda **kwargs: {
+                    "status": "failed",
+                    "date": "2026-06-22",
+                    "sectors": [],
+                    "errors": ["stockapi:/v1/hotBkJlrDr:60050:permission"],
+                },
+                "get_stockapi_hot_sector_leaders": lambda **kwargs: {
+                    "status": "partial",
+                    "date": "2026-06-22",
+                    "items": [
+                        {"code": "600001", "name": "光模块龙头", "bk_name": "CPO 光模块", "rank": 1, "net_inflow": 600_000_000, "strength": 90}
+                    ],
+                },
+                "get_stockapi_sector_constituents": lambda **kwargs: {"status": "empty", "items": []},
+                "get_eastmoney_cjzc_daily": lambda **kwargs: {"status": "empty", "themes": []},
+                "discover_watchlist_candidates": lambda **kwargs: {"status": "empty", "candidates": []},
+            },
+            today="20260623",
+            limit_per_source=5,
+            total_limit=12,
+        )
+
+    assert result.theme_momentum["regime"] in {"mainline_markup", "mainline_divergence", "range_rotation"}
+    assert result.theme_momentum["source_status"]["hot_sectors"] == "failed"
+    assert result.theme_momentum["matched_counts"]["total"] >= 2
+    assert any(item["source"] == "theme_momentum_snapshot" for item in result.diagnostics)
+
+    core_profiles = [
+        seed.extras.get("theme_profile")
+        for seed in result.seeds
+        if seed.code == "600001" and isinstance(seed.extras, dict)
+    ]
+    unrelated_profiles = [
+        seed.extras.get("theme_profile")
+        for seed in result.seeds
+        if seed.code == "600000" and isinstance(seed.extras, dict)
+    ]
+    assert any(
+        profile and profile["stock_role"] in {"core_leader", "core_midcap", "high_beta_leader"}
+        for profile in core_profiles
+    ), core_profiles
+    assert any(profile and profile["stock_role"] == "unrelated" for profile in unrelated_profiles)
+    assert any(
+        signal.get("dimension") == "theme_regime"
+        for seed in result.seeds
+        for signal in seed.trigger_signals
+    )
 
 
 def test_build_seed_pool_result_records_quality_and_structured_signals():

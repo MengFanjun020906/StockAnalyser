@@ -11,17 +11,28 @@ Tools:
 import logging
 import math
 import re
+import json
 import concurrent.futures
 import time
 import requests
 from datetime import datetime, timedelta
-from threading import Thread
+from pathlib import Path
+from threading import Lock, Thread
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from src.agent.candidate_experts import CandidateExpertOrchestrator, apply_hard_exclusion
 from src.agent.candidate_providers.alphasift_provider import AlphaSiftCandidateProvider
 from src.agent.candidate_providers.sequoia_provider import SequoiaCandidateProvider
 from src.agent.regime import SentimentComponents, coerce_bars, detect_market_regime
+from src.agent.regime_probability import (
+    build_path_profile,
+    build_regime_probability,
+    build_reentry_reference,
+    build_sample_quality_summary,
+    compute_regime_return_frame,
+    compute_symbol_regime_return_frame,
+    format_regime_probability_brief,
+)
 from src.agent.sentiment.news_events import score_news_items
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 from src.data.stock_index_loader import get_index_stock_name, get_stock_name_index_map
@@ -31,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 _SECTOR_CONSTITUENT_FETCH_TIMEOUT_S = 3.0
 _EVENT_IMPACT_MAX_CONFIRMED_THEMES = 4
+_MARKET_HISTORY_RUN_CACHE_TTL_SECONDS = 900.0
+_MARKET_HISTORY_RUN_CACHE_MAX_ITEMS = 16
+_MARKET_HISTORY_RUN_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]], str]] = {}
+_MARKET_HISTORY_RUN_CACHE_LOCK = Lock()
 
 
 def _run_with_timeout(
@@ -145,107 +160,160 @@ def _get_sector_rankings_agent_probe(manager: Any, top_n: int, timeout: float) -
 
 
 def _get_tushare_sector_rankings_fast(top_n: int, timeout: float) -> Optional[tuple]:
-    """Fast-path sector rankings via Tushare moneyflow industry endpoints."""
+    """Fast-path sector rankings via Tushare THS hot industry-board rankings."""
     try:
-        from data_provider.tushare_client import get_tushare_token, query_tushare_api
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=Path(__file__).resolve().parents[3] / ".env", override=False)
+    except Exception:
+        pass
+    try:
+        from data_provider.tushare_client import build_tushare_http_client, get_tushare_token
     except Exception:
         return None
     if not get_tushare_token():
         return None
 
     started_at = time.time()
-    now = datetime.now()
-    cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    end_day = now.date() if now >= cutoff else (now.date() - timedelta(days=1))
-    start_day = end_day - timedelta(days=20)
     source_chain: List[Dict[str, Any]] = []
     errors: List[str] = []
+    client = build_tushare_http_client(timeout=max(1, int(timeout)))
 
-    def remaining(default: float = 1.5) -> float:
+    def remaining(default: float = 4.0) -> float:
         return max(1.0, min(default, float(timeout) - (time.time() - started_at)))
 
-    try:
-        cal_df = query_tushare_api(
-            "trade_cal",
-            params={
-                "exchange": "SSE",
-                "start_date": start_day.strftime("%Y%m%d"),
-                "end_date": end_day.strftime("%Y%m%d"),
-            },
-            fields="cal_date,is_open",
-            timeout=int(remaining(2.0)),
-        )
-        dates = [
-            str(row.get("cal_date") or "")
-            for row in cal_df.to_dict(orient="records")
-            if str(row.get("is_open")) in {"1", "1.0", "True", "true"}
-        ]
-        dates = list(reversed([item for item in dates if item]))[:4]
-    except Exception as exc:
-        dates = [end_day.strftime("%Y%m%d")]
-        errors.append(f"tushare:trade_cal:{exc}")
+    def _to_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            number = float(value)
+        except Exception:
+            return None
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
 
-    def rank_rows(rows: List[Dict[str, Any]], name_key: str) -> tuple:
-        scored: List[Dict[str, Any]] = []
+    def _to_int(value: Any) -> Optional[int]:
+        number = _to_float(value)
+        if number is None:
+            return None
+        return int(number)
+
+    def normalize_rows(rows: List[Dict[str, Any]], trade_date: str) -> tuple:
+        latest_trade_date = trade_date
+        if not latest_trade_date:
+            trade_dates = sorted({str(row.get("trade_date") or "").strip() for row in rows if row.get("trade_date")})
+            latest_trade_date = trade_dates[-1] if trade_dates else ""
+        ranked: List[Dict[str, Any]] = []
         for row in rows:
-            try:
-                change = float(row.get("pct_change"))
-            except Exception:
+            row_trade_date = str(row.get("trade_date") or trade_date).strip()
+            if latest_trade_date and row_trade_date and row_trade_date != latest_trade_date:
                 continue
-            name = str(row.get(name_key) or "").strip()
-            if name:
-                scored.append({"name": name, "change_pct": change})
-        scored.sort(key=lambda item: item["change_pct"], reverse=True)
-        top = scored[:top_n]
-        bottom = list(reversed(scored[-top_n:])) if scored else []
+            data_type = str(row.get("data_type") or "").strip()
+            if data_type and data_type != "行业板块":
+                continue
+            name = str(row.get("ts_name") or row.get("name") or "").strip()
+            code = str(row.get("ts_code") or "").strip()
+            if not name and not code:
+                continue
+            rank = _to_int(row.get("rank"))
+            item: Dict[str, Any] = {
+                "name": name or code,
+                "code": code,
+                "rank": rank,
+                "change_pct": _to_float(row.get("pct_change")),
+                "current_price": _to_float(row.get("current_price")),
+                "hot": _to_float(row.get("hot")),
+                "trade_date": row_trade_date or latest_trade_date,
+                "data_type": data_type or "行业板块",
+                "rank_time": str(row.get("rank_time") or "").strip(),
+                "rank_reason": str(row.get("rank_reason") or "").strip(),
+                "source": "tushare:ths_hot",
+                "ranking_basis": "THS热榜:market=行业板块",
+            }
+            ranked.append(item)
+        ranked.sort(key=lambda item: item["rank"] if item.get("rank") is not None else 10**9)
+        top = ranked[:top_n]
+        bottom_candidates = [item for item in ranked if item.get("change_pct") is not None]
+        bottom_candidates.sort(key=lambda item: item["change_pct"])
+        bottom = bottom_candidates[:top_n]
         return top, bottom
 
-    for trade_date in dates:
+    def _previous_weekday(day):
+        day = day - timedelta(days=1)
+        while day.weekday() >= 5:
+            day = day - timedelta(days=1)
+        return day
+
+    now = datetime.now()
+    candidate_days = []
+    today = now.date()
+    if today.weekday() < 5 and now.time() >= datetime.strptime("22:30", "%H:%M").time():
+        candidate_days.append(today)
+        day = today
+    else:
+        day = _previous_weekday(today)
+        candidate_days.append(day)
+    while len(candidate_days) < 5:
+        day = _previous_weekday(day)
+        candidate_days.append(day)
+    candidate_dates = [day.strftime("%Y%m%d") for day in candidate_days]
+
+    for trade_date in candidate_dates:
         if time.time() - started_at >= timeout:
             break
-        for api_name, fields, name_key, filter_industry in (
-            ("moneyflow_ind_ths", "trade_date,industry,pct_change", "industry", False),
-            ("moneyflow_ind_dc", "trade_date,name,pct_change,content_type", "name", True),
-        ):
+        for is_new in ("Y", "N"):
             call_start = time.time()
             try:
-                df = query_tushare_api(
-                    api_name,
-                    params={"trade_date": trade_date},
-                    fields=fields,
-                    timeout=int(remaining(1.5)),
+                params = {"market": "行业板块", "is_new": is_new}
+                if trade_date:
+                    params["trade_date"] = trade_date
+                client._timeout = remaining(4.0)
+                df = client.query(
+                    "ths_hot",
+                    **params,
+                    fields=(
+                        "trade_date,data_type,ts_code,ts_name,rank,pct_change,"
+                        "current_price,hot,concept,rank_reason,rank_time"
+                    ),
                 )
             except Exception as exc:
-                errors.append(f"tushare:{api_name}:{exc}")
+                errors.append(f"tushare:ths_hot:{exc}")
                 source_chain.append({
-                    "provider": f"tushare:{api_name}",
+                    "provider": "tushare:ths_hot",
                     "result": "failed",
                     "duration_ms": int((time.time() - call_start) * 1000),
+                    "trade_date": trade_date,
+                    "market": "行业板块",
+                    "is_new": is_new,
                     "error": str(exc),
                 })
                 continue
-            if filter_industry and "content_type" in df.columns:
-                df = df[df["content_type"] == "行业"]
             if df is None or df.empty:
                 source_chain.append({
-                    "provider": f"tushare:{api_name}",
+                    "provider": "tushare:ths_hot",
                     "result": "empty",
                     "duration_ms": int((time.time() - call_start) * 1000),
                     "trade_date": trade_date,
+                    "market": "行业板块",
+                    "is_new": is_new,
                 })
                 continue
-            top, bottom = rank_rows(df.to_dict(orient="records"), name_key)
+            top, bottom = normalize_rows(df.to_dict(orient="records"), trade_date)
             if top or bottom:
                 source_chain.append({
-                    "provider": f"tushare:{api_name}",
+                    "provider": "tushare:ths_hot",
                     "result": "ok",
                     "duration_ms": int((time.time() - call_start) * 1000),
                     "trade_date": trade_date,
+                    "market": "行业板块",
+                    "is_new": is_new,
+                    "ranking_basis": "THS热榜:market=行业板块",
                 })
                 return top, bottom, source_chain, ""
 
     if source_chain or errors:
-        return [], [], source_chain, " | ".join(errors) or "Tushare sector rankings empty"
+        return [], [], source_chain, " | ".join(errors) or "Tushare ths_hot industry rankings empty"
     return None
 
 
@@ -1838,9 +1906,31 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
-    timeout = min(_get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 3.0), 6.0)
+    timeout = max(3.0, _get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 10.0))
     started_at = time.time()
-    eastmoney_timeout = min(timeout, 3.0)
+    tushare_timeout = min(timeout, max(1.0, min(4.5, timeout * 0.45)))
+    tushare_result, tushare_err, tushare_ms = _run_with_timeout(
+        lambda: _get_tushare_sector_rankings_fast(top_n, tushare_timeout),
+        tushare_timeout,
+        "tushare_ths_hot_industry_rankings",
+    )
+    if isinstance(tushare_result, tuple) and len(tushare_result) == 4:
+        top_sectors, bottom_sectors, source_chain, chain_error = tushare_result
+        if top_sectors or bottom_sectors:
+            return {
+                "status": "ok",
+                "top_sectors": top_sectors or [],
+                "bottom_sectors": bottom_sectors or [],
+                "source_chain": source_chain,
+                "data_source": "tushare:ths_hot",
+                "ranking_market": "行业板块",
+                "ranking_basis": "THS热榜:market=行业板块",
+                "bottom_basis": "lowest pct_change within returned THS hot industry-board rows",
+                "errors": [chain_error] if chain_error else [],
+            }
+
+    remaining_timeout = max(0.0, timeout - (time.time() - started_at))
+    eastmoney_timeout = min(remaining_timeout, max(0.75, min(3.0, timeout * 0.30)))
     eastmoney_result, eastmoney_err, eastmoney_ms = _run_with_timeout(
         lambda: _get_eastmoney_industry_rankings_fast(top_n),
         eastmoney_timeout,
@@ -1858,7 +1948,7 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
             }
 
     remaining_timeout = max(0.0, timeout - (time.time() - started_at))
-    stockapi_timeout = min(remaining_timeout, 2.0)
+    stockapi_timeout = min(remaining_timeout, max(0.5, min(2.5, timeout * 0.25)))
     stockapi_result, stockapi_err, stockapi_ms = _run_with_timeout(
         lambda: _get_stockapi_sector_rankings_fast(top_n),
         stockapi_timeout,
@@ -1877,6 +1967,28 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
 
     source_chain: List[Dict[str, Any]] = []
     errors: List[str] = []
+    if tushare_err:
+        source_chain.append({
+            "provider": "tushare:ths_hot",
+            "result": "timeout" if "timeout" in str(tushare_err).lower() else "failed",
+            "duration_ms": tushare_ms,
+            "market": "行业板块",
+            "error": tushare_err,
+        })
+        errors.append(str(tushare_err))
+    elif isinstance(tushare_result, tuple) and len(tushare_result) == 4:
+        _, _, tushare_chain, tushare_chain_error = tushare_result
+        source_chain.extend(tushare_chain or [])
+        if tushare_chain_error:
+            errors.append(str(tushare_chain_error))
+    else:
+        source_chain.append({
+            "provider": "tushare:ths_hot",
+            "result": "empty",
+            "duration_ms": tushare_ms,
+            "market": "行业板块",
+        })
+
     if eastmoney_err:
         source_chain.append({
             "provider": "eastmoney:stock_board_industry_name_em",
@@ -1960,8 +2072,9 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
 get_sector_rankings_tool = ToolDefinition(
     name="get_sector_rankings",
     description=(
-        "Get sector rankings. Prefer Eastmoney industry-board realtime quotes "
-        "(stock_board_industry_name_em / quote.eastmoney boardlist page); fall back to "
+        "Get industry-board hot rankings. Prefer Tushare THS hot rank "
+        "`ths_hot(market=行业板块)`; fall back to Eastmoney industry-board realtime "
+        "quotes (stock_board_industry_name_em / quote.eastmoney boardlist page), then "
         "StockAPI /v1/hotBkJlrDr when available. Permission, quota, network and remote "
         "disconnect failures are returned as structured failed/timeout diagnostics "
         "without slow fetcher probing."
@@ -2061,9 +2174,25 @@ def _derive_market_flow_component(flow: Dict[str, Any]) -> Optional[float]:
     return max(-1.0, min(1.0, value / 50_000_000_000.0))
 
 
-def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+def _load_market_history(
+    index_code: str,
+    lookback_days: int,
+    *,
+    cache_first: bool = False,
+) -> tuple[List[Dict[str, Any]], str]:
+    ts_code = _normalize_index_ts_code(index_code)
+    if cache_first:
+        cached_rows, cached_source = _load_market_history_cache_only(
+            ts_code,
+            lookback_days,
+            source_suffix="cache_first",
+        )
+        if cached_rows:
+            return cached_rows, cached_source
+
     fast_rows, fast_source = _load_index_history_from_tushare(index_code, lookback_days)
     if fast_rows:
+        _store_market_history_run_cache(_normalize_index_ts_code(index_code), fast_rows, fast_source)
         return fast_rows, fast_source
 
     from src.services.history_loader import load_history_df
@@ -2075,27 +2204,83 @@ def _load_market_history(index_code: str, lookback_days: int) -> tuple[List[Dict
         for row in rows:
             if "date" in row:
                 row["date"] = str(row["date"])
+        _store_market_history_run_cache(ts_code, rows, source)
         return rows, source
 
     sdk_source = ""
     if fallback_to_network:
         sdk_rows, sdk_source = _load_index_history_from_tushare_sdk(index_code, lookback_days)
         if sdk_rows:
+            _store_market_history_run_cache(ts_code, sdk_rows, sdk_source)
             return sdk_rows, sdk_source
 
     sources = [s for s in [fast_source, source, sdk_source] if s]
     return [], ";".join(sources) if sources else "all_sources_failed"
 
 
+def _load_market_history_cache_only(
+    ts_code: str,
+    lookback_days: int,
+    *,
+    source_suffix: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    run_rows, run_source = _load_market_history_run_cache(ts_code, lookback_days, source_suffix=source_suffix)
+    if run_rows:
+        return run_rows, run_source
+    disk_rows, disk_source = _load_index_history_cache(ts_code, lookback_days, source_suffix=source_suffix)
+    if disk_rows:
+        _store_market_history_run_cache(ts_code, disk_rows, disk_source)
+        return disk_rows, disk_source
+    return [], disk_source
+
+
+def _load_market_history_run_cache(
+    ts_code: str,
+    lookback_days: int,
+    *,
+    source_suffix: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    now = time.time()
+    with _MARKET_HISTORY_RUN_CACHE_LOCK:
+        cached = _MARKET_HISTORY_RUN_CACHE.get(ts_code)
+    if not cached:
+        return [], f"run_cache_miss:{source_suffix}"
+    cached_at, rows, source = cached
+    if now - cached_at > _MARKET_HISTORY_RUN_CACHE_TTL_SECONDS:
+        with _MARKET_HISTORY_RUN_CACHE_LOCK:
+            _MARKET_HISTORY_RUN_CACHE.pop(ts_code, None)
+        return [], f"run_cache_expired:{source_suffix}"
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    normalized_rows = sorted(normalized_rows, key=lambda item: str(item.get("date") or ""))
+    if len(normalized_rows) < int(max(1, lookback_days)):
+        return [], f"run_cache_short:{source_suffix}:{len(normalized_rows)}"
+    return normalized_rows[-int(max(1, lookback_days)):], f"{source}:run_cache:{source_suffix}"
+
+
+def _store_market_history_run_cache(ts_code: str, rows: List[Dict[str, Any]], source: str) -> None:
+    normalized_rows = [row for row in rows if isinstance(row, dict)]
+    if not normalized_rows:
+        return
+    normalized_rows = sorted(normalized_rows, key=lambda item: str(item.get("date") or ""))
+    with _MARKET_HISTORY_RUN_CACHE_LOCK:
+        _MARKET_HISTORY_RUN_CACHE[ts_code] = (time.time(), normalized_rows, source or "market_history")
+        if len(_MARKET_HISTORY_RUN_CACHE) > _MARKET_HISTORY_RUN_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                _MARKET_HISTORY_RUN_CACHE,
+                key=lambda key: _MARKET_HISTORY_RUN_CACHE[key][0],
+            )
+            _MARKET_HISTORY_RUN_CACHE.pop(oldest_key, None)
+
+
 def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    ts_code = _normalize_index_ts_code(index_code)
     try:
         from data_provider.tushare_client import build_tushare_http_client, get_tushare_token
     except Exception:
-        return [], ""
+        return _load_index_history_cache(ts_code, lookback_days, source_suffix="import_unavailable")
     if not get_tushare_token():
-        return [], ""
+        return _load_index_history_cache(ts_code, lookback_days, source_suffix="no_token")
 
-    ts_code = _normalize_index_ts_code(index_code)
     end_day = datetime.now().date()
     start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
     try:
@@ -2111,8 +2296,14 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
         )
     except Exception as exc:
         logger.warning("Tushare HTTP index_daily failed for %s: %s", ts_code, exc)
+        cached_rows, cached_source = _load_index_history_cache(ts_code, lookback_days, source_suffix="after_http_error")
+        if cached_rows:
+            return cached_rows, cached_source
         return [], "tushare:index_daily_failed"
     if df is None or df.empty:
+        cached_rows, cached_source = _load_index_history_cache(ts_code, lookback_days, source_suffix="after_empty")
+        if cached_rows:
+            return cached_rows, cached_source
         return [], "tushare:index_daily_empty"
 
     rows: List[Dict[str, Any]] = []
@@ -2131,7 +2322,50 @@ def _load_index_history_from_tushare(index_code: str, lookback_days: int) -> tup
             "pct_chg": row.get("pct_chg"),
         })
     rows = sorted(rows, key=lambda item: str(item.get("date") or ""))
-    return rows[-lookback_days:], "tushare:index_daily"
+    rows = rows[-lookback_days:]
+    _write_index_history_cache(ts_code, rows, source="tushare:index_daily")
+    return rows, "tushare:index_daily"
+
+
+def _index_history_cache_path(ts_code: str) -> Path:
+    safe_code = re.sub(r"[^A-Z0-9_.-]", "_", str(ts_code or "index").upper())
+    return Path(".cache") / "regime" / "index_daily" / f"{safe_code}.json"
+
+
+def _load_index_history_cache(ts_code: str, lookback_days: int, *, source_suffix: str = "hit") -> tuple[List[Dict[str, Any]], str]:
+    path = _index_history_cache_path(ts_code)
+    if not path.exists():
+        return [], f"tushare:index_daily_cache_miss:{source_suffix}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("rows") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            return [], f"tushare:index_daily_cache_invalid:{source_suffix}"
+        normalized_rows = [row for row in rows if isinstance(row, dict)]
+        normalized_rows = sorted(normalized_rows, key=lambda item: str(item.get("date") or ""))
+        if not normalized_rows:
+            return [], f"tushare:index_daily_cache_empty:{source_suffix}"
+        return normalized_rows[-int(max(1, lookback_days)):], f"tushare:index_daily_cache:{source_suffix}"
+    except Exception as exc:
+        logger.warning("Tushare index_daily cache read failed for %s: %s", ts_code, exc)
+        return [], f"tushare:index_daily_cache_error:{source_suffix}"
+
+
+def _write_index_history_cache(ts_code: str, rows: List[Dict[str, Any]], *, source: str) -> None:
+    if not rows:
+        return
+    path = _index_history_cache_path(ts_code)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts_code": ts_code,
+            "source": source,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "rows": rows,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("Tushare index_daily cache write skipped for %s: %s", ts_code, exc)
 
 
 def _load_index_history_from_tushare_sdk(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
@@ -2458,6 +2692,366 @@ detect_market_regime_tool = ToolDefinition(
         ),
     ],
     handler=_handle_detect_market_regime,
+    category="market",
+)
+
+
+def _handle_get_regime_forward_probability(
+    market: str = "cn",
+    index_code: str = "000300",
+    regime: Optional[str] = None,
+    current_price: Optional[float] = None,
+    lookback_days: int = 900,
+    windows: Optional[List[int]] = None,
+) -> dict:
+    """Compute forward-return probabilities for the current or requested regime."""
+    market_key = (market or "cn").strip().lower()
+    if market_key != "cn":
+        return {
+            "status": "not_supported",
+            "market": market_key,
+            "error": "get_regime_forward_probability currently supports China A-share market only.",
+        }
+
+    normalized_windows = [
+        int(value)
+        for value in (windows or [7, 30, 60, 90])
+        if str(value).strip().isdigit() and int(value) > 0
+    ] or [7, 30, 60, 90]
+    max_window = max(normalized_windows)
+    lookback = max(260, min(int(lookback_days or 900), 1600))
+    history_result, history_err, history_ms = _run_with_timeout(
+        lambda: _load_market_history(
+            index_code or "000300",
+            lookback + max_window + 100,
+            cache_first=True,
+        ),
+        _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 25.0),
+        "regime_forward_history",
+    )
+    if isinstance(history_result, tuple) and len(history_result) == 2:
+        history_rows, history_source = history_result
+    else:
+        history_rows, history_source = [], "timeout" if history_err else "none"
+    bars = coerce_bars(history_rows)
+    if len(bars) < 140 + max_window:
+        return {
+            "status": "insufficient_data",
+            "market": market_key,
+            "index_code": index_code,
+            "history_source": history_source,
+            "history_records": len(bars),
+            "duration_ms": history_ms,
+            "error": history_err or "not enough historical OHLC bars for forward probability.",
+            "note": "样本不足，不生成强概率结论。",
+        }
+
+    current_state = detect_market_regime(bars, market=market_key, confirmation_bars=1).to_dict()
+    target_regime = str(regime or current_state.get("regime") or "unknown").strip().lower()
+    frame = compute_regime_return_frame(
+        bars,
+        windows=normalized_windows,
+        market=market_key,
+    )
+    probability = build_regime_probability(frame, regime=target_regime, windows=normalized_windows)
+    sample_quality_summary = build_sample_quality_summary(bars, frame, windows=normalized_windows)
+    profile_window = 90 if 90 in normalized_windows else max_window
+    path_profile = build_path_profile(frame, regime=target_regime, window=profile_window)
+    price = current_price
+    if price is None and bars:
+        price = bars[-1].close
+    reentry = build_reentry_reference(
+        probability,
+        current_price=price,
+        window=30 if 30 in normalized_windows else min(normalized_windows),
+    )
+    status = "ok" if probability.get("sample_count", 0) else "insufficient_data"
+    payload = {
+        "status": status,
+        "market": market_key,
+        "index_code": index_code,
+        "symbol": _normalize_index_ts_code(index_code),
+        "as_of": current_state.get("as_of"),
+        "regime": target_regime,
+        "current_regime": current_state,
+        "source": "ohlc_forward_return",
+        "history_source": history_source,
+        "history_records": len(bars),
+        "duration_ms": history_ms,
+        "windows": probability.get("windows", {}),
+        "sample_count": probability.get("sample_count", 0),
+        "sample_quality_summary": sample_quality_summary,
+        "path_profile": path_profile,
+        "reentry_reference": reentry,
+        "brief": "",
+        "guardrails": [
+            "Regime probability is evidence only and must not directly override Judge or Risk Gate.",
+            "low_confidence=true means the probability layer cannot be a primary decision reason.",
+        ],
+    }
+    payload["brief"] = format_regime_probability_brief(payload)
+    if history_err:
+        payload.setdefault("data_errors", []).append(f"history: {history_err}")
+    return payload
+
+
+def _load_symbol_history(stock_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    from src.services.history_loader import load_history_df
+
+    df, source = load_history_df(stock_code, days=lookback_days, fallback_to_network=True)
+    if df is None or df.empty:
+        return [], source or "none"
+    rows = df.tail(lookback_days).to_dict(orient="records")
+    for row in rows:
+        if "date" in row:
+            row["date"] = str(row["date"])[:10]
+    return rows, source
+
+
+def _handle_get_symbol_regime_probability(
+    stock_code: str,
+    market: str = "cn",
+    index_code: str = "000300",
+    regime: Optional[str] = None,
+    current_price: Optional[float] = None,
+    lookback_days: int = 900,
+    windows: Optional[List[int]] = None,
+) -> dict:
+    """Compute single-symbol forward probabilities conditional on market regime."""
+    market_key = (market or "cn").strip().lower()
+    if market_key != "cn":
+        return {
+            "status": "not_supported",
+            "market": market_key,
+            "error": "get_symbol_regime_probability currently supports China A-share market only.",
+        }
+    symbol = str(stock_code or "").strip()
+    if not symbol:
+        return {"status": "invalid_input", "error": "stock_code is required."}
+
+    normalized_windows = [
+        int(value)
+        for value in (windows or [7, 30, 60, 90])
+        if str(value).strip().isdigit() and int(value) > 0
+    ] or [7, 30, 60, 90]
+    max_window = max(normalized_windows)
+    lookback = max(260, min(int(lookback_days or 900), 1600))
+    history_days = lookback + max_window + 100
+    component_timeout = _get_agent_timeout_attr("agent_regime_component_timeout_seconds", 25.0)
+
+    market_result, market_err, market_ms = _run_with_timeout(
+        lambda: _load_market_history(index_code or "000300", history_days, cache_first=True),
+        component_timeout,
+        "symbol_regime_market_history",
+    )
+    if isinstance(market_result, tuple) and len(market_result) == 2:
+        market_rows, market_source = market_result
+    else:
+        market_rows, market_source = [], "timeout" if market_err else "none"
+    market_bars = coerce_bars(market_rows)
+
+    symbol_result, symbol_err, symbol_ms = _run_with_timeout(
+        lambda: _load_symbol_history(symbol, history_days),
+        component_timeout,
+        "symbol_regime_symbol_history",
+    )
+    if isinstance(symbol_result, tuple) and len(symbol_result) == 2:
+        symbol_rows, symbol_source = symbol_result
+    else:
+        symbol_rows, symbol_source = [], "timeout" if symbol_err else "none"
+    symbol_bars = coerce_bars(symbol_rows)
+
+    if len(market_bars) < 140 + max_window or len(symbol_bars) < 140 + max_window:
+        return {
+            "status": "insufficient_data",
+            "market": market_key,
+            "stock_code": symbol,
+            "index_code": index_code,
+            "market_history_source": market_source,
+            "symbol_history_source": symbol_source,
+            "market_history_records": len(market_bars),
+            "symbol_history_records": len(symbol_bars),
+            "duration_ms": market_ms + symbol_ms,
+            "errors": [item for item in [market_err, symbol_err] if item],
+            "note": "样本不足，不生成单股 regime probability。",
+        }
+
+    current_state = detect_market_regime(market_bars, market=market_key, confirmation_bars=1).to_dict()
+    target_regime = str(regime or current_state.get("regime") or "unknown").strip().lower()
+    market_frame = compute_regime_return_frame(
+        market_bars,
+        windows=normalized_windows,
+        market=market_key,
+    )
+    symbol_frame = compute_symbol_regime_return_frame(
+        symbol_bars,
+        market_frame,
+        windows=normalized_windows,
+    )
+    probability = build_regime_probability(symbol_frame, regime=target_regime, windows=normalized_windows)
+    sample_quality_summary = build_sample_quality_summary(symbol_bars, symbol_frame, windows=normalized_windows)
+    profile_window = 90 if 90 in normalized_windows else max_window
+    path_profile = build_path_profile(symbol_frame, regime=target_regime, window=profile_window)
+    price = current_price
+    if price is None and symbol_bars:
+        price = symbol_bars[-1].close
+    reentry = build_reentry_reference(
+        probability,
+        current_price=price,
+        window=30 if 30 in normalized_windows else min(normalized_windows),
+    )
+    status = "ok" if probability.get("sample_count", 0) else "insufficient_data"
+    payload = {
+        "status": status,
+        "market": market_key,
+        "stock_code": symbol,
+        "index_code": index_code,
+        "index_symbol": _normalize_index_ts_code(index_code),
+        "as_of": current_state.get("as_of"),
+        "regime": target_regime,
+        "current_regime": current_state,
+        "source": "symbol_ohlc_forward_return_by_market_regime",
+        "market_history_source": market_source,
+        "symbol_history_source": symbol_source,
+        "market_history_records": len(market_bars),
+        "symbol_history_records": len(symbol_bars),
+        "matched_anchor_count": len(symbol_frame),
+        "duration_ms": market_ms + symbol_ms,
+        "windows": probability.get("windows", {}),
+        "sample_count": probability.get("sample_count", 0),
+        "sample_quality_summary": sample_quality_summary,
+        "path_profile": path_profile,
+        "reentry_reference": reentry,
+        "symbol_regime_probability": {
+            "regime": target_regime,
+            "windows": probability.get("windows", {}),
+            "path_profile": path_profile,
+            "reentry_reference": reentry,
+        },
+        "brief": "",
+        "guardrails": [
+            "Symbol regime probability is evidence only and must not directly override Judge or Risk Gate.",
+            "The market regime label comes from the index proxy; forward returns are measured on the stock itself.",
+            "low_confidence=true means the probability layer cannot be a primary decision reason.",
+        ],
+    }
+    payload["brief"] = format_regime_probability_brief(payload)
+    errors = [item for item in [market_err, symbol_err] if item]
+    if errors:
+        payload["data_errors"] = errors
+    return payload
+
+
+get_regime_forward_probability_tool = ToolDefinition(
+    name="get_regime_forward_probability",
+    description=(
+        "Compute historical forward-return probabilities for the current China A-share market regime. "
+        "Use this as evidence for reentry/downside reference, not as a direct buy/sell signal."
+    ),
+    parameters=[
+        ToolParameter(
+            name="market",
+            type="string",
+            description="Market code. Currently only 'cn' is supported.",
+            required=False,
+            default="cn",
+            enum=["cn"],
+        ),
+        ToolParameter(
+            name="index_code",
+            type="string",
+            description="A-share index proxy, default CSI 300 '000300'.",
+            required=False,
+            default="000300",
+        ),
+        ToolParameter(
+            name="regime",
+            type="string",
+            description="Optional target regime. If omitted, the tool detects the latest regime from history.",
+            required=False,
+        ),
+        ToolParameter(
+            name="current_price",
+            type="number",
+            description="Optional current index price used to compute reentry_price. Defaults to latest close.",
+            required=False,
+        ),
+        ToolParameter(
+            name="lookback_days",
+            type="integer",
+            description="Trading days for historical sampling, default 900, capped at 1600.",
+            required=False,
+            default=900,
+        ),
+        ToolParameter(
+            name="windows",
+            type="array",
+            description="Forward windows in trading days, default [7,30,60,90].",
+            required=False,
+            default=[7, 30, 60, 90],
+        ),
+    ],
+    handler=_handle_get_regime_forward_probability,
+    category="market",
+)
+
+
+get_symbol_regime_probability_tool = ToolDefinition(
+    name="get_symbol_regime_probability",
+    description=(
+        "Compute a single stock's historical forward-return probabilities conditional on the current "
+        "China A-share market regime. Only use for deep-dive symbols or current holdings; evidence only."
+    ),
+    parameters=[
+        ToolParameter(
+            name="stock_code",
+            type="string",
+            description="A-share stock code, e.g. 600519 or 600519.SH.",
+            required=True,
+        ),
+        ToolParameter(
+            name="market",
+            type="string",
+            description="Market code. Currently only 'cn' is supported.",
+            required=False,
+            default="cn",
+            enum=["cn"],
+        ),
+        ToolParameter(
+            name="index_code",
+            type="string",
+            description="A-share index proxy for market regime labels, default CSI 300 '000300'.",
+            required=False,
+            default="000300",
+        ),
+        ToolParameter(
+            name="regime",
+            type="string",
+            description="Optional target market regime. If omitted, the tool detects the latest regime from index history.",
+            required=False,
+        ),
+        ToolParameter(
+            name="current_price",
+            type="number",
+            description="Optional current stock price used to compute reentry_price. Defaults to latest stock close.",
+            required=False,
+        ),
+        ToolParameter(
+            name="lookback_days",
+            type="integer",
+            description="Trading days for historical sampling, default 900, capped at 1600.",
+            required=False,
+            default=900,
+        ),
+        ToolParameter(
+            name="windows",
+            type="array",
+            description="Forward windows in trading days, default [7,30,60,90].",
+            required=False,
+            default=[7, 30, 60, 90],
+        ),
+    ],
+    handler=_handle_get_symbol_regime_probability,
     category="market",
 )
 
@@ -2927,6 +3521,8 @@ discover_watchlist_candidates_tool = ToolDefinition(
 
 ALL_MARKET_TOOLS = [
     detect_market_regime_tool,
+    get_regime_forward_probability_tool,
+    get_symbol_regime_probability_tool,
     get_market_indices_tool,
     get_sector_rankings_tool,
     discover_watchlist_candidates_tool,

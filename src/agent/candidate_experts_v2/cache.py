@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Persistent file-backed cache for candidate expert v2 packets.
 
-Design choices (see docs/选股池多专家设计.md §9):
+Design choices (see docs/plans/选股池多专家设计.md §9):
 - Cross-session persistence (survives process restart) but never crosses
   trading days: any key whose ``date`` field differs from today is ignored.
 - TTL per expert dimension (intraday data shorter, eod data full day).

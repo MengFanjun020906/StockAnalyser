@@ -454,6 +454,35 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["status"], "failed")
         self.assertIn("Failed to resolve", " ".join(ctx["errors"]))
 
+    def test_capital_flow_context_passes_agent_budget_to_adapter(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        seen = {}
+
+        class _BudgetAwareAdapter:
+            def get_capital_flow(self, _stock_code, **kwargs):
+                seen["budget_seconds"] = kwargs.get("budget_seconds")
+                return {
+                    "status": "failed",
+                    "stock_flow": {},
+                    "sector_rankings": {"top": [], "bottom": []},
+                    "source_chain": [],
+                    "errors": ["empty"],
+                }
+
+        manager._fundamental_adapter = _BudgetAwareAdapter()
+        cfg = SimpleNamespace(
+            enable_fundamental_pipeline=True,
+            fundamental_cache_ttl_seconds=120,
+            fundamental_stage_timeout_seconds=1.5,
+            fundamental_fetch_timeout_seconds=0.8,
+            fundamental_retry_max=1,
+        )
+        with patch("src.config.get_config", return_value=cfg):
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=0.5)
+
+        self.assertEqual(ctx["status"], "failed")
+        self.assertEqual(seen["budget_seconds"], 0.5)
+
     def test_chip_distribution_context_preserves_fetcher_errors(self) -> None:
         fetcher = _DummyChipFetcher(
             "AkshareFetcher",

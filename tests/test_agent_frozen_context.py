@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from datetime import date
 
@@ -141,6 +142,43 @@ class ExecuteToolsFrozenContextTestCase(unittest.TestCase):
         )
 
         self.assertEqual(len(observed), num_tools)
+
+    def test_parallel_tool_batch_timeout_keeps_completed_results(self):
+        """Batch timeout should only mark still-running tools as timed out."""
+        from src.agent.runner import _execute_tools
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="fast_spy",
+                description="fast",
+                parameters=[],
+                handler=lambda **kwargs: {"status": "ok"},
+            )
+        )
+
+        def _slow_spy(**kwargs):
+            time.sleep(0.2)
+            return {"status": "ok"}
+
+        registry.register(ToolDefinition(name="slow_spy", description="slow", parameters=[], handler=_slow_spy))
+        log: list[dict] = []
+
+        results = _execute_tools(
+            tool_calls=[_FakeToolCall("fast_spy"), _FakeToolCall("slow_spy")],
+            tool_registry=registry,
+            step=1,
+            progress_callback=None,
+            tool_calls_log=log,
+            tool_wait_timeout_seconds=0.05,
+        )
+
+        by_tool = {entry["tool"]: entry for entry in log}
+        self.assertEqual(len(results), 2)
+        self.assertTrue(by_tool["fast_spy"]["success"])
+        self.assertNotIn("timeout", by_tool["fast_spy"])
+        self.assertFalse(by_tool["slow_spy"]["success"])
+        self.assertTrue(by_tool["slow_spy"]["timeout"])
 
 
 if __name__ == "__main__":

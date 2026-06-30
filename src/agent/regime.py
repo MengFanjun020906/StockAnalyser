@@ -253,7 +253,7 @@ def detect_market_regime(
     conflicts.extend(_detect_conflicts(bucket, sentiment_state, wyckoff_phase, trend))
     meta = _VOL_BUCKET_META.get(bucket, _VOL_BUCKET_META[VolatilityBucket.UNKNOWN])
     strategy_hints = list(meta["strategy_hints"])
-    strategy_hints.extend(_regime_strategy_hints(regime, wyckoff_phase, sentiment_state))
+    strategy_hints.extend(_regime_strategy_hints(regime, bucket, wyckoff_phase, sentiment_state))
     risk_level = _risk_level(regime, bucket, sentiment_state)
     data_quality = _data_quality(len(bars), sentiment_payload)
 
@@ -484,8 +484,6 @@ def _classify_regime(
         and sentiment_state in {SentimentState.FEAR, SentimentState.EXTREME_FEAR}
     ):
         return MarketRegime.RISK_OFF
-    if bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
-        return MarketRegime.HIGH_VOLATILITY
     if wyckoff_phase == WyckoffPhase.MARKUP or (
         trend.get("above_ma20") and trend.get("above_ma60") and trend.get("ret20", 0.0) > 0.03
     ):
@@ -494,6 +492,8 @@ def _classify_regime(
         not trend.get("above_ma20") and not trend.get("above_ma60") and trend.get("ret20", 0.0) < -0.03
     ):
         return MarketRegime.TRENDING_DOWN
+    if bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
+        return MarketRegime.HIGH_VOLATILITY
     return MarketRegime.RANGE_BOUND
 
 
@@ -557,6 +557,7 @@ def _detect_conflicts(
 
 def _regime_strategy_hints(
     regime: MarketRegime,
+    bucket: VolatilityBucket,
     wyckoff_phase: WyckoffPhase,
     sentiment_state: SentimentState,
 ) -> List[str]:
@@ -567,8 +568,12 @@ def _regime_strategy_hints(
         hints.append("panic 下禁止追涨杀跌，优先处理止损和流动性。")
     elif regime == MarketRegime.TRENDING_UP:
         hints.append("趋势向上时可接受回踩确认后的顺势策略。")
+        if bucket in {VolatilityBucket.ELEVATED, VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
+            hints.append("高波动上涨趋势中，波动不是开仓否决项；应降仓并使用承接确认、分歧转一致或回踩不破作为触发。")
     elif regime == MarketRegime.TRENDING_DOWN:
         hints.append("趋势向下时反弹优先视为减仓或观察机会。")
+    elif regime == MarketRegime.HIGH_VOLATILITY:
+        hints.append("高波动但方向不明时，避免把突破票直接升级为无条件买入，优先等待承接确认。")
     else:
         hints.append("震荡环境下优先箱体上下沿和低吸高抛，避免中位追价。")
     if wyckoff_phase == WyckoffPhase.DISTRIBUTION:

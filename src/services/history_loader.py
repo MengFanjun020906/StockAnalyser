@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import os
+import sqlite3
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from threading import Lock
 from typing import Any, List, Optional, Tuple
 
@@ -124,6 +127,76 @@ def _select_best_bars(db, stock_code: str, start: date, end: date) -> Tuple[Opti
     return best_code, best_bars
 
 
+def _sequoia_symbol_variants(stock_code: str) -> List[str]:
+    raw_code = str(stock_code or "").strip()
+    candidates, normalized_code = _history_code_candidates(raw_code)
+    variants: List[str] = []
+    for candidate in [raw_code, normalized_code, *candidates]:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        if text not in variants:
+            variants.append(text)
+        if "." in text:
+            parts = [part for part in text.split(".") if part]
+            for part in parts:
+                if part.isdigit() and part not in variants:
+                    variants.append(part)
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) == 6 and digits not in variants:
+            variants.append(digits)
+    return variants
+
+
+def _load_sequoia_history_df(stock_code: str, start: date, end: date) -> Optional[pd.DataFrame]:
+    db_path = (
+        os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
+        or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
+        or "Sequoia-X/data/sequoia_v2.db"
+    )
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return None
+    variants = _sequoia_symbol_variants(stock_code)
+    if not variants:
+        return None
+    placeholders = ",".join("?" * len(variants))
+    params = [*variants, start.isoformat(), end.isoformat()]
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""SELECT symbol, date, open, high, low, close, volume, turnover
+                    FROM stock_daily
+                    WHERE symbol IN ({placeholders})
+                      AND date >= ?
+                      AND date <= ?
+                    ORDER BY date""",
+                params,
+            ).fetchall()
+    except Exception as exc:
+        logger.debug("load_history_df(%s): Sequoia DB read failed: %s", stock_code, exc)
+        return None
+    if not rows:
+        return None
+    return pd.DataFrame(
+        [
+            {
+                "code": stock_code,
+                "date": row["date"],
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+                "amount": row["turnover"],
+                "source": f"sequoia_stock_daily:{row['symbol']}",
+            }
+            for row in rows
+        ]
+    )
+
+
 def _effective_cache_end(stock_code: str, end: date) -> date:
     """Return the latest daily-bar date that is acceptable for cache hits."""
     try:
@@ -195,6 +268,22 @@ def load_history_df(
             return df, "db_cache"
     except Exception as e:
         logger.debug("load_history_df(%s): DB read failed: %s", stock_code, e)
+
+    # --- 1b. Local Sequoia stock_daily fallback ---------------------------
+    try:
+        required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
+        df = _load_sequoia_history_df(stock_code, start, end)
+        if df is not None and not df.empty:
+            latest_date = max((_coerce_bar_date(value) for value in df["date"]), default=date.min)
+            effective_end = _effective_cache_end(stock_code, end)
+            if _cache_latest_is_fresh(latest_date, effective_end, end) and len(df) >= required_records:
+                logger.debug(
+                    "load_history_df(%s): %d bars from Sequoia DB (requested %d, latest=%s, effective_end=%s)",
+                    stock_code, len(df), days, latest_date, effective_end,
+                )
+                return df, "sequoia_stock_daily"
+    except Exception as e:
+        logger.debug("load_history_df(%s): Sequoia fallback failed: %s", stock_code, e)
 
     if not fallback_to_network:
         return None, "db_cache_miss"

@@ -433,6 +433,82 @@ class PortfolioApiTestCase(unittest.TestCase):
         missing_trade = self.client.delete("/api/v1/portfolio/trades/999999")
         self.assertEqual(missing_trade.status_code, 404)
 
+    def test_baseline_reset_replaces_account_events_and_rebuilds_snapshot(self) -> None:
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Main", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/portfolio/cash-ledger",
+                json={
+                    "account_id": account_id,
+                    "event_date": "2026-01-01",
+                    "direction": "in",
+                    "amount": 10000,
+                    "currency": "CNY",
+                },
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/portfolio/trades",
+                json={
+                    "account_id": account_id,
+                    "symbol": "600519",
+                    "trade_date": "2026-01-02",
+                    "side": "buy",
+                    "quantity": 10,
+                    "price": 100,
+                    "fee": 0,
+                    "tax": 0,
+                    "market": "cn",
+                    "currency": "CNY",
+                },
+            ).status_code,
+            200,
+        )
+
+        reset_resp = self.client.post(
+            f"/api/v1/portfolio/accounts/{account_id}/baseline-reset",
+            json={
+                "as_of": "2026-01-10",
+                "cash_amount": 2000,
+                "positions": [
+                    {"symbol": "600519", "quantity": 20, "price": 90, "market": "cn", "currency": "CNY"},
+                    {"symbol": "000001", "quantity": 100, "price": 10, "market": "cn", "currency": "CNY"},
+                ],
+                "note": "manual reset",
+            },
+        )
+        self.assertEqual(reset_resp.status_code, 200)
+        payload = reset_resp.json()
+        self.assertEqual(payload["deleted_trades"], 1)
+        self.assertEqual(payload["deleted_cash_ledger"], 1)
+        self.assertEqual(payload["position_count"], 2)
+        self.assertEqual(payload["trade_count"], 2)
+        self.assertEqual(payload["cash_ledger_count"], 2)
+
+        self._save_close("600519", date(2026, 1, 10), 95.0)
+        self._save_close("000001", date(2026, 1, 10), 11.0)
+        snapshot_resp = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"account_id": account_id, "as_of": "2026-01-10"},
+        )
+        self.assertEqual(snapshot_resp.status_code, 200)
+        snapshot = snapshot_resp.json()["accounts"][0]
+        self.assertAlmostEqual(snapshot["total_cash"], 2000.0, places=6)
+        positions = {item["symbol"]: item for item in snapshot["positions"]}
+        self.assertEqual(set(positions), {"000001", "600519"})
+        self.assertAlmostEqual(positions["600519"]["quantity"], 20.0, places=6)
+        self.assertAlmostEqual(positions["600519"]["avg_cost"], 90.0, places=6)
+        self.assertAlmostEqual(positions["000001"]["quantity"], 100.0, places=6)
+        self.assertAlmostEqual(positions["000001"]["avg_cost"], 10.0, places=6)
+
     def test_create_trade_busy_returns_409(self) -> None:
         with patch(
             "api.v1.endpoints.portfolio.PortfolioService.record_trade",

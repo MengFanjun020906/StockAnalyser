@@ -18,8 +18,11 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock
+from queue import Full, Queue
+from threading import Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
 
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
@@ -29,6 +32,13 @@ _fetcher_manager_singleton = None
 _fetcher_manager_lock = Lock()
 _tushare_trade_date_cache: Dict[Tuple[int, int, int, int, str, bool], List[str]] = {}
 _tushare_trade_date_cache_lock = Lock()
+_capital_flow_audit_queue: Queue = Queue(maxsize=128)
+_capital_flow_audit_cache: Dict[Tuple[str, str, str, str, str], Tuple[float, Dict[str, Any]]] = {}
+_capital_flow_audit_inflight: Dict[Tuple[str, str, str, str, str], bool] = {}
+_capital_flow_audit_lock = Lock()
+_capital_flow_audit_worker_started = False
+_CAPITAL_FLOW_AUDIT_CACHE_TTL_SECONDS = 1800.0
+_CAPITAL_FLOW_AUDIT_CACHE_MAX_ITEMS = 128
 _DAILY_HISTORY_DEFAULT_DAYS = 60
 _DAILY_HISTORY_MAX_DAYS = 365
 _TUSHARE_NEWS_SOURCES = {
@@ -50,6 +60,13 @@ _CJZC_RESOURCE_DIR = (
 )
 _CJZC_DAILY_PUBLISH_CUTOFF_HOUR = 6
 _CJZC_COMPANY_LINE_RE = re.compile(r"(?:(?:^)|[。！？；;\n\r]\s*|(?:\d+[、.]\s*))([\u4e00-\u9fa5A-Za-z0-9（）()]{2,24})\s*[：:](.*?)(?=(?:[。！？；;\n\r]\s*|\s+|(?:\d+[、.]\s*))[\u4e00-\u9fa5A-Za-z0-9（）()]{2,24}\s*[：:]|$)")
+_DISCLOSURE_KEYWORD_GROUPS: Dict[str, List[str]] = {
+    "storage_material": ["存储用抛光片", "抛光片", "存储领域", "存储芯片", "DRAM", "NAND"],
+    "soi_silicon_photonics": ["SOI", "SOI硅片", "硅光", "光互连", "12英寸SOI", "12 英寸SOI"],
+    "capacity_300mm": ["300mm", "300 mm", "12英寸", "12 英寸", "近完美单晶", "85万片/月", "85 万片/月", "半导体硅片"],
+    "investor_relation": ["投资者关系活动记录表", "投资者关系", "调研活动", "机构调研"],
+    "annual_report": ["年度报告", "年报"],
+}
 
 
 def _run_manager_task_with_timeout(
@@ -629,7 +646,23 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
     else:
         fast_path_enabled = False
     if fast_path_enabled:
-        fast_result = _query_tushare_chip_distribution(stock_code)
+        fast_result, fast_err, fast_cost_ms = _run_data_task_with_timeout(
+            lambda: _query_tushare_chip_distribution(stock_code),
+            timeout,
+            "tushare_cyq_chips",
+        )
+        if fast_err or not isinstance(fast_result, dict):
+            fast_result = {
+                "stock_code": stock_code,
+                "status": "timeout" if fast_err and "timeout" in str(fast_err).lower() else "failed",
+                "error_summary": str(fast_err or "Tushare cyq_chips unavailable"),
+                "errors": [str(fast_err or "Tushare cyq_chips unavailable")],
+                "source_chain": [{
+                    "provider": "tushare:cyq_chips",
+                    "result": "timeout" if fast_err and "timeout" in str(fast_err).lower() else "failed",
+                    "duration_ms": fast_cost_ms,
+                }],
+            }
         if fast_result.get("status") == "ok":
             return fast_result
 
@@ -1158,6 +1191,234 @@ def _normalize_stockapi_page_arg(value: Any, default: int, minimum: int = 1, max
     return max(minimum, min(maximum, normalized))
 
 
+def _capital_flow_audit_cache_key(
+    stock_code: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    selected_source: Optional[str],
+    latest_date: Optional[str],
+) -> Tuple[str, str, str, str, str]:
+    return (
+        str(stock_code or "").strip().upper(),
+        str(start_date or ""),
+        str(end_date or ""),
+        str(selected_source or ""),
+        str(latest_date or ""),
+    )
+
+
+def _read_capital_flow_audit_cache(key: Tuple[str, str, str, str, str]) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _capital_flow_audit_lock:
+        cached = _capital_flow_audit_cache.get(key)
+        if not cached:
+            return None
+        created_at, payload = cached
+        if now - created_at > _CAPITAL_FLOW_AUDIT_CACHE_TTL_SECONDS:
+            _capital_flow_audit_cache.pop(key, None)
+            return None
+        return dict(payload)
+
+
+def _store_capital_flow_audit_cache(key: Tuple[str, str, str, str, str], payload: Dict[str, Any]) -> None:
+    with _capital_flow_audit_lock:
+        _capital_flow_audit_cache[key] = (time.time(), dict(payload))
+        while len(_capital_flow_audit_cache) > _CAPITAL_FLOW_AUDIT_CACHE_MAX_ITEMS:
+            oldest_key = min(_capital_flow_audit_cache.items(), key=lambda item: item[1][0])[0]
+            _capital_flow_audit_cache.pop(oldest_key, None)
+
+
+def _run_capital_flow_audit_task(
+    adapter: Any,
+    stock_code: str,
+    selected_source: Optional[str],
+    selected_flow: Dict[str, Any],
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Dict[str, Any]:
+    started_at = time.time()
+    try:
+        result = adapter.audit_capital_flow_sources(
+            stock_code,
+            selected_source=selected_source,
+            selected_flow=selected_flow,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except Exception as exc:
+        logger.debug("capital flow source audit failed for %s: %s", stock_code, exc)
+        result = {
+            "status": "failed",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": [f"capital_flow_audit:{type(exc).__name__}:{exc}"],
+        }
+    if not isinstance(result, dict):
+        result = {
+            "status": "failed",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": ["capital_flow_audit:invalid_result"],
+        }
+    result["mode"] = "background"
+    result["duration_ms"] = int((time.time() - started_at) * 1000)
+    return result
+
+
+def _capital_flow_audit_worker_loop() -> None:
+    while True:
+        item = _capital_flow_audit_queue.get()
+        try:
+            (
+                key,
+                adapter,
+                stock_code,
+                selected_source,
+                selected_flow,
+                start_date,
+                end_date,
+            ) = item
+            payload = _run_capital_flow_audit_task(
+                adapter,
+                stock_code,
+                selected_source,
+                selected_flow,
+                start_date,
+                end_date,
+            )
+            _store_capital_flow_audit_cache(key, payload)
+        except Exception as exc:
+            logger.debug("capital flow audit worker failed: %s", exc)
+        finally:
+            try:
+                cache_key = item[0]
+                with _capital_flow_audit_lock:
+                    _capital_flow_audit_inflight.pop(cache_key, None)
+            except Exception:
+                pass
+            _capital_flow_audit_queue.task_done()
+
+
+def _ensure_capital_flow_audit_worker() -> None:
+    global _capital_flow_audit_worker_started
+    with _capital_flow_audit_lock:
+        if _capital_flow_audit_worker_started:
+            return
+        worker = Thread(
+            target=_capital_flow_audit_worker_loop,
+            name="capital_flow_audit",
+            daemon=True,
+        )
+        _capital_flow_audit_worker_started = True
+        worker.start()
+
+
+def _schedule_capital_flow_audit(
+    manager: Any,
+    stock_code: str,
+    selected_source: Optional[str],
+    selected_flow: Dict[str, Any],
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Dict[str, Any]:
+    key = _capital_flow_audit_cache_key(
+        stock_code,
+        start_date,
+        end_date,
+        selected_source,
+        selected_flow.get("latest_date") if isinstance(selected_flow, dict) else None,
+    )
+    cached = _read_capital_flow_audit_cache(key)
+    if cached is not None:
+        cached["cache"] = "hit"
+        return cached
+
+    adapter = getattr(manager, "_fundamental_adapter", None)
+    if adapter is None or not hasattr(adapter, "audit_capital_flow_sources"):
+        return {
+            "status": "unavailable",
+            "mode": "background",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": ["capital_flow_audit:adapter_unavailable"],
+        }
+
+    with _capital_flow_audit_lock:
+        if _capital_flow_audit_inflight.get(key):
+            return {
+                "status": "pending",
+                "mode": "background",
+                "selected_flow_source": selected_source,
+                "checked_sources": [],
+                "source_conflicts": [],
+                "warnings": [],
+                "errors": [],
+            }
+        _capital_flow_audit_inflight[key] = True
+
+    _ensure_capital_flow_audit_worker()
+    try:
+        _capital_flow_audit_queue.put_nowait((
+            key,
+            adapter,
+            stock_code,
+            selected_source,
+            dict(selected_flow),
+            start_date,
+            end_date,
+        ))
+    except Full:
+        with _capital_flow_audit_lock:
+            _capital_flow_audit_inflight.pop(key, None)
+        return {
+            "status": "skipped_busy",
+            "mode": "background",
+            "selected_flow_source": selected_source,
+            "checked_sources": [],
+            "source_conflicts": [],
+            "warnings": [],
+            "errors": ["capital_flow_audit:queue_full"],
+        }
+
+    return {
+        "status": "pending",
+        "mode": "background",
+        "selected_flow_source": selected_source,
+        "checked_sources": [],
+        "source_conflicts": [],
+        "warnings": [],
+        "errors": [],
+    }
+
+
+def _compact_capital_flow_audit(audit: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "status": audit.get("status"),
+        "mode": audit.get("mode", "background"),
+        "selected_flow_source": audit.get("selected_flow_source"),
+        "checked_sources": audit.get("checked_sources", []),
+        "cache": audit.get("cache"),
+        "duration_ms": audit.get("duration_ms"),
+        "errors": audit.get("errors", []),
+        "source_summaries": audit.get("source_summaries", {}),
+    }
+
+
+def _attach_capital_flow_audit(response: Dict[str, Any], audit: Dict[str, Any]) -> Dict[str, Any]:
+    warnings = list(response.get("warnings") or [])
+    warnings.extend(str(item) for item in audit.get("warnings", []) if str(item).strip())
+    response["warnings"] = warnings
+    response["source_conflicts"] = list(audit.get("source_conflicts", []) or [])
+    response["capital_flow_audit"] = _compact_capital_flow_audit(audit)
+    return response
+
+
 def _handle_get_capital_flow(
     stock_code: str,
     start_date: Optional[str] = None,
@@ -1191,6 +1452,11 @@ def _handle_get_capital_flow(
             "stock_code": stock_code,
             "status": "error",
             "error": f"capital flow fetch failed: {exc}",
+            "errors": [str(exc)],
+            "source_chain": [{
+                "provider": "capital_flow",
+                "result": "failed",
+            }],
         }
 
     status = ctx.get("status", "not_supported")
@@ -1199,6 +1465,10 @@ def _handle_get_capital_flow(
             "stock_code": stock_code,
             "status": "not_supported",
             "note": "Capital flow data is only available for A-share stocks (not ETFs/indices).",
+            "source_chain": [{
+                "provider": "capital_flow",
+                "result": "not_supported",
+            }],
         }
 
     data = ctx.get("data", {})
@@ -1213,11 +1483,11 @@ def _handle_get_capital_flow(
             error_summary = "capital-flow endpoint timeout"
         elif "tushare_moneyflow" in joined_errors:
             if "empty_data" in joined_errors:
-                error_summary = "Tushare moneyflow returned no capital-flow rows for the queried window"
+                error_summary = "Tushare moneyflow endpoints returned no capital-flow rows for the queried window"
             elif "invalid_date" in joined_errors:
                 error_summary = "Tushare moneyflow query window is invalid"
             else:
-                error_summary = "Tushare moneyflow capital-flow endpoint failed"
+                error_summary = "Tushare moneyflow capital-flow endpoints failed"
         elif "stockapi_codeFlow" in joined_errors:
             if "empty_data" in joined_errors:
                 error_summary = "StockAPI codeFlow returned no capital-flow rows for the queried window"
@@ -1230,7 +1500,7 @@ def _handle_get_capital_flow(
         else:
             error_summary = str(errors[0])
 
-    return {
+    response = {
         "stock_code": stock_code,
         "status": status,
         "query": {
@@ -1240,10 +1510,33 @@ def _handle_get_capital_flow(
             "page_size": normalized_page_size,
         },
         "main_net_inflow": stock_flow.get("main_net_inflow"),
+        "main_inflow_5d": stock_flow.get("main_inflow_5d"),
+        "main_inflow_10d": stock_flow.get("main_inflow_10d"),
         "inflow_5d": stock_flow.get("inflow_5d"),
         "inflow_10d": stock_flow.get("inflow_10d"),
+        "net_inflow": stock_flow.get("net_inflow"),
+        "net_inflow_5d": stock_flow.get("net_inflow_5d"),
+        "net_inflow_10d": stock_flow.get("net_inflow_10d"),
         "latest_date": stock_flow.get("latest_date"),
         "source_update": stock_flow.get("source_update"),
+        "amount_unit": stock_flow.get("amount_unit", "CNY"),
+        "raw_amount_unit": stock_flow.get("raw_amount_unit"),
+        "selected_flow_source": stock_flow.get("selected_flow_source"),
+        "flow_sources": stock_flow.get("flow_sources"),
+        "latest_price": stock_flow.get("latest_price"),
+        "pct_change": stock_flow.get("pct_change"),
+        "net_inflow_rate": stock_flow.get("net_inflow_rate"),
+        "extra_large_net_inflow": stock_flow.get("extra_large_net_inflow"),
+        "extra_large_net_inflow_rate": stock_flow.get("extra_large_net_inflow_rate"),
+        "large_net_inflow": stock_flow.get("large_net_inflow"),
+        "large_net_inflow_rate": stock_flow.get("large_net_inflow_rate"),
+        "medium_net_inflow": stock_flow.get("medium_net_inflow"),
+        "medium_net_inflow_rate": stock_flow.get("medium_net_inflow_rate"),
+        "small_net_inflow": stock_flow.get("small_net_inflow"),
+        "small_net_inflow_rate": stock_flow.get("small_net_inflow_rate"),
+        "main_inflow_definition": stock_flow.get("main_inflow_definition"),
+        "net_inflow_definition": stock_flow.get("net_inflow_definition"),
+        "latest_raw": stock_flow.get("latest_raw"),
         "source_chain": source_chain,
         "sector_rankings": {
             "top_inflow_sectors": sector_rankings.get("top", [])[:3],
@@ -1252,13 +1545,35 @@ def _handle_get_capital_flow(
         "error_summary": error_summary,
         "errors": errors,
     }
+    if status in {"ok", "partial"} and isinstance(stock_flow, dict) and stock_flow.get("selected_flow_source"):
+        audit = _schedule_capital_flow_audit(
+            manager,
+            stock_code,
+            selected_source=stock_flow.get("selected_flow_source"),
+            selected_flow=stock_flow,
+            start_date=normalized_start_date,
+            end_date=normalized_end_date,
+        )
+        response = _attach_capital_flow_audit(response, audit)
+    return response
 
 
 get_capital_flow_tool = ToolDefinition(
     name="get_capital_flow",
     description=(
-        "Get main-force (主力) capital flow data for an A-share stock. "
-        "Returns the latest daily net inflow, 5-day and 10-day cumulative inflows. "
+        "Get A-share stock capital flow with explicit semantics and units. The tool normalizes "
+        "three different per-stock sources into one failover contract: Tushare Eastmoney `moneyflow_dc`, "
+        "Tushare THS `moneyflow_ths`, and legacy Tushare `moneyflow`; StockAPI codeFlow is still "
+        "a fallback. The tool returns as soon as the first usable source is found. "
+        "`selected_flow_source` tells which source populates the top-level fields, and "
+        "`flow_sources` retains the successful source so its statistics are auditable. "
+        "After the main result returns, a background audit may compare non-selected Tushare sources; "
+        "completed conflicts appear only in `warnings`/`source_conflicts` and do not override top-level fields. "
+        "`main_net_inflow`, `main_inflow_5d`, and `main_inflow_10d` always follow the selected source's "
+        "documented main/large-order definition and are in CNY. `net_inflow*` keeps the selected "
+        "source's own net-flow definition. `inflow_5d`/`inflow_10d` remain backward-compatible aliases "
+        "for the selected main-flow口径. Do not mix DC, THS, and legacy moneyflow values as if they "
+        "were the same statistical definition; inspect `selected_flow_source` and definitions first. "
         "Only supported for A-share individual stocks (not ETFs, indices, HK, or US stocks)."
     ),
     parameters=[
@@ -1309,6 +1624,12 @@ ALL_DATA_TOOLS.append(get_capital_flow_tool)
 # ============================================================
 
 def _get_fundamental_adapter():
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=Path(__file__).resolve().parents[3] / ".env", override=False)
+    except Exception:
+        pass
     from data_provider.fundamental_adapter import AkshareFundamentalAdapter
 
     return AkshareFundamentalAdapter()
@@ -1751,22 +2072,35 @@ def _query_tushare_stock_moneyflow(stock_code: str, timeout_seconds: Optional[fl
         result["stock_code"] = stock_code
         return result
 
-    dated_amounts: List[Tuple[str, float]] = []
+    net_amounts_by_date: Dict[str, float] = {}
+    main_amounts_by_date: Dict[str, float] = {}
+    raw_by_date: Dict[str, Dict[str, Any]] = {}
     for row in result.get("items") or []:
         trade_date = str(row.get("trade_date") or "").replace("-", "")[:8]
-        amount = _safe_number(row.get("net_mf_amount"))
-        if amount is None:
-            buy_lg = _safe_number(row.get("buy_lg_amount")) or 0.0
-            sell_lg = _safe_number(row.get("sell_lg_amount")) or 0.0
-            buy_elg = _safe_number(row.get("buy_elg_amount")) or 0.0
-            sell_elg = _safe_number(row.get("sell_elg_amount")) or 0.0
-            amount = (buy_lg + buy_elg) - (sell_lg + sell_elg)
-        if trade_date and amount is not None:
+        if len(trade_date) != 8:
+            continue
+        net_amount = _safe_number(row.get("net_mf_amount"))
+        buy_lg = _safe_number(row.get("buy_lg_amount"))
+        sell_lg = _safe_number(row.get("sell_lg_amount"))
+        buy_elg = _safe_number(row.get("buy_elg_amount"))
+        sell_elg = _safe_number(row.get("sell_elg_amount"))
+        if net_amount is not None:
             # Tushare moneyflow amount columns are in 10k yuan; keep tool output in yuan.
-            dated_amounts.append((trade_date, float(amount) * 10000.0))
+            net_amounts_by_date[trade_date] = float(net_amount) * 10000.0
+        if any(value is not None for value in (buy_lg, sell_lg, buy_elg, sell_elg)):
+            main_amount = (buy_lg or 0.0) + (buy_elg or 0.0) - (sell_lg or 0.0) - (sell_elg or 0.0)
+            main_amounts_by_date[trade_date] = float(main_amount) * 10000.0
+        raw_by_date[trade_date] = {
+            "net_mf_amount_10k_cny": net_amount,
+            "buy_lg_amount_10k_cny": buy_lg,
+            "sell_lg_amount_10k_cny": sell_lg,
+            "buy_elg_amount_10k_cny": buy_elg,
+            "sell_elg_amount_10k_cny": sell_elg,
+        }
 
-    dated_amounts.sort(key=lambda item: item[0])
-    if not dated_amounts:
+    net_rows = sorted(net_amounts_by_date.items(), key=lambda item: item[0])
+    main_rows = sorted(main_amounts_by_date.items(), key=lambda item: item[0])
+    if not net_rows and not main_rows:
         return {
             "stock_code": stock_code,
             "status": "empty",
@@ -1774,16 +2108,30 @@ def _query_tushare_stock_moneyflow(stock_code: str, timeout_seconds: Optional[fl
             "errors": ["tushare:moneyflow empty usable rows"],
             "source_chain": result.get("source_chain", []),
         }
-    amounts = [item[1] for item in dated_amounts]
-    latest_date, latest_amount = dated_amounts[-1]
+    latest_date = (main_rows or net_rows)[-1][0]
+    latest_main = main_amounts_by_date.get(latest_date)
+    latest_net = net_amounts_by_date.get(latest_date)
+    main_amounts = [item[1] for item in main_rows]
+    net_amounts = [item[1] for item in net_rows]
     return {
         "stock_code": stock_code,
         "status": "ok",
-        "main_net_inflow": latest_amount,
-        "inflow_5d": float(sum(amounts[-5:])),
-        "inflow_10d": float(sum(amounts[-10:])),
+        "main_net_inflow": latest_main,
+        "main_inflow_5d": float(sum(main_amounts[-5:])) if main_amounts else None,
+        "main_inflow_10d": float(sum(main_amounts[-10:])) if main_amounts else None,
+        "net_inflow": latest_net,
+        "net_inflow_5d": float(sum(net_amounts[-5:])) if net_amounts else None,
+        "net_inflow_10d": float(sum(net_amounts[-10:])) if net_amounts else None,
+        # Backward-compatible aliases now point to the main-force口径.
+        "inflow_5d": float(sum(main_amounts[-5:])) if main_amounts else None,
+        "inflow_10d": float(sum(main_amounts[-10:])) if main_amounts else None,
         "latest_date": f"{latest_date[:4]}-{latest_date[4:6]}-{latest_date[6:8]}",
         "source_update": "tushare_moneyflow_after_market_close",
+        "amount_unit": "CNY",
+        "raw_amount_unit": "10k CNY",
+        "main_inflow_definition": "(buy_lg_amount + buy_elg_amount - sell_lg_amount - sell_elg_amount) * 10000",
+        "net_inflow_definition": "net_mf_amount * 10000",
+        "latest_raw": raw_by_date.get(latest_date, {}),
         "source_chain": result.get("source_chain", []),
         "errors": [],
     }
@@ -2718,28 +3066,54 @@ def _to_yuan_from_100m(value: Any) -> Optional[float]:
 def _handle_get_tushare_moneyflow_ind_ths(
     trade_date: str = "",
     ts_code: str = "",
+    start_date: str = "",
+    end_date: str = "",
     limit: int = 30,
 ) -> dict:
     """Get Tushare THS industry money-flow ranking without fallback."""
     requested_date = _normalize_tushare_date(trade_date)
+    requested_start_date = _normalize_tushare_date(start_date)
+    requested_end_date = _normalize_tushare_date(end_date)
     effective_limit = max(1, min(int(limit or 30), 200))
     target_code = _clean_text(ts_code).upper()
     fields = (
         "trade_date,ts_code,industry,lead_stock,close,pct_change,company_num,"
         "pct_change_stock,close_price,net_buy_amount,net_sell_amount,net_amount"
     )
-    selected_date, result, source_chain, errors = _tushare_recent_date_query(
-        "moneyflow_ind_ths",
-        requested_date=requested_date,
-        fields=fields,
-        param_builder=lambda _date: {"ts_code": target_code},
-    )
+    params: Dict[str, Any] = {
+        "ts_code": target_code,
+        "trade_date": requested_date,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
+    }
+    params = {k: v for k, v in params.items() if v}
+    source_chain: List[Dict[str, Any]]
+    errors: List[str]
+    if requested_start_date or requested_end_date:
+        result = _tushare_query_all_rows(
+            "moneyflow_ind_ths",
+            params,
+            fields,
+            timeout=_get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0),
+        )
+        selected_date = requested_date or requested_end_date or requested_start_date
+        source_chain = list(result.get("source_chain") or [])
+        errors = list(result.get("errors") or [])
+    else:
+        selected_date, result, source_chain, errors = _tushare_recent_date_query(
+            "moneyflow_ind_ths",
+            requested_date=requested_date,
+            fields=fields,
+            param_builder=lambda _date: {"ts_code": target_code},
+        )
     if result.get("status") != "ok":
         return {
             "status": result.get("status") or "failed",
             "api_name": "moneyflow_ind_ths",
             "trade_date": selected_date,
             "ts_code": target_code,
+            "start_date": requested_start_date,
+            "end_date": requested_end_date,
             "items": [],
             "source_chain": source_chain,
             "errors": errors or [f"tushare:moneyflow_ind_ths unavailable for {selected_date}"],
@@ -2784,6 +3158,8 @@ def _handle_get_tushare_moneyflow_ind_ths(
         "api_name": "moneyflow_ind_ths",
         "trade_date": selected_date,
         "ts_code": target_code,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
         "items": items,
         "total_rows": int(result.get("total_rows") or len(raw_items)),
         "source_chain": source_chain,
@@ -2800,6 +3176,8 @@ get_tushare_moneyflow_ind_ths_tool = ToolDefinition(
     parameters=[
         ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
         ToolParameter(name="ts_code", type="string", description="Optional THS board code, e.g. 881267.TI.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
         ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
     ],
     handler=_handle_get_tushare_moneyflow_ind_ths,
@@ -3001,6 +3379,200 @@ get_tushare_moneyflow_cnt_ths_tool = ToolDefinition(
         ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
     ],
     handler=_handle_get_tushare_moneyflow_cnt_ths,
+    category="data",
+)
+
+
+def _normalize_board_capital_item(item: Dict[str, Any], *, source_key: str) -> Dict[str, Any]:
+    row = dict(item)
+    row["source_key"] = source_key
+    row["amount_unit"] = "CNY"
+    if source_key == "tushare_moneyflow_ind_dc":
+        row["board_type"] = _clean_text(row.get("content_type")) or "unknown"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "moneyflow_ind_dc.net_amount (CNY, Eastmoney board main-force net inflow)"
+        row["net_inflow_definition"] = "same as main_net_inflow for moneyflow_ind_dc"
+    elif source_key == "tushare_moneyflow_ind_ths":
+        row["board_type"] = "行业"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "moneyflow_ind_ths.net_amount * 100000000 (THS industry net amount)"
+        row["net_inflow_definition"] = "moneyflow_ind_ths.net_amount * 100000000"
+    elif source_key == "tushare_moneyflow_cnt_ths":
+        row["board_type"] = "概念"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "moneyflow_cnt_ths.net_amount * 100000000 (THS concept net amount)"
+        row["net_inflow_definition"] = "moneyflow_cnt_ths.net_amount * 100000000"
+    else:
+        row["board_type"] = _clean_text(row.get("content_type")) or "unknown"
+        row["main_net_inflow"] = _safe_number(row.get("net_inflow"))
+        row["main_inflow_definition"] = "unknown board capital-flow source"
+        row["net_inflow_definition"] = "unknown board capital-flow source"
+    return row
+
+
+def _top_bottom_board_items(items: List[Dict[str, Any]], limit: int) -> Dict[str, List[Dict[str, Any]]]:
+    ranked = sorted(
+        [item for item in items if isinstance(item, dict)],
+        key=lambda item: (
+            float(item.get("main_net_inflow") or item.get("net_inflow") or 0.0),
+            float(item.get("pct_change") or item.get("change_ratio") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+        reverse=True,
+    )
+    bottom = sorted(
+        [item for item in items if isinstance(item, dict)],
+        key=lambda item: (
+            float(item.get("main_net_inflow") or item.get("net_inflow") or 0.0),
+            float(item.get("pct_change") or item.get("change_ratio") or 0.0),
+            str(item.get("ts_code") or ""),
+        ),
+    )
+    return {
+        "top": ranked[:limit],
+        "bottom": bottom[:limit],
+    }
+
+
+def _handle_get_board_capital_flow(
+    trade_date: str = "",
+    ts_code: str = "",
+    content_type: str = "",
+    limit: int = 20,
+) -> dict:
+    """Get board-level capital flow through a unified THS/DC contract."""
+    effective_limit = max(1, min(int(limit or 20), 100))
+    requested_type = _clean_text(content_type)
+    source_results: Dict[str, Any] = {}
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    dc_types = [requested_type] if requested_type in {"行业", "概念", "地域"} else ["行业", "概念", "地域"]
+    dc_items: List[Dict[str, Any]] = []
+    for dc_type in dc_types:
+        dc_result = _handle_get_tushare_moneyflow_ind_dc(
+            trade_date=trade_date,
+            ts_code=ts_code,
+            content_type=dc_type,
+            limit=max(effective_limit, 30),
+        )
+        key = f"tushare_moneyflow_ind_dc:{dc_type}"
+        source_results[key] = dc_result
+        source_chain.extend(dc_result.get("source_chain") or [])
+        errors.extend(dc_result.get("errors") or [])
+        for item in dc_result.get("items") or []:
+            if isinstance(item, dict):
+                dc_items.append(_normalize_board_capital_item(item, source_key="tushare_moneyflow_ind_dc"))
+
+    ths_ind_result: Optional[Dict[str, Any]] = None
+    ths_ind_items: List[Dict[str, Any]] = []
+    if requested_type in {"", "行业"}:
+        ths_ind_result = _handle_get_tushare_moneyflow_ind_ths(
+            trade_date=trade_date,
+            ts_code=ts_code,
+            limit=max(effective_limit, 30),
+        )
+        source_results["tushare_moneyflow_ind_ths"] = ths_ind_result
+        source_chain.extend(ths_ind_result.get("source_chain") or [])
+        errors.extend(ths_ind_result.get("errors") or [])
+        for item in ths_ind_result.get("items") or []:
+            if isinstance(item, dict):
+                ths_ind_items.append(_normalize_board_capital_item(item, source_key="tushare_moneyflow_ind_ths"))
+
+    ths_cnt_result: Optional[Dict[str, Any]] = None
+    ths_cnt_items: List[Dict[str, Any]] = []
+    if requested_type in {"", "概念"}:
+        ths_cnt_result = _handle_get_tushare_moneyflow_cnt_ths(
+            trade_date=trade_date,
+            ts_code=ts_code,
+            limit=max(effective_limit, 30),
+        )
+        source_results["tushare_moneyflow_cnt_ths"] = ths_cnt_result
+        source_chain.extend(ths_cnt_result.get("source_chain") or [])
+        errors.extend(ths_cnt_result.get("errors") or [])
+        for item in ths_cnt_result.get("items") or []:
+            if isinstance(item, dict):
+                ths_cnt_items.append(_normalize_board_capital_item(item, source_key="tushare_moneyflow_cnt_ths"))
+
+    all_items = dc_items + ths_ind_items + ths_cnt_items
+    selected_source = "tushare_moneyflow_ind_dc" if dc_items else (
+        "tushare_moneyflow_cnt_ths" if ths_cnt_items else (
+            "tushare_moneyflow_ind_ths" if ths_ind_items else ""
+        )
+    )
+    ranking = _top_bottom_board_items(all_items, effective_limit)
+    selected_ranking = _top_bottom_board_items(
+        dc_items or ths_cnt_items or ths_ind_items,
+        effective_limit,
+    )
+    statuses = [
+        str(payload.get("status") or "empty")
+        for payload in source_results.values()
+        if isinstance(payload, dict)
+    ]
+    status = "ok" if all_items else ("failed" if any(value in {"failed", "timeout", "error"} for value in statuses) else "empty")
+    trade_dates = [
+        str(payload.get("trade_date") or "")
+        for payload in source_results.values()
+        if isinstance(payload, dict) and payload.get("trade_date")
+    ]
+    return {
+        "status": status,
+        "api_name": "board_capital_flow",
+        "trade_date": trade_dates[0] if trade_dates else _normalize_tushare_date(trade_date),
+        "ts_code": _clean_text(ts_code).upper(),
+        "content_type": requested_type or "all",
+        "selected_flow_source": selected_source,
+        "amount_unit": "CNY",
+        "source_definitions": {
+            "tushare_moneyflow_ind_dc": "Eastmoney 行业/概念/地域板块资金流；net_amount/buy_* 字段已是 CNY。",
+            "tushare_moneyflow_ind_ths": "THS 行业资金流；net_buy_amount/net_sell_amount/net_amount 原始单位为亿元，工具转为 CNY。",
+            "tushare_moneyflow_cnt_ths": "THS 概念资金流；net_buy_amount/net_sell_amount/net_amount 原始单位为亿元，工具转为 CNY。",
+        },
+        "top_boards": ranking["top"],
+        "bottom_boards": ranking["bottom"],
+        "selected_top_boards": selected_ranking["top"],
+        "selected_bottom_boards": selected_ranking["bottom"],
+        "flow_sources": {
+            "tushare_moneyflow_ind_dc": _top_bottom_board_items(dc_items, effective_limit),
+            "tushare_moneyflow_ind_ths": _top_bottom_board_items(ths_ind_items, effective_limit),
+            "tushare_moneyflow_cnt_ths": _top_bottom_board_items(ths_cnt_items, effective_limit),
+        },
+        "source_status": {
+            key: {
+                "status": value.get("status"),
+                "count": len(value.get("items") or []),
+                "trade_date": value.get("trade_date"),
+                "errors": value.get("errors") or [],
+            }
+            for key, value in source_results.items()
+            if isinstance(value, dict)
+        },
+        "source_chain": source_chain,
+        "errors": errors,
+        "notes": [
+            "DC, THS industry, and THS concept board flows use different statistics; compare values only with source_definitions.",
+            "selected_flow_source identifies the preferred top-level ranking source; flow_sources keeps each source separate.",
+        ],
+    }
+
+
+get_board_capital_flow_tool = ToolDefinition(
+    name="get_board_capital_flow",
+    description=(
+        "Get unified A-share board/sector capital flow by combining Tushare Eastmoney "
+        "`moneyflow_ind_dc`, THS industry `moneyflow_ind_ths`, and THS concept "
+        "`moneyflow_cnt_ths`. Amounts are normalized to CNY, while source_definitions and "
+        "flow_sources preserve the different DC/THS statistical definitions. Use this instead "
+        "of asking the model to manually compare separate board-moneyflow tools."
+    ),
+    parameters=[
+        ToolParameter(name="trade_date", type="string", description="Optional trade date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional board code, e.g. BK0477 or 885748.TI.", required=False, default=""),
+        ToolParameter(name="content_type", type="string", description="Optional DC board type: 行业/概念/地域. Blank queries all supported board types plus THS industry/concept.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max top/bottom rows per ranking (default: 20, max: 100).", required=False, default=20),
+    ],
+    handler=_handle_get_board_capital_flow,
     category="data",
 )
 
@@ -3856,6 +4428,347 @@ get_tushare_stock_alerts_tool = ToolDefinition(
 )
 
 
+def _normalize_disclosure_date(value: str = "") -> str:
+    return _normalize_tushare_date(value)
+
+
+def _display_disclosure_date(value: str = "") -> str:
+    normalized = _normalize_disclosure_date(value)
+    if len(normalized) == 8:
+        return f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+    return str(value or "").strip()
+
+
+def _cninfo_plate_for_stock(stock_code: str) -> str:
+    code = str(stock_code or "").strip()
+    if code.startswith(("6", "9")):
+        return "sh"
+    if code.startswith(("0", "3")):
+        return "sz"
+    if code.startswith(("8", "4")):
+        return "bj"
+    return ""
+
+
+def _disclosure_doc_type(title: str) -> str:
+    text = str(title or "")
+    if "投资者关系" in text or "调研" in text:
+        return "investor_relation"
+    if "年度报告" in text or "年报" in text:
+        return "annual_report"
+    if "半年度报告" in text:
+        return "semi_annual_report"
+    if "季度报告" in text:
+        return "quarterly_report"
+    return "announcement"
+
+
+def _match_disclosure_terms(text: str, keywords: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
+    haystack = str(text or "")
+    groups: List[str] = []
+    terms: List[str] = []
+    keyword_set = set(str(item).strip() for item in (keywords or []) if str(item).strip())
+    for group, group_terms in _DISCLOSURE_KEYWORD_GROUPS.items():
+        matched = [term for term in group_terms if term and term in haystack]
+        if matched:
+            groups.append(group)
+            terms.extend(matched)
+    for term in keyword_set:
+        if term in haystack:
+            terms.append(term)
+            if "custom_keyword" not in groups:
+                groups.append("custom_keyword")
+    return sorted(set(groups)), sorted(set(terms), key=lambda item: (len(item), item))
+
+
+def _compact_disclosure_summary(text: str, matched_terms: List[str], limit: int = 260) -> str:
+    body = _compact_cjzc_text(text, limit=4000)
+    if not body:
+        return ""
+    for term in matched_terms:
+        idx = body.find(term)
+        if idx >= 0:
+            start = max(0, idx - 80)
+            end = min(len(body), idx + max(120, len(term) + 120))
+            return _compact_cjzc_text(body[start:end], limit=limit)
+    return _compact_cjzc_text(body, limit=limit)
+
+
+def _cninfo_full_url(adjunct_url: str) -> str:
+    url = str(adjunct_url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://static.cninfo.com.cn/{url.lstrip('/')}"
+
+
+def _fetch_disclosure_text(url: str, *, timeout_seconds: float = 8.0) -> Dict[str, Any]:
+    if not url:
+        return {"status": "missing", "text": "", "errors": ["missing disclosure url"]}
+    start = time.time()
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout_seconds,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.cninfo.com.cn/",
+            },
+        )
+        response.raise_for_status()
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        raw = response.content or b""
+        elapsed_ms = int((time.time() - start) * 1000)
+        if "pdf" in content_type or url.lower().endswith(".pdf"):
+            # PDF text extraction is intentionally optional at the bottom layer.
+            # The announcement list remains usable even when PDF parsing is unavailable.
+            return {
+                "status": "skipped_pdf",
+                "text": "",
+                "elapsed_ms": elapsed_ms,
+                "errors": ["PDF body extraction is not enabled; title and metadata were used"],
+            }
+        text = raw.decode(response.encoding or "utf-8", errors="ignore")
+        return {
+            "status": "ok",
+            "text": _strip_cjzc_html(text, limit=6000),
+            "elapsed_ms": elapsed_ms,
+            "errors": [],
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "text": "",
+            "elapsed_ms": int((time.time() - start) * 1000),
+            "errors": [str(exc)],
+        }
+
+
+def _query_cninfo_disclosures(
+    stock_code: str,
+    stock_name: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    keywords: Optional[List[str]] = None,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    start = _display_disclosure_date(start_date)
+    end = _display_disclosure_date(end_date)
+    se_date = f"{start}~{end}" if start and end else ""
+    page_size = max(1, min(int(limit or 20), 50))
+    base_payload = {
+        "pageNum": 1,
+        "pageSize": page_size,
+        "column": "sse" if _cninfo_plate_for_stock(stock_code) == "sh" else "szse",
+        "tabName": "fulltext",
+        "plate": _cninfo_plate_for_stock(stock_code),
+        "stock": str(stock_code or "").strip(),
+        "searchkey": "",
+        "secid": "",
+        "category": "",
+        "trade": "",
+        "seDate": se_date,
+        "sortName": "",
+        "sortType": "",
+        "isHLtitle": "true",
+    }
+    query_variants: List[Dict[str, Any]] = [dict(base_payload)]
+    # CNInfo often returns empty for bare `stock=code`; full-text `searchkey`
+    # is the reliable open-web fallback for SSE/KCB announcements.
+    for searchkey in [str(stock_code or "").strip(), str(stock_name or "").strip()]:
+        if searchkey:
+            variant = dict(base_payload)
+            variant["stock"] = ""
+            variant["searchkey"] = searchkey
+            query_variants.append(variant)
+    for term in [str(item).strip() for item in (keywords or []) if str(item).strip()]:
+        if term in {"抛光片", "SOI", "300mm", "85万片/月", "半导体硅片", "存储领域"}:
+            continue
+        variant = dict(base_payload)
+        variant["stock"] = ""
+        variant["searchkey"] = f"{stock_code} {term}".strip()
+        query_variants.append(variant)
+
+    rows_by_key: Dict[str, Dict[str, Any]] = {}
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for payload in query_variants:
+        start_ts = time.time()
+        try:
+            response = requests.post(
+                "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+                data=payload,
+                timeout=max(8.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            rows = data.get("announcements") if isinstance(data, dict) else []
+            source_chain.append({
+                "provider": "cninfo:hisAnnouncement",
+                "result": "ok" if rows else "empty",
+                "duration_ms": int((time.time() - start_ts) * 1000),
+                "params": {key: value for key, value in payload.items() if value not in ("", None)},
+            })
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("announcementId") or row.get("adjunctUrl") or row.get("announcementTitle") or "")
+                if key and key not in rows_by_key:
+                    rows_by_key[key] = row
+        except Exception as exc:
+            source_chain.append({
+                "provider": "cninfo:hisAnnouncement",
+                "result": "failed",
+                "duration_ms": int((time.time() - start_ts) * 1000),
+                "params": {key: value for key, value in payload.items() if value not in ("", None)},
+            })
+            errors.append(str(exc))
+    rows = list(rows_by_key.values())
+    if rows:
+        return {
+            "status": "ok",
+            "items": rows,
+            "source_chain": source_chain,
+            "errors": errors,
+        }
+    return {
+        "status": "failed" if errors and not any(chain.get("result") == "empty" for chain in source_chain) else "empty",
+        "items": [],
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+def _normalize_cninfo_announcement(row: Dict[str, Any]) -> Dict[str, Any]:
+    title = _strip_cjzc_html(str(row.get("announcementTitle") or row.get("title") or ""), limit=240)
+    sec_name = str(row.get("secName") or row.get("name") or "").strip()
+    sec_code = str(row.get("secCode") or row.get("stock_code") or "").strip()
+    announcement_time = row.get("announcementTime") or row.get("ann_date") or row.get("date") or ""
+    if isinstance(announcement_time, (int, float)):
+        ann_date = datetime.fromtimestamp(float(announcement_time) / 1000.0).strftime("%Y-%m-%d")
+    else:
+        ann_date = _display_disclosure_date(str(announcement_time))
+    url = _cninfo_full_url(str(row.get("adjunctUrl") or row.get("url") or ""))
+    return {
+        "stock_code": sec_code,
+        "stock_name": sec_name,
+        "title": title,
+        "ann_date": ann_date,
+        "url": url,
+        "doc_type": _disclosure_doc_type(title),
+        "source": "cninfo",
+    }
+
+
+def _handle_get_stock_disclosure_events(
+    stock_code: str,
+    stock_name: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    keywords: Optional[List[str]] = None,
+    include_body: bool = False,
+    limit: int = 20,
+) -> dict:
+    """Get public company disclosure/IR evidence from open announcement sources."""
+    code = str(stock_code or "").strip()
+    if not code:
+        return {"status": "failed", "stock_code": code, "items": [], "events": [], "errors": ["stock_code is required"]}
+
+    start_default, end_default = _default_recent_date_range(120)
+    start = _normalize_disclosure_date(start_date) or start_default
+    end = _normalize_disclosure_date(end_date) or end_default
+    effective_limit = max(1, min(int(limit or 20), 50))
+    custom_keywords = [str(item).strip() for item in (keywords or []) if str(item).strip()]
+
+    cninfo = _query_cninfo_disclosures(code, stock_name, start, end, custom_keywords, effective_limit)
+    raw_rows = cninfo.get("items") or []
+    items: List[Dict[str, Any]] = []
+    errors: List[str] = list(cninfo.get("errors") or [])
+    source_chain: List[Dict[str, Any]] = list(cninfo.get("source_chain") or [])
+
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        item = _normalize_cninfo_announcement(raw)
+        item["stock_code"] = item.get("stock_code") or code
+        item["stock_name"] = item.get("stock_name") or stock_name
+        body_text = ""
+        body_status = "not_requested"
+        body_errors: List[str] = []
+        if include_body:
+            fetched = _fetch_disclosure_text(str(item.get("url") or ""))
+            body_text = str(fetched.get("text") or "")
+            body_status = str(fetched.get("status") or "unknown")
+            body_errors = list(fetched.get("errors") or [])
+            if body_errors:
+                errors.extend(body_errors)
+        match_text = " ".join([str(item.get("title") or ""), body_text])
+        groups, terms = _match_disclosure_terms(match_text, custom_keywords)
+        item.update({
+            "matched_groups": groups,
+            "matched_terms": terms,
+            "evidence_summary": _compact_disclosure_summary(match_text, terms),
+            "body_status": body_status,
+            "body_errors": body_errors[:3],
+        })
+        items.append(item)
+
+    def _item_sort_key(item: Dict[str, Any]) -> Tuple[int, int]:
+        relevant = bool(item.get("matched_terms")) or item.get("doc_type") in {"investor_relation", "annual_report"}
+        date_digits = re.sub(r"\D", "", str(item.get("ann_date") or ""))
+        try:
+            date_value = int(date_digits or "0")
+        except ValueError:
+            date_value = 0
+        return (0 if relevant else 1, -date_value)
+
+    items = sorted(items, key=_item_sort_key)[:effective_limit]
+
+    # Keep all disclosure items for audit, but expose event candidates separately.
+    events = [
+        item for item in items
+        if item.get("matched_terms") or item.get("doc_type") in {"investor_relation", "annual_report"}
+    ]
+
+    status = "ok" if events else ("partial" if items else str(cninfo.get("status") or "failed"))
+    return {
+        "status": status,
+        "stock_code": code,
+        "stock_name": stock_name,
+        "date_window": {"start_date": start, "end_date": end},
+        "items": items,
+        "events": events,
+        "event_count": len(events),
+        "source_chain": source_chain,
+        "errors": errors,
+    }
+
+
+get_stock_disclosure_events_tool = ToolDefinition(
+    name="get_stock_disclosure_events",
+    description=(
+        "Get public disclosure/IR/annual-report evidence for one A-share from open announcement sources. "
+        "Use it to verify company-level theme fit such as SOI, 300mm wafers, polishing wafers and capacity."
+    ),
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 688126."),
+        ToolParameter(name="stock_name", type="string", description="Optional stock name.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="keywords", type="array", description="Optional custom keywords to match in titles/body.", required=False, default=[]),
+        ToolParameter(name="include_body", type="boolean", description="Fetch announcement body when available; PDF extraction may be skipped.", required=False, default=False),
+        ToolParameter(name="limit", type="integer", description="Max announcements to inspect (default: 20, max: 50).", required=False, default=20),
+    ],
+    handler=_handle_get_stock_disclosure_events,
+    category="data",
+)
+
+
 def _handle_get_tushare_stock_shock(
     stock_code: str = "",
     trade_date: str = "",
@@ -4321,6 +5234,119 @@ get_tushare_adj_factor_tool = ToolDefinition(
 )
 
 
+def _handle_get_tushare_stk_factor(
+    stock_code: str = "",
+    ts_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 30,
+) -> dict:
+    """Get Tushare daily technical factors (stk_factor) without fallback."""
+    raw_code = _clean_text(ts_code) or _clean_text(stock_code)
+    tushare_code = _to_tushare_ts_code(raw_code) if raw_code else ""
+    effective_limit = max(1, min(int(limit or 30), 200))
+    fields = (
+        "ts_code,trade_date,close,open,high,low,pre_close,change,pct_change,"
+        "vol,amount,adj_factor,open_hfq,open_qfq,close_hfq,close_qfq,"
+        "high_hfq,high_qfq,low_hfq,low_qfq,pre_close_hfq,pre_close_qfq,"
+        "macd_dif,macd_dea,macd,kdj_k,kdj_d,kdj_j,rsi_6,rsi_12,rsi_24,"
+        "boll_upper,boll_mid,boll_lower,cci"
+    )
+    result = _tushare_query(
+        "stk_factor",
+        {
+            "ts_code": tushare_code,
+            "trade_date": _normalize_tushare_date(trade_date),
+            "start_date": _normalize_tushare_date(start_date),
+            "end_date": _normalize_tushare_date(end_date),
+        },
+        fields,
+        effective_limit,
+    )
+
+    items: List[Dict[str, Any]] = []
+    for row in result.get("items") or []:
+        if not isinstance(row, dict):
+            continue
+        row_ts_code = _clean_text(row.get("ts_code")).upper()
+        items.append({
+            "ts_code": row_ts_code,
+            "code": _normalize_ts_code_to_symbol(row_ts_code),
+            "trade_date": str(row.get("trade_date") or "").replace("-", "")[:8],
+            "open": _safe_number(row.get("open")),
+            "high": _safe_number(row.get("high")),
+            "low": _safe_number(row.get("low")),
+            "close": _safe_number(row.get("close")),
+            "pre_close": _safe_number(row.get("pre_close")),
+            "change": _safe_number(row.get("change")),
+            "pct_change": _safe_number(row.get("pct_change")),
+            "vol": _safe_number(row.get("vol")),
+            "volume": _safe_number(row.get("vol")),
+            "amount": _safe_number(row.get("amount")),
+            "adj_factor": _safe_number(row.get("adj_factor")),
+            "open_hfq": _safe_number(row.get("open_hfq")),
+            "open_qfq": _safe_number(row.get("open_qfq")),
+            "close_hfq": _safe_number(row.get("close_hfq")),
+            "close_qfq": _safe_number(row.get("close_qfq")),
+            "high_hfq": _safe_number(row.get("high_hfq")),
+            "high_qfq": _safe_number(row.get("high_qfq")),
+            "low_hfq": _safe_number(row.get("low_hfq")),
+            "low_qfq": _safe_number(row.get("low_qfq")),
+            "pre_close_hfq": _safe_number(row.get("pre_close_hfq")),
+            "pre_close_qfq": _safe_number(row.get("pre_close_qfq")),
+            "macd_dif": _safe_number(row.get("macd_dif")),
+            "macd_dea": _safe_number(row.get("macd_dea")),
+            "macd": _safe_number(row.get("macd")),
+            "kdj_k": _safe_number(row.get("kdj_k")),
+            "kdj_d": _safe_number(row.get("kdj_d")),
+            "kdj_j": _safe_number(row.get("kdj_j")),
+            "rsi_6": _safe_number(row.get("rsi_6")),
+            "rsi_12": _safe_number(row.get("rsi_12")),
+            "rsi_24": _safe_number(row.get("rsi_24")),
+            "boll_upper": _safe_number(row.get("boll_upper")),
+            "boll_mid": _safe_number(row.get("boll_mid")),
+            "boll_lower": _safe_number(row.get("boll_lower")),
+            "cci": _safe_number(row.get("cci")),
+            "source": "tushare:stk_factor",
+        })
+    items.sort(key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+    result.update({
+        "api_name": "stk_factor",
+        "stock_code": _normalize_ts_code_to_symbol(tushare_code or raw_code),
+        "ts_code": tushare_code,
+        "trade_date": _normalize_tushare_date(trade_date),
+        "start_date": _normalize_tushare_date(start_date),
+        "end_date": _normalize_tushare_date(end_date),
+        "items": items[:effective_limit],
+        "latest": items[0] if items else {},
+        "notes": [
+            "Tushare stk_factor indicators are calculated from front-adjusted prices.",
+            "The front-adjusted price series is a historical daily snapshot and may differ from dynamic pro_bar qfq output.",
+        ],
+    })
+    return result
+
+
+get_tushare_stk_factor_tool = ToolDefinition(
+    name="get_tushare_stk_factor",
+    description=(
+        "Get Tushare stock daily technical factors (stk_factor) without fallback. "
+        "Returns front-adjusted technical indicators such as MACD, KDJ, RSI, BOLL, and CCI."
+    ),
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="A-share stock code, e.g. 600519 or 600519.SH.", required=False, default=""),
+        ToolParameter(name="ts_code", type="string", description="Optional Tushare stock code alias, e.g. 600519.SH.", required=False, default=""),
+        ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="limit", type="integer", description="Max rows to return (default: 30, max: 200).", required=False, default=30),
+    ],
+    handler=_handle_get_tushare_stk_factor,
+    category="data",
+)
+
+
 def _to_tushare_index_code(index_code: str) -> str:
     raw = str(index_code or "").strip().upper()
     if "." in raw:
@@ -4555,9 +5581,16 @@ get_tushare_moneyflow_hsgt_tool = ToolDefinition(
 )
 
 
-def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) -> dict:
+def _handle_get_tushare_moneyflow_mkt_dc(
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 10,
+) -> dict:
     """Get Tushare DC broad-market money flow without fallback."""
     requested_date = _normalize_tushare_date(trade_date)
+    requested_start_date = _normalize_tushare_date(start_date)
+    requested_end_date = _normalize_tushare_date(end_date)
     effective_limit = max(1, min(int(limit or 10), 60))
     fields = (
         "trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,"
@@ -4569,6 +5602,13 @@ def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) 
         result = _tushare_query(
             "moneyflow_mkt_dc",
             {"trade_date": requested_date},
+            fields,
+            limit=effective_limit,
+        )
+    elif requested_start_date or requested_end_date:
+        result = _tushare_query(
+            "moneyflow_mkt_dc",
+            {"start_date": requested_start_date, "end_date": requested_end_date},
             fields,
             limit=effective_limit,
         )
@@ -4614,6 +5654,8 @@ def _handle_get_tushare_moneyflow_mkt_dc(trade_date: str = "", limit: int = 10) 
     result.update({
         "api_name": "moneyflow_mkt_dc",
         "trade_date": requested_date,
+        "start_date": requested_start_date,
+        "end_date": requested_end_date,
         "items": items[:effective_limit],
     })
     return result
@@ -4627,6 +5669,8 @@ get_tushare_moneyflow_mkt_dc_tool = ToolDefinition(
     ),
     parameters=[
         ToolParameter(name="trade_date", type="string", description="Optional trade date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="start_date", type="string", description="Optional start date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
+        ToolParameter(name="end_date", type="string", description="Optional end date, YYYYMMDD or YYYY-MM-DD.", required=False, default=""),
         ToolParameter(name="limit", type="integer", description="Recent rows to return when trade_date is omitted (default: 10, max: 60).", required=False, default=10),
     ],
     handler=_handle_get_tushare_moneyflow_mkt_dc,
@@ -5055,9 +6099,11 @@ ALL_DATA_TOOLS.extend([
     get_tushare_moneyflow_ind_ths_tool,
     get_tushare_moneyflow_ind_dc_tool,
     get_tushare_moneyflow_cnt_ths_tool,
+    get_board_capital_flow_tool,
     get_tushare_ths_member_tool,
     get_tushare_today_news_tool,
     get_eastmoney_cjzc_daily_tool,
+    get_stock_disclosure_events_tool,
     get_tushare_announcements_tool,
     get_tushare_stock_alerts_tool,
     get_tushare_stock_shock_tool,
@@ -5072,6 +6118,7 @@ ALL_DATA_TOOLS.extend([
     get_tushare_express_tool,
     get_tushare_dividend_tool,
     get_tushare_adj_factor_tool,
+    get_tushare_stk_factor_tool,
     get_tushare_index_daily_tool,
     get_tushare_trade_calendar_tool,
     get_tushare_moneyflow_ths_tool,

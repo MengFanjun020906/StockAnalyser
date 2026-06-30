@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,6 +27,7 @@ from src.agent.stock_selection import (
     _compact_candidate_seed,
     _compact_tool_result_for_trace,
     _normalize_deep_dive_payload,
+    _persist_seed_pool_quality_snapshot,
     _resolve_candidate_discovery_mode,
     _run_candidate_discovery_tool,
     _select_deep_dive_targets,
@@ -146,6 +148,35 @@ def _registry():
         ],
         handler=lambda stock_code, stock_name: {"report": f"{stock_code} {stock_name} 无重大利空"},
     ))
+    registry.register(ToolDefinition(
+        name="get_regime_forward_probability",
+        description="market regime probability",
+        parameters=[],
+        handler=lambda **kwargs: {
+            "status": "ok",
+            "regime": kwargs.get("regime") or "trending_up",
+            "sample_count": 20,
+            "windows": {"30": {"n": 20, "effective_n": 2, "p_up": 0.55, "p_below_current": 0.4, "low_confidence": False}},
+            "reentry_reference": {"reentry_price": 9.6, "low_confidence": False},
+        },
+    ))
+    registry.register(ToolDefinition(
+        name="get_symbol_regime_probability",
+        description="symbol regime probability",
+        parameters=[],
+        handler=lambda stock_code, **kwargs: {
+            "status": "ok",
+            "stock_code": stock_code,
+            "regime": kwargs.get("regime") or "trending_up",
+            "source": "symbol_ohlc_forward_return_by_market_regime",
+            "sample_count": 18,
+            "matched_anchor_count": 18,
+            "symbol_history_records": 220,
+            "windows": {"30": {"n": 18, "effective_n": 2, "p_up": 0.61, "p_below_current": 0.44, "p20_min_return_pct": -4.2, "low_confidence": False}},
+            "path_profile": {"window": "90d", "n": 18},
+            "reentry_reference": {"current_price": kwargs.get("current_price"), "reentry_price": 9.58, "low_confidence": False},
+        },
+    ))
     return registry
 
 
@@ -188,6 +219,21 @@ def _context():
             include_watchlist_ranking=True,
         ),
     )
+
+
+def _context_with_position(symbol: str = "600002"):
+    ctx = _context()
+    ctx.positions = [
+        PositionContext(
+            symbol=symbol,
+            quantity=100,
+            avg_cost=9.5,
+            last_price=10.0,
+            market_value=1000.0,
+            position_pct=2.0,
+        )
+    ]
+    return ctx
 
 
 def _json_response(payload, tokens=1):
@@ -449,11 +495,11 @@ def test_stock_selection_report_does_not_promote_weak_wait_or_candidate_score_to
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 三、关键风险与等待确认", 1)[0]
 
     assert "| 机会首选 | 暂无高质量机会标的 |" in markdown
     assert "| 执行首选 | 暂无可执行标的 |" in markdown
-    assert "## 三、深挖结果与等待/排除决策" in recommendation_section
+    assert "## 二、深挖结果与等待/排除决策" in recommendation_section
     assert "### ⏳ 等待确认 1：000568 泸州老窖" in recommendation_section
     assert "### 🥇 首选：000568 泸州老窖" not in recommendation_section
     assert "| 理想入场区间 | 当前不形成可执行买点，仅保留观察条件 |" not in recommendation_section
@@ -523,10 +569,10 @@ def test_stock_selection_final_markdown_keeps_debate_auxiliary():
 
     markdown = render_stock_selection_markdown(report)
 
-    conclusion_block = markdown.split("## 七、辅助审查摘要", 1)[0]
+    conclusion_block = markdown.split("## 五、风控复查摘要", 1)[0]
     assert "组合主结论：候选质量尚可但等待回踩确认。" in conclusion_block
     assert "如果它进入核心原因" not in conclusion_block
-    assert "## 七、辅助审查摘要" in markdown
+    assert "## 五、风控复查摘要" in markdown
     assert "反方审查与 Judge 裁决" not in markdown
     assert "风险三" in markdown
     assert "风险四" not in markdown
@@ -766,7 +812,7 @@ def test_stock_selection_candidate_appendix_sorts_by_entry_score_and_marks_deep_
     }
 
     markdown = render_stock_selection_markdown(report)
-    candidate_section = markdown.split("## 附录一、候选池来源与入池理由", 1)[1].split("## 附录二", 1)[0]
+    candidate_section = markdown.split("## 附录二、候选池来源与入池理由", 1)[1].split("## 附录三", 1)[0]
 
     assert "| 排名 | 股票 | 入池通道 | 入池分 | 深度分析 | 入池理由 | 关注点 |" in candidate_section
     assert candidate_section.index("| 1 | 301183 东田微") < candidate_section.index("| 2 | 000568 泸州老窖")
@@ -863,13 +909,14 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert "选股分析报告：下周可关注候选" in result.final_markdown
     assert "核心推荐结论" in result.final_markdown
     assert "深挖结果与等待/排除决策" in result.final_markdown
-    assert "Execute 证据摘要" in result.final_markdown
+    assert "Execute 证据摘要" not in result.final_markdown
     assert "候选池来源与入池理由" in result.final_markdown or "候选池来源与入池理由" in result.appendix_markdown
     assert "逐股维度证据展开" in result.final_markdown or "逐股维度证据展开" in result.appendix_markdown
     assert "600001 测试一" in result.final_markdown
-    assert "MA5/MA20 多头" in result.final_markdown
-    assert "跌破 9 元支撑" in result.final_markdown
-    assert "capital_flow" in result.final_markdown
+    combined_markdown = result.final_markdown + "\n" + result.appendix_markdown
+    assert "MA5/MA20 多头" in combined_markdown
+    assert "跌破 9 元支撑" in combined_markdown
+    assert "capital_flow" in combined_markdown
     assert result.context.stage_summary("judge_decision")["final_action"] == "wait"
     assert result.context.stages["candidate_discovery"].full_ref == "candidate_discovery.json"
     assert adapter.call_text.call_count == 8
@@ -883,6 +930,65 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert capital_flow_calls
     assert all(call["success"] is False for call in capital_flow_calls)
     assert "get_capital_flow" in result.context.evidence_ledger["summary"]["failed_tools"]
+
+
+def test_stock_selection_resume_reuses_complete_candidate_discovery_artifact(tmp_path):
+    resume_dir = tmp_path / "trace-old"
+    resume_dir.mkdir()
+    (resume_dir / "candidate_discovery.json").write_text(json.dumps({
+        "status": "ok",
+        "summary": {"candidate_codes": ["600001"], "main_limitations": []},
+        "full_ref": "candidate_discovery.json",
+        "full": {
+            "candidates": [{"code": "600001", "name": "测试一", "market": "cn", "source": "resume"}],
+            "missing_evidence": [],
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({
+            "stage": "candidate_screening",
+            "status": "ok",
+            "summary": {"deep_dive_targets": ["600001"], "monitor_targets": [], "rejected_targets": [], "main_limitations": []},
+            "full": {"shortlist": [{"code": "600001", "name": "测试一", "screening_result": "deep_dive", "score": 80}]},
+        }),
+        _json_response({
+            "stage": "single_stock_deep_dive",
+            "status": "ok",
+            "summary": {"code": "600001", "name": "测试一", "action_bias": "wait", "action_strength": "weak"},
+            "full": {"stock": {"code": "600001", "name": "测试一"}, "action_bias": "wait", "entry_quality": {}, "dimension_summary": {}, "missing_evidence": []},
+        }),
+        _json_response({"stage": "meta_orchestrator", "status": "ok", "summary": {"package_count": 1}, "full": {"packages": []}}),
+        _json_response({"stage": "pricing_agent", "status": "ok", "summary": {"priced_count": 0}, "full": {"if_then_order_matrix": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"final_action": "wait", "primary_plan_verdict": "accept_with_changes", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {}}),
+    ]
+    events = []
+
+    result = run_stock_selection_pipeline(
+        task="继续选股",
+        agent_user_context=_context(),
+        tool_registry=_registry_with_candidates([{"code": "999999", "name": "不应召回", "market": "cn"}]),
+        llm_adapter=adapter,
+        run_id="trace-new",
+        orchestration_mode="legacy",
+        candidate_discovery_mode="thesis_desk_committee",
+        resume_artifact_dir=str(resume_dir),
+        resume_from_run_id="trace-old",
+        progress_callback=events.append,
+    )
+
+    assert result.success is True
+    assert result.context.stage_full("candidate_discovery")["candidates"][0]["source"] == "resume"
+    assert not any(call["tool"] == "discover_watchlist_candidates" for call in result.tool_calls_log)
+    assert any(event["type"] == "selection_resume_loaded" for event in events)
+    assert any(
+        event["type"] == "selection_resume_reused_stage"
+        and event.get("payload", {}).get("stage") == "candidate_discovery"
+        for event in events
+    )
 
 
 def test_stock_selection_prompts_use_compact_evidence_cards_not_raw_previews():
@@ -946,6 +1052,41 @@ def test_stock_selection_prompts_use_compact_evidence_cards_not_raw_previews():
     assert any('"raw_policy"' in prompt for prompt in prompts)
 
 
+def test_stock_selection_attaches_symbol_regime_probability_for_deep_dive_and_holdings():
+    adapter = MagicMock()
+    adapter.call_text.side_effect = [
+        _json_response({"stage": "candidate_discovery", "status": "ok", "summary": {"candidate_codes": ["600001"]}, "full": {"candidates": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "candidate_screening", "status": "ok", "summary": {"deep_dive_targets": ["600001"]}, "full": {"shortlist": [{"code": "600001", "name": "测试一"}]}}),
+        _json_response({"stage": "single_stock_deep_dive", "status": "ok", "summary": {"code": "600001", "name": "测试一", "action_bias": "wait"}, "full": {"stock": {"code": "600001", "name": "测试一"}}}),
+        _json_response({"stage": "meta_orchestrator", "status": "ok", "summary": {"package_count": 1}, "full": {"packages": []}}),
+        _json_response({"stage": "pricing_agent", "status": "ok", "summary": {"priced_count": 0}, "full": {"if_then_order_matrix": []}}),
+        _json_response({"stage": "portfolio_allocation", "status": "ok", "summary": {"portfolio_action": "wait", "core_reason": "等待"}, "full": {"positions_plan": []}}),
+        _json_response({"stage": "adversarial_review", "status": "ok", "summary": {"opposing_summary": "等待"}, "full": {"opposing_thesis": {}}}),
+        _json_response({"stage": "judge_decision", "status": "ok", "summary": {"primary_plan_verdict": "accept", "final_action": "wait", "decision_summary": "等待", "next_step": "render_final_report"}, "full": {"winner": "mixed"}}),
+    ]
+
+    result = run_stock_selection_pipeline(
+        task="帮我选一下下周可以入手的股票",
+        agent_user_context=_context_with_position("600002"),
+        tool_registry=_registry(),
+        llm_adapter=adapter,
+        run_id="test-symbol-regime-probability",
+    )
+
+    assert result.success is True
+    stage = result.final_report_json["symbol_regime_probability"]
+    assert stage["summary"]["scope_counts"] == {"deep_dive": 1, "holding": 1}
+    codes = {item["stock_code"] for item in stage["summary"]["results_brief"]}
+    assert codes == {"600001", "600002"}
+    deep_full = result.final_report_json["single_stock_deep_dive"]["full"]["results"][0]["full"]
+    assert deep_full["symbol_regime_probability"]["stock_code"] == "600001"
+    prompts = [call.args[0][1]["content"] for call in adapter.call_text.call_args_list]
+    allocation_prompt = next(prompt for prompt in prompts if "组合配置 Agent" in prompt)
+    assert '"symbol_regime_probabilities"' in allocation_prompt
+    symbol_calls = [call for call in result.tool_calls_log if call["tool"] == "get_symbol_regime_probability"]
+    assert [call["arguments"]["stock_code"] for call in symbol_calls] == ["600001", "600002"]
+
+
 def test_stock_selection_runs_meta_and_pricing_stages_before_allocation():
     adapter = MagicMock()
     adapter.call_text.side_effect = [
@@ -986,12 +1127,12 @@ def test_stock_selection_runs_meta_and_pricing_stages_before_allocation():
     assert any("Meta-Agent / Orchestrator" in prompt for prompt in prompts)
     assert any("点位计算 Agent / 条件单计算层" in prompt for prompt in prompts)
     assert any("Meta/点位计算字段语义" in prompt for prompt in prompts)
-    assert "## 二、Meta-Agent 链路对齐（非推荐排序）" in result.final_markdown
-    assert "字段说明" in result.final_markdown
-    assert "Right_Side_Momentum_High_Exhaustion_Risk" in result.final_markdown
-    assert "点位计算 If-Then 条件单" in result.final_markdown
-    assert "Meta 场景约束" in result.final_markdown
-    assert "点位计算条件单" in result.final_markdown
+    assert "## 附录一、系统推理链路（调试用）" in result.appendix_markdown
+    assert "字段说明" not in result.final_markdown
+    assert "右侧动量，但短线过热" in result.appendix_markdown
+    assert "点位条件单" in result.appendix_markdown
+    assert "Meta 场景约束" not in result.final_markdown
+    assert "点位计算条件单" not in result.final_markdown
     assert "Pricing If-Then" not in result.final_markdown
 
 
@@ -1347,9 +1488,9 @@ def test_stock_selection_recommendation_section_always_shows_deep_dived_candidat
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 三、关键风险与等待确认", 1)[0]
 
-    assert "## 三、深挖结果与等待/排除决策" in recommendation_section
+    assert "## 二、深挖结果与等待/排除决策" in recommendation_section
     assert "### 👀 强观察 1：688127 蓝特光学（候选分 100）" in recommendation_section
     assert "### 👀 强观察 2：603629 利通电子（候选分 100）" in recommendation_section
     assert "### 👀 强观察 3：603256 宏和科技（候选分 100）" in recommendation_section
@@ -1427,17 +1568,96 @@ def test_stock_selection_wait_with_conditions_renders_conditional_entry():
     }
 
     markdown = render_stock_selection_markdown(report)
-    recommendation_section = markdown.split("## 四、Execute 证据摘要", 1)[0]
+    recommendation_section = markdown.split("## 三、关键风险与等待确认", 1)[0]
 
-    assert "## 三、推荐排序与入场决策" in recommendation_section
+    assert "## 二、推荐排序与入场决策" in recommendation_section
     assert "| 机会首选 | 688266 泽璟制药-U |" in markdown
     assert "| 执行首选 | 688266 泽璟制药-U（条件触发） |" in markdown
     assert "### ⚡ 条件入场 1：688266 泽璟制药-U（候选分 96）" in recommendation_section
     assert "| 看盘动作 | 条件入场，不是无条件追买 |" in recommendation_section
-    assert "| 明日触发条件 | 竞价强承接且开盘 15 分钟不破分时均线" in recommendation_section
+    assert "| 必要条件 |" in recommendation_section
+    assert "竞价强承接且开盘 15 分钟不破分时均线" in recommendation_section
+    assert "| 加分条件 | 竞价强承接且开盘 15 分钟不破分时均线 |" in recommendation_section
+    assert "| 加分条件 | 满足其一即可：竞价强承接且开盘 15 分钟不破分时均线 |" not in recommendation_section
     assert "| 可试探仓位 | 5%-10% 试探仓" in recommendation_section
     assert "| 禁止追高 | 高开超过 6% 且无回踩不追 |" in recommendation_section
     assert "| 失效条件 | 跌破前一日低点或板块退潮；跌破前一日低点 |" in recommendation_section
+
+
+def test_stock_selection_report_uses_chinese_labels_and_split_entry_conditions():
+    report = {
+        "candidate_discovery": {
+            "summary": {"source_count": 1},
+            "full": {"candidates": [{"code": "603260", "name": "合盛硅业", "source": "alphasift", "signal_score": 96}]},
+        },
+        "candidate_screening": {"summary": {}, "full": {}},
+        "single_stock_deep_dive": {
+            "summary": {},
+            "full": {
+                "results": [
+                    {
+                        "summary": {
+                            "code": "603260",
+                            "name": "合盛硅业",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下；乖离修复至8%以下；MACD金叉；主力资金净流入",
+                            "no_chase_line": "43.50",
+                            "stop_loss": "跌破41.50",
+                            "main_supporting_evidence": ["资金承接持续"],
+                        },
+                        "full": {
+                            "stock": {"code": "603260", "name": "合盛硅业"},
+                            "entry_quality": {
+                                "ideal_entry_zone": "价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下；乖离修复至8%以下；MACD金叉；主力资金净流入",
+                                "failure_condition": "跌破41.50",
+                            },
+                            "key_evidence": ["资金承接持续"],
+                            "missing_evidence": [],
+                        },
+                    }
+                ]
+            },
+        },
+        "portfolio_allocation": {
+            "summary": {"portfolio_action": "wait", "core_reason": "等待条件触发"},
+            "full": {
+                "positions_plan": [
+                    {
+                        "rank": 1,
+                        "code": "603260",
+                        "name": "合盛硅业",
+                        "action": "wait",
+                        "action_strength": "medium",
+                        "execution_mode": "conditional_open",
+                        "initial_position_pct": 0,
+                        "entry_condition": "价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下；乖离修复至8%以下；MACD金叉；主力资金净流入",
+                        "stop_loss_condition": "跌破41.50",
+                    }
+                ]
+            },
+        },
+        "adversarial_review": {"summary": {}, "full": {}},
+        "judge_decision": {
+            "summary": {
+                "primary_plan_verdict": "accept_with_changes",
+                "final_action": "wait",
+                "decision_summary": "条件触发后再执行",
+            },
+            "full": {},
+        },
+    }
+
+    markdown = render_stock_selection_markdown(report)
+    main_report = markdown.split("<!-- APPENDIX_SEPARATOR -->", 1)[0]
+
+    assert "| 最终动作 | 等待 |" in main_report
+    assert "| 裁决 | 有条件采纳 |" in main_report
+    assert "### 字段说明" not in main_report
+    assert "Meta-Agent 链路对齐" not in main_report
+    assert "Execute 证据摘要" not in main_report
+    assert "| 必要条件 | 价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下 |" in main_report
+    assert "| 加分条件 | 满足其一即可：MACD金叉 / 主力资金净流入 |" in main_report
 
 
 def test_stock_selection_headline_and_meta_chain_align_with_deep_dive_body():
@@ -1531,18 +1751,129 @@ def test_stock_selection_headline_and_meta_chain_align_with_deep_dive_body():
     }
 
     markdown = render_stock_selection_markdown(report)
-    observation_pool = markdown.split("### 观察池", 1)[1].split("## 四、Execute 证据摘要", 1)[0]
+    observation_pool = markdown.split("### 观察池", 1)[1].split("## 三、关键风险与等待确认", 1)[0]
 
     assert "| 机会首选 | 300308 中际旭创 |" in markdown
     assert "| 执行首选 | 300308 中际旭创（条件触发） |" in markdown
     assert "| 可观察标的 | 600487 亨通光电 |" in markdown
     assert "| 可观察标的 | 300628 亿联网络 |" not in markdown
     assert "300628 亿联网络" in observation_pool
-    assert "## 二、Meta-Agent 链路对齐（非推荐排序）" in markdown
-    assert "### 链路对齐：300308 中际旭创" in markdown
-    assert "### 链路对齐：600487 亨通光电" in markdown
-    assert "### 链路对齐：603341 龙旗科技" not in markdown
+    assert "## 附录一、系统推理链路（调试用）" in markdown
+    assert "### 300308 中际旭创" in markdown
+    assert "### 600487 亨通光电" in markdown
+    assert "### 603341 龙旗科技" not in markdown
     assert "### 1. 300308 中际旭创" not in markdown
+
+
+def test_stock_selection_headline_watch_excludes_opportunity_and_execution_picks():
+    report = {
+        "candidate_discovery": {
+            "summary": {"source_count": 3},
+            "full": {
+                "candidates": [
+                    {"code": "688401", "name": "路维光电", "source": "theme_catalyst", "final_score": 94, "reason": "光刻掩膜版主题催化"},
+                    {"code": "300308", "name": "中际旭创", "source": "momentum", "final_score": 93, "reason": "CPO 动量延续"},
+                    {"code": "600487", "name": "亨通光电", "source": "capital_flow", "final_score": 88, "reason": "资金流入但等待确认"},
+                ]
+            },
+        },
+        "candidate_screening": {"summary": {}, "full": {}},
+        "single_stock_deep_dive": {
+            "summary": {},
+            "full": {
+                "results": [
+                    {
+                        "summary": {
+                            "code": "688401",
+                            "name": "路维光电",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "回踩 5 日线企稳",
+                            "stop_loss": "跌破前低",
+                            "main_supporting_evidence": ["主题与基本面匹配，机会质量最高"],
+                        },
+                        "full": {
+                            "stock": {"code": "688401", "name": "路维光电"},
+                            "key_evidence": ["主题与基本面匹配，机会质量最高"],
+                            "failure_conditions": ["跌破前低"],
+                        },
+                    },
+                    {
+                        "summary": {
+                            "code": "300308",
+                            "name": "中际旭创",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "回踩 MA20 企稳",
+                            "stop_loss": "跌破 MA20",
+                            "main_supporting_evidence": ["动量和资金共振"],
+                        },
+                        "full": {
+                            "stock": {"code": "300308", "name": "中际旭创"},
+                            "key_evidence": ["动量和资金共振"],
+                            "failure_conditions": ["跌破 MA20"],
+                        },
+                    },
+                    {
+                        "summary": {
+                            "code": "600487",
+                            "name": "亨通光电",
+                            "action_bias": "wait",
+                            "action_strength": "medium",
+                            "ideal_entry_zone": "回踩支撑确认",
+                            "stop_loss": "跌破支撑",
+                            "main_supporting_evidence": ["资金流入，仍需确认"],
+                        },
+                        "full": {
+                            "stock": {"code": "600487", "name": "亨通光电"},
+                            "key_evidence": ["资金流入，仍需确认"],
+                            "failure_conditions": ["跌破支撑"],
+                        },
+                    },
+                ]
+            },
+        },
+        "portfolio_allocation": {
+            "summary": {
+                "portfolio_action": "wait",
+                "core_reason": "本轮没有无条件买入标的，但存在可按次日条件触发的强候选",
+            },
+            "full": {
+                "positions_plan": [
+                    {
+                        "rank": 1,
+                        "code": "300308",
+                        "name": "中际旭创",
+                        "action": "wait",
+                        "execution_mode": "conditional_open",
+                        "entry_condition": "回踩 MA20 企稳",
+                        "stop_loss_condition": "跌破 MA20",
+                    },
+                    {
+                        "rank": 2,
+                        "code": "688401",
+                        "name": "路维光电",
+                        "action": "wait",
+                        "action_strength": "medium",
+                        "execution_mode": "strong_watch",
+                        "entry_condition": "等待量价确认",
+                        "stop_loss_condition": "跌破前低",
+                    },
+                ]
+            },
+        },
+        "adversarial_review": {"summary": {}, "full": {}},
+        "judge_decision": {"summary": {"primary_plan_verdict": "wait_for_more_data", "final_action": "wait"}, "full": {}},
+    }
+
+    markdown = render_stock_selection_markdown(report)
+    headline = markdown.split("## 二、", 1)[0]
+
+    assert "| 机会首选 | 688401 路维光电 |" in headline
+    assert "| 执行首选 | 300308 中际旭创（条件触发） |" in headline
+    assert "| 可观察标的 | 600487 亨通光电 |" in headline
+    assert "| 可观察标的 | 688401 路维光电 |" not in headline
+    assert "| 可观察标的 | 300308 中际旭创 |" not in headline
 
 
 def test_stock_selection_high_score_without_exit_condition_renders_strong_watch():
@@ -2138,7 +2469,7 @@ def test_stock_selection_marks_partial_capital_flow_without_data_failed():
     assert all(call["success"] is False for call in capital_flow_calls)
 
 
-def test_stock_selection_marks_capital_flow_with_errors_failed_even_with_data():
+def test_stock_selection_keeps_capital_flow_with_data_successful_when_errors_are_diagnostics():
     registry = _registry()
     registry.register(ToolDefinition(
         name="get_capital_flow",
@@ -2175,7 +2506,7 @@ def test_stock_selection_marks_capital_flow_with_errors_failed_even_with_data():
     assert result.success is True
     capital_flow_calls = [call for call in result.tool_calls_log if call["tool"] == "get_capital_flow"]
     assert capital_flow_calls
-    assert all(call["success"] is False for call in capital_flow_calls)
+    assert all(call["success"] is True for call in capital_flow_calls)
 
 
 def test_stock_selection_overwrites_mismatched_stock_name_by_code():
@@ -2427,8 +2758,12 @@ def test_run_candidate_discovery_tool_uses_committee_when_mode_is_thesis_desk():
     assert event_types[:3] == [
         "selection_candidate_discovery_mode",
         "selection_seed_pool_built",
-        "selection_seed_gate_done",
+        "selection_seed_pool_quality_snapshot",
     ]
+    assert "selection_seed_gate_done" in event_types
+    assert event_types.index("selection_seed_pool_quality_snapshot") < event_types.index(
+        "selection_seed_gate_done",
+    )
     seed_event = next(e for e in events if e.get("type") == "selection_seed_pool_built")
     assert seed_event["payload"]["seed_pool_summary"]["seed_count"] >= 1
     assert seed_event["payload"]["seed_pool_diagnostics"]
@@ -2479,6 +2814,72 @@ def test_fallback_candidate_discovery_preserves_seed_pool_metadata():
     assert payload["full"]["seed_gate"]["status"] == "ok"
     assert payload["full"]["seed_pool_diagnostics"][0]["source"] == "user_watchlist"
     assert payload["full"]["seed_market_regime"]["regime"] == "range_bound"
+
+
+def test_seed_pool_quality_snapshot_before_open_uses_previous_seed_date():
+    ctx = SelectionRunContext(run_id="selection-run", user_message="m", candidate_discovery_mode="llm_expert_committee")
+    payload = {
+        "status": "ok",
+        "seed_pool_summary": {
+            "seed_count": 1,
+            "preview": [{"code": "600001", "name": "测试一", "source": "daily_screener"}],
+        },
+    }
+
+    service_instance = MagicMock()
+    service_instance.persist_candidate_discovery_snapshot.return_value = {"status": "ok", "snapshot_id": 1}
+    fixed_now = datetime(2026, 6, 10, 8, 59)
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is None else fixed_now.replace(tzinfo=tz)
+
+    with patch("src.services.seed_pool_quality_service.SeedPoolQualityService", return_value=service_instance), \
+            patch("src.agent.stock_selection.datetime", FixedDateTime):
+        _persist_seed_pool_quality_snapshot(ctx=ctx, payload=payload, today="20260610")
+
+    kwargs = service_instance.persist_candidate_discovery_snapshot.call_args.kwargs
+    assert kwargs["seed_date"].isoformat() == "2026-06-09"
+    assert kwargs["run_id"] == "selection-run:2026-06-09"
+    assert kwargs["trace_id"] == "selection-run:2026-06-09"
+    assert kwargs["generated_at"] == fixed_now
+
+
+def test_seed_pool_quality_snapshot_uses_seed_freshness_and_trace_id():
+    ctx = SelectionRunContext(run_id="trace-abc123", user_message="m", candidate_discovery_mode="thesis_desk_committee")
+    payload = {
+        "status": "ok",
+        "seed_pool_summary": {
+            "seed_count": 1,
+            "preview": [
+                {
+                    "code": "002718",
+                    "name": "友邦吊顶",
+                    "source": "daily_screener",
+                    "freshness": "20260611",
+                }
+            ],
+        },
+    }
+
+    service_instance = MagicMock()
+    service_instance.persist_candidate_discovery_snapshot.return_value = {"status": "ok", "snapshot_id": 1}
+    fixed_now = datetime(2026, 6, 12, 14, 20)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is None else fixed_now.replace(tzinfo=tz)
+
+    with patch("src.services.seed_pool_quality_service.SeedPoolQualityService", return_value=service_instance), \
+            patch("src.agent.stock_selection.datetime", FixedDateTime):
+        _persist_seed_pool_quality_snapshot(ctx=ctx, payload=payload, today="20260612")
+
+    kwargs = service_instance.persist_candidate_discovery_snapshot.call_args.kwargs
+    assert kwargs["seed_date"].isoformat() == "2026-06-11"
+    assert kwargs["run_id"] == "trace-abc123:2026-06-11"
+    assert kwargs["trace_id"] == "trace-abc123"
+    assert kwargs["generated_at"] == fixed_now
 
 
 def test_run_candidate_discovery_tool_returns_failed_payload_when_thesis_committee_raises():
