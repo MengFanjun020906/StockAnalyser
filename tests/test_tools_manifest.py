@@ -101,6 +101,9 @@ def test_shipped_desk_manifests_expose_high_value_context_tools():
             "get_symbol_regime_probability",
         },
         "theme_catalyst_desk": {
+            "get_cls_telegraph_news",
+            "get_xueqiu_hot_news",
+            "get_macro_finance_news",
             "get_stock_disclosure_events",
             "get_tushare_announcements",
             "get_stockapi_sector_constituents",
@@ -364,3 +367,6 @@ def test_build_theme_catalyst_desk_system_prompt_includes_catalyst_rules():
     assert "业务匹配" in prompt
     assert "setup_type=theme_catalyst" in prompt
     assert "`get_eastmoney_cjzc_daily`" in prompt
+    assert "`get_cls_telegraph_news`" in prompt
+    assert "`get_xueqiu_hot_news`" in prompt
+    assert "`get_macro_finance_news`" in prompt

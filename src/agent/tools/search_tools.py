@@ -10,11 +10,12 @@ Tools:
 """
 
 import logging
+import hashlib
 import sys
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -26,6 +27,108 @@ from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
 logger = logging.getLogger(__name__)
+
+_CN_TZ = timezone(timedelta(hours=8))
+_ORZ_DAILYNEWS_ENDPOINT = "https://orz.ai/api/v1/dailynews/"
+_CLS_TELEGRAPH_ENDPOINT = _ORZ_DAILYNEWS_ENDPOINT
+_CLS_TELEGRAPH_PAGE_URL = "https://www.cls.cn/telegraph"
+_XUEQIU_HOT_PAGE_URL = "https://xueqiu.com/"
+_SINA_FINANCE_PAGE_URL = "https://finance.sina.com.cn/7x24/"
+_EASTMONEY_FINANCE_PAGE_URL = "https://finance.eastmoney.com/"
+_ORZ_DAILYNEWS_PLATFORM_META = {
+    "cls": {
+        "source": "财联社电报",
+        "provider": "orz.dailynews.cls",
+        "page_url": _CLS_TELEGRAPH_PAGE_URL,
+    },
+    "xueqiu": {
+        "source": "雪球热榜",
+        "provider": "orz.dailynews.xueqiu",
+        "page_url": _XUEQIU_HOT_PAGE_URL,
+    },
+    "sina_finance": {
+        "source": "新浪财经7x24",
+        "provider": "orz.dailynews.sina_finance",
+        "page_url": _SINA_FINANCE_PAGE_URL,
+    },
+    "eastmoney": {
+        "source": "东方财富快讯",
+        "provider": "orz.dailynews.eastmoney",
+        "page_url": _EASTMONEY_FINANCE_PAGE_URL,
+    },
+}
+_MACRO_FINANCE_PLATFORMS = ("sina_finance", "eastmoney")
+_MACRO_DAILYNEWS_KEYWORDS = (
+    "非农",
+    "就业数据",
+    "失业率",
+    "初请失业金",
+    "ADP",
+    "CPI",
+    "PPI",
+    "PMI",
+    "GDP",
+    "PCE",
+    "通胀",
+    "美联储",
+    "FOMC",
+    "加息",
+    "降息",
+    "利率",
+    "国债收益率",
+    "美元指数",
+    "人民币汇率",
+    "汇率",
+    "央行",
+    "人民银行",
+    "公开市场",
+    "逆回购",
+    "MLF",
+    "LPR",
+    "降准",
+    "存款准备金率",
+    "社融",
+    "M2",
+    "流动性",
+    "净投放",
+    "净回笼",
+    "财政政策",
+    "货币政策",
+    "油价",
+    "原油",
+    "大宗商品",
+)
+_ASCII_MACRO_KEYWORDS = {"ADP", "CPI", "PPI", "PMI", "GDP", "PCE", "FOMC", "MLF", "LPR", "M2"}
+_CENTRAL_BANK_ENTITY_KEYWORDS = {"央行", "人民银行"}
+_CENTRAL_BANK_OPERATION_KEYWORDS = {
+    "公开市场",
+    "逆回购",
+    "正回购",
+    "MLF",
+    "LPR",
+    "降准",
+    "降息",
+    "加息",
+    "存款准备金率",
+    "流动性",
+    "净投放",
+    "净回笼",
+    "货币政策",
+}
+_MACRO_SEARCH_FALLBACK_QUERIES = (
+    ("us_nfp", "美国 非农 就业数据 美联储 最新"),
+    ("china_open_market", "央行 逆回购 公开市场 操作 净投放 最新"),
+    ("china_liquidity", "人民银行 MLF LPR 降准 降息 流动性 最新"),
+    ("global_macro", "CPI PPI PMI 美联储 利率 美元指数 最新"),
+)
+_ORZ_DAILYNEWS_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+}
+_CLS_TELEGRAPH_HEADERS = _ORZ_DAILYNEWS_HEADERS
 
 
 def _run_search_task_with_timeout(
@@ -114,6 +217,730 @@ def _to_yfinance_symbol(stock_code: str) -> str:
     if digits.startswith(("8", "4")):
         return f"{digits}.BJ"
     return code
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on", "重要", "重点", "是"}
+
+
+def _normalize_cls_stock_id(stock_id: Any) -> Dict[str, str]:
+    raw = str(stock_id or "").strip()
+    if not raw:
+        return {"raw": "", "code": "", "ts_code": ""}
+    lowered = raw.lower()
+    digits = re.sub(r"\D", "", raw)
+    market = ""
+    if lowered.startswith("sh"):
+        market = "SH"
+    elif lowered.startswith("sz"):
+        market = "SZ"
+    elif lowered.startswith("bj"):
+        market = "BJ"
+    elif "." in raw:
+        left, right = raw.rsplit(".", 1)
+        return {"raw": raw, "code": re.sub(r"\D", "", left), "ts_code": f"{left}.{right.upper()}"}
+    elif digits.startswith(("6", "9")):
+        market = "SH"
+    elif digits.startswith(("8", "4")):
+        market = "BJ"
+    elif digits:
+        market = "SZ"
+    return {
+        "raw": raw,
+        "code": digits or raw,
+        "ts_code": f"{digits}.{market}" if digits and market else "",
+    }
+
+
+def _cls_timestamp(ts_value: Any) -> Dict[str, Any]:
+    ts = _safe_int(ts_value, 0)
+    if ts <= 0:
+        return {"published_ts": 0, "published_at": "", "date": "", "time": ""}
+    dt = datetime.fromtimestamp(ts, tz=_CN_TZ)
+    return {
+        "published_ts": ts,
+        "published_at": dt.isoformat(),
+        "date": dt.strftime("%Y-%m-%d"),
+        "time": dt.strftime("%H:%M:%S"),
+    }
+
+
+def _dailynews_timestamp(value: Any) -> Dict[str, Any]:
+    if isinstance(value, (int, float)) or str(value or "").strip().isdigit():
+        return _cls_timestamp(value)
+
+    text = str(value or "").strip()
+    if not text:
+        return {"published_ts": 0, "published_at": "", "date": "", "time": ""}
+
+    parsed: Optional[datetime] = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(text[:19], fmt).replace(tzinfo=_CN_TZ)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_CN_TZ)
+            else:
+                parsed = parsed.astimezone(_CN_TZ)
+        except ValueError:
+            return {"published_ts": 0, "published_at": "", "date": "", "time": ""}
+
+    ts = int(parsed.timestamp())
+    return {
+        "published_ts": ts,
+        "published_at": parsed.isoformat(),
+        "date": parsed.strftime("%Y-%m-%d"),
+        "time": parsed.strftime("%H:%M:%S"),
+    }
+
+
+def _orz_dailynews_query_url(platform: str) -> str:
+    return f"{_ORZ_DAILYNEWS_ENDPOINT}?platform={str(platform or '').strip()}"
+
+
+def _extract_cls_roll_data(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if isinstance(data, dict):
+        roll_data = data.get("roll_data")
+        if isinstance(roll_data, list):
+            return [item for item in roll_data if isinstance(item, dict)]
+        linked = data.get("l")
+        if isinstance(linked, dict):
+            rows = [item for _, item in sorted(linked.items(), reverse=True)]
+            return [item for item in rows if isinstance(item, dict)]
+        if isinstance(linked, list):
+            return [item for item in linked if isinstance(item, dict)]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def _normalize_cls_subjects(subjects: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    if not isinstance(subjects, list):
+        return normalized
+    for subject in subjects:
+        if not isinstance(subject, dict):
+            continue
+        name = str(subject.get("subject_name") or subject.get("name") or "").strip()
+        if not name:
+            continue
+        normalized.append({
+            "id": _safe_int(subject.get("subject_id") or subject.get("id"), 0),
+            "name": name,
+            "plate_id": _safe_int(subject.get("plate_id"), 0),
+            "channel": str(subject.get("channel") or "").strip(),
+        })
+    return normalized
+
+
+def _normalize_cls_stocks(stock_list: Any) -> List[Dict[str, Any]]:
+    stocks: List[Dict[str, Any]] = []
+    if not isinstance(stock_list, list):
+        return stocks
+    for stock in stock_list:
+        if not isinstance(stock, dict):
+            continue
+        stock_id = stock.get("StockID") or stock.get("stock_id") or stock.get("code")
+        code_info = _normalize_cls_stock_id(stock_id)
+        name = str(stock.get("name") or stock.get("Name") or stock.get("stock_name") or "").strip()
+        if not (code_info["code"] or name):
+            continue
+        stocks.append({
+            "name": name,
+            "code": code_info["code"],
+            "ts_code": code_info["ts_code"],
+            "raw_stock_id": code_info["raw"],
+            "last": _safe_float(stock.get("last"), 0.0),
+            "change_pct": _safe_float(stock.get("RiseRange"), 0.0),
+            "status": str(stock.get("status") or "").strip(),
+        })
+    return stocks
+
+
+def _normalize_orz_dailynews_item(row: Dict[str, Any], *, platform: str) -> Dict[str, Any]:
+    platform_key = str(platform or "").strip().lower()
+    meta = _ORZ_DAILYNEWS_PLATFORM_META.get(
+        platform_key,
+        {
+            "source": f"orz dailynews {platform_key or 'unknown'}",
+            "provider": f"orz.dailynews.{platform_key or 'unknown'}",
+            "page_url": _ORZ_DAILYNEWS_ENDPOINT,
+        },
+    )
+    source_label = str(meta["source"])
+    provider = str(meta["provider"])
+    default_url = str(meta["page_url"])
+
+    rank = _safe_int(row.get("rank"), 0)
+    score = _safe_float(row.get("score"), 0.0)
+    raw_item_id = row.get("id") or row.get("news_id") or row.get("article_id") or row.get("rank")
+    item_id = str(raw_item_id or "").strip()
+    title = str(row.get("title") or "").strip()
+    brief = str(row.get("brief") or row.get("summary") or "").strip()
+    content = str(row.get("content") or "").strip()
+    snippet = brief or content or title
+    display_title = title or snippet[:80]
+    timestamp = _dailynews_timestamp(
+        row.get("publish_time") or row.get("published_at") or row.get("published_date") or row.get("ctime")
+    )
+    level = str(row.get("level") or "").strip().upper()
+    subjects = _normalize_cls_subjects(row.get("subjects"))
+    stocks = _normalize_cls_stocks(row.get("stock_list"))
+    important_flags = {
+        "level": level,
+        "jpush": _safe_int(row.get("jpush"), 0),
+        "recommend": _safe_int(row.get("recommend"), 0),
+        "is_top": _safe_int(row.get("is_top"), 0),
+        "is_fad": _safe_int(row.get("is_fad"), 0),
+        "rank": rank,
+        "score": score,
+    }
+    return {
+        "id": item_id,
+        "title": display_title,
+        "brief": brief,
+        "content": content,
+        "snippet": snippet,
+        "url": str(row.get("url") or (f"https://www.cls.cn/detail/{item_id}" if platform_key == "cls" and item_id else default_url)),
+        "source": source_label,
+        "provider": provider,
+        **timestamp,
+        "level": level,
+        "is_important": level in {"A", "B"} or (0 < rank <= 10) or score >= 100 or any(
+            important_flags[key] for key in ("jpush", "recommend", "is_top", "is_fad")
+        ),
+        "subjects": subjects,
+        "subject_names": [item["name"] for item in subjects],
+        "stocks": stocks,
+        "author": str(row.get("author") or "").strip(),
+        "reading_num": _safe_int(row.get("reading_num"), 0),
+        "comment_num": _safe_int(row.get("comment_num"), 0),
+        "share_num": _safe_int(row.get("share_num"), 0),
+        "raw_type": row.get("type"),
+        "rank": rank,
+        "score": score,
+        "raw_source": str(row.get("source") or platform_key).strip(),
+        "importance_flags": important_flags,
+    }
+
+
+def _normalize_cls_telegraph_item(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _normalize_orz_dailynews_item(row, platform="cls")
+
+
+def _fetch_orz_dailynews_payload(platform: str, timeout_seconds: float) -> Dict[str, Any]:
+    response = requests.get(
+        _ORZ_DAILYNEWS_ENDPOINT,
+        params={"platform": platform},
+        headers=_ORZ_DAILYNEWS_HEADERS,
+        timeout=max(1.0, float(timeout_seconds or 6.0)),
+    )
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise ValueError("orz dailynews returned non-object JSON")
+    return body
+
+
+def _fetch_cls_telegraph_payload(params: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
+    return _fetch_orz_dailynews_payload("cls", timeout_seconds=timeout_seconds)
+
+
+def _dailynews_payload_error(payload: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return "invalid dailynews response"
+
+    status = payload.get("status")
+    if status is not None and str(status).strip().lower() not in {"200", "0", "ok", "success"}:
+        return str(payload.get("msg") or payload.get("message") or status)
+
+    errno = payload.get("errno")
+    if errno not in (0, "0", None):
+        return str(payload.get("msg") or payload.get("message") or errno)
+
+    return None
+
+
+def _filter_dailynews_items(
+    items: List[Dict[str, Any]],
+    *,
+    effective_limit: int,
+    important_only: bool,
+    keyword: str,
+    last_time: int = 0,
+    min_score: float = 0.0,
+) -> List[Dict[str, Any]]:
+    filtered = list(items)
+    if important_only:
+        filtered = [item for item in filtered if item.get("is_important")]
+    if last_time > 0:
+        filtered = [
+            item for item in filtered
+            if _safe_int(item.get("published_ts"), 0) <= last_time
+        ]
+    if min_score > 0:
+        filtered = [
+            item for item in filtered
+            if _safe_float(item.get("score"), 0.0) >= min_score
+        ]
+    keyword_text = str(keyword or "").strip()
+    if keyword_text:
+        lowered_keyword = keyword_text.lower()
+        filtered = [
+            item for item in filtered
+            if lowered_keyword in " ".join([
+                str(item.get("title") or ""),
+                str(item.get("brief") or ""),
+                str(item.get("content") or ""),
+                " ".join(str(name) for name in item.get("subject_names") or []),
+                " ".join(str(stock.get("name") or "") for stock in item.get("stocks") or []),
+            ]).lower()
+        ]
+    return filtered[:effective_limit]
+
+
+def _dailynews_item_text(item: Dict[str, Any]) -> str:
+    return " ".join([
+        str(item.get("title") or ""),
+        str(item.get("brief") or ""),
+        str(item.get("content") or ""),
+        " ".join(str(name) for name in item.get("subject_names") or []),
+        " ".join(str(stock.get("name") or "") for stock in item.get("stocks") or [] if isinstance(stock, dict)),
+    ])
+
+
+def _macro_keywords_for_dailynews_item(item: Dict[str, Any]) -> List[str]:
+    text = _dailynews_item_text(item)
+    lowered = text.lower()
+    matched: List[str] = []
+    for keyword in _MACRO_DAILYNEWS_KEYWORDS:
+        keyword_text = str(keyword or "").strip()
+        if not keyword_text:
+            continue
+        if _dailynews_text_has_macro_keyword(text, lowered, keyword_text):
+            matched.append(keyword_text)
+    return matched
+
+
+def _is_macro_dailynews_item(item: Dict[str, Any]) -> bool:
+    return bool(_macro_keywords_for_dailynews_item(item))
+
+
+def _dailynews_text_has_macro_keyword(text: str, lowered: str, keyword: str) -> bool:
+    if keyword in _CENTRAL_BANK_ENTITY_KEYWORDS:
+        return keyword in text and any(
+            _dailynews_text_has_macro_keyword(text, lowered, term)
+            for term in _CENTRAL_BANK_OPERATION_KEYWORDS
+        )
+    if keyword.upper() in _ASCII_MACRO_KEYWORDS:
+        return bool(re.search(rf"(?<![A-Za-z0-9.]){re.escape(keyword)}(?![A-Za-z0-9.])", text, re.IGNORECASE))
+    return keyword.lower() in lowered
+
+
+def _split_dailynews_platforms(value: str = "") -> List[str]:
+    requested = [part.strip().lower() for part in str(value or "").split(",") if part.strip()]
+    platforms = requested or list(_MACRO_FINANCE_PLATFORMS)
+    allowed = set(_ORZ_DAILYNEWS_PLATFORM_META)
+    result: List[str] = []
+    for platform in platforms:
+        if platform in allowed and platform not in result:
+            result.append(platform)
+    return result or list(_MACRO_FINANCE_PLATFORMS)
+
+
+def _macro_item_dedup_key(item: Dict[str, Any]) -> str:
+    return "|".join(
+        str(part or "")
+        for part in (
+            item.get("provider"),
+            item.get("id"),
+            item.get("url"),
+            item.get("title"),
+            item.get("published_at") or item.get("published_date"),
+        )
+    )
+
+
+def _normalize_macro_search_result(result: Any, *, query_id: str, query: str, provider: str, rank: int) -> Optional[Dict[str, Any]]:
+    title = str(getattr(result, "title", "") or "").strip()
+    snippet = str(getattr(result, "snippet", "") or "").strip()
+    url = str(getattr(result, "url", "") or "").strip()
+    source = str(getattr(result, "source", "") or "search_general_news").strip()
+    published_date = getattr(result, "published_date", None)
+    text = " ".join([title, snippet, str(published_date or ""), query])
+    matched_keywords = _macro_keywords_for_dailynews_item({
+        "title": title,
+        "brief": snippet,
+        "content": "",
+        "subject_names": [],
+        "stocks": [],
+    })
+    if not matched_keywords:
+        return None
+    item_id = hashlib.sha1("|".join([query_id, title, url, str(published_date or "")]).encode("utf-8")).hexdigest()[:16]
+    timestamp = _dailynews_timestamp(published_date)
+    return {
+        "id": item_id,
+        "title": title or snippet[:80] or query,
+        "brief": snippet,
+        "content": snippet,
+        "snippet": snippet,
+        "url": url,
+        "source": source,
+        "provider": f"search_general_news:{provider or 'unknown'}",
+        **timestamp,
+        "level": "",
+        "is_important": True,
+        "subjects": [],
+        "subject_names": [],
+        "stocks": [],
+        "author": "",
+        "reading_num": 0,
+        "comment_num": 0,
+        "share_num": 0,
+        "raw_type": "search_general_news",
+        "rank": rank,
+        "score": max(0.0, 100.0 - rank),
+        "raw_source": source,
+        "importance_flags": {"search_fallback": 1, "query_id": query_id},
+        "macro_keywords": matched_keywords,
+        "is_macro": True,
+        "fallback_query": query,
+        "fallback_query_id": query_id,
+        "published_date": str(published_date or ""),
+        "search_text": text,
+    }
+
+
+def _handle_get_orz_dailynews(
+    *,
+    platform: str,
+    limit: int,
+    important_only: bool = False,
+    keyword: str = "",
+    last_time: int = 0,
+    min_score: float = 0.0,
+    timeout_seconds: float = 6.0,
+) -> dict:
+    started = time.time()
+    platform_key = str(platform or "").strip().lower()
+    effective_limit = max(1, min(_safe_int(limit, 20), 50))
+    important_flag = _coerce_bool(important_only)
+    effective_timeout = max(1.0, min(float(timeout_seconds or 6.0), 15.0))
+    effective_last_time = _safe_int(last_time, 0)
+    effective_min_score = max(0.0, _safe_float(min_score, 0.0))
+    keyword_text = str(keyword or "").strip()
+    provider = f"orz.dailynews.{platform_key}"
+    query_url = _orz_dailynews_query_url(platform_key)
+
+    payload, err, fetch_ms = _run_search_task_with_timeout(
+        lambda: _fetch_orz_dailynews_payload(platform_key, timeout_seconds=effective_timeout),
+        effective_timeout + 1.0,
+        provider,
+    )
+    source_chain: List[Dict[str, Any]] = [{
+        "provider": provider,
+        "endpoint": _ORZ_DAILYNEWS_ENDPOINT,
+        "params": {"platform": platform_key},
+        "page_url": _ORZ_DAILYNEWS_PLATFORM_META.get(platform_key, {}).get("page_url", _ORZ_DAILYNEWS_ENDPOINT),
+        "result": "pending",
+        "duration_ms": fetch_ms,
+    }]
+    if err or not isinstance(payload, dict):
+        source_chain[0]["result"] = "error"
+        return {
+            "status": "error",
+            "provider": provider,
+            "query_url": query_url,
+            "endpoint": _ORZ_DAILYNEWS_ENDPOINT,
+            "results_count": 0,
+            "results": [],
+            "important_only": important_flag,
+            "keyword": keyword_text,
+            "last_time": effective_last_time,
+            "min_score": effective_min_score,
+            "source_chain": source_chain,
+            "errors": [str(err or "invalid orz dailynews response")],
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    payload_error = _dailynews_payload_error(payload)
+    if payload_error:
+        source_chain[0]["result"] = "error"
+        source_chain[0]["payload_status"] = payload.get("status")
+        source_chain[0]["errno"] = payload.get("errno")
+        return {
+            "status": "error",
+            "provider": provider,
+            "query_url": query_url,
+            "endpoint": _ORZ_DAILYNEWS_ENDPOINT,
+            "results_count": 0,
+            "results": [],
+            "important_only": important_flag,
+            "keyword": keyword_text,
+            "last_time": effective_last_time,
+            "min_score": effective_min_score,
+            "source_chain": source_chain,
+            "errors": [payload_error],
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    rows = _extract_cls_roll_data(payload)
+    items = [
+        _normalize_orz_dailynews_item(row, platform=platform_key)
+        for row in rows
+    ]
+    items = _filter_dailynews_items(
+        items,
+        effective_limit=effective_limit,
+        important_only=important_flag,
+        keyword=keyword_text,
+        last_time=effective_last_time,
+        min_score=effective_min_score,
+    )
+    source_chain[0]["result"] = "ok" if items else "empty"
+    source_chain[0]["count"] = len(items)
+    source_chain[0]["payload_status"] = payload.get("status")
+
+    return {
+        "status": "ok" if items else "empty",
+        "provider": provider,
+        "query_url": query_url,
+        "endpoint": _ORZ_DAILYNEWS_ENDPOINT,
+        "results_count": len(items),
+        "results": items,
+        "important_only": important_flag,
+        "keyword": keyword_text,
+        "last_time": effective_last_time,
+        "min_score": effective_min_score,
+        "next_last_time": min(
+            [item["published_ts"] for item in items if item.get("published_ts")] or [0]
+        ),
+        "source_chain": source_chain,
+        "errors": [],
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "notes": [
+            "Data source: https://orz.ai/api/v1/dailynews/",
+            "The upstream feed exposes ranked dailynews items; cursor support is emulated by local published_ts filtering.",
+        ],
+    }
+
+
+def _handle_get_cls_telegraph_news(
+    limit: int = 20,
+    important_only: bool = False,
+    keyword: str = "",
+    last_time: int = 0,
+    timeout_seconds: float = 6.0,
+) -> dict:
+    """Fetch 财联社电报/消息热榜 items through the orz dailynews feed."""
+
+    return _handle_get_orz_dailynews(
+        platform="cls",
+        limit=limit,
+        important_only=important_only,
+        keyword=keyword,
+        last_time=last_time,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _handle_get_xueqiu_hot_news(
+    limit: int = 20,
+    keyword: str = "",
+    min_score: float = 0.0,
+    timeout_seconds: float = 6.0,
+) -> dict:
+    """Fetch 雪球热榜 items through the orz dailynews feed."""
+
+    return _handle_get_orz_dailynews(
+        platform="xueqiu",
+        limit=limit,
+        keyword=keyword,
+        min_score=min_score,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _handle_get_macro_finance_news(
+    limit: int = 30,
+    platforms: str = "",
+    keyword: str = "",
+    include_search_fallback: bool = True,
+    search_days: int = 3,
+    timeout_seconds: float = 6.0,
+) -> dict:
+    """Fetch macro-finance items from finance-oriented orz dailynews feeds."""
+
+    started = time.time()
+    effective_limit = max(1, min(_safe_int(limit, 30), 50))
+    effective_timeout = max(1.0, min(float(timeout_seconds or 6.0), 15.0))
+    keyword_text = str(keyword or "").strip()
+    fallback_enabled = _coerce_bool(include_search_fallback)
+    effective_search_days = max(1, min(_safe_int(search_days, 3), 30))
+    selected_platforms = _split_dailynews_platforms(platforms)
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+
+    for platform in selected_platforms:
+        result = _handle_get_orz_dailynews(
+            platform=platform,
+            limit=50,
+            important_only=False,
+            keyword="",
+            timeout_seconds=effective_timeout,
+        )
+        source_chain.extend(result.get("source_chain") or [])
+        if result.get("status") == "error":
+            errors.extend(str(item) for item in result.get("errors") or [])
+            continue
+        for item in result.get("results") or []:
+            if not isinstance(item, dict):
+                continue
+            if keyword_text and keyword_text.lower() not in _dailynews_item_text(item).lower():
+                continue
+            matched_keywords = _macro_keywords_for_dailynews_item(item)
+            if not matched_keywords:
+                continue
+            dedup_key = _macro_item_dedup_key(item)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            enriched = dict(item)
+            enriched["macro_keywords"] = matched_keywords
+            enriched["is_macro"] = True
+            merged.append(enriched)
+
+    if fallback_enabled and len(merged) < effective_limit:
+        try:
+            service = _get_search_service()
+            if not getattr(service, "is_available", False):
+                source_chain.append({
+                    "provider": "search_general_news",
+                    "result": "disabled",
+                    "days": effective_search_days,
+                    "queries": [query for _, query in _MACRO_SEARCH_FALLBACK_QUERIES],
+                })
+            else:
+                for query_id, query in _MACRO_SEARCH_FALLBACK_QUERIES:
+                    if len(merged) >= effective_limit:
+                        break
+                    response = service.search_general_news(
+                        query,
+                        max_results=3,
+                        days=effective_search_days,
+                    )
+                    provider = str(getattr(response, "provider", "") or "search_general_news")
+                    ok = bool(getattr(response, "success", False))
+                    source_chain.append({
+                        "provider": provider,
+                        "result": "ok" if ok else "failed",
+                        "query_id": query_id,
+                        "query": query,
+                        "days": effective_search_days,
+                        "max_results": 3,
+                    })
+                    if not ok:
+                        errors.append(str(getattr(response, "error_message", "") or f"{query_id} search failed"))
+                        continue
+                    for rank, result in enumerate(getattr(response, "results", []) or [], start=1):
+                        item = _normalize_macro_search_result(
+                            result,
+                            query_id=query_id,
+                            query=query,
+                            provider=provider,
+                            rank=rank,
+                        )
+                        if not item:
+                            continue
+                        if keyword_text and keyword_text.lower() not in _dailynews_item_text(item).lower():
+                            continue
+                        dedup_key = _macro_item_dedup_key(item)
+                        if dedup_key in seen:
+                            continue
+                        seen.add(dedup_key)
+                        merged.append(item)
+                        if len(merged) >= effective_limit:
+                            break
+        except Exception as exc:
+            errors.append(str(exc))
+            source_chain.append({
+                "provider": "search_general_news",
+                "result": "error",
+                "error": str(exc),
+                "days": effective_search_days,
+            })
+
+    merged.sort(
+        key=lambda item: (
+            -_safe_int(item.get("published_ts"), 0),
+            _safe_int(item.get("rank"), 9999) or 9999,
+            -_safe_float(item.get("score"), 0.0),
+        )
+    )
+    items = merged[:effective_limit]
+    for chain in source_chain:
+        if isinstance(chain, dict) and chain.get("result") == "ok":
+            chain_provider = str(chain.get("provider") or "")
+            chain["macro_count"] = sum(
+                1
+                for item in items
+                if str(item.get("provider") or "") in {chain_provider, f"search_general_news:{chain_provider}"}
+            )
+
+    return {
+        "status": "ok" if items else ("partial" if errors else "empty"),
+        "provider": "orz.dailynews.macro_finance",
+        "query_url": ",".join(_orz_dailynews_query_url(platform) for platform in selected_platforms),
+        "endpoint": _ORZ_DAILYNEWS_ENDPOINT,
+        "platforms": selected_platforms,
+        "results_count": len(items),
+        "results": items,
+        "keyword": keyword_text,
+        "include_search_fallback": fallback_enabled,
+        "search_days": effective_search_days,
+        "macro_keywords": list(_MACRO_DAILYNEWS_KEYWORDS),
+        "source_chain": source_chain,
+        "errors": errors,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "notes": [
+            "Data source: https://orz.ai/api/v1/dailynews/",
+            "Macro layer is filtered locally from finance-oriented platforms, currently sina_finance and eastmoney by default.",
+        ],
+    }
 
 
 def _openinvest_path() -> Optional[Path]:
@@ -808,6 +1635,157 @@ search_openinvest_news_tool = ToolDefinition(
 )
 
 
+get_cls_telegraph_news_tool = ToolDefinition(
+    name="get_cls_telegraph_news",
+    description=(
+        "Fetch 财联社电报/消息热榜 items via https://orz.ai/api/v1/dailynews/?platform=cls. "
+        "Use this for intraday market news, policy/material/company catalysts, and theme-catalyst evidence. "
+        "Returns normalized ranked news cards with publish time, score/rank, source_chain, "
+        "and structured degradation errors when the upstream feed is unavailable."
+    ),
+    parameters=[
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max telegraph items to return (default: 20, max: 50).",
+            required=False,
+            default=20,
+        ),
+        ToolParameter(
+            name="important_only",
+            type="boolean",
+            description="Whether to keep only high-importance items based on rank/score and legacy CLS flags when present.",
+            required=False,
+            default=False,
+        ),
+        ToolParameter(
+            name="keyword",
+            type="string",
+            description="Optional keyword filter over title, brief, content, subjects, and linked stock names.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="last_time",
+            type="integer",
+            description="Optional published_ts upper bound. The orz dailynews feed is fetched once, then filtered locally.",
+            required=False,
+            default=0,
+        ),
+        ToolParameter(
+            name="timeout_seconds",
+            type="number",
+            description="HTTP timeout budget in seconds (default: 6, max: 15).",
+            required=False,
+            default=6.0,
+        ),
+    ],
+    handler=_handle_get_cls_telegraph_news,
+    category="search",
+)
+
+
+get_xueqiu_hot_news_tool = ToolDefinition(
+    name="get_xueqiu_hot_news",
+    description=(
+        "Fetch 雪球热榜 items via https://orz.ai/api/v1/dailynews/?platform=xueqiu. "
+        "Use this to observe retail/social attention, hot themes, and market discussion heat. "
+        "Returns normalized ranked hot-news cards with publish time, score/rank, source_chain, "
+        "and structured degradation errors when the upstream feed is unavailable."
+    ),
+    parameters=[
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max hot-list items to return (default: 20, max: 50).",
+            required=False,
+            default=20,
+        ),
+        ToolParameter(
+            name="keyword",
+            type="string",
+            description="Optional keyword filter over title and content.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="min_score",
+            type="number",
+            description="Optional minimum heat score filter.",
+            required=False,
+            default=0.0,
+        ),
+        ToolParameter(
+            name="timeout_seconds",
+            type="number",
+            description="HTTP timeout budget in seconds (default: 6, max: 15).",
+            required=False,
+            default=6.0,
+        ),
+    ],
+    handler=_handle_get_xueqiu_hot_news,
+    category="search",
+)
+
+
+get_macro_finance_news_tool = ToolDefinition(
+    name="get_macro_finance_news",
+    description=(
+        "Fetch macro-finance news from finance-oriented orz dailynews feeds, currently "
+        "sina_finance and eastmoney by default. Use this for nonfarm payrolls, CPI/PPI/PMI, "
+        "Fed/interest-rate events, PBOC open-market operations, reverse repos, MLF/LPR, "
+        "liquidity and broad market risk-appetite signals. Returns only items matched by "
+        "macro keywords, with provider/source_chain and structured degradation errors."
+    ),
+    parameters=[
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Max macro-finance items to return (default: 30, max: 50).",
+            required=False,
+            default=30,
+        ),
+        ToolParameter(
+            name="platforms",
+            type="string",
+            description="Comma-separated orz dailynews platforms. Defaults to sina_finance,eastmoney.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="keyword",
+            type="string",
+            description="Optional extra keyword filter after macro filtering.",
+            required=False,
+            default="",
+        ),
+        ToolParameter(
+            name="include_search_fallback",
+            type="boolean",
+            description="Whether to use SearchService.search_general_news for fixed macro queries when dailynews coverage is thin.",
+            required=False,
+            default=True,
+        ),
+        ToolParameter(
+            name="search_days",
+            type="integer",
+            description="Lookback days for SearchService fallback queries (default: 3, max: 30).",
+            required=False,
+            default=3,
+        ),
+        ToolParameter(
+            name="timeout_seconds",
+            type="number",
+            description="HTTP timeout budget in seconds per upstream platform (default: 6, max: 15).",
+            required=False,
+            default=6.0,
+        ),
+    ],
+    handler=_handle_get_macro_finance_news,
+    category="search",
+)
+
+
 search_stock_prompt_intel_tool = ToolDefinition(
     name="search_stock_prompt_intel",
     description=(
@@ -1062,6 +2040,9 @@ search_comprehensive_intel_tool = ToolDefinition(
 ALL_SEARCH_TOOLS = [
     search_stock_news_tool,
     search_openinvest_news_tool,
+    get_cls_telegraph_news_tool,
+    get_xueqiu_hot_news_tool,
+    get_macro_finance_news_tool,
     search_stock_prompt_intel_tool,
     score_stock_news_sentiment_tool,
     search_comprehensive_intel_tool,

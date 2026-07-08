@@ -13,6 +13,7 @@ import AgentVerdictReviewsPage from './pages/AgentVerdictReviewsPage';
 import AgentEntryExecutionBacktestsPage from './pages/AgentEntryExecutionBacktestsPage';
 import CandidatePoolPage from './pages/CandidatePoolPage';
 import SeedPoolQualityPage from './pages/SeedPoolQualityPage';
+import NewsSignalsPage from './pages/NewsSignalsPage';
 import { ApiErrorAlert, Shell } from './components/common';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { useAgentChatStore } from './stores/agentChatStore';
@@ -74,6 +75,7 @@ const AppContent: React.FC = () => {
         <Route path="/agent-entry-execution-backtests" element={<AgentEntryExecutionBacktestsPage />} />
         <Route path="/candidate-pool" element={<CandidatePoolPage />} />
         <Route path="/seed-pool-quality" element={<SeedPoolQualityPage />} />
+        <Route path="/news-signals" element={<NewsSignalsPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/settings" element={<SettingsPage />} />

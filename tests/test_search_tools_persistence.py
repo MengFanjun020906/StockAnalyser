@@ -8,11 +8,17 @@ import types
 from unittest.mock import MagicMock, patch
 
 from src.agent.tools.search_tools import (
+    _handle_get_cls_telegraph_news,
+    _handle_get_macro_finance_news,
+    _handle_get_xueqiu_hot_news,
     _handle_search_comprehensive_intel,
     _handle_search_openinvest_news,
     _handle_score_stock_news_sentiment,
     _handle_search_stock_prompt_intel,
     _handle_search_stock_news,
+    get_cls_telegraph_news_tool,
+    get_macro_finance_news_tool,
+    get_xueqiu_hot_news_tool,
     search_stock_prompt_intel_tool,
     ALL_SEARCH_TOOLS,
 )
@@ -38,6 +44,217 @@ def _response(query: str, *, success: bool = True) -> SearchResponse:
 
 
 class SearchToolsPersistenceTest(unittest.TestCase):
+    def test_get_cls_telegraph_news_normalizes_orz_dailynews_response(self) -> None:
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "200",
+            "msg": "success",
+            "data": [
+                {
+                    "title": "[电报解读] 三星第三季DRAM拟提价20%",
+                    "url": "https://www.cls.cn/telegraph",
+                    "content": "三星第三季DRAM拟提价20%，国产存储厂商关注升温。",
+                    "source": "cls",
+                    "publish_time": "2026-07-04 11:11:41",
+                    "score": 997,
+                    "rank": 4,
+                }
+            ],
+        }
+
+        with patch("src.agent.tools.search_tools.requests.get", return_value=response) as requests_get:
+            result = _handle_get_cls_telegraph_news(limit=5, keyword="DRAM", timeout_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["provider"], "orz.dailynews.cls")
+        self.assertEqual(result["query_url"], "https://orz.ai/api/v1/dailynews/?platform=cls")
+        self.assertEqual(result["results_count"], 1)
+        item = result["results"][0]
+        self.assertEqual(item["id"], "4")
+        self.assertEqual(item["url"], "https://www.cls.cn/telegraph")
+        self.assertEqual(item["published_at"], "2026-07-04T11:11:41+08:00")
+        self.assertEqual(item["score"], 997.0)
+        self.assertEqual(item["rank"], 4)
+        self.assertTrue(item["is_important"])
+        self.assertIn(get_cls_telegraph_news_tool, ALL_SEARCH_TOOLS)
+        self.assertEqual(requests_get.call_args.kwargs["params"], {"platform": "cls"})
+
+    def test_get_cls_telegraph_news_filters_important_items(self) -> None:
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "200",
+            "data": [
+                {"title": "普通快讯", "content": "普通", "publish_time": "2026-07-04 10:00:00", "rank": 16, "score": 20},
+                {"title": "重要快讯", "content": "重要", "publish_time": "2026-07-04 10:01:00", "rank": 2, "score": 998},
+            ],
+        }
+
+        with patch("src.agent.tools.search_tools.requests.get", return_value=response):
+            result = _handle_get_cls_telegraph_news(limit=5, important_only=True, timeout_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["results_count"], 1)
+        self.assertEqual(result["results"][0]["id"], "2")
+
+    def test_get_xueqiu_hot_news_normalizes_orz_dailynews_response(self) -> None:
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "200",
+            "msg": "success",
+            "data": [
+                {
+                    "title": "人型机器人商业化落地加速",
+                    "url": "https://xueqiu.com/",
+                    "content": "机器人利好催化密集，相关 ETF 盘中走强。",
+                    "source": "xueqiu",
+                    "publish_time": "2026-07-04 11:11:40",
+                    "score": 17,
+                    "rank": 5,
+                },
+                {
+                    "title": "半导体材料板块走弱",
+                    "url": "https://xueqiu.com/",
+                    "content": "半导体材料板块震荡下挫。",
+                    "source": "xueqiu",
+                    "publish_time": "2026-07-04 11:11:40",
+                    "score": 157,
+                    "rank": 7,
+                },
+            ],
+        }
+
+        with patch("src.agent.tools.search_tools.requests.get", return_value=response) as requests_get:
+            result = _handle_get_xueqiu_hot_news(limit=10, keyword="半导体", min_score=100, timeout_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["provider"], "orz.dailynews.xueqiu")
+        self.assertEqual(result["query_url"], "https://orz.ai/api/v1/dailynews/?platform=xueqiu")
+        self.assertEqual(result["results_count"], 1)
+        self.assertEqual(result["results"][0]["title"], "半导体材料板块走弱")
+        self.assertEqual(result["results"][0]["source"], "雪球热榜")
+        self.assertIn(get_xueqiu_hot_news_tool, ALL_SEARCH_TOOLS)
+        self.assertEqual(requests_get.call_args.kwargs["params"], {"platform": "xueqiu"})
+
+    def test_get_macro_finance_news_filters_macro_items_from_finance_platforms(self) -> None:
+        sina_response = MagicMock()
+        sina_response.raise_for_status.return_value = None
+        sina_response.json.return_value = {
+            "status": "200",
+            "data": [
+                {
+                    "title": "美国6月非农数据超预期 美联储降息预期降温",
+                    "content": "非农就业数据强于预期，美元指数走强。",
+                    "source": "sina_finance",
+                    "publish_time": "2026-07-04 09:10:00",
+                    "rank": 1,
+                },
+                {
+                    "title": "某公司发布新品",
+                    "content": "新品发布。",
+                    "source": "sina_finance",
+                    "publish_time": "2026-07-04 09:09:00",
+                    "rank": 2,
+                },
+                {
+                    "title": "MiniMax M2.7 模型升级",
+                    "content": "模型版本升级，推理效率提升。",
+                    "source": "sina_finance",
+                    "publish_time": "2026-07-04 09:08:00",
+                    "rank": 3,
+                },
+            ],
+        }
+        eastmoney_response = MagicMock()
+        eastmoney_response.raise_for_status.return_value = None
+        eastmoney_response.json.return_value = {
+            "status": "200",
+            "data": [
+                {
+                    "title": "央行开展5000亿元逆回购操作",
+                    "content": "公开市场净投放，维护流动性合理充裕。",
+                    "source": "eastmoney",
+                    "publish_time": "2026-07-04 09:05:00",
+                    "rank": 1,
+                },
+                {
+                    "title": "瀚银科技被罚没近7445万元",
+                    "content": "中国人民银行上海市分行披露行政处罚决定。",
+                    "source": "eastmoney",
+                    "publish_time": "2026-07-04 09:04:00",
+                    "rank": 2,
+                }
+            ],
+        }
+
+        with patch("src.agent.tools.search_tools.requests.get", side_effect=[sina_response, eastmoney_response]) as requests_get:
+            result = _handle_get_macro_finance_news(limit=10, include_search_fallback=False, timeout_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["provider"], "orz.dailynews.macro_finance")
+        self.assertEqual(result["platforms"], ["sina_finance", "eastmoney"])
+        self.assertEqual(result["results_count"], 2)
+        self.assertEqual({item["provider"] for item in result["results"]}, {"orz.dailynews.sina_finance", "orz.dailynews.eastmoney"})
+        self.assertTrue(all(item["is_macro"] for item in result["results"]))
+        self.assertIn("非农", result["results"][0]["macro_keywords"])
+        self.assertNotIn("MiniMax", " ".join(item["title"] for item in result["results"]))
+        self.assertNotIn("瀚银科技", " ".join(item["title"] for item in result["results"]))
+        self.assertIn(get_macro_finance_news_tool, ALL_SEARCH_TOOLS)
+        self.assertEqual(requests_get.call_args_list[0].kwargs["params"], {"platform": "sina_finance"})
+        self.assertEqual(requests_get.call_args_list[1].kwargs["params"], {"platform": "eastmoney"})
+
+    def test_get_macro_finance_news_uses_search_fallback_when_dailynews_has_no_macro(self) -> None:
+        empty_response = MagicMock()
+        empty_response.raise_for_status.return_value = None
+        empty_response.json.return_value = {"status": "200", "data": []}
+        service = SimpleNamespace(
+            is_available=True,
+            search_general_news=MagicMock(side_effect=[
+                SearchResponse(
+                    query="美国 非农 就业数据 美联储 最新",
+                    provider="UnitSearch",
+                    success=True,
+                    results=[
+                        SearchResult(
+                            title="美国6月非农就业数据超预期",
+                            snippet="非农就业数据强于市场预期，美联储降息预期降温。",
+                            url="https://example.test/nfp",
+                            source="example",
+                            published_date="2026-07-04",
+                        )
+                    ],
+                ),
+                SearchResponse(query="q2", provider="UnitSearch", success=True, results=[]),
+                SearchResponse(query="q3", provider="UnitSearch", success=True, results=[]),
+                SearchResponse(query="q4", provider="UnitSearch", success=True, results=[]),
+            ]),
+        )
+
+        with patch("src.agent.tools.search_tools.requests.get", return_value=empty_response), \
+             patch("src.agent.tools.search_tools._get_search_service", return_value=service):
+            result = _handle_get_macro_finance_news(limit=5, timeout_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["include_search_fallback"])
+        self.assertEqual(result["results_count"], 1)
+        self.assertEqual(result["results"][0]["provider"], "search_general_news:UnitSearch")
+        self.assertIn("非农", result["results"][0]["macro_keywords"])
+        service.search_general_news.assert_called()
+
+    def test_get_cls_telegraph_news_reports_structured_error(self) -> None:
+        with patch(
+            "src.agent.tools.search_tools._run_search_task_with_timeout",
+            return_value=(None, "cls_telegraph timeout", 1000),
+        ):
+            result = _handle_get_cls_telegraph_news(limit=5, timeout_seconds=1)
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["source_chain"][0]["result"], "error")
+        self.assertEqual(result["errors"], ["cls_telegraph timeout"])
+
     def test_search_stock_news_persists_successful_response(self) -> None:
         response = _response("贵州茅台 600519 latest news")
         service = SimpleNamespace(

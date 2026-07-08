@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Regression tests for effective trading date resolution."""
 
+import builtins
+import importlib
+import sys
 from datetime import date, datetime, time, timezone
 from types import SimpleNamespace
 import unittest
@@ -10,6 +13,30 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.core import trading_calendar
+
+
+class TradingCalendarImportTestCase(unittest.TestCase):
+    def test_exchange_calendars_import_error_fails_open(self):
+        module_name = "src.core.trading_calendar"
+        original_module = sys.modules.pop(module_name, None)
+        original_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "exchange_calendars":
+                raise TypeError("broken exchange_calendars import")
+            return original_import(name, *args, **kwargs)
+
+        try:
+            with patch("builtins.__import__", side_effect=fake_import):
+                reloaded = importlib.import_module(module_name)
+
+            self.assertFalse(reloaded._XCALS_AVAILABLE)
+            self.assertTrue(reloaded.is_market_open("cn", date(2026, 7, 1)))
+            self.assertEqual(reloaded.get_open_markets_today(), {"cn", "hk", "us"})
+        finally:
+            sys.modules.pop(module_name, None)
+            if original_module is not None:
+                sys.modules[module_name] = original_module
 
 
 class _FakeCalendar:

@@ -15,7 +15,6 @@ import pandas as pd
 from data_provider.baostock_fetcher import BaostockFetcher
 from src.repositories.stock_repo import StockRepository
 from src.services.agent_entry_execution_backtest_service import (
-    DEFAULT_ENTRY_EXPIRY_DAYS,
     DEFAULT_MAX_HOLD_DAYS,
     DEFAULT_MINUTE_ADJUSTFLAG,
     DEFAULT_MINUTE_FREQUENCY,
@@ -180,7 +179,9 @@ def _build_symbol_ranges(plans: List[Dict[str, Any]], *, current_date: date) -> 
         decision_date = _parse_date(plan.get("decision_date") or item.get("decision_date"))
         if not symbol or decision_date is None:
             continue
-        entry_expiry = int(plan.get("entry_expiry_days") or DEFAULT_ENTRY_EXPIRY_DAYS)
+        entry_expiry = _safe_int(plan.get("entry_expiry_days") or plan.get("signal_valid_days"))
+        if entry_expiry is None or entry_expiry <= 0:
+            continue
         max_hold = int(plan.get("max_hold_days") or DEFAULT_MAX_HOLD_DAYS)
         horizon_days = max(30, (entry_expiry + max_hold) * 2)
         end_date = min(current_date, decision_date + timedelta(days=horizon_days))
@@ -302,6 +303,13 @@ def _parse_date(value: Any) -> Optional[date]:
     try:
         return date.fromisoformat(text[:10])
     except ValueError:
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
 
 

@@ -380,16 +380,39 @@ def _compute_trading_day_filter(
 
     from src.core.trading_calendar import (
         get_market_for_stock,
+        get_effective_trading_date,
         get_open_markets_today,
         compute_effective_region,
     )
+    from src.storage import DatabaseManager
 
     open_markets = get_open_markets_today()
     filtered_codes = []
+    db = None
     for code in stock_codes:
         mkt = get_market_for_stock(code)
         if mkt in open_markets or mkt is None:
             filtered_codes.append(code)
+            continue
+
+        try:
+            if db is None:
+                db = DatabaseManager.get_instance()
+            target_date = get_effective_trading_date(mkt)
+            if not db.has_today_data(code, target_date):
+                filtered_codes.append(code)
+                logger.info(
+                    "%s 所属市场今日休市，但 %s 数据缺失，保留本次运行用于补跑。",
+                    code,
+                    target_date.isoformat(),
+                )
+        except Exception as exc:
+            filtered_codes.append(code)
+            logger.warning(
+                "%s 交易日补跑检查失败，按 fail-open 保留本次运行: %s",
+                code,
+                exc,
+            )
 
     if config.market_review_enabled and not getattr(args, 'no_market_review', False):
         effective_region = compute_effective_region(

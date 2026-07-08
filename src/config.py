@@ -729,6 +729,11 @@ class Config:
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     news_strategy_profile: str = "short"  # 新闻窗口策略档位：ultra_short/short/medium/long
+    news_event_extractor_mode: str = "fallback"  # fallback | llm | auto
+    news_event_extractor_model: str = ""
+    news_event_extractor_timeout_seconds: int = 12
+    news_event_extractor_max_tokens: int = 900
+    news_event_extractor_temperature: float = 0.0
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === Graphiti 知识图谱配置 ===
@@ -1465,6 +1470,29 @@ class Config:
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
             news_strategy_profile=cls._parse_news_strategy_profile(
                 os.getenv('NEWS_STRATEGY_PROFILE', 'short')
+            ),
+            news_event_extractor_mode=(os.getenv('NEWS_EVENT_EXTRACTOR_MODE', 'fallback') or 'fallback').strip().lower(),
+            news_event_extractor_model=os.getenv('NEWS_EVENT_EXTRACTOR_MODEL', '').strip(),
+            news_event_extractor_timeout_seconds=parse_env_int(
+                os.getenv('NEWS_EVENT_EXTRACTOR_TIMEOUT_SECONDS'),
+                12,
+                field_name='NEWS_EVENT_EXTRACTOR_TIMEOUT_SECONDS',
+                minimum=1,
+                maximum=120,
+            ),
+            news_event_extractor_max_tokens=parse_env_int(
+                os.getenv('NEWS_EVENT_EXTRACTOR_MAX_TOKENS'),
+                900,
+                field_name='NEWS_EVENT_EXTRACTOR_MAX_TOKENS',
+                minimum=128,
+                maximum=4096,
+            ),
+            news_event_extractor_temperature=parse_env_float(
+                os.getenv('NEWS_EVENT_EXTRACTOR_TEMPERATURE'),
+                0.0,
+                field_name='NEWS_EVENT_EXTRACTOR_TEMPERATURE',
+                minimum=0.0,
+                maximum=2.0,
             ),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             graphiti_enabled=os.getenv('GRAPHITI_ENABLED', 'false').lower() == 'true',

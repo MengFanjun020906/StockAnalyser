@@ -19,6 +19,8 @@ export type EntryExecutionStrategyResult = {
   holdingDays?: number | null;
   pnlPct?: number | null;
   ambiguousBar?: boolean;
+  tradeRule?: string | null;
+  sellableFrom?: string | null;
   entryReason?: string | null;
   limits?: string[];
 };
@@ -35,6 +37,9 @@ export type EntryExecutionTradePlan = {
   stopLossPrice?: number | null;
   takeProfitPrice?: number | null;
   entryExpiryDays?: number;
+  signalValidDays?: number;
+  signalValidUntil?: string | null;
+  signalValidityLabel?: string | null;
   maxHoldDays?: number;
   executionMode?: string;
   finalAction?: string;

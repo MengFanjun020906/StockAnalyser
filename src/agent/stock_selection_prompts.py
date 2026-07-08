@@ -662,7 +662,7 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 3. 首仓必须保守，除非行情、技术、基本面、消息和资金证据均明确支持。
 4. 休市、资金面缺失、消息面缺失或行情时效不明时，只能给条件型计划。
 5. 如果开盘价或当前价高于 no_chase_line，回踩/低吸型计划必须自动降级为 wait；强势突破/涨停/资金接力型计划只有在出现明确承接确认、分歧转一致、可成交且止损/失效条件清晰时，才允许保留 conditional_open，且首仓必须降档。
-6. 每只股票必须给动作、首仓比例或不买原因、入场条件、加仓条件、止损条件、复查触发。
+6. 每只股票必须给动作、首仓比例或不买原因、入场条件、信号有效期、加仓条件、止损条件、复查触发。
 7. 候选整体质量不足时输出本轮不建仓。
 8. 账户摘要为空或可用现金缺失时，portfolio_action 不得为 open；但如果候选具备强势延续条件、明确触发条件和失效条件，可以输出 action=wait + execution_mode=conditional_open，并将仓位写为“需按账户约束确认”或保守试探区间。
 9. 如果 market_regime 为 risk_off / panic，portfolio_action 必须为 wait 或 reject；如果 volatility_bucket 为 extreme，不得主动开新仓。
@@ -675,6 +675,7 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 16. 如果输入包含 meta_orchestrator_summary、meta_constraint_packages 和 if_then_order_matrix，必须优先遵守 Meta-Agent 的硬约束和点位计算层的 If-Then 条件单；不得把 Meta 只用于定性的 asset_regime 误写成无条件买入建议。
 17. positions_plan.entry_condition / stop_loss_condition 应优先来自 if_then_order_matrix 中选中的场景；如果点位计算层只给 monitor/plain_wait，不得强行升级为 open。
 18. symbol_regime_probabilities 只对 deep dive 标的和持仓标的提供后验概率证据与 reentry_reference；low_confidence=true 时只能作为弱证据，不得单独提高仓位或绕过点位/风控条件。
+19. positions_plan.entry_expiry_days 必须由你根据入场条件、行情波动、事件窗口和交易周期明确给出，不得依赖系统默认值。所有 open/conditional_open 必须输出 signal_validity_label 和 signal_validity_reason，超期未触发则失效或复查，不得让买点无限期有效；无法判断有效期时必须降级为 wait/monitor 并写明缺口。
 
 {META_POINT_CALC_FIELD_GUIDE}
 
@@ -707,6 +708,11 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
         "initial_position_pct": 0,
         "initial_amount": 0,
         "entry_condition": "",
+        "entry_expiry_days": 2,
+        "signal_valid_days": 2,
+        "signal_valid_until": "YYYY-MM-DD 或空",
+        "signal_validity_label": "AI 判断的有效期，例如 2 个交易日，超期未触发则失效",
+        "signal_validity_reason": "为什么给这个有效期",
         "add_condition": "",
         "stop_loss_condition": "",
         "take_profit_condition": "",

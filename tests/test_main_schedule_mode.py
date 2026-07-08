@@ -137,6 +137,50 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
         )
 
+    def test_trading_day_filter_keeps_closed_market_stock_when_latest_data_missing(self) -> None:
+        args = self._make_args()
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_enabled=False,
+        )
+        db = SimpleNamespace(has_today_data=lambda _code, _target: False)
+
+        with patch("src.core.trading_calendar.get_open_markets_today", return_value=set()), \
+             patch("src.core.trading_calendar.get_market_for_stock", return_value="cn"), \
+             patch("src.core.trading_calendar.get_effective_trading_date", return_value=datetime(2026, 7, 3).date()), \
+             patch("src.storage.DatabaseManager.get_instance", return_value=db):
+            filtered, effective_region, should_skip = main._compute_trading_day_filter(
+                config,
+                args,
+                ["600519"],
+            )
+
+        self.assertEqual(filtered, ["600519"])
+        self.assertIsNone(effective_region)
+        self.assertFalse(should_skip)
+
+    def test_trading_day_filter_skips_closed_market_stock_when_latest_data_exists(self) -> None:
+        args = self._make_args()
+        config = self._make_config(
+            trading_day_check_enabled=True,
+            market_review_enabled=False,
+        )
+        db = SimpleNamespace(has_today_data=lambda _code, _target: True)
+
+        with patch("src.core.trading_calendar.get_open_markets_today", return_value=set()), \
+             patch("src.core.trading_calendar.get_market_for_stock", return_value="cn"), \
+             patch("src.core.trading_calendar.get_effective_trading_date", return_value=datetime(2026, 7, 3).date()), \
+             patch("src.storage.DatabaseManager.get_instance", return_value=db):
+            filtered, effective_region, should_skip = main._compute_trading_day_filter(
+                config,
+                args,
+                ["600519"],
+            )
+
+        self.assertEqual(filtered, [])
+        self.assertIsNone(effective_region)
+        self.assertTrue(should_skip)
+
     def test_schedule_mode_reload_uses_latest_runtime_config(self) -> None:
         args = self._make_args(schedule=True)
         startup_config = self._make_config(schedule_enabled=True, schedule_time="18:00")

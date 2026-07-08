@@ -3,7 +3,7 @@
 import json
 import os
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,7 +13,12 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from src.config import Config
 from src.services.agent_entry_minute_data_service import AgentEntryMinuteDataService
-from src.services.agent_entry_execution_backtest_service import AgentEntryExecutionBacktestService
+from src.services.agent_entry_execution_backtest_service import (
+    AgentEntryExecutionBacktestService,
+    _attach_signal_validity,
+    _simulate_next_open,
+    _simulate_strict,
+)
 from src.storage import DatabaseManager, StockDaily, StockMinuteBar
 
 
@@ -38,6 +43,9 @@ def _write_entry_trace(trace_dir: Path) -> None:
                             "action": "wait",
                             "execution_mode": "conditional_open",
                             "entry_condition": "回踩 10.0-10.2 可试探",
+                            "entry_expiry_days": 2,
+                            "signal_valid_days": 2,
+                            "signal_validity_label": "2 个交易日，未触发则失效",
                             "stop_loss_condition": "跌破 9.7",
                             "take_profit_condition": "目标 10.8",
                         }
@@ -67,6 +75,9 @@ def _write_mixed_entry_trace(trace_dir: Path) -> None:
                             "action": "wait",
                             "execution_mode": "conditional_open",
                             "entry_condition": "回踩 10.0-10.2 可试探",
+                            "entry_expiry_days": 2,
+                            "signal_valid_days": 2,
+                            "signal_validity_label": "2 个交易日，未触发则失效",
                             "stop_loss_condition": "跌破 9.7",
                             "take_profit_condition": "目标 10.8",
                         },
@@ -112,6 +123,9 @@ def test_entry_execution_backtest_builds_final_report_trades_from_stock_daily():
                                 "action": "wait",
                                 "execution_mode": "conditional_open",
                                 "entry_condition": "回踩 10.0-10.2 可试探",
+                                "entry_expiry_days": 2,
+                                "signal_valid_days": 2,
+                                "signal_validity_label": "2 个交易日，未触发则失效",
                                 "stop_loss_condition": "跌破 9.7",
                                 "take_profit_condition": "目标 11.2",
                             },
@@ -121,6 +135,9 @@ def test_entry_execution_backtest_builds_final_report_trades_from_stock_daily():
                                 "name": "测试二",
                                 "action": "wait",
                                 "entry_condition": "回踩 20.0-20.2",
+                                "entry_expiry_days": 2,
+                                "signal_valid_days": 2,
+                                "signal_validity_label": "2 个交易日，未触发则失效",
                                 "stop_loss_condition": "跌破 19.5",
                             },
                             {
@@ -129,6 +146,9 @@ def test_entry_execution_backtest_builds_final_report_trades_from_stock_daily():
                                 "name": "测试三",
                                 "action": "wait",
                                 "entry_condition": "回踩 30.0-30.2",
+                                "entry_expiry_days": 2,
+                                "signal_valid_days": 2,
+                                "signal_validity_label": "2 个交易日，未触发则失效",
                                 "stop_loss_condition": "跌破 29.5",
                             },
                             {
@@ -137,6 +157,9 @@ def test_entry_execution_backtest_builds_final_report_trades_from_stock_daily():
                                 "name": "第四只",
                                 "action": "wait",
                                 "entry_condition": "回踩 40.0-40.2",
+                                "entry_expiry_days": 2,
+                                "signal_valid_days": 2,
+                                "signal_validity_label": "2 个交易日，未触发则失效",
                             },
                             {
                                 "rank": 5,
@@ -226,6 +249,23 @@ def test_entry_execution_backtest_prefers_cached_minute_bars():
                     amount=12900,
                 )
             )
+            session.add(
+                StockMinuteBar(
+                    code="600001",
+                    baostock_code="sh.600001",
+                    frequency="5",
+                    adjustflag="3",
+                    bar_datetime=datetime(2024, 1, 3, 9, 35),
+                    bar_date=date(2024, 1, 3),
+                    bar_time="09:35:00",
+                    open=10.7,
+                    high=10.9,
+                    low=10.6,
+                    close=10.85,
+                    volume=1200,
+                    amount=12900,
+                )
+            )
             session.commit()
 
         rows = AgentEntryExecutionBacktestService(db_manager=db).build_backtests_for_trace(trace_dir=trace_dir)
@@ -235,9 +275,174 @@ def test_entry_execution_backtest_prefers_cached_minute_bars():
         strict = rows[0]["strategies"]["strict_ai_entry"]
         assert strict["status"] == "filled"
         assert strict["entry_date"] == "2024-01-02 09:35:00"
-        assert strict["exit_date"] == "2024-01-02 10:00:00"
+        assert strict["exit_date"] == "2024-01-03 09:35:00"
         assert strict["exit_reason"] == "take_profit"
         assert strict["holding_days"] == 1
+        assert strict["trade_rule"] == "cn_t_plus_1"
+        assert strict["sellable_from"] == "2024-01-03 09:35:00"
+        assert rows[0]["trade_plan"]["signal_valid_until"] == "2024-01-03"
+
+        DatabaseManager.reset_instance()
+
+
+def test_strict_entry_respects_a_share_t_plus_one_on_daily_bars():
+    bars = [
+        {"date": "2026-07-02", "open": 10.0, "high": 11.3, "low": 9.5, "close": 10.5},
+        {"date": "2026-07-03", "open": 10.4, "high": 10.9, "low": 10.2, "close": 10.6},
+    ]
+    plan = {
+        "entry_zone_low": 10.0,
+        "entry_zone_high": 10.2,
+        "stop_loss_price": 9.7,
+        "take_profit_price": 11.2,
+        "entry_expiry_days": 1,
+        "max_hold_days": 2,
+    }
+
+    result = _simulate_strict(
+        strategy_name="strict_ai_entry",
+        start_price=10.0,
+        forward_bars=bars,
+        trade_plan=plan,
+    )
+
+    assert result["status"] == "filled"
+    assert result["entry_date"] == "2026-07-02"
+    assert result["exit_date"] == "2026-07-03"
+    assert result["exit_reason"] == "timeout_exit"
+    assert result["trade_rule"] == "cn_t_plus_1"
+    assert result["sellable_from"] == "2026-07-03"
+
+
+def test_signal_validity_uses_entry_expiry_trading_window():
+    bars = [
+        {"date": "2026-07-02", "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.1},
+        {"date": "2026-07-03", "open": 10.1, "high": 10.3, "low": 9.9, "close": 10.2},
+        {"date": "2026-07-06", "open": 10.2, "high": 10.4, "low": 10.0, "close": 10.3},
+        {"date": "2026-07-07", "open": 10.3, "high": 10.5, "low": 10.1, "close": 10.4},
+    ]
+
+    plan = _attach_signal_validity({"entry_expiry_days": 3}, bars)
+
+    assert plan["signal_valid_days"] == 3
+    assert plan["signal_valid_until"] == "2026-07-06"
+    assert plan["signal_validity_label"] == "3 个交易日"
+
+
+def test_missing_signal_validity_defaults_to_five_day_entry_window():
+    bars = [
+        {"date": "2026-07-02", "open": 10.4, "high": 10.8, "low": 10.3, "close": 10.5},
+        {"date": "2026-07-03", "open": 10.5, "high": 10.7, "low": 10.4, "close": 10.6},
+        {"date": "2026-07-06", "open": 10.6, "high": 10.9, "low": 10.4, "close": 10.7},
+        {"date": "2026-07-07", "open": 10.7, "high": 10.8, "low": 10.4, "close": 10.6},
+        {"date": "2026-07-08", "open": 10.6, "high": 10.7, "low": 10.3, "close": 10.5},
+        {"date": "2026-07-09", "open": 10.5, "high": 10.7, "low": 10.1, "close": 10.3},
+    ]
+
+    plan = _attach_signal_validity({"decision_date": "2026-07-01"}, bars)
+    assert plan["entry_expiry_days"] == 5
+    assert plan["signal_valid_days"] == 5
+    assert plan["signal_valid_until"] == "2026-07-08"
+    assert plan["signal_validity_label"] == "AI 未给出有效期，默认 5 个交易日内未触发买入则失效"
+
+    result = _simulate_strict(
+        strategy_name="strict_ai_entry",
+        start_price=10.5,
+        forward_bars=bars,
+        trade_plan={
+            "decision_date": "2026-07-01",
+            "entry_zone_low": 10.0,
+            "entry_zone_high": 10.2,
+            "stop_loss_price": 9.7,
+            "take_profit_price": 11.2,
+        },
+    )
+
+    assert result["status"] == "not_filled"
+    assert result["entry_reason"] == "signal_expired"
+    assert result["entry_window_days"] == 5
+    assert result["limits"] == ["signal_expired"]
+
+
+def test_default_max_hold_exits_after_thirty_trading_days_without_sl_tp():
+    bars = [
+        {
+            "date": (date(2026, 7, 1) + timedelta(days=idx)).isoformat(),
+            "open": 10.0,
+            "high": 10.4,
+            "low": 9.8,
+            "close": 10.1,
+        }
+        for idx in range(35)
+    ]
+
+    result = _simulate_next_open(
+        strategy_name="next_open_baseline",
+        start_price=10.0,
+        forward_bars=bars,
+        trade_plan={
+            "entry_expiry_days": 5,
+            "stop_loss_price": 9.0,
+            "take_profit_price": 12.0,
+        },
+    )
+
+    assert result["status"] == "filled"
+    assert result["exit_reason"] == "timeout_exit"
+    assert result["holding_days"] == 30
+    assert result["exit_date"] == "2026-07-31"
+
+
+def test_backtest_extracts_validity_label_and_expires_unfilled_signal():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["DATABASE_PATH"] = str(Path(tmp) / "test.db")
+        Config._instance = None
+        DatabaseManager.reset_instance()
+        db = DatabaseManager.get_instance()
+        trace_dir = Path(tmp) / "agent_traces" / "20260101-trace-validity-label"
+        trace_dir.mkdir(parents=True)
+        _write_json(trace_dir / "summary.json", {"artifact_dir": str(trace_dir)})
+        _write_json(
+            trace_dir / "final_report.json",
+            {
+                "market_regime": {"as_of": "2024-01-01", "regime": "range_bound"},
+                "portfolio_allocation": {
+                    "full": {
+                        "positions_plan": [
+                            {
+                                "rank": 1,
+                                "code": "600030",
+                                "name": "有效期文案",
+                                "action": "wait",
+                                "execution_mode": "conditional_open",
+                                "entry_condition": "回踩 10.0-10.2 可试探",
+                                "signal_validity_label": "2 个交易日，未触发则失效",
+                                "stop_loss_condition": "跌破 9.7",
+                                "take_profit_condition": "目标 11.2",
+                            }
+                        ]
+                    }
+                },
+                "pricing_agent": {"full": {"if_then_order_matrix": []}},
+                "judge_decision": {"summary": {"final_action": "wait"}},
+            },
+        )
+        with db.get_session() as session:
+            session.add(StockDaily(code="600030", date=date(2024, 1, 1), close=10.8, open=10.8, high=10.9, low=10.5))
+            session.add(StockDaily(code="600030", date=date(2024, 1, 2), close=10.7, open=10.7, high=10.8, low=10.4))
+            session.add(StockDaily(code="600030", date=date(2024, 1, 3), close=10.6, open=10.6, high=10.7, low=10.3))
+            session.add(StockDaily(code="600030", date=date(2024, 1, 4), close=10.2, open=10.3, high=10.4, low=10.1))
+            session.commit()
+
+        rows = AgentEntryExecutionBacktestService(db_manager=db).build_backtests_for_trace(trace_dir=trace_dir)
+
+        assert len(rows) == 1
+        assert rows[0]["trade_plan"]["entry_expiry_days"] == 2
+        assert rows[0]["trade_plan"]["signal_valid_until"] == "2024-01-03"
+        strict = rows[0]["strategies"]["strict_ai_entry"]
+        assert strict["status"] == "not_filled"
+        assert strict["entry_reason"] == "signal_expired"
+        assert strict["limits"] == ["signal_expired"]
 
         DatabaseManager.reset_instance()
 
@@ -265,6 +470,9 @@ def test_entry_execution_backtest_ignores_list_markers_and_skips_abnormal_entry_
                                 "action": "wait",
                                 "execution_mode": "conditional_open",
                                 "entry_condition": "1. 回踩 10.0-10.2 可试探",
+                                "entry_expiry_days": 2,
+                                "signal_valid_days": 2,
+                                "signal_validity_label": "2 个交易日，未触发则失效",
                                 "stop_loss_condition": "2. 跌破 9.7",
                                 "take_profit_condition": "3. 目标 11.2",
                             },

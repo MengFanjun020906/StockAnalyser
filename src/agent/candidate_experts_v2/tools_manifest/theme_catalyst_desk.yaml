@@ -32,6 +32,95 @@ tools:
       - 盘前 6 点前当天日报可能 missing。
       - 原文抓取失败时只能使用摘要降级，必须降低结论强度。
 
+  - tool: get_cls_telegraph_news
+    priority: 6
+    when_to_use: >-
+      获取财联社当日消息热榜/电报条目，用于捕捉盘中政策、产业、海外映射、
+      材料供应和公司线索等即时催化。
+    typical_args:
+      limit: 20
+      important_only: false
+      keyword: ""
+    returns_summary: >-
+      返回经 orz dailynews 归一化后的财联社条目，包括标题、内容、发布时间、
+      热度分数、排名、source_chain 和降级错误。
+    key_fields:
+      - results
+      - title
+      - content
+      - published_at
+      - score
+      - rank
+      - source_chain
+      - errors
+    combo_hints:
+      - 适合补盘中 product_export / domestic_substitution_policy / overseas_mapping 线索。
+      - 财联社热榜只证明消息催化存在，仍需结合业务上下文、披露或资金验证映射到公司。
+      - 付费栏目摘要可能只给线索，不得把“这家公司”直接臆造成具体股票。
+    cost: cheap
+    failure_modes:
+      - orz dailynews 失败或返回 empty 时只能降级，不能阻断主题催化席。
+
+  - tool: get_xueqiu_hot_news
+    priority: 7
+    when_to_use: >-
+      获取雪球热榜，观察市场讨论热度、散户关注方向和热门主题扩散，
+      作为主题热度与情绪确认的辅助证据。
+    typical_args:
+      limit: 20
+      keyword: ""
+      min_score: 0
+    returns_summary: >-
+      返回经 orz dailynews 归一化后的雪球热榜条目，包括标题、内容、发布时间、
+      热度分数、排名、source_chain 和降级错误。
+    key_fields:
+      - results
+      - title
+      - content
+      - published_at
+      - score
+      - rank
+      - source_chain
+      - errors
+    combo_hints:
+      - 雪球热榜可验证 crowding / attention，但不能单独作为基本面或政策催化证据。
+      - 若雪球热榜和板块资金同向，说明主题扩散增强；若只有热度无资金，最多 watch。
+      - 热榜出现负面讨论、澄清或风险词时，优先降低主题催化结论强度。
+    cost: cheap
+    failure_modes:
+      - 热榜高度情绪化，可能滞后或拥挤；必须结合行情、资金和公司披露交叉验证。
+
+  - tool: get_macro_finance_news
+    priority: 7
+    when_to_use: >-
+      获取新浪财经 7x24、东方财富快讯等宏观财经源，补充美国非农、CPI/PPI/PMI、
+      美联储利率、央行公开市场操作、逆回购、MLF/LPR、流动性和汇率等宏观层信号。
+    typical_args:
+      limit: 30
+      platforms: ""
+      keyword: ""
+      include_search_fallback: true
+      search_days: 3
+    returns_summary: >-
+      返回经 orz dailynews 归一化并按宏观关键词过滤后的宏观财经条目，包括标题、
+      内容、发布时间、命中的 macro_keywords、source_chain 和降级错误。
+    key_fields:
+      - results
+      - title
+      - content
+      - published_at
+      - macro_keywords
+      - source_chain
+      - errors
+    combo_hints:
+      - 宏观消息用于判断市场风险偏好、流动性和指数/风格约束，不应直接臆造公司受益。
+      - 与 get_tushare_moneyflow_mkt_dc、get_board_capital_flow 联动：宏观方向与资金确认同向时提高权重。
+      - 若只有宏观利好但板块资金、价格结构不确认，最多作为背景约束或 watch 证据。
+    cost: cheap
+    failure_modes:
+      - orz dailynews 的宏观源可能只返回当日热榜，未命中时只能降级，不能阻断其它消息源。
+      - 宏观消息影响方向可能被市场预期提前定价，不能把“利好/利空”直接等同于股票涨跌。
+
   - tool: get_stock_business_context
     priority: 8
     when_to_use: >-

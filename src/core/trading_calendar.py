@@ -29,6 +29,11 @@ except ImportError:
         "exchange-calendars not installed; trading day check disabled. "
         "Run: pip install exchange-calendars"
     )
+except Exception as exc:
+    logger.warning(
+        "exchange-calendars unavailable (%s); trading day check disabled.",
+        exc,
+    )
 
 # Market -> exchange code (exchange-calendars)
 MARKET_EXCHANGE = {"cn": "XSHG", "hk": "XHKG", "us": "XNYS"}

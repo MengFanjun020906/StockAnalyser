@@ -6,10 +6,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, get_origin
 
 import litellm
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from graphiti_core.llm_client import LLMClient, LLMConfig
 from graphiti_core.llm_client.client import DEFAULT_MAX_TOKENS
@@ -89,12 +89,43 @@ class LiteLLMGraphitiClient(LLMClient):
             "temperature": self.temperature,
         }
         if response_model is not None:
-            request_kwargs["response_format"] = {"type": "json_object"}
+            schema = response_model.model_json_schema()
+            schema_name = getattr(response_model, "__name__", "structured_response")
+            request_kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": schema,
+                },
+            }
+            payload_messages.append({
+                "role": "user",
+                "content": (
+                    "Return only the JSON data object that matches the requested schema. "
+                    "Do not return the schema itself, do not include markdown, and do not include commentary. "
+                    f"Required top-level keys: {', '.join(schema.get('properties', {}).keys()) or schema_name}."
+                ),
+            })
 
         try:
             response = await self._call_litellm(**request_kwargs)
             content = response.choices[0].message.content or "{}"
-            return json.loads(content)
+            parsed = json.loads(content)
+            if response_model is not None:
+                try:
+                    response_model(**parsed)
+                except ValidationError as exc:
+                    if _looks_like_json_schema(parsed):
+                        fallback = _empty_response_for_model(response_model)
+                        if fallback is not None:
+                            logger.warning(
+                                "Graphiti LLM model=%s returned a JSON schema instead of data; using empty %s fallback",
+                                model,
+                                getattr(response_model, "__name__", "response_model"),
+                            )
+                            return fallback
+                    raise exc
+            return parsed
         except Exception as exc:
             rate_limit_error = _resolve_litellm_exception("RateLimitError")
             if isinstance(exc, rate_limit_error):
@@ -121,3 +152,40 @@ class LiteLLMGraphitiClient(LLMClient):
             group_id=group_id,
             prompt_name=prompt_name,
         )
+
+
+def _looks_like_json_schema(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        value.get("type") == "object"
+        and isinstance(value.get("properties"), dict)
+        and ("$defs" in value or "title" in value)
+    )
+
+
+def _empty_response_for_model(response_model: type[BaseModel]) -> dict[str, Any] | None:
+    fields = getattr(response_model, "model_fields", {})
+    if not fields:
+        return None
+    payload: dict[str, Any] = {}
+    for name, field in fields.items():
+        annotation = getattr(field, "annotation", None)
+        origin = get_origin(annotation)
+        if origin is list or annotation is list:
+            payload[name] = []
+        elif origin is dict or annotation is dict:
+            payload[name] = {}
+        elif annotation is str:
+            payload[name] = ""
+        elif annotation is bool:
+            payload[name] = False
+        elif annotation in {int, float}:
+            payload[name] = 0
+        else:
+            return None
+    try:
+        response_model(**payload)
+    except ValidationError:
+        return None
+    return payload

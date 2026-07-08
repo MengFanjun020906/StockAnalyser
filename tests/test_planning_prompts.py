@@ -49,6 +49,7 @@ def test_default_zh_prompt_contains_phase_one_contract_sections():
         "持仓动作表格",
         "执行动作矩阵",
         "入场决策表格",
+        "信号有效期",
         "分层建仓计划",
     ]
     for snippet in required_snippets:
@@ -104,6 +105,7 @@ def test_position_review_requires_price_scenarios_and_layered_holding_strategy()
         "减仓/止损条件",
         "目标区间",
         "复查节奏",
+        "动作有效期",
     ]
 
     for snippet in required_snippets:
@@ -126,6 +128,7 @@ def test_entry_analysis_requires_actionable_entry_plan():
         "次优入场区间",
         "禁止追高线",
         "首仓比例",
+        "信号有效期",
         "加仓条件",
         "止损位",
         "第一目标位",
@@ -215,8 +218,9 @@ def test_watchlist_scan_output_format_is_first_class_contract():
         "6. 反方审查摘要与 Judge 裁决",
         "| 最终动作 | OPEN_PARTIAL/WAIT_FOR_MORE_DATA/REJECT_ALL/MONITOR |",
         "| 股票 | 入池来源 | 入池分 | 是否深度分析 | 入池理由 | 观察状态 |",
-        "| 股票 | 结论 | 入场条件 | 止损/淘汰 | 关键支持 | 主要反证/缺口 |",
-        "| 股票 | 动作 | 首仓金额/比例 | 加仓条件 | 降级条件 | 复查时间 |",
+        "| 股票 | 结论 | 入场条件 | 信号有效期 | 止损/淘汰 | 关键支持 | 主要反证/缺口 |",
+        "| 股票 | 动作 | 首仓金额/比例 | 信号有效期 | 加仓条件 | 降级条件 | 复查时间 |",
+        "| 排名 | 股票 | 动作 | 动作强度 | 首仓比例 | 理想入场 | 信号有效期 | 禁止追高 | 止损 | 复查触发 |",
         "| 机会首选 | 代码 名称 / 暂无高质量机会标的 |",
         "| 执行首选 | 代码 名称（可执行/条件触发） / 暂无可执行标的 |",
         "如果没有满足执行条件的计划，写“暂无可执行标的”",
