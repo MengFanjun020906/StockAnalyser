@@ -67,6 +67,10 @@ describe('AgentEntryExecutionBacktestsPage', () => {
     expect(screen.getByText('600001')).toBeInTheDocument();
     expect(screen.getByText('测试一')).toBeInTheDocument();
     expect(screen.getByText('10.00 - 10.20')).toBeInTheDocument();
+    expect(screen.getByText('3 个交易日')).toBeInTheDocument();
+    expect(screen.getByText('截至 2024-01-04')).toBeInTheDocument();
+    expect(screen.getByText('超期未触发则不成交')).toBeInTheDocument();
+    expect(screen.getByText('A 股 T+1，买入日不判卖出')).toBeInTheDocument();
     expect(screen.getAllByText('+9.80%').some((item) => item.classList.contains('text-danger'))).toBe(true);
     expect(screen.getAllByText('已成交').length).toBeGreaterThan(0);
     expect(screen.getByTestId('entry-execution-kline')).toBeInTheDocument();
@@ -290,16 +294,23 @@ function makeResponse() {
           entryZoneHigh: 10.2,
           stopLossPrice: 9.7,
           takeProfitPrice: 11.2,
+          entryExpiryDays: 3,
+          signalValidDays: 3,
+          signalValidUntil: '2024-01-04',
+          signalValidityLabel: '3 个交易日',
         },
         strategies: {
           strict_ai_entry: {
             status: 'filled',
             entryPrice: 10.2,
+            entryDate: '2024-01-02',
             exitDate: '2024-01-03',
             exitPrice: 11.2,
             exitReason: 'take_profit',
             holdingDays: 2,
             pnlPct: 9.8,
+            tradeRule: 'cn_t_plus_1',
+            sellableFrom: '2024-01-03',
           },
           atr_elastic_entry: {
             status: 'filled',

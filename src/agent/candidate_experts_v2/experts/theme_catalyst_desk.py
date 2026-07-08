@@ -17,6 +17,9 @@ from src.agent.candidate_experts_v2.tools_manifest import load_manifest, validat
 
 THEME_CATALYST_DESK_TOOLS: tuple[str, ...] = (
     "get_eastmoney_cjzc_daily",
+    "get_cls_telegraph_news",
+    "get_xueqiu_hot_news",
+    "get_macro_finance_news",
     "get_stock_business_context",
     "get_stock_disclosure_events",
     "get_tushare_announcements",

@@ -76,7 +76,7 @@
   "stop_loss_price": 9.7,
   "take_profit_price": 11.2,
   "entry_expiry_days": 5,
-  "max_hold_days": 20,
+  "max_hold_days": 30,
   "execution_mode": "conditional_open",
   "final_action": "wait",
   "parse_status": "ok"
@@ -93,8 +93,8 @@
 | `breakout_trigger` | 突破确认价，供突破对照策略使用 |
 | `stop_loss_price` | 止损价 |
 | `take_profit_price` | 止盈价 |
-| `entry_expiry_days` | 等待入场最长交易日数，默认 5 |
-| `max_hold_days` | 成交后最长持有交易日数，默认 20 |
+| `entry_expiry_days` | 等待入场最长交易日数，默认 5；缺失有效期时只默认买入触发窗口，超过窗口未买入则作废 |
+| `max_hold_days` | 成交后最长持有交易日数，默认 30 |
 | `parse_status` | `ok`、`partial`、`failed`，解析失败不得静默丢弃 |
 
 历史 Trace 中部分点位是自然语言，第一版可以做 best-effort 解析，但必须保留 `parse_status` 与 `parse_warnings`。后续应推动点位计算层直接输出结构化数值字段，减少自然语言解析误差。
@@ -129,7 +129,7 @@
 1. 当日触及止损价，按止损价退出。
 2. 当日触及止盈价，按止盈价退出。
 3. 如果同一天同时触及止盈和止损，第一版按保守的止损优先处理，并标记 `ambiguous_bar=true`。
-4. 如果持有满 `max_hold_days=20` 仍未触发止盈或止损，按超时日收盘价强制卖出。
+4. 如果持有满 `max_hold_days=30` 仍未触发止盈或止损，按超时日收盘价强制卖出。
 
 收益计算：
 
@@ -182,7 +182,7 @@ close_to_close_return_20d 决策后 20 日收盘收益
 
 ### 2. next_open_baseline
 
-如果最终报告给出可关注或条件入场标的，则按下一交易日开盘价买入，仍使用 AI 的止盈、止损和 20 日超时退出。
+如果最终报告给出可关注或条件入场标的，则按下一交易日开盘价买入，仍使用 AI 的止盈、止损和 30 日超时退出。
 
 用途：
 
@@ -364,7 +364,7 @@ apps/dsa-web/src/pages/AgentEntryExecutionBacktestsPage.tsx
   "take_profit_price": 11.2,
   "breakout_trigger": 10.8,
   "entry_expiry_days": 5,
-  "max_hold_days": 20
+  "max_hold_days": 30
 }
 ```
 
@@ -400,8 +400,8 @@ POST /api/v1/agent-entry-execution-backtests/rebuild
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `entry_expiry_days` | 5 | 等待入场最长交易日 |
-| `max_hold_days` | 20 | 成交后最长持有交易日 |
+| `entry_expiry_days` | 5 | 等待入场最长交易日；缺失有效期时默认 5 个交易日内未触发买入则失效 |
+| `max_hold_days` | 30 | 成交后最长持有交易日 |
 | `same_day_bar_order` | `stop_first` | 同日触发止盈止损时按止损优先 |
 | `position_weighting` | `equal_per_signal` | 不设本金，每条最终输出等权 |
 | `max_symbols_per_trace` | 4 | 只评估最终报告输出，通常不超过 4 条 |

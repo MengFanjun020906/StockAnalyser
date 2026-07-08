@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [新功能] 新闻消息面新增可选轻量 LLM 事件抽取器，支持 `deepseek/deepseek-v4-flash` JSON 事件事实抽取，失败时自动降级到规则兜底并记录 diagnostics。
+- [新功能] 新闻消息面新增 `NewsExtractedEvent` 事件抽取层，重建时保存结构化事件事实，Web“消息”详情展示事件事实、核验状态、置信度和实体链接。
+- [修复] 入场执行回测缺失信号有效期时默认 5 个交易日买入窗口，并将默认成交后超时退出从 20 个交易日调整为 30 个交易日。
+- [改进] 新闻消息面按主题级 raw episode 入库，并将传导路径升级为事件类型、链路步骤、分数拆解和结论摘要，减少聚合新闻刷屏。
+- [改进] 新闻信号边新增质量评分、强弱等级、质量 flags 和语义边 top-k 收敛，Web“消息”详情与 Neo4j 显式关系同步展示边质量诊断。
+- [新功能] 新闻消息入库新增规范化正文、质量评分、低质量保留审计和卡片降权门，Web“消息”详情展示来源质量诊断。
+- [文档] Graphiti 消息卡片计划记录 2026-07-04 本地 Neo4j/Ollama 验证进度，并明确下一阶段聚焦入库质量和边质量提升。
+- [新功能] 新闻信号卡片新增 `news_signal_edges` 真源表、边重建/查询 API、单卡局部图 API，并在 Graphiti 同步时将规则边和 embedding 语义边 best-effort 投影为 Neo4j 显式关系。
+- [改进] Web“消息”页详情区新增事件线索面板，选中卡片后展示局部图边类型、权重、目标和建边理由。
+- [改进] Graphiti 新闻卡片 episode content 改为分段可读文本，保留摘要、产业、公司影响、传导路径和原始消息引用，避免 Neo4j Browser 展示整块 JSON。
+- [修复] Graphiti 同步改用常驻事件循环复用 Neo4j async client，并强化 LiteLLM 结构化输出处理，避免新闻卡片同步后 Neo4j 无节点。
+- [修复] 新闻信号原始消息入库按 `episode_id` 与 `dedup_key` 双键幂等合并，避免同一条财联社消息因 `dedup_key` 变化在重建时报唯一键冲突。
+- [改进] Web“消息”页将“重建卡片”和“同步图谱”拆成两个按钮，重建默认不等待 Graphiti，并为新闻重建/图谱同步请求配置更长超时。
+- [修复] 新闻信号卡片 SQLite 轻量迁移对重复加列竞态做幂等容错，避免打开“消息”页时报 `duplicate column name: signal_layer`。
+- [新功能] 新闻信号卡片保存后默认 best-effort 写入 Graphiti episode，并新增 `/api/v1/news-signals/graph-sync` 从关系型真源补同步 pending/failed 卡片。
+- [改进] 新闻信号卡片新增 `get_macro_finance_news` 宏观财经源，默认从 orz dailynews 的 `sina_finance`、`eastmoney` 平台过滤非农、逆回购、利率、流动性等宏观消息，并用 `SearchService.search_general_news()` 做关键词 fallback，接入重建 API、Web 重建按钮和主题催化席白名单。
+- [改进] 新闻信号卡片新增 `signal_layer=industry/company/macro` 三层分类和筛选，重建链路默认纳入雪球热榜，并补充三类消息工具真实 smoke 验证记录。
+- [改进] `get_cls_telegraph_news` 改用 `https://orz.ai/api/v1/dailynews/?platform=cls`，并新增 `get_xueqiu_hot_news` 雪球热榜工具，主题催化席白名单同步开放两个消息面工具。
+- [修复] daily run 在周末或休市日会检查最新已完成交易日的数据缺口，缺失时继续补跑对应股票，避免周六无法补齐周五行情。
+- [新功能] 新增新闻信号卡片第一版，包含关系型真源表、重建 API、EvidenceCard 适配、反馈 overlay、指标接口和 Web“消息”页面。
+- [改进] Web“消息”页反馈按钮会按已有反馈保持高亮并展示次数，避免重复点击后无法确认状态。
+- [测试] 新增新闻信号卡片服务单测，覆盖幂等入库、主题公司映射、EvidenceCard 适配和反馈降权读路径。
+- [文档] Graphiti 消息卡片计划补充与 EvidenceCard、主题词典、主题催化席和 Seed Pool T+1 评估的复用边界、反馈闭环、调度预算、幂等重建和观测契约。
+- [修复] Agent 入场执行回测按 A 股 T+1 规则处理退出，买入当日不再触发止盈、止损或超时卖出。
+- [改进] Web 入场执行回测表格新增信号有效期和到期日展示，明确超期未触发的入场信号不成交。
+- [修复] Agent 入场执行回测可从 AI 有效期字段或文案提取有效窗口，超过有效期未触发入场时按信号作废处理。
+- [改进] Agent 选股链路和单股分析输出表格新增信号/动作有效期，条件型入场有效期由 AI 明确给出，超期未触发需失效或复查。
+- [新功能] Agent 新增 `get_cls_telegraph_news` 财联社电报实时新闻工具，先作为独立搜索工具保留，用于后续消息卡片链路补充日内突发消息证据。
+- [文档] Graphiti 消息卡片设计文档补充财联社电报第一版接入方案、字段契约、轻量过滤和失败降级策略。
+- [修复] `scripts/daily_run.sh` 的 Sequoia 日线步骤按最新已完成交易日写入续跑标记，避免盘中运行更新到上一交易日后阻止收盘后补齐当日行情。
+- [修复] 交易日历模块在 `exchange-calendars` 依赖版本错配导致导入异常时改为 fail-open，避免 `main.py` / daily run 入口被交易日检查依赖拖垮。
 - [修复] CI checkout 补齐 `graphiti` 子模块映射，并在 backend-gate / docker-build 拉取子模块，避免 `-e ./graphiti` 依赖安装在 GitHub Actions 中失败。
 - [文档] 更新 openInvest 原理接入索引，补充新版 openInvest 的信息隔离委员会、事件层、path profile、运行时治理、回测防前视和 PnL/benchmark 自审计等可借鉴原则。
 - [修复] `scripts/ci_gate.sh` 默认优先使用仓库 `.venv` Python，并在 flake8 critical check / offline pytest 排除本地外部 clone 与 gitlink 目录，避免系统 Python 或 `openInvest`、`graphiti`、`Sequoia-X`、`alphasift` 干扰 DSA 后端门禁。

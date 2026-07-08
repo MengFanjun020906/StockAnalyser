@@ -22,7 +22,9 @@ from src.storage import DatabaseManager
 
 
 DEFAULT_ENTRY_EXPIRY_DAYS = 5
-DEFAULT_MAX_HOLD_DAYS = 20
+DEFAULT_MAX_HOLD_DAYS = 30
+A_SHARE_T_PLUS_ONE_RULE = "cn_t_plus_1"
+MISSING_SIGNAL_VALIDITY_LABEL = "AI 未给出有效期，默认 5 个交易日内未触发买入则失效"
 MAX_SYMBOLS_PER_TRACE = 4
 STRATEGY_NAMES = ("strict_ai_entry", "next_open_baseline", "atr_elastic_entry", "breakout_fallback_entry")
 DEFAULT_MINUTE_FREQUENCY = "5"
@@ -288,7 +290,20 @@ class AgentEntryExecutionBacktestService:
     ) -> tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Any]]:
         code_candidates = _stock_code_candidates(symbol)
         max_window = int(trade_plan.get("max_hold_days") or DEFAULT_MAX_HOLD_DAYS)
-        entry_expiry = int(trade_plan.get("entry_expiry_days") or DEFAULT_ENTRY_EXPIRY_DAYS)
+        entry_expiry = _trade_plan_entry_expiry_days(trade_plan)
+        if entry_expiry is None:
+            warnings = ["missing_signal_validity"]
+            return (
+                {name: {"status": "invalid_trade_plan", "limits": warnings} for name in STRATEGY_NAMES},
+                warnings,
+                {
+                    "granularity": "none",
+                    "source": "trade_plan",
+                    "status": "invalid_trade_plan",
+                    "code": symbol,
+                    "reason": "missing_signal_validity",
+                },
+            )
         eval_window = max_window + entry_expiry
 
         for code in code_candidates:
@@ -318,6 +333,7 @@ class AgentEntryExecutionBacktestService:
                             "daily_bars": _aggregate_daily_bars(minute_bars),
                         },
                     )
+                sanitized_trade_plan = _attach_signal_validity(sanitized_trade_plan, minute_bars)
                 trade_plan.update(sanitized_trade_plan)
                 strict = _simulate_strict(
                     strategy_name="strict_ai_entry",
@@ -398,6 +414,7 @@ class AgentEntryExecutionBacktestService:
                     "daily_bars": _aggregate_daily_bars(forward_bars),
                 },
             )
+        sanitized_trade_plan = _attach_signal_validity(sanitized_trade_plan, forward_bars)
         trade_plan.update(sanitized_trade_plan)
 
         strict = _simulate_strict(strategy_name="strict_ai_entry", start_price=float(start_bar.close), forward_bars=forward_bars, trade_plan=sanitized_trade_plan)
@@ -470,6 +487,8 @@ def _build_trade_plan(
     take_profit = _extract_single_price(plan.get("take_profit_condition") or pricing.get("take_profit") or source_text)
     breakout = _extract_single_price(pricing.get("breakout_trigger") or plan.get("breakout_trigger"))
     entry_rule = _infer_entry_rule(plan, pricing)
+    signal_valid_until = _source_signal_valid_until(plan, pricing)
+    expiry_days = _source_entry_expiry_days(plan, pricing, decision_date=decision_date, signal_valid_until=signal_valid_until)
     parse_warnings: List[str] = []
     if entry_low is None and entry_high is None:
         parse_warnings.append("missing_entry_zone")
@@ -492,7 +511,10 @@ def _build_trade_plan(
         "breakout_trigger": breakout,
         "stop_loss_price": stop_loss,
         "take_profit_price": take_profit,
-        "entry_expiry_days": int(plan.get("entry_expiry_days") or pricing.get("entry_expiry_days") or DEFAULT_ENTRY_EXPIRY_DAYS),
+        "entry_expiry_days": expiry_days,
+        "signal_valid_days": expiry_days,
+        "signal_valid_until": signal_valid_until.isoformat() if signal_valid_until is not None else None,
+        "signal_validity_label": _source_signal_validity_label(plan, pricing, expiry_days, signal_valid_until),
         "max_hold_days": int(plan.get("max_hold_days") or pricing.get("max_hold_days") or DEFAULT_MAX_HOLD_DAYS),
         "execution_mode": str(plan.get("execution_mode") or pricing.get("execution_mode") or "conditional_open"),
         "final_action": str(plan.get("action") or pricing.get("action") or "wait"),
@@ -504,12 +526,14 @@ def _build_trade_plan(
 def _simulate_strict(*, strategy_name: str, start_price: float, forward_bars: List[Any], trade_plan: Dict[str, Any]) -> Dict[str, Any]:
     entry_low = trade_plan.get("entry_zone_low")
     entry_high = trade_plan.get("entry_zone_high")
-    expiry = int(trade_plan.get("entry_expiry_days") or DEFAULT_ENTRY_EXPIRY_DAYS)
+    expiry = _trade_plan_entry_expiry_days(trade_plan)
     max_hold = int(trade_plan.get("max_hold_days") or DEFAULT_MAX_HOLD_DAYS)
     stop_loss = trade_plan.get("stop_loss_price")
     take_profit = trade_plan.get("take_profit_price")
     if entry_low is None and entry_high is None:
         return {"status": "not_filled", "entry_reason": "missing_entry_zone", "limits": ["missing_entry_zone"]}
+    if expiry is None:
+        return {"status": "not_filled", "entry_reason": "missing_signal_validity", "limits": ["missing_signal_validity"]}
     entry_fill = None
     entry_date = None
     entry_window = _indexed_bars_for_first_trading_days(forward_bars, expiry)
@@ -529,10 +553,11 @@ def _simulate_strict(*, strategy_name: str, start_price: float, forward_bars: Li
     if entry_fill is None:
         return {
             "status": "not_filled",
-            "entry_reason": "timeout",
+            "entry_reason": "signal_expired",
             "entry_window_days": expiry,
+            "signal_valid_until": trade_plan.get("signal_valid_until"),
             "max_high": _max_bar_value([bar for _, bar in entry_window], "high"),
-            "limits": ["entry_timeout"],
+            "limits": ["signal_expired"],
         }
     return _exit_after_entry(
         strategy_name=strategy_name,
@@ -572,8 +597,10 @@ def _simulate_elastic(*, strategy_name: str, start_price: float, forward_bars: L
         return {"status": "not_filled", "entry_reason": "missing_entry_zone", "limits": ["missing_entry_zone"]}
     base_high = float(entry_high if entry_high is not None else entry_low)
     elastic_high = base_high * 1.02
-    expiry = int(trade_plan.get("entry_expiry_days") or DEFAULT_ENTRY_EXPIRY_DAYS)
+    expiry = _trade_plan_entry_expiry_days(trade_plan)
     max_hold = int(trade_plan.get("max_hold_days") or DEFAULT_MAX_HOLD_DAYS)
+    if expiry is None:
+        return {"status": "not_filled", "entry_reason": "missing_signal_validity", "limits": ["missing_signal_validity"]}
     for idx, bar in _indexed_bars_for_first_trading_days(forward_bars, expiry):
         low = _bar_value(bar, "low")
         high = _bar_value(bar, "high")
@@ -593,7 +620,13 @@ def _simulate_elastic(*, strategy_name: str, start_price: float, forward_bars: L
             take_profit=trade_plan.get("take_profit_price"),
             max_hold=max_hold,
         )
-    return {"status": "not_filled", "entry_reason": "timeout", "entry_window_days": expiry, "limits": ["entry_timeout"]}
+    return {
+        "status": "not_filled",
+        "entry_reason": "signal_expired",
+        "entry_window_days": expiry,
+        "signal_valid_until": trade_plan.get("signal_valid_until"),
+        "limits": ["signal_expired"],
+    }
 
 
 def _simulate_breakout(*, strategy_name: str, start_price: float, forward_bars: List[Any], trade_plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -601,7 +634,9 @@ def _simulate_breakout(*, strategy_name: str, start_price: float, forward_bars: 
     if trigger is None:
         return {"status": "strategy_skipped", "limits": ["missing_breakout_trigger"]}
     max_hold = int(trade_plan.get("max_hold_days") or DEFAULT_MAX_HOLD_DAYS)
-    expiry = int(trade_plan.get("entry_expiry_days") or DEFAULT_ENTRY_EXPIRY_DAYS)
+    expiry = _trade_plan_entry_expiry_days(trade_plan)
+    if expiry is None:
+        return {"status": "not_filled", "entry_reason": "missing_signal_validity", "limits": ["missing_signal_validity"]}
     for idx, bar in _indexed_bars_for_first_trading_days(forward_bars, expiry):
         high = _bar_value(bar, "high")
         if high is None or float(high) < float(trigger):
@@ -617,7 +652,13 @@ def _simulate_breakout(*, strategy_name: str, start_price: float, forward_bars: 
             take_profit=trade_plan.get("take_profit_price"),
             max_hold=max_hold,
         )
-    return {"status": "not_filled", "entry_reason": "breakout_not_hit", "limits": ["breakout_not_hit"]}
+    return {
+        "status": "not_filled",
+        "entry_reason": "signal_expired",
+        "entry_window_days": expiry,
+        "signal_valid_until": trade_plan.get("signal_valid_until"),
+        "limits": ["signal_expired", "breakout_not_hit"],
+    }
 
 
 def _exit_after_entry(
@@ -633,9 +674,16 @@ def _exit_after_entry(
 ) -> Dict[str, Any]:
     stop_loss_value = float(stop_loss) if stop_loss is not None else None
     take_profit_value = float(take_profit) if take_profit is not None else None
-    horizon = _bars_from_index_for_trading_days(forward_bars, entry_index, max_hold)
+    horizon = _sellable_bars_after_entry_for_trading_days(forward_bars, entry_index, max_hold)
     if not horizon:
-        return {"status": "insufficient_forward_bars", "limits": ["missing_exit_bars"]}
+        return {
+            "status": "insufficient_forward_bars",
+            "entry_date": _value_to_iso(entry_date),
+            "entry_price": round(float(entry_fill), 4),
+            "trade_rule": A_SHARE_T_PLUS_ONE_RULE,
+            "limits": ["missing_t_plus_1_exit_bars"],
+        }
+    sellable_from = _bar_timestamp(horizon[0])
     for bar_offset, bar in enumerate(horizon, start=1):
         low = _bar_value(bar, "low")
         high = _bar_value(bar, "high")
@@ -648,13 +696,13 @@ def _exit_after_entry(
         holding_days = len(_distinct_trade_dates(horizon[:bar_offset]))
         if stop_hit and take_hit:
             exit_price = stop_loss_value
-            return _finalize_exit(strategy_name, entry_fill, entry_date, bar_date, exit_price, "ambiguous_stop_first", holding_days, True)
+            return _finalize_exit(strategy_name, entry_fill, entry_date, bar_date, exit_price, "ambiguous_stop_first", holding_days, True, sellable_from)
         if stop_hit:
-            return _finalize_exit(strategy_name, entry_fill, entry_date, bar_date, stop_loss_value, "stop_loss", holding_days, False)
+            return _finalize_exit(strategy_name, entry_fill, entry_date, bar_date, stop_loss_value, "stop_loss", holding_days, False, sellable_from)
         if take_hit:
-            return _finalize_exit(strategy_name, entry_fill, entry_date, bar_date, take_profit_value, "take_profit", holding_days, False)
+            return _finalize_exit(strategy_name, entry_fill, entry_date, bar_date, take_profit_value, "take_profit", holding_days, False, sellable_from)
     last = horizon[-1]
-    return _finalize_exit(strategy_name, entry_fill, entry_date, _bar_timestamp(last), _bar_value(last, "close"), "timeout_exit", len(_distinct_trade_dates(horizon)), False)
+    return _finalize_exit(strategy_name, entry_fill, entry_date, _bar_timestamp(last), _bar_value(last, "close"), "timeout_exit", len(_distinct_trade_dates(horizon)), False, sellable_from)
 
 
 def _finalize_exit(
@@ -666,6 +714,7 @@ def _finalize_exit(
     reason: str,
     holding_days: int,
     ambiguous_bar: bool,
+    sellable_from: Any = None,
 ) -> Dict[str, Any]:
     if exit_price is None:
         return {"status": "insufficient_forward_bars", "limits": ["missing_exit_price"]}
@@ -681,6 +730,8 @@ def _finalize_exit(
         "holding_days": holding_days,
         "pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
         "ambiguous_bar": ambiguous_bar,
+        "trade_rule": A_SHARE_T_PLUS_ONE_RULE,
+        "sellable_from": _value_to_iso(sellable_from),
     }
 
 
@@ -778,6 +829,208 @@ def _bars_from_index_for_trading_days(bars: Sequence[Any], start_index: int, tra
             seen_set.add(trade_date)
         selected.append(bar)
     return selected
+
+
+def _sellable_bars_after_entry_for_trading_days(bars: Sequence[Any], entry_index: int, trading_days: int) -> List[Any]:
+    """Return bars eligible for exit under A-share T+1: never sell on entry date."""
+    max_days = max(1, int(trading_days or 1))
+    if entry_index < 0 or entry_index >= len(bars):
+        return []
+    entry_trade_date = _bar_trade_date(bars[entry_index])
+    selected: List[Any] = []
+    seen_dates: List[date] = []
+    seen_set = set()
+    for bar in bars[entry_index + 1:]:
+        trade_date = _bar_trade_date(bar)
+        if trade_date is None:
+            continue
+        if entry_trade_date is not None and trade_date <= entry_trade_date:
+            continue
+        if trade_date not in seen_set:
+            if len(seen_dates) >= max_days:
+                break
+            seen_dates.append(trade_date)
+            seen_set.add(trade_date)
+        selected.append(bar)
+    return selected
+
+
+def _source_entry_expiry_days(
+    plan: Dict[str, Any],
+    pricing: Dict[str, Any],
+    *,
+    decision_date: Optional[date] = None,
+    signal_valid_until: Optional[date] = None,
+) -> Optional[int]:
+    explicit_days = _positive_int(
+        plan.get("entry_expiry_days")
+        or plan.get("signal_valid_days")
+        or pricing.get("entry_expiry_days")
+        or pricing.get("signal_valid_days")
+    )
+    if explicit_days is not None:
+        return explicit_days
+    label_days = _extract_signal_valid_days_from_text(_source_signal_validity_text(plan, pricing))
+    if label_days is not None:
+        return label_days
+    if decision_date is not None and signal_valid_until is not None:
+        return max(1, (signal_valid_until - decision_date).days + 1) if signal_valid_until >= decision_date else None
+    return DEFAULT_ENTRY_EXPIRY_DAYS
+
+
+def _trade_plan_entry_expiry_days(trade_plan: Dict[str, Any]) -> Optional[int]:
+    explicit_days = _positive_int(trade_plan.get("entry_expiry_days") or trade_plan.get("signal_valid_days"))
+    if explicit_days is not None:
+        return explicit_days
+    label_days = _extract_signal_valid_days_from_text(str(trade_plan.get("signal_validity_label") or ""))
+    if label_days is not None:
+        return label_days
+    decision_date = _parse_date(trade_plan.get("decision_date"))
+    valid_until = _parse_date(trade_plan.get("signal_valid_until"))
+    if decision_date is not None and valid_until is not None and valid_until >= decision_date:
+        return max(1, (valid_until - decision_date).days + 1)
+    if valid_until is not None:
+        return None
+    return DEFAULT_ENTRY_EXPIRY_DAYS
+
+
+def _trade_plan_has_explicit_entry_expiry(trade_plan: Dict[str, Any]) -> bool:
+    if str(trade_plan.get("signal_validity_label") or "").strip() == MISSING_SIGNAL_VALIDITY_LABEL:
+        return False
+    if _positive_int(trade_plan.get("entry_expiry_days") or trade_plan.get("signal_valid_days")) is not None:
+        return True
+    if _extract_signal_valid_days_from_text(str(trade_plan.get("signal_validity_label") or "")) is not None:
+        return True
+    return _parse_date(trade_plan.get("signal_valid_until")) is not None
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    parsed = _safe_int(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _source_signal_validity_label(
+    plan: Dict[str, Any],
+    pricing: Dict[str, Any],
+    expiry_days: Optional[int],
+    valid_until: Any,
+) -> str:
+    label = plan.get("signal_validity_label") or pricing.get("signal_validity_label")
+    if isinstance(label, str) and label.strip():
+        return label.strip()
+    if not _source_has_explicit_entry_expiry(plan, pricing, valid_until):
+        return MISSING_SIGNAL_VALIDITY_LABEL
+    if expiry_days is None:
+        return MISSING_SIGNAL_VALIDITY_LABEL
+    text = f"{expiry_days} 个交易日"
+    if isinstance(valid_until, date):
+        return f"{text}，截至 {valid_until.isoformat()}"
+    if isinstance(valid_until, str) and valid_until.strip():
+        return f"{text}，截至 {valid_until.strip()}"
+    return f"{text}，超期未触发则失效"
+
+
+def _source_signal_validity_text(plan: Dict[str, Any], pricing: Dict[str, Any]) -> str:
+    values = [
+        plan.get("signal_validity_label"),
+        plan.get("signal_validity"),
+        plan.get("signal_validity_reason"),
+        pricing.get("signal_validity_label"),
+        pricing.get("signal_validity"),
+        pricing.get("signal_validity_reason"),
+    ]
+    return "；".join(str(value).strip() for value in values if str(value or "").strip())
+
+
+def _source_has_explicit_entry_expiry(plan: Dict[str, Any], pricing: Dict[str, Any], valid_until: Any) -> bool:
+    explicit_days = _positive_int(
+        plan.get("entry_expiry_days")
+        or plan.get("signal_valid_days")
+        or pricing.get("entry_expiry_days")
+        or pricing.get("signal_valid_days")
+    )
+    if explicit_days is not None:
+        return True
+    if _extract_signal_valid_days_from_text(_source_signal_validity_text(plan, pricing)) is not None:
+        return True
+    return _parse_date(valid_until) is not None
+
+
+def _source_signal_valid_until(plan: Dict[str, Any], pricing: Dict[str, Any]) -> Optional[date]:
+    explicit = _parse_date(plan.get("signal_valid_until") or pricing.get("signal_valid_until"))
+    if explicit is not None:
+        return explicit
+    return _extract_signal_valid_until_from_text(_source_signal_validity_text(plan, pricing))
+
+
+def _extract_signal_valid_days_from_text(text: Any) -> Optional[int]:
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    patterns = (
+        r"(\d{1,2})\s*个?\s*交易日",
+        r"有效期[^0-9]{0,8}(\d{1,2})\s*(?:天|日)",
+        r"(\d{1,2})\s*(?:天|日)内",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return _positive_int(match.group(1))
+    return None
+
+
+def _extract_signal_valid_until_from_text(text: Any) -> Optional[date]:
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    patterns = (
+        r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})",
+        r"截至\s*(\d{1,2})[-/.月](\d{1,2})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if not match:
+            continue
+        if len(match.groups()) == 3:
+            year, month, day = match.groups()
+        else:
+            year = str(date.today().year)
+            month, day = match.groups()
+        parsed = _parse_date(f"{int(year):04d}-{int(month):02d}-{int(day):02d}")
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _attach_signal_validity(trade_plan: Dict[str, Any], bars: Sequence[Any]) -> Dict[str, Any]:
+    sanitized = dict(trade_plan)
+    uses_default_expiry = not _trade_plan_has_explicit_entry_expiry(sanitized)
+    expiry_days = _trade_plan_entry_expiry_days(sanitized)
+    if expiry_days is None:
+        sanitized["entry_expiry_days"] = None
+        sanitized["signal_valid_days"] = None
+        sanitized["signal_valid_until"] = None
+        sanitized["signal_validity_label"] = MISSING_SIGNAL_VALIDITY_LABEL
+        return sanitized
+    explicit_until = _parse_date(sanitized.get("signal_valid_until"))
+    if explicit_until is not None:
+        until_window = [
+            (idx, bar)
+            for idx, bar in enumerate(bars)
+            if (_bar_trade_date(bar) is not None and _bar_trade_date(bar) <= explicit_until)
+        ]
+        if until_window:
+            valid_dates_until = _distinct_trade_dates([bar for _, bar in until_window])
+            expiry_days = min(expiry_days, len(valid_dates_until)) if valid_dates_until else expiry_days
+    entry_window = _indexed_bars_for_first_trading_days(bars, expiry_days)
+    valid_dates = _distinct_trade_dates([bar for _, bar in entry_window])
+    sanitized["entry_expiry_days"] = expiry_days
+    sanitized["signal_valid_days"] = expiry_days
+    sanitized["signal_valid_until"] = valid_dates[-1].isoformat() if valid_dates else None
+    sanitized["signal_validity_label"] = MISSING_SIGNAL_VALIDITY_LABEL if uses_default_expiry else f"{expiry_days} 个交易日"
+    return sanitized
 
 
 def _aggregate_daily_bars(bars: Sequence[Any]) -> List[Dict[str, Any]]:

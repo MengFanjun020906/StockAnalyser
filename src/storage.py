@@ -242,6 +242,243 @@ class NewsIntel(Base):
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
 
 
+class RawNewsEpisode(Base):
+    """Immutable-ish raw news episode used as the source of truth for signal cards."""
+
+    __tablename__ = 'raw_news_episodes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    episode_id = Column(String(80), nullable=False, unique=True, index=True)
+    dedup_key = Column(String(128), nullable=False, unique=True, index=True)
+
+    source = Column(String(80), nullable=False, index=True)
+    provider = Column(String(80), index=True)
+    source_id = Column(String(120), index=True)
+    url = Column(String(1000))
+    title = Column(String(300), nullable=False)
+    summary = Column(Text)
+    content = Column(Text)
+    normalized_content = Column(Text)
+    quality_score = Column(Float, default=0.0, index=True)
+    quality_grade = Column(String(24), default='unknown', index=True)
+    quality_flags_json = Column(Text)
+
+    published_at = Column(DateTime, index=True)
+    ingested_at = Column(DateTime, default=datetime.now, index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    session = Column(String(32), default='unknown', index=True)
+
+    subjects_json = Column(Text)
+    stocks_json = Column(Text)
+    source_chain_json = Column(Text)
+    raw_payload_json = Column(Text)
+    status = Column(String(32), default='ok', index=True)
+    errors_json = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_raw_news_signal_date_source', 'signal_date', 'source'),
+        Index('ix_raw_news_published_source', 'published_at', 'source'),
+        Index('ix_raw_news_quality_date', 'quality_grade', 'signal_date'),
+    )
+
+
+class NewsExtractedEvent(Base):
+    """Structured event extracted from a raw news episode before card generation."""
+
+    __tablename__ = 'news_extracted_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    raw_episode_id = Column(String(80), nullable=False, index=True)
+    card_id = Column(String(96), index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    event_time = Column(DateTime, index=True)
+
+    event_type = Column(String(64), nullable=False, index=True)
+    trigger = Column(String(120))
+    subject = Column(String(200))
+    object = Column(String(300))
+    direction = Column(String(32), default='neutral', index=True)
+    metric_value = Column(String(120))
+    evidence_sentence = Column(Text)
+    source_url = Column(String(1000))
+    source = Column(String(80), index=True)
+
+    extractor = Column(String(64), default='rule_fallback', index=True)
+    confidence = Column(Float, default=0.0, index=True)
+    verification_status = Column(String(32), default='source_only', index=True)
+    verification_sources_json = Column(Text)
+    entity_links_json = Column(Text)
+    diagnostics_json = Column(Text)
+    status = Column(String(32), default='active', index=True)
+
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('raw_episode_id', 'event_type', 'trigger', 'evidence_sentence', name='uix_news_event_identity'),
+        Index('ix_news_event_card_type', 'card_id', 'event_type'),
+        Index('ix_news_event_date_type', 'signal_date', 'event_type'),
+        Index('ix_news_event_verification', 'verification_status', 'confidence'),
+    )
+
+
+class NewsSignalCard(Base):
+    """Persistent news signal card derived from one or more raw news episodes."""
+
+    __tablename__ = 'news_signal_cards'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    card_id = Column(String(96), nullable=False, unique=True, index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    session = Column(String(32), default='unknown', index=True)
+    signal_layer = Column(String(24), default='industry', index=True)
+
+    summary_short = Column(String(300), nullable=False)
+    news_tone = Column(String(24), default='neutral', index=True)
+    market_impact = Column(String(24), default='unknown', index=True)
+    impact_horizon = Column(String(24), default='short', index=True)
+    valid_from = Column(DateTime)
+    valid_until = Column(DateTime, index=True)
+    decay_rule = Column(String(32), default='3d')
+    refresh_trigger = Column(String(300))
+    staleness_score = Column(Float, default=0.0)
+
+    evidence_grade = Column(String(32), default='plausible', index=True)
+    inference_level = Column(String(32), default='first_order', index=True)
+    mapping_status = Column(String(32), default='industry_only', index=True)
+    mapping_confidence = Column(Float, default=0.0)
+    signal_score = Column(Float, default=0.0, index=True)
+    status = Column(String(32), default='active', index=True)
+
+    primary_industries_json = Column(Text)
+    secondary_industries_json = Column(Text)
+    explicit_entities_json = Column(Text)
+    industry_impacts_json = Column(Text)
+    company_impacts_json = Column(Text)
+    transmission_paths_json = Column(Text)
+    raw_episode_ids_json = Column(Text)
+    source_chain_json = Column(Text)
+    diagnostics_json = Column(Text)
+
+    source_count = Column(Integer, default=0)
+    graph_sync_status = Column(String(32), default='pending', index=True)
+    graph_retry_count = Column(Integer, default=0)
+    graph_last_error = Column(Text)
+    embedding_model = Column(String(120))
+    embedding_dimension = Column(Integer)
+    threshold_profile = Column(String(120))
+
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_news_signal_date_score', 'signal_date', 'signal_score'),
+        Index('ix_news_signal_status_date', 'status', 'signal_date'),
+        Index('ix_news_signal_layer_date', 'signal_layer', 'signal_date'),
+    )
+
+
+class NewsSignalFeedback(Base):
+    """User feedback overlay for a news signal card."""
+
+    __tablename__ = 'news_signal_feedback'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    card_id = Column(String(96), nullable=False, index=True)
+    feedback_type = Column(String(32), nullable=False, index=True)
+    note = Column(Text)
+    payload_json = Column(Text)
+    user_id = Column(String(80), index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_news_signal_feedback_card_type', 'card_id', 'feedback_type'),
+    )
+
+
+class NewsSignalSeedLink(Base):
+    """Link between a news signal card and a seed pool item."""
+
+    __tablename__ = 'news_signal_seed_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    card_id = Column(String(96), nullable=False, index=True)
+    seed_item_id = Column(Integer, ForeignKey('selection_seed_pool_items.id'), index=True)
+    source_desk = Column(String(64), index=True)
+    gate_result = Column(String(32), default='unknown', index=True)
+    signal_score_snapshot = Column(Float)
+    mapping_confidence = Column(Float)
+    evidence_grade = Column(String(32))
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('card_id', 'seed_item_id', 'source_desk', name='uix_news_signal_seed_link'),
+    )
+
+
+class NewsSignalOutcome(Base):
+    """Post-hoc outcome projection for card-linked seed items."""
+
+    __tablename__ = 'news_signal_outcomes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    card_id = Column(String(96), nullable=False, index=True)
+    seed_item_id = Column(Integer, ForeignKey('selection_seed_pool_items.id'), index=True)
+    evaluation_date = Column(Date, nullable=False, index=True)
+    alpha_return_pct = Column(Float)
+    mfe_pct = Column(Float)
+    mae_pct = Column(Float)
+    liquidity_status = Column(String(32), default='UNKNOWN', index=True)
+    data_status = Column(String(24), default='pending', index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('card_id', 'seed_item_id', 'evaluation_date', name='uix_news_signal_outcome_card_seed_date'),
+        Index('ix_news_signal_outcome_card_status', 'card_id', 'data_status'),
+    )
+
+
+class NewsSignalEdge(Base):
+    """Generated relation edge for news signal cards."""
+
+    __tablename__ = 'news_signal_edges'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    edge_id = Column(String(128), nullable=False, unique=True, index=True)
+    source_card_id = Column(String(96), nullable=False, index=True)
+    target_card_id = Column(String(96), index=True)
+    target_type = Column(String(32), nullable=False, index=True)
+    target_id = Column(String(128), nullable=False, index=True)
+    edge_class = Column(String(32), nullable=False, index=True)
+    edge_type = Column(String(64), nullable=False, index=True)
+    weight = Column(Float, default=0.0, index=True)
+    edge_quality = Column(Float, default=0.0, index=True)
+    quality_grade = Column(String(24), default='unknown', index=True)
+    quality_flags_json = Column(Text)
+    method = Column(String(32), default='rule', index=True)
+    rationale = Column(Text)
+    evidence_json = Column(Text)
+    embedding_model = Column(String(120))
+    threshold_profile = Column(String(120))
+    decay_rule = Column(String(32), default='none')
+    status = Column(String(32), default='active', index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('source_card_id', 'target_type', 'target_id', 'edge_type', name='uix_news_signal_edge_identity'),
+        Index('ix_news_signal_edge_source_class', 'source_card_id', 'edge_class'),
+        Index('ix_news_signal_edge_target_card', 'target_card_id', 'edge_class'),
+        Index('ix_news_signal_edge_type_weight', 'edge_type', 'weight'),
+        Index('ix_news_signal_edge_quality', 'quality_grade', 'edge_quality'),
+    )
+
+
 class FundamentalSnapshot(Base):
     """
     基本面上下文快照（P0 write-only）。
@@ -963,7 +1200,171 @@ class DatabaseManager:
     def _run_schema_migrations(self) -> None:
         if not self._is_sqlite_engine:
             return
+        self._migrate_raw_news_episode_quality()
+        self._migrate_news_extracted_events()
+        self._migrate_news_signal_edge_quality()
+        self._migrate_news_signal_card_layer()
         self._migrate_seed_pool_snapshot_unique_key()
+
+    def _migrate_raw_news_episode_quality(self) -> None:
+        with self._engine.begin() as conn:
+            table = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='raw_news_episodes'"
+            ).fetchone()
+            if table is None:
+                return
+            self._add_sqlite_column_if_missing(
+                conn,
+                "raw_news_episodes",
+                "normalized_content",
+                "ALTER TABLE raw_news_episodes ADD COLUMN normalized_content TEXT",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                "raw_news_episodes",
+                "quality_score",
+                "ALTER TABLE raw_news_episodes ADD COLUMN quality_score FLOAT DEFAULT 0.0",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                "raw_news_episodes",
+                "quality_grade",
+                "ALTER TABLE raw_news_episodes ADD COLUMN quality_grade VARCHAR(24) DEFAULT 'unknown'",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                "raw_news_episodes",
+                "quality_flags_json",
+                "ALTER TABLE raw_news_episodes ADD COLUMN quality_flags_json TEXT",
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_raw_news_quality_date ON raw_news_episodes (quality_grade, signal_date)"
+            )
+
+    def _migrate_news_extracted_events(self) -> None:
+        with self._engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS news_extracted_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id VARCHAR(128) NOT NULL,
+                    raw_episode_id VARCHAR(80) NOT NULL,
+                    card_id VARCHAR(96),
+                    signal_date DATE NOT NULL,
+                    event_time DATETIME,
+                    event_type VARCHAR(64) NOT NULL,
+                    trigger VARCHAR(120),
+                    subject VARCHAR(200),
+                    object VARCHAR(300),
+                    direction VARCHAR(32) DEFAULT 'neutral',
+                    metric_value VARCHAR(120),
+                    evidence_sentence TEXT,
+                    source_url VARCHAR(1000),
+                    source VARCHAR(80),
+                    extractor VARCHAR(64) DEFAULT 'rule_fallback',
+                    confidence FLOAT DEFAULT 0.0,
+                    verification_status VARCHAR(32) DEFAULT 'source_only',
+                    verification_sources_json TEXT,
+                    entity_links_json TEXT,
+                    diagnostics_json TEXT,
+                    status VARCHAR(32) DEFAULT 'active',
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    UNIQUE (event_id),
+                    UNIQUE (raw_episode_id, event_type, trigger, evidence_sentence)
+                )
+                """
+            )
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_extracted_events_event_id ON news_extracted_events (event_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_extracted_events_raw_episode_id ON news_extracted_events (raw_episode_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_extracted_events_card_id ON news_extracted_events (card_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_card_type ON news_extracted_events (card_id, event_type)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_date_type ON news_extracted_events (signal_date, event_type)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_verification ON news_extracted_events (verification_status, confidence)")
+
+    def _migrate_news_signal_edge_quality(self) -> None:
+        with self._engine.begin() as conn:
+            table = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='news_signal_edges'"
+            ).fetchone()
+            if table is None:
+                return
+            self._add_sqlite_column_if_missing(
+                conn,
+                "news_signal_edges",
+                "edge_quality",
+                "ALTER TABLE news_signal_edges ADD COLUMN edge_quality FLOAT DEFAULT 0.0",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                "news_signal_edges",
+                "quality_grade",
+                "ALTER TABLE news_signal_edges ADD COLUMN quality_grade VARCHAR(24) DEFAULT 'unknown'",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                "news_signal_edges",
+                "quality_flags_json",
+                "ALTER TABLE news_signal_edges ADD COLUMN quality_flags_json TEXT",
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_news_signal_edge_quality ON news_signal_edges (quality_grade, edge_quality)"
+            )
+
+    def _migrate_news_signal_card_layer(self) -> None:
+        with self._engine.begin() as conn:
+            table = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='news_signal_cards'"
+            ).fetchone()
+            if table is None:
+                return
+            self._add_sqlite_column_if_missing(
+                conn,
+                "news_signal_cards",
+                "signal_layer",
+                "ALTER TABLE news_signal_cards ADD COLUMN signal_layer VARCHAR(24) DEFAULT 'industry'",
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_news_signal_layer_date ON news_signal_cards (signal_layer, signal_date)"
+            )
+
+    @staticmethod
+    def _sqlite_column_exists(conn, table_name: str, column_name: str) -> bool:
+        columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql(f"PRAGMA table_info('{table_name}')").fetchall()
+        }
+        return column_name in columns
+
+    @staticmethod
+    def _is_sqlite_duplicate_column_error(exc: OperationalError) -> bool:
+        return "duplicate column name" in str(exc).lower()
+
+    @classmethod
+    def _add_sqlite_column_if_missing(
+        cls,
+        conn,
+        table_name: str,
+        column_name: str,
+        alter_sql: str,
+    ) -> None:
+        if cls._sqlite_column_exists(conn, table_name, column_name):
+            return
+        try:
+            conn.exec_driver_sql(alter_sql)
+        except OperationalError as exc:
+            if cls._is_sqlite_duplicate_column_error(exc) and cls._sqlite_column_exists(
+                conn,
+                table_name,
+                column_name,
+            ):
+                logger.info(
+                    "SQLite schema migration skipped already-added column: %s.%s",
+                    table_name,
+                    column_name,
+                )
+                return
+            raise
 
     def _migrate_seed_pool_snapshot_unique_key(self) -> None:
         with self._engine.begin() as conn:

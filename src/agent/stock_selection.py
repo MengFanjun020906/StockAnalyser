@@ -864,23 +864,24 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         "",
         "## 四、组合配置简表",
         "",
-        "| 排名 | 股票 | 动作 | 首仓比例 | 必要条件 | 复查触发 |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| 排名 | 股票 | 动作 | 首仓比例 | 必要条件 | 有效期 | 复查触发 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ])
     if positions:
         for item in positions:
             lines.append(
-                "| {rank} | {stock} | {action} | {pct} | {entry} | {review} |".format(
+                "| {rank} | {stock} | {action} | {pct} | {entry} | {validity} | {review} |".format(
                     rank=item.get("rank") or "-",
                     stock=_markdown_cell(f"{item.get('code') or '-'} {item.get('name') or ''}".strip()),
                     action=_markdown_cell(_final_action_label(item.get("action"))),
                     pct=_markdown_cell(_format_pct(item.get("initial_position_pct"))),
                     entry=_markdown_cell(_necessary_conditions_text(_entry_condition_source_from_plan(item))),
+                    validity=_markdown_cell(_signal_validity_text(item)),
                     review=_markdown_cell(item.get("review_trigger") or "-"),
                 )
             )
     else:
-        lines.append("| - | - | 等待 | - | 候选不足或证据不足 | 补充候选或等待数据 |")
+        lines.append("| - | - | 等待 | - | 候选不足或证据不足 | 未设置交易信号 | 补充候选或等待数据 |")
 
     lines.extend([
         "",
@@ -4661,6 +4662,10 @@ def _fallback_portfolio_allocation(ctx: SelectionRunContext) -> Dict[str, Any]:
             "add_condition": "突破后回踩不破再评估",
             "stop_loss_condition": (selected_scenario or {}).get("stop_loss") or summary.get("stop_loss") or "跌破关键支撑",
             "take_profit_condition": "到达第一压力位分批止盈",
+            "entry_expiry_days": None,
+            "signal_valid_days": None,
+            "signal_validity_label": "AI 未给出有效期，需补充后执行",
+            "signal_valid_until": "",
             "review_trigger": "下一交易日开盘或关键价格触发",
             "auto_downgrade_rules": ["如果价格高于 no_chase_line 且无回踩/承接确认，降级为 wait"],
             "reason": "来自单股深度分析和 Meta/点位计算条件矩阵的条件型计划。",
@@ -5057,6 +5062,9 @@ def _downgrade_position_to_monitor(item: Dict[str, Any], *, reason: str) -> None
     item["initial_position_pct"] = 0
     item["initial_amount"] = 0
     item["entry_condition"] = "仅监控，不设置买入触发；等待基本面、资金或消息证据补齐后重新评估。"
+    item["signal_validity_label"] = "未设置交易信号"
+    item["signal_valid_days"] = 0
+    item["signal_valid_until"] = ""
     item["add_condition"] = "-"
     item["stop_loss_condition"] = "未建仓，不设置交易止损；若继续走弱则移出观察。"
     item["review_trigger"] = item.get("review_trigger") or "下一轮候选池刷新或关键公告/资金变化后复查"
@@ -5712,6 +5720,10 @@ def _recommendation_items(
             "failure_condition": summary.get("failure_condition") or entry_quality.get("failure_condition"),
             "target_1": summary.get("target_1") or entry_quality.get("target_1"),
             "target_2": summary.get("target_2") or entry_quality.get("target_2"),
+            "entry_expiry_days": summary.get("entry_expiry_days") or entry_quality.get("entry_expiry_days"),
+            "signal_valid_days": summary.get("signal_valid_days") or entry_quality.get("signal_valid_days"),
+            "signal_valid_until": summary.get("signal_valid_until") or entry_quality.get("signal_valid_until"),
+            "signal_validity_label": summary.get("signal_validity_label") or entry_quality.get("signal_validity_label"),
             "supporting_evidence": _as_text_list(full.get("key_evidence") or summary.get("main_supporting_evidence")),
             "risk_flags": _as_text_list(full.get("risk_flags") or summary.get("main_risks")),
             "failure_conditions": _as_text_list(full.get("failure_conditions")),
@@ -5761,6 +5773,10 @@ def _recommendation_items(
             "add_condition": plan.get("add_condition"),
             "stop_loss_condition": plan.get("stop_loss_condition"),
             "take_profit_condition": plan.get("take_profit_condition"),
+            "entry_expiry_days": plan.get("entry_expiry_days"),
+            "signal_valid_days": plan.get("signal_valid_days"),
+            "signal_valid_until": plan.get("signal_valid_until"),
+            "signal_validity_label": plan.get("signal_validity_label"),
             "review_trigger": plan.get("review_trigger"),
             "plan_reason": plan.get("reason"),
         })
@@ -6129,6 +6145,7 @@ def _render_standard_recommendation_table(item: Dict[str, Any], *, actionable: b
 
     if actionable:
         rows.append(f"| 首仓比例 | {_markdown_cell(_format_pct(item.get('initial_position_pct')))} |")
+        rows.append(f"| 信号有效期 | {_markdown_cell(_signal_validity_text(item))} |")
         add_condition = item.get("add_condition") or "-"
         if _has_meaningful_wait_field(add_condition):
             rows.append(f"| 加仓条件 | {_markdown_cell(add_condition)} |")
@@ -6168,6 +6185,62 @@ def _has_meaningful_wait_field(value: Any) -> bool:
     return not any(template in text for template in low_signal_templates)
 
 
+def _signal_validity_text(item: Dict[str, Any]) -> str:
+    action = str(item.get("action") or "").strip().lower()
+    mode = str(item.get("execution_mode") or "").strip().lower()
+    has_trade_signal = (
+        mode in {"immediate_open", "conditional_open"}
+        or action in {"open", "buy"}
+        or (action == "wait" and _has_entry_condition(item) and _has_exit_condition(item))
+    )
+    if not has_trade_signal:
+        return "未设置交易信号"
+
+    label = item.get("signal_validity_label") or item.get("signal_validity")
+    until = item.get("signal_valid_until") or item.get("valid_until")
+    if _has_text_value(label):
+        text = str(label).strip()
+        if _has_text_value(until) and "截至" not in text:
+            text = f"{text}，截至 {until}"
+        return text
+
+    raw_days = item.get("signal_valid_days") or item.get("entry_expiry_days") or item.get("valid_days")
+    if not _has_text_value(raw_days):
+        return "AI 未给出有效期，需补充后执行"
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError):
+        return "AI 未给出有效期，需补充后执行"
+    if days <= 0:
+        return "AI 未给出有效期，需补充后执行"
+    text = f"{days} 个交易日"
+    if _has_text_value(until):
+        return f"{text}，截至 {until}"
+    return f"{text}，超期未触发则失效"
+
+
+def _watch_validity_text(item: Dict[str, Any]) -> str:
+    label = item.get("watch_validity_label") or item.get("signal_validity_label") or item.get("signal_validity")
+    until = item.get("signal_valid_until") or item.get("valid_until")
+    if _has_text_value(label) and str(label).strip() != "未设置交易信号":
+        text = str(label).strip()
+        if _has_text_value(until) and "截至" not in text:
+            text = f"{text}，截至 {until}"
+        return text
+    raw_days = item.get("signal_valid_days") or item.get("entry_expiry_days") or item.get("valid_days")
+    if not _has_text_value(raw_days):
+        return "AI 未给出观察有效期，需复查后保留"
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError):
+        return "AI 未给出观察有效期，需复查后保留"
+    if days <= 0:
+        return "AI 未给出观察有效期，需复查后保留"
+    if _has_text_value(until):
+        return f"{days} 个交易日，截至 {until}"
+    return f"{days} 个交易日，未升级则移出强观察"
+
+
 def _render_conditional_entry_table(item: Dict[str, Any]) -> List[str]:
     return [
         "| 项目 | 决策 |",
@@ -6176,6 +6249,7 @@ def _render_conditional_entry_table(item: Dict[str, Any]) -> List[str]:
         f"| 动作强度 | {_markdown_cell(_action_strength_label(item.get('action_strength')))} |",
         f"| 行情口径 | {_markdown_cell(_quote_basis_label(item.get('quote_basis')))} |",
         f"| 必要条件 | {_markdown_cell(_necessary_conditions_text(item))} |",
+        f"| 信号有效期 | {_markdown_cell(_signal_validity_text(item))} |",
         f"| 加分条件 | {_markdown_cell(_bonus_conditions_text(item))} |",
         f"| 止盈目标 | {_markdown_cell(_take_profit_condition_text(item))} |",
         f"| 止损位 | {_markdown_cell(item.get('stop_loss_condition') or item.get('stop_loss') or '缺失：未给出止损位')} |",
@@ -6197,6 +6271,7 @@ def _render_strong_watch_table(item: Dict[str, Any]) -> List[str]:
         f"| 候选分 | {_markdown_cell(_format_score(item.get('candidate_score')) if item.get('candidate_score') is not None else '-')} |",
         f"| 不能直接入场原因 | {_markdown_cell(_strong_watch_blocker(item))} |",
         f"| 明日重点观察 | {_markdown_cell(_strong_watch_focus(item))} |",
+        f"| 观察有效期 | {_markdown_cell(_watch_validity_text(item))} |",
         f"| 触发升级条件 | {_markdown_cell(_strong_watch_upgrade_condition(item))} |",
         f"| 作废条件 | {_markdown_cell(_failure_condition_text(item))} |",
         "",

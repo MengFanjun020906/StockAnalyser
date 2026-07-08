@@ -1557,6 +1557,9 @@ def test_stock_selection_wait_with_conditions_renders_conditional_entry():
                         "action_strength": "medium",
                         "initial_position_pct": 0,
                         "entry_condition": "竞价强承接且开盘 15 分钟不破分时均线",
+                        "entry_expiry_days": 2,
+                        "signal_valid_days": 2,
+                        "signal_validity_label": "2 个交易日，未触发则失效",
                         "stop_loss_condition": "跌破前一日低点",
                         "review_trigger": "次日竞价和开盘 15 分钟复查",
                     }
@@ -1576,6 +1579,7 @@ def test_stock_selection_wait_with_conditions_renders_conditional_entry():
     assert "### ⚡ 条件入场 1：688266 泽璟制药-U（候选分 96）" in recommendation_section
     assert "| 看盘动作 | 条件入场，不是无条件追买 |" in recommendation_section
     assert "| 必要条件 |" in recommendation_section
+    assert "| 信号有效期 | 2 个交易日，未触发则失效 |" in recommendation_section
     assert "竞价强承接且开盘 15 分钟不破分时均线" in recommendation_section
     assert "| 加分条件 | 竞价强承接且开盘 15 分钟不破分时均线 |" in recommendation_section
     assert "| 加分条件 | 满足其一即可：竞价强承接且开盘 15 分钟不破分时均线 |" not in recommendation_section
@@ -1657,6 +1661,7 @@ def test_stock_selection_report_uses_chinese_labels_and_split_entry_conditions()
     assert "Meta-Agent 链路对齐" not in main_report
     assert "Execute 证据摘要" not in main_report
     assert "| 必要条件 | 价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下 |" in main_report
+    assert "| 1 | 603260 合盛硅业 | 等待 | 0% | 价格回踩42.50-43.22区间；成交量萎缩至20日均量80%以下 | AI 未给出有效期，需补充后执行 | - |" in main_report
     assert "| 加分条件 | 满足其一即可：MACD金叉 / 主力资金净流入 |" in main_report
 
 

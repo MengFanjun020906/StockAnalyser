@@ -12,7 +12,9 @@
 #   2. update_fundamental_candidates.py (tushare, 更新财务快照, 可跳过)
 #
 # 续跑机制:
-#   每天在 .cache/ 下生成一个状态文件 daily_run_YYYYMMDD.state，
+#   每天在 .cache/ 下生成一个状态文件 daily_run_YYYYMMDD.state。
+#   Sequoia 日线步骤按最新已完成交易日写入标记，避免盘中运行更新到上一交易日后
+#   阻止收盘后补齐当日行情；其他步骤按自然日写入标记。
 #   每步成功完成后写入标记；中断重跑时自动跳过已完成步骤。
 #   --reset 可强制清除状态重头跑。
 
@@ -129,7 +131,18 @@ info "STOCK_LIST           : ${STOCK_LIST:-(未配置，使用默认)}"
 info "CANDIDATE_MODE       : ${AGENT_CANDIDATE_DISCOVERY_MODE:-(未配置)}"
 
 SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db}"
-STEP1_KEY="step1_stock_daily_with_index"
+STEP1_TARGET_DATE=$("$PYTHON" - <<'PY' 2>/dev/null
+from scripts.update_sequoia_candidates import resolve_cn_resume_target_date
+
+print(resolve_cn_resume_target_date().strftime("%Y%m%d"))
+PY
+) || STEP1_TARGET_DATE="$DATE_KEY"
+if [ "$STEP1_TARGET_DATE" = "$DATE_KEY" ]; then
+    info "SEQUOIA_TARGET_DATE  : ${STEP1_TARGET_DATE}"
+else
+    info "SEQUOIA_TARGET_DATE  : ${STEP1_TARGET_DATE}（最新已完成 A 股交易日）"
+fi
+STEP1_KEY="step1_stock_daily_with_index_${STEP1_TARGET_DATE}"
 
 # ============================================================
 # Step 1: 更新 stock_daily 日线

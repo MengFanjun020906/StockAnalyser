@@ -43,6 +43,14 @@ const statusLabels: Record<string, string> = {
   unknown: '未知',
 };
 
+const reasonLabels: Record<string, string> = {
+  signal_expired: '信号过期未触发',
+  missing_signal_validity: '缺少信号有效期',
+  entry_timeout: '入场窗口未触发',
+  missing_entry_zone: '缺少入场区间',
+  breakout_not_hit: '突破未触发',
+};
+
 function fmtPct(value?: number | null): string {
   if (value == null || !Number.isFinite(Number(value))) return '--';
   const sign = Number(value) > 0 ? '+' : '';
@@ -98,6 +106,17 @@ function priceDataLabel(granularity?: string): string {
   if (granularity === 'daily') return '日线兜底';
   if (granularity === 'none') return '无行情';
   return granularity || '未知';
+}
+
+function signalValidityLabel(plan?: EntryExecutionTradePlan): string {
+  const days = plan?.signalValidDays ?? plan?.entryExpiryDays;
+  if (days == null || !Number.isFinite(Number(days))) return '--';
+  return `${Number(days)} 个交易日`;
+}
+
+function reasonLabel(value?: string | null): string {
+  if (!value) return '--';
+  return reasonLabels[value] || value;
 }
 
 const StrategyBars: React.FC<{ summary: EntryExecutionBacktestResponse['summary'] }> = ({ summary }) => {
@@ -462,12 +481,13 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
   return (
     <div className="overflow-hidden border border-border/70 bg-card/70">
       <div className="overflow-x-auto">
-        <table className="min-w-[1600px] divide-y divide-border/60 text-sm">
+        <table className="min-w-[1740px] divide-y divide-border/60 text-sm">
           <thead className="bg-elevated/70 text-xs uppercase tracking-[0.08em] text-secondary-text">
             <tr>
               <th className="w-[96px] px-4 py-3 text-left">日期</th>
               <th className="w-[120px] px-4 py-3 text-left">标的</th>
               <th className="w-[170px] px-4 py-3 text-left">入场区间</th>
+              <th className="w-[150px] px-4 py-3 text-left">信号有效期</th>
               <th className="w-[96px] px-4 py-3 text-left">数据</th>
               <th className="w-[110px] px-4 py-3 text-left">策略状态</th>
               <th className="w-[96px] px-4 py-3 text-right">收益</th>
@@ -497,6 +517,11 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
                     <div className="text-xs text-cyan">{strategyEntryLabel}</div>
                     <div className="text-xs text-secondary-text">SL {fmtPrice(plan.stopLossPrice)} / TP {fmtPrice(plan.takeProfitPrice)}</div>
                   </td>
+                  <td className="px-4 py-3">
+                    <div className="font-medium text-foreground">{signalValidityLabel(plan)}</div>
+                    <div className="text-xs text-secondary-text">截至 {plan.signalValidUntil || '--'}</div>
+                    <div className="text-xs text-secondary-text">超期未触发则不成交</div>
+                  </td>
                   <td className="whitespace-nowrap px-4 py-3">
                     <Badge variant={priceDataVariant(priceData.granularity)}>{priceDataLabel(priceData.granularity)}</Badge>
                     <div className="mt-1 text-xs text-secondary-text">
@@ -507,13 +532,14 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
                   <td className="whitespace-nowrap px-4 py-3">
                     <Badge variant={statusVariant(status)}>{statusLabels[status] || status}</Badge>
                     {result.ambiguousBar ? <div className="mt-1 text-xs text-warning">同日止盈止损，按止损优先</div> : null}
+                    {result.tradeRule === 'cn_t_plus_1' ? <div className="mt-1 text-xs text-secondary-text">A 股 T+1，买入日不判卖出</div> : null}
                   </td>
                   <td className={cn('whitespace-nowrap px-4 py-3 text-right font-semibold tabular-nums', Number(result.pnlPct) > 0 ? 'text-danger' : Number(result.pnlPct) < 0 ? 'text-success' : 'text-secondary-text')}>
                     {fmtPct(result.pnlPct)}
                     <div className="text-xs font-normal text-secondary-text">{result.holdingDays != null ? `${result.holdingDays} 日` : '--'}</div>
                   </td>
                   <td className="w-[190px] px-4 py-3">
-                    <div className="text-foreground">{result.exitReason || result.entryReason || '--'}</div>
+                    <div className="text-foreground">{reasonLabel(result.exitReason || result.entryReason)}</div>
                     <div className="mt-1 grid grid-cols-[34px_1fr] gap-x-1 gap-y-0.5 text-xs text-secondary-text">
                       <span>入</span>
                       <span className="truncate tabular-nums" title={result.entryDate || ''}>{compactDateTime(result.entryDate)}</span>
@@ -651,7 +677,7 @@ const AgentEntryExecutionBacktestsPage: React.FC = () => {
             <h1 className="text-2xl font-semibold text-foreground">入场执行回测</h1>
           </div>
           <p className="max-w-3xl text-sm text-secondary-text">
-            只评估选股报告最终输出标的，按 AI 入场区间、止盈、止损和 20 日超时退出回放，专门观察入场是否过保守。
+            只评估选股报告最终输出标的，按 AI 入场区间、信号有效期、止盈、止损和 30 日超时退出回放；未给有效期时默认 5 个交易日内未触发买入则失效，A 股按 T+1 处理，买入当日不触发卖出。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
