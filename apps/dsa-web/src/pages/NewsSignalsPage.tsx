@@ -48,6 +48,18 @@ const edgeQualityLabels: Record<string, string> = {
   low: '弱边',
 };
 
+const edgeTypeLabels: Record<string, string> = {
+  same_event: '同一事件演化',
+  same_company: '同公司关联',
+  same_theme: '同主题关联',
+  same_industry: '同产业关联',
+  impacts_industry: '影响产业',
+  impacts_company: '影响公司',
+  benefits_company: '潜在受益公司',
+  harms_company: '潜在受损公司',
+  semantic_similarity: '语义相似待核验',
+};
+
 function fmtNum(value?: number | null, digits = 1): string {
   if (value == null || !Number.isFinite(Number(value))) return '--';
   return Number(value).toFixed(digits);
@@ -198,6 +210,7 @@ const SignalDetail: React.FC<{
   const usefulCount = Number(feedbackCounts.useful || 0);
   const wrongCount = Number(feedbackCounts.wrong || 0);
   const noisyCount = Number(feedbackCounts.noisy || 0);
+  const graphNodeById = new Map((graph?.nodes || []).map((node) => [node.id, node]));
 
   return (
     <div className="border border-border/70 bg-card/60">
@@ -379,31 +392,44 @@ const SignalDetail: React.FC<{
             </div>
           </div>
           <div className="space-y-2">
-            {(graph?.edges || []).slice(0, 8).map((edge) => (
-              <div key={edge.edgeId || `${edge.sourceCardId}-${edge.targetId}-${edge.edgeType}`} className="border border-border/60 bg-elevated/50 px-3 py-2 text-sm">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant={edge.edgeClass === 'semantic_similarity' ? 'info' : edge.edgeClass === 'event_clue' ? 'history' : 'default'}>
-                    {edgeClassLabels[edge.edgeClass || ''] || edge.edgeClass || '--'}
-                  </Badge>
-                  <Badge variant={qualityVariant(edge.qualityGrade)}>{edgeQualityLabels[edge.qualityGrade || ''] || edge.qualityGrade || '--'}</Badge>
-                  <span className="font-medium text-foreground">{edge.edgeType || '--'}</span>
-                  <span className="text-xs tabular-nums text-secondary-text">
-                    质量 {fmtNum(edge.edgeQuality, 0)} / 权重 {fmtNum((edge.weight || 0) * 100, 0)}%
-                  </span>
-                </div>
-                <div className="mt-1 text-xs leading-5 text-secondary-text">
-                  {edge.targetType === 'card' ? edge.targetCardId : edge.targetId}
-                </div>
-                {edge.rationale ? <p className="mt-1 text-xs leading-5 text-secondary-text">{edge.rationale}</p> : null}
-                {(edge.qualityFlags || []).length ? (
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {(edge.qualityFlags || []).slice(0, 4).map((flag) => (
-                      <span key={flag} className="border border-border/60 bg-card/70 px-2 py-0.5 text-xs text-secondary-text">{flag}</span>
-                    ))}
+            {(graph?.edges || []).slice(0, 8).map((edge) => {
+              const relatedId = edge.relatedCardId || edge.targetCardId || edge.targetId || '';
+              const relatedNode = graphNodeById.get(relatedId);
+              const relatedLabel = edge.relatedLabel || edge.targetLabel || relatedNode?.label || (edge.targetType === 'card' ? '关联新闻' : edge.targetId) || '--';
+              const relatedDate = edge.relatedSignalDate || edge.targetSignalDate || relatedNode?.signalDate;
+              const paths = edge.relatedTransmissionPaths || edge.targetTransmissionPaths || relatedNode?.transmissionPaths || [];
+              return (
+                <div key={edge.edgeId || `${edge.sourceCardId}-${edge.targetId}-${edge.edgeType}`} className="border border-border/60 bg-elevated/50 px-3 py-2 text-sm">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={edge.edgeClass === 'semantic_similarity' ? 'info' : edge.edgeClass === 'event_clue' ? 'history' : 'default'}>
+                      {edgeClassLabels[edge.edgeClass || ''] || edge.edgeClass || '--'}
+                    </Badge>
+                    <Badge variant={qualityVariant(edge.qualityGrade)}>{edgeQualityLabels[edge.qualityGrade || ''] || edge.qualityGrade || '--'}</Badge>
+                    <span className="font-medium text-foreground">{edgeTypeLabels[edge.edgeType || ''] || edge.edgeType || '--'}</span>
+                    <span className="text-xs tabular-nums text-secondary-text">
+                      质量 {fmtNum(edge.edgeQuality, 0)} / 权重 {fmtNum((edge.weight || 0) * 100, 0)}%
+                    </span>
                   </div>
-                ) : null}
-              </div>
-            ))}
+                  <div className="mt-2 font-medium leading-6 text-foreground">{relatedLabel}</div>
+                  {relatedDate ? <div className="mt-0.5 text-xs text-secondary-text">{relatedDate}</div> : null}
+                  {paths.slice(0, 2).map((path, index) => (
+                    <div key={`${edge.edgeId || relatedId}-path-${index}`} className="mt-2 border-l-2 border-cyan/40 pl-3 text-xs leading-5 text-secondary-text">
+                      <div className="font-medium text-foreground">{path.eventCategory || '传导路径'}</div>
+                      <div>{[path.mechanism, path.target].filter(Boolean).join(' -> ') || path.conclusion || path.rationale || '传导信息待补充'}</div>
+                      {path.conclusion && (path.mechanism || path.target) ? <div className="mt-0.5">结论：{path.conclusion}</div> : null}
+                    </div>
+                  ))}
+                  {edge.rationale ? <p className="mt-1 text-xs leading-5 text-secondary-text">关系说明：{edge.rationale}</p> : null}
+                  {(edge.qualityFlags || []).length ? (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {(edge.qualityFlags || []).slice(0, 4).map((flag) => (
+                        <span key={flag} className="border border-border/60 bg-card/70 px-2 py-0.5 text-xs text-secondary-text">{flag}</span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
             {!graphLoading && !(graph?.edges || []).length ? (
               <div className="border border-border/60 bg-elevated/50 px-3 py-2 text-sm text-secondary-text">暂无关联边，重建卡片或同步图谱后会自动补规则线索。</div>
             ) : null}
@@ -450,7 +476,7 @@ const NewsSignalsPage: React.FC = () => {
   const [signalLayer, setSignalLayer] = useState('');
   const [industry, setIndustry] = useState('');
   const [horizon, setHorizon] = useState('');
-  const [status, setStatus] = useState('');
+  const [status, setStatus] = useState('active');
   const [includeSemanticEdges, setIncludeSemanticEdges] = useState(false);
   const [data, setData] = useState<NewsSignalListResponse | null>(null);
   const [metrics, setMetrics] = useState<NewsSignalMetrics | null>(null);

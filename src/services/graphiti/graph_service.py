@@ -280,9 +280,10 @@ def _news_signal_edge_props(edge: dict[str, Any], group_id: str) -> dict[str, An
 class GraphitiService:
     """Best-effort Graphiti facade with lazy initialization."""
 
-    def __init__(self) -> None:
+    def __init__(self, fallback_search: Any = None) -> None:
         self.config = get_config()
         self.enabled = bool(self.config.graphiti_enabled)
+        self._fallback_search = fallback_search
         self._client = None
         self._graphiti_cls = None
         self._indices_ready = False
@@ -329,6 +330,35 @@ class GraphitiService:
     def is_available(self) -> bool:
         return self.enabled and self._client is not None
 
+    def _search_relational_fallback(
+        self,
+        query: str,
+        *,
+        market: str | None,
+        limit: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        try:
+            if self._fallback_search is None:
+                from .search_fallback import RelationalGraphSearch
+
+                self._fallback_search = RelationalGraphSearch()
+            return self._fallback_search.search(
+                query,
+                market=market,
+                limit=limit,
+                reason=reason,
+            )
+        except Exception as exc:
+            logger.warning("Relational graph search fallback failed for query=%r: %s", query, exc, exc_info=True)
+            return {
+                "success": False,
+                "error": str(exc),
+                "query": query,
+                "source": "relational_fallback",
+                "degraded": True,
+            }
+
     def _ensure_sync_loop(self) -> asyncio.AbstractEventLoop:
         with self._sync_loop_lock:
             if self._sync_loop is not None and self._sync_loop.is_running():
@@ -346,10 +376,14 @@ class GraphitiService:
             self._sync_thread = thread
             return loop
 
-    def _run_sync(self, coro) -> Any:
+    def _run_sync(self, coro, *, timeout_seconds: float | None = None) -> Any:
         loop = self._ensure_sync_loop()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result()
+        try:
+            return future.result(timeout=timeout_seconds)
+        except TimeoutError:
+            future.cancel()
+            raise
 
     async def _ensure_indices(self) -> bool:
         """Create Graphiti's Neo4j schema before first write/search."""
@@ -557,6 +591,43 @@ class GraphitiService:
             logger.warning("Graphiti news signal ingestion failed for %s: %s", card_id, exc, exc_info=True)
             return {"status": "failed", "error": str(exc)}
 
+    async def remove_news_signal_card(
+        self,
+        *,
+        card_id: str,
+        market: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove all Graphiti episodes generated for a suppressed news card."""
+        if not self.is_available():
+            return {"status": "skipped", "reason": "graphiti_unavailable"}
+        normalized_card_id = str(card_id or "").strip()
+        if not normalized_card_id:
+            return {"status": "failed", "error": "card_id is required"}
+
+        group_id = self._resolve_group_id(market=market, user_id=user_id)
+        episode_name = f"news_signal:{_safe_group_token(normalized_card_id, 'news_signal')}"
+        try:
+            records, _, _ = await self._client.driver.execute_query(
+                "MATCH (e:Episodic {name: $name, group_id: $group_id}) RETURN e.uuid AS uuid",
+                name=episode_name,
+                group_id=group_id,
+                routing_="r",
+            )
+            episode_uuids = [str(record["uuid"]) for record in records if record.get("uuid")]
+            for episode_uuid in episode_uuids:
+                await self._client.remove_episode(episode_uuid)
+            return {
+                "status": "removed" if episode_uuids else "skipped",
+                "reason": "episode_not_found" if not episode_uuids else "",
+                "card_id": normalized_card_id,
+                "group_id": group_id,
+                "removed": len(episode_uuids),
+            }
+        except Exception as exc:
+            logger.warning("Graphiti news signal removal failed for %s: %s", normalized_card_id, exc, exc_info=True)
+            return {"status": "failed", "error": str(exc), "card_id": normalized_card_id}
+
     def ingest_analysis_sync(self, **kwargs: Any) -> None:
         if not self.is_available():
             return
@@ -575,11 +646,25 @@ class GraphitiService:
 
         self._run_sync(self.ingest_market_event(**kwargs))
 
-    def ingest_news_signal_card_sync(self, **kwargs: Any) -> dict[str, Any]:
+    def ingest_news_signal_card_sync(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         if not self.is_available():
             return {"status": "skipped", "reason": "graphiti_unavailable"}
 
-        return self._run_sync(self.ingest_news_signal_card(**kwargs))
+        return self._run_sync(
+            self.ingest_news_signal_card(**kwargs),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def remove_news_signal_card_sync(self, **kwargs: Any) -> dict[str, Any]:
+        if not self.is_available():
+            return {"status": "skipped", "reason": "graphiti_unavailable"}
+
+        return self._run_sync(self.remove_news_signal_card(**kwargs))
 
     def sync_news_signal_edges_sync(
         self,
@@ -593,32 +678,45 @@ class GraphitiService:
 
         if not self.config.graphiti_enabled:
             return {"status": "disabled", "reason": "graphiti_disabled", "edges": 0}
-        if not edges:
-            return {"status": "skipped", "reason": "no_edges", "edges": 0}
-
         try:
             from neo4j import GraphDatabase
         except Exception as exc:
             return {"status": "disabled", "reason": f"neo4j_driver_unavailable: {exc}", "edges": 0}
 
         group_id = self._resolve_group_id(market=market, user_id=user_id)
-        card_by_id = {
+        all_cards_by_id = {
             str(card.get("card_id") or ""): card
             for card in cards
             if str(card.get("card_id") or "").strip()
         }
+        card_by_id = {
+            card_id: card
+            for card_id, card in all_cards_by_id.items()
+            if str(card.get("status") or "active") == "active"
+        }
+        active_card_ids = set(card_by_id)
+        inactive_card_ids = sorted(set(all_cards_by_id) - active_card_ids)
+        filtered_edges = [
+            edge
+            for edge in edges
+            if str(edge.get("source_card_id") or "").strip() in active_card_ids
+            and (
+                str(edge.get("target_type") or "") != "card"
+                or str(edge.get("target_card_id") or edge.get("target_id") or "").strip() in active_card_ids
+            )
+        ]
+        if not filtered_edges and not inactive_card_ids:
+            return {"status": "skipped", "reason": "no_edges", "edges": 0}
         touched_card_ids = {
             str(edge.get("source_card_id") or "").strip()
-            for edge in edges
+            for edge in filtered_edges
             if str(edge.get("source_card_id") or "").strip()
         }
         touched_card_ids.update(
             str(edge.get("target_card_id") or "").strip()
-            for edge in edges
+            for edge in filtered_edges
             if str(edge.get("target_card_id") or "").strip()
         )
-        for card_id in touched_card_ids:
-            card_by_id.setdefault(card_id, {"card_id": card_id, "summary_short": card_id})
 
         driver = GraphDatabase.driver(
             self.config.graphiti_neo4j_uri,
@@ -635,6 +733,26 @@ class GraphitiService:
                         session.run(query).consume()
                     except Exception as exc:
                         logger.debug("News signal graph schema statement skipped: %s", exc)
+
+                if inactive_card_ids:
+                    session.run(
+                        """
+                        MATCH (s:NewsSignalCard)-[r:NEWS_SIGNAL_SEMANTIC_SIMILARITY|NEWS_SIGNAL_EVENT_CLUE|NEWS_SIGNAL_TYPED_RELATION]->(t)
+                        WHERE r.group_id = $group_id
+                          AND (s.card_id IN $inactive_card_ids OR (t:NewsSignalCard AND t.card_id IN $inactive_card_ids))
+                        DELETE r
+                        """,
+                        group_id=group_id,
+                        inactive_card_ids=inactive_card_ids,
+                    ).consume()
+                    session.run(
+                        """
+                        MATCH (n:NewsSignalCard)
+                        WHERE n.card_id IN $inactive_card_ids AND NOT (n)--()
+                        DELETE n
+                        """,
+                        inactive_card_ids=inactive_card_ids,
+                    ).consume()
 
                 if touched_card_ids:
                     session.run(
@@ -659,7 +777,7 @@ class GraphitiService:
                         props=props,
                     ).consume()
 
-                for edge in edges:
+                for edge in filtered_edges:
                     source_id = str(edge.get("source_card_id") or "").strip()
                     target_id = str(edge.get("target_id") or "").strip()
                     edge_id = str(edge.get("edge_id") or "").strip()
@@ -715,17 +833,33 @@ class GraphitiService:
             "group_id": group_id,
             "edges": projected,
             "cards": len(card_by_id),
+            "input_edges": len(edges),
+            "skipped_inactive_edges": len(edges) - len(filtered_edges),
+            "inactive_cards_pruned": len(inactive_card_ids),
         }
 
     async def search(self, query: str, *, market: str | None = None, limit: int = 10) -> dict[str, Any]:
         if not self.is_available():
-            return {"success": False, "error": "Graphiti is disabled"}
+            return self._search_relational_fallback(
+                query,
+                market=market,
+                limit=limit,
+                reason="graphiti_disabled",
+            )
         if not await self._ensure_indices():
-            return {"success": False, "error": "Graphiti index initialization failed", "query": query}
+            return self._search_relational_fallback(
+                query,
+                market=market,
+                limit=limit,
+                reason="graphiti_index_initialization_failed",
+            )
 
         try:
+            from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
+
             results = await self._client.search_(
                 query=query,
+                config=COMBINED_HYBRID_SEARCH_RRF,
                 group_ids=[self._resolve_group_id(market=market)],
             )
             edges = getattr(results, "edges", []) or []
@@ -740,13 +874,43 @@ class GraphitiService:
             }
         except Exception as exc:
             logger.warning("Graphiti search failed for query=%r: %s", query, exc, exc_info=True)
-            return {"success": False, "error": str(exc), "query": query}
+            fallback = self._search_relational_fallback(
+                query,
+                market=market,
+                limit=limit,
+                reason="graphiti_search_failed",
+            )
+            fallback["graphiti_error"] = str(exc)
+            return fallback
 
-    def search_sync(self, query: str, *, market: str | None = None, limit: int = 10) -> dict[str, Any]:
+    def search_sync(
+        self,
+        query: str,
+        *,
+        market: str | None = None,
+        limit: int = 10,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         if not self.is_available():
-            return {"success": False, "error": "Graphiti is disabled", "query": query}
+            return self._search_relational_fallback(
+                query,
+                market=market,
+                limit=limit,
+                reason="graphiti_disabled",
+            )
 
-        return self._run_sync(self.search(query, market=market, limit=limit))
+        try:
+            return self._run_sync(
+                self.search(query, market=market, limit=limit),
+                timeout_seconds=timeout_seconds,
+            )
+        except TimeoutError:
+            return self._search_relational_fallback(
+                query,
+                market=market,
+                limit=limit,
+                reason="graphiti_search_timeout",
+            )
 
     async def close(self) -> None:
         if self._client is None:

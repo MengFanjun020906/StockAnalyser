@@ -622,8 +622,6 @@ const AgentEntryExecutionBacktestsPage: React.FC = () => {
     setError(null);
     try {
       const result = await agentEntryExecutionBacktestsApi.syncMinuteBars({
-        limit: 300,
-        decisionDate: decisionDate || undefined,
         symbol: symbol.trim() || undefined,
         frequency: '5',
         adjustflag: '3',
@@ -637,7 +635,7 @@ const AgentEntryExecutionBacktestsPage: React.FC = () => {
     } finally {
       setSyncing(false);
     }
-  }, [decisionDate, loadData, symbol]);
+  }, [loadData, symbol]);
 
   useEffect(() => {
     void loadData();
@@ -689,9 +687,9 @@ const AgentEntryExecutionBacktestsPage: React.FC = () => {
             <Database className={cn('h-4 w-4', rebuilding ? 'animate-pulse' : '')} />
             重建样本
           </button>
-          <button type="button" className="btn-primary inline-flex h-10 items-center gap-2 px-4" onClick={() => void syncMinuteBars()} disabled={loading || rebuilding || syncing || !decisionDate}>
+          <button type="button" className="btn-primary inline-flex h-10 items-center gap-2 px-4" onClick={() => void syncMinuteBars()} disabled={loading || rebuilding || syncing}>
             <CloudDownload className={cn('h-4 w-4', syncing ? 'animate-pulse' : '')} />
-            同步当前日期分钟线
+            同步历史分钟线至最新
           </button>
         </div>
       </div>
@@ -756,7 +754,7 @@ const AgentEntryExecutionBacktestsPage: React.FC = () => {
       {error ? <ApiErrorAlert error={error} /> : null}
       {syncResult?.sync ? (
         <div className="border border-cyan/40 bg-cyan/10 px-4 py-3 text-sm text-foreground">
-          已同步 {syncResult.sync.fetchedSymbols ?? 0}/{syncResult.sync.symbolCount ?? 0} 只最终报告标的分钟线，
+          已同步 {syncResult.sync.fetchedSymbols ?? 0}/{syncResult.sync.symbolCount ?? 0} 只历史最终报告标的分钟线至最新，
           拉取 {syncResult.sync.fetchedRows ?? 0} 根，新增 {syncResult.sync.writtenRows ?? 0} 根，
           失败 {syncResult.sync.failedSymbols ?? 0} 只。
         </div>

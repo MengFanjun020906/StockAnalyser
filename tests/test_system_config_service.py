@@ -271,17 +271,27 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_format" for issue in validation["issues"]))
 
-    def test_validate_reports_invalid_searxng_url(self) -> None:
-        validation = self.service.validate(items=[{"key": "SEARXNG_BASE_URLS", "value": "searx.local,https://ok.example"}])
-        self.assertFalse(validation["valid"])
-        self.assertTrue(any(issue["code"] == "invalid_url" for issue in validation["issues"]))
+    def test_schema_only_exposes_anysearch_for_web_search(self) -> None:
+        schema = self.service.get_schema()
+        serialized = str(schema)
 
-    def test_validate_reports_invalid_public_searxng_toggle(self) -> None:
-        validation = self.service.validate(
-            items=[{"key": "SEARXNG_PUBLIC_INSTANCES_ENABLED", "value": "maybe"}]
+        self.assertIn("ANYSEARCH_API_KEY", serialized)
+        for retired_key in SystemConfigService._HIDDEN_CONFIG_KEYS:
+            self.assertNotIn(retired_key, serialized)
+
+    def test_get_config_hides_retired_search_settings_from_existing_env(self) -> None:
+        self._rewrite_env(
+            "ANYSEARCH_API_KEY=anysearch-secret",
+            "TAVILY_API_KEYS=legacy-secret",
+            "SEARXNG_BASE_URLS=https://legacy-search.example",
         )
-        self.assertFalse(validation["valid"])
-        self.assertTrue(any(issue["code"] == "invalid_type" for issue in validation["issues"]))
+
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertIn("ANYSEARCH_API_KEY", items)
+        for retired_key in SystemConfigService._HIDDEN_CONFIG_KEYS:
+            self.assertNotIn(retired_key, items)
 
     def test_validate_reports_invalid_feishu_webhook_url(self) -> None:
         validation = self.service.validate(

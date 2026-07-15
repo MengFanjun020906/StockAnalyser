@@ -340,7 +340,7 @@ apps/dsa-web/src/pages/AgentEntryExecutionBacktestsPage.tsx
 
 - 从 `entry_execution_backtest.jsonl` 读取样本，不重跑 Agent。
 - 通过“重建样本”按钮从本地 Trace 与本地 `StockDaily` 刷新 JSONL。
-- 通过“同步分钟线”按钮按最终报告标的拉取 baostock 分钟 K，写入 `stock_minute_bars` 后自动重建 JSONL。
+- 通过“同步历史分钟线至最新”按钮扫描全部历史最终报告标的，从各自决策日期开始补齐 baostock 分钟 K 回测窗口，窗口上限为当前最新可用日期；写入 `stock_minute_bars` 后自动重建 JSONL，页面的决策日期筛选不限制同步范围。
 - 展示严格 AI 入场成交率。
 - 展示 `strict_ai_entry`、`next_open_baseline`、`atr_elastic_entry`、`breakout_fallback_entry` 四套策略平均收益。
 - 表格逐条展示最终报告标的、入场区间、止盈止损、行情粒度、当前策略状态、收益、退出原因和 Trace。

@@ -44,7 +44,22 @@ describe('NewsSignalsPage', () => {
     mocks.get.mockResolvedValue(makeListResponse().items[0]);
     mocks.graph.mockResolvedValue({
       centerCardId: 'card:test',
-      nodes: [{ id: 'card:test', type: 'card', label: '央行开展逆回购操作' }],
+      nodes: [
+        { id: 'card:test', type: 'card', label: '央行开展逆回购操作' },
+        {
+          id: 'card:xueqiu:419faede45061977d632dd49',
+          type: 'card',
+          label: '机器人核心零部件涨价，产业链订单等待验证',
+          signalDate: '2026-07-03',
+          transmissionPaths: [
+            {
+              eventCategory: '价格/供需',
+              mechanism: '核心零部件涨价传导',
+              conclusion: '需要订单与利润率继续验证',
+            },
+          ],
+        },
+      ],
       edges: [
         {
           edgeId: 'edge:test',
@@ -60,8 +75,32 @@ describe('NewsSignalsPage', () => {
           method: 'rule',
           rationale: '新闻卡片主主题指向国内流动性。',
         },
+        {
+          edgeId: 'edge:related-card',
+          sourceCardId: 'card:test',
+          targetCardId: 'card:xueqiu:419faede45061977d632dd49',
+          targetType: 'card',
+          targetId: 'card:xueqiu:419faede45061977d632dd49',
+          targetLabel: '机器人核心零部件涨价，产业链订单等待验证',
+          targetSignalDate: '2026-07-03',
+          targetTransmissionPaths: [
+            {
+              eventCategory: '价格/供需',
+              mechanism: '核心零部件涨价传导',
+              conclusion: '需要订单与利润率继续验证',
+            },
+          ],
+          edgeClass: 'event_clue',
+          edgeType: 'same_theme',
+          weight: 0.74,
+          edgeQuality: 72,
+          qualityGrade: 'medium',
+          qualityFlags: [],
+          method: 'rule',
+          rationale: '两条新闻处于同一产业主题，仍需核验是否为同一事件。',
+        },
       ],
-      summary: { edgeCount: 1 },
+      summary: { edgeCount: 2 },
     });
     mocks.rebuild.mockResolvedValue({
       status: 'ok',
@@ -98,7 +137,10 @@ describe('NewsSignalsPage', () => {
       });
     });
     expect(await screen.findByText(/图谱同步 ok/)).toBeInTheDocument();
-    expect(await screen.findByText('事件线索')).toBeInTheDocument();
+    expect((await screen.findAllByText('事件线索')).length).toBeGreaterThan(0);
+    expect(await screen.findByText('机器人核心零部件涨价，产业链订单等待验证')).toBeInTheDocument();
+    expect(await screen.findByText(/核心零部件涨价传导/)).toBeInTheDocument();
+    expect(screen.queryByText('card:xueqiu:419faede45061977d632dd49')).not.toBeInTheDocument();
     expect(await screen.findByText('强边')).toBeInTheDocument();
     expect(await screen.findByText(/质量 91/)).toBeInTheDocument();
     expect(await screen.findByText('事件事实')).toBeInTheDocument();

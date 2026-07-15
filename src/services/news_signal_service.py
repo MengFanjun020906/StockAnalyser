@@ -36,6 +36,8 @@ from src.agent.evidence.schemas import (
 )
 from src.core.trading_calendar import get_effective_trading_date
 from src.repositories.news_signal_repo import NewsSignalRepository
+from src.repositories.graphiti_outbox_repo import GraphitiOutboxRepository
+from src.services.graphiti.semantic_thresholds import resolve_semantic_threshold
 
 
 NEWS_SIGNAL_SCHEMA_VERSION = "news_signal_card.v1"
@@ -164,6 +166,25 @@ MARKETING_TERMS = (
     "订阅",
     "研报",
 )
+GENERIC_COMPANY_TEASER_TERMS = (
+    "这家公司",
+    "这家公司的",
+    "这家企业",
+    "该公司",
+    "相关公司",
+    "公司上半年",
+    "公司净利",
+)
+GENERIC_RELATION_THEMES = {
+    "实时快讯",
+    "实时消息",
+    "市场快讯",
+    "市场资讯",
+    "财经新闻",
+    "行业动态",
+    "其他",
+    "未分类",
+}
 SIGNAL_TERMS = tuple(dict.fromkeys(POSITIVE_TERMS + NEGATIVE_TERMS + LONG_TERMS + MEDIUM_TERMS + MACRO_TERMS))
 logger = logging.getLogger(__name__)
 
@@ -410,8 +431,14 @@ class NewsEventLLMExtractor:
 class NewsSignalService:
     """Application service for news signal cards."""
 
-    def __init__(self, repo: Optional[NewsSignalRepository] = None, event_llm_extractor: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        repo: Optional[NewsSignalRepository] = None,
+        event_llm_extractor: Optional[Any] = None,
+        outbox_repo: Optional[GraphitiOutboxRepository] = None,
+    ) -> None:
         self.repo = repo or NewsSignalRepository()
+        self.outbox_repo = outbox_repo or GraphitiOutboxRepository(self.repo.db)
         self._concept_mapping = _load_concept_mapping()
         self._event_llm_extractor = event_llm_extractor if event_llm_extractor is not None else NewsEventLLMExtractor()
 
@@ -483,6 +510,21 @@ class NewsSignalService:
             if saved_cards
             else {"status": "skipped", "reason": "no_saved_cards"}
         )
+        cluster_sync = (
+            self.reconcile_same_event_clusters(signal_date=target.isoformat(), limit=500)
+            if saved_cards
+            else {"status": "skipped", "reason": "no_saved_cards"}
+        )
+        active_saved_cards = [
+            detail
+            for card in saved_cards
+            if (detail := self.repo.get_card(str(card.get("card_id") or "")))
+            and detail.get("status") == "active"
+        ]
+        outbox_enqueued = self._enqueue_graphiti_jobs(
+            active_saved_cards,
+            signal_dates=[target.isoformat()] if saved_cards else [],
+        )
         graph_sync = (
             self.sync_graphiti(
                 card_ids=[str(card.get("card_id") or "") for card in saved_cards if card.get("card_id")],
@@ -500,10 +542,122 @@ class NewsSignalService:
             "events_upserted": len(saved_events),
             "cards_upserted": len(saved_cards),
             "edge_sync": edge_sync,
+            "cluster_sync": cluster_sync,
             "graph_sync": graph_sync,
+            "outbox_enqueued": outbox_enqueued,
             "errors": errors,
             "cards": saved_cards,
         }
+
+    def ingest_cls_incremental(self, *, limit: int = 50) -> Dict[str, Any]:
+        """Persist only unseen CLS feed episodes and rebuild affected relations."""
+
+        payload, source_error = self._fetch_cls(limit=max(1, min(int(limit or 50), 50)))
+        if source_error or not payload:
+            return {
+                "status": "failed",
+                "source": "cls_telegraph",
+                "new_raw_episodes": 0,
+                "events_upserted": 0,
+                "cards_upserted": 0,
+                "cursor": self.repo.latest_raw_episode_cursor("cls_telegraph"),
+                "errors": [source_error or {"source": "cls_telegraph", "error": "empty payload"}],
+            }
+
+        raw_payloads, card_payloads = self._build_from_cls(payload)
+        existing_ids = self.repo.existing_raw_episode_ids(
+            item.get("episode_id") for item in raw_payloads
+        )
+        new_raw_payloads = [
+            item for item in raw_payloads
+            if str(item.get("episode_id") or "") not in existing_ids
+        ]
+        new_episode_ids = {
+            str(item.get("episode_id") or "")
+            for item in new_raw_payloads
+            if item.get("episode_id")
+        }
+        new_card_payloads = [
+            card for card in card_payloads
+            if new_episode_ids.intersection(
+                str(value or "") for value in card.get("raw_episode_ids") or []
+            )
+        ]
+
+        saved_raw = self.repo.upsert_raw_episodes(new_raw_payloads)
+        saved_events = self.repo.upsert_extracted_events(
+            _collect_extracted_events(new_card_payloads)
+        )
+        saved_cards = self.repo.upsert_cards(new_card_payloads)
+        affected_dates = sorted(
+            {
+                str(card.get("signal_date") or "")
+                for card in saved_cards
+                if card.get("signal_date")
+            }
+        )
+        edge_sync = [
+            self.rebuild_edges(signal_date=signal_date, limit=500)
+            for signal_date in affected_dates
+        ]
+        cluster_sync = [
+            self.reconcile_same_event_clusters(signal_date=signal_date, limit=500)
+            for signal_date in affected_dates
+        ]
+        active_saved_cards = [
+            detail
+            for card in saved_cards
+            if (detail := self.repo.get_card(str(card.get("card_id") or "")))
+            and detail.get("status") == "active"
+        ]
+        outbox_enqueued = self._enqueue_graphiti_jobs(
+            active_saved_cards,
+            signal_dates=affected_dates,
+        )
+        return {
+            "status": "ok" if saved_raw else "empty",
+            "source": "cls_telegraph",
+            "fetched_items": len(raw_payloads),
+            "new_raw_episodes": len(saved_raw),
+            "events_upserted": len(saved_events),
+            "cards_upserted": len(saved_cards),
+            "affected_dates": affected_dates,
+            "edge_sync": edge_sync,
+            "cluster_sync": cluster_sync,
+            "outbox_enqueued": outbox_enqueued,
+            "cursor": self.repo.latest_raw_episode_cursor("cls_telegraph"),
+            "errors": [],
+        }
+
+    def _enqueue_graphiti_jobs(
+        self,
+        cards: Iterable[Dict[str, Any]],
+        *,
+        signal_dates: Iterable[str],
+        market: str = "cn",
+    ) -> int:
+        enqueued = 0
+        for card in cards:
+            card_id = str(card.get("card_id") or "").strip()
+            if not card_id:
+                continue
+            is_active = str(card.get("status") or "active") == "active"
+            self.outbox_repo.enqueue(
+                event_type="news_signal_card_episode" if is_active else "news_signal_card_delete",
+                aggregate_id=card_id,
+                payload={"card_id": card_id},
+                market=market,
+            )
+            enqueued += 1
+        for signal_date in sorted({str(value or "").strip() for value in signal_dates if str(value or "").strip()}):
+            self.outbox_repo.enqueue(
+                event_type="news_signal_edge_projection",
+                aggregate_id=signal_date,
+                payload={"signal_date": signal_date},
+                market=market,
+            )
+            enqueued += 1
+        return enqueued
 
     def list_cards(
         self,
@@ -532,6 +686,116 @@ class NewsSignalService:
 
     def get_card(self, card_id: str) -> Optional[Dict[str, Any]]:
         return self.repo.get_card(card_id)
+
+    def seed_evidence_for_codes(
+        self,
+        codes: Iterable[str],
+        *,
+        signal_date: str = "",
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """Return actionable news evidence only for stocks already in the seed pool."""
+
+        requested_codes = {
+            _normalize_stock_code(code)
+            for code in codes
+            if _normalize_stock_code(code)
+        }
+        if not requested_codes:
+            return {
+                "requested_codes": 0,
+                "matched_codes": 0,
+                "attached_cards": 0,
+                "items_by_code": {},
+                "skipped": {},
+            }
+
+        cards = self.repo.list_cards(
+            signal_date=signal_date or None,
+            status="active",
+            limit=max(1, min(int(limit or 200), 500)),
+        )
+        items_by_code: Dict[str, List[Dict[str, Any]]] = {}
+        skipped: Dict[str, int] = {}
+
+        def _skip(reason: str) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+
+        for card in cards:
+            if str(card.get("evidence_grade") or "").strip().lower() == "speculative":
+                _skip("speculative")
+                continue
+            if str(card.get("mapping_status") or "").strip().lower() != "mapped":
+                _skip("mapping_not_explicit")
+                continue
+            mapping_confidence = _float_or_none(card.get("mapping_confidence")) or 0.0
+            if mapping_confidence < 0.65:
+                _skip("low_mapping_confidence")
+                continue
+            signal_score = _float_or_none(card.get("adjusted_signal_score"))
+            if signal_score is None:
+                signal_score = _float_or_none(card.get("signal_score")) or 0.0
+            if signal_score < 50.0:
+                _skip("low_signal_score")
+                continue
+            valid_until = _parse_datetime(card.get("valid_until"))
+            if valid_until is not None:
+                now = datetime.now(valid_until.tzinfo) if valid_until.tzinfo else datetime.now()
+                if valid_until < now:
+                    _skip("expired")
+                    continue
+
+            for company in card.get("company_impacts") or []:
+                if not isinstance(company, dict):
+                    continue
+                code = _normalize_stock_code(company.get("symbol") or company.get("code"))
+                if code not in requested_codes:
+                    continue
+                direction = str(company.get("direction") or "").strip().lower()
+                if direction != "benefit":
+                    _skip("company_not_benefit")
+                    continue
+                company_confidence = _float_or_none(company.get("confidence")) or 0.0
+                if company_confidence < 0.65:
+                    _skip("low_company_confidence")
+                    continue
+                items_by_code.setdefault(code, []).append(
+                    {
+                        "card_id": card.get("card_id"),
+                        "summary_short": card.get("summary_short"),
+                        "signal_date": card.get("signal_date"),
+                        "signal_layer": card.get("signal_layer"),
+                        "impact_horizon": card.get("impact_horizon"),
+                        "evidence_grade": card.get("evidence_grade"),
+                        "inference_level": card.get("inference_level"),
+                        "mapping_confidence": mapping_confidence,
+                        "signal_score": signal_score,
+                        "company_direction": direction,
+                        "company_confidence": company_confidence,
+                        "company_rationale": company.get("rationale"),
+                        "primary_industries": card.get("primary_industries") or [],
+                        "raw_episode_ids": card.get("raw_episode_ids") or [],
+                        "gate_result": "matched_existing_seed",
+                    }
+                )
+
+        for evidence_items in items_by_code.values():
+            evidence_items.sort(
+                key=lambda item: (
+                    float(item.get("signal_score") or 0.0),
+                    float(item.get("company_confidence") or 0.0),
+                ),
+                reverse=True,
+            )
+            del evidence_items[3:]
+
+        return {
+            "requested_codes": len(requested_codes),
+            "matched_codes": len(items_by_code),
+            "attached_cards": sum(len(items) for items in items_by_code.values()),
+            "items_by_code": items_by_code,
+            "skipped": skipped,
+        }
 
     def add_feedback(self, *, card_id: str, feedback_type: str, note: str = "", payload: Optional[Dict[str, Any]] = None, user_id: str = "") -> Dict[str, Any]:
         return self.repo.add_feedback(
@@ -574,6 +838,10 @@ class NewsSignalService:
         semantic_vectors: Optional[Dict[str, List[float]]] = None,
     ) -> Dict[str, Any]:
         cards = self.repo.list_cards(signal_date=signal_date or None, status="active", limit=limit)
+        scope_cards = self.repo.list_cards(
+            signal_date=signal_date or None,
+            limit=max(500, int(limit or 160)),
+        )
         edges: List[Dict[str, Any]] = []
         edges.extend(_build_typed_relation_edges(cards))
         edges.extend(_build_event_clue_edges(cards))
@@ -581,7 +849,10 @@ class NewsSignalService:
         if include_semantic:
             semantic_edges, semantic_status = self._build_semantic_similarity_edges(cards, semantic_vectors=semantic_vectors)
             edges.extend(semantic_edges)
-        result = self.repo.replace_edges_for_cards([str(card.get("card_id") or "") for card in cards], edges)
+        result = self.repo.replace_edges_for_cards(
+            [str(card.get("card_id") or "") for card in scope_cards],
+            edges,
+        )
         edge_counts = _count_dict(item.get("edge_class") for item in edges)
         edge_quality_counts = _count_dict(item.get("quality_grade") for item in edges)
         return {
@@ -617,10 +888,13 @@ class NewsSignalService:
                     }
 
         nodes: List[Dict[str, Any]] = []
+        card_details: Dict[str, Dict[str, Any]] = {}
         for related_card_id in sorted(card_ids):
             card = center if related_card_id == center.get("card_id") else self.repo.get_card(related_card_id)
             if not card:
                 continue
+            card_details[related_card_id] = card
+            raw_episodes = card.get("raw_episodes") if isinstance(card.get("raw_episodes"), list) else []
             nodes.append(
                 {
                     "id": str(card.get("card_id") or ""),
@@ -629,14 +903,47 @@ class NewsSignalService:
                     "signal_date": card.get("signal_date"),
                     "signal_layer": card.get("signal_layer"),
                     "signal_score": card.get("signal_score"),
+                    "transmission_paths": (card.get("transmission_paths") or [])[:3],
+                    "source_previews": [
+                        {
+                            "title": raw.get("title"),
+                            "published_at": raw.get("published_at"),
+                            "source": raw.get("source"),
+                            "url": raw.get("url"),
+                        }
+                        for raw in raw_episodes[:3]
+                        if isinstance(raw, dict)
+                    ],
                 }
             )
         nodes.extend(target_nodes.values())
+        enriched_edges: List[Dict[str, Any]] = []
+        center_id = str(center.get("card_id") or "")
+        for edge in edges:
+            enriched = dict(edge)
+            target_card_id = str(edge.get("target_card_id") or "").strip()
+            target_card = card_details.get(target_card_id)
+            if target_card:
+                enriched["target_label"] = str(target_card.get("summary_short") or target_card_id)[:140]
+                enriched["target_signal_date"] = target_card.get("signal_date")
+                enriched["target_transmission_paths"] = (target_card.get("transmission_paths") or [])[:3]
+            elif edge.get("target_type") != "card":
+                enriched["target_label"] = _target_label(str(edge.get("target_id") or ""))
+
+            source_card_id = str(edge.get("source_card_id") or "").strip()
+            related_card_id = target_card_id if source_card_id == center_id else source_card_id
+            related_card = card_details.get(related_card_id)
+            if related_card and related_card_id != center_id:
+                enriched["related_card_id"] = related_card_id
+                enriched["related_label"] = str(related_card.get("summary_short") or related_card_id)[:140]
+                enriched["related_signal_date"] = related_card.get("signal_date")
+                enriched["related_transmission_paths"] = (related_card.get("transmission_paths") or [])[:3]
+            enriched_edges.append(enriched)
         return {
             "schema_version": NEWS_SIGNAL_SCHEMA_VERSION,
             "center_card_id": str(center.get("card_id") or ""),
             "nodes": nodes,
-            "edges": edges,
+            "edges": enriched_edges,
             "summary": {
                 "node_count": len(nodes),
                 "edge_count": len(edges),
@@ -649,6 +956,323 @@ class NewsSignalService:
     def refresh_outcomes(self) -> Dict[str, Any]:
         return self.repo.refresh_outcomes_from_seed_evaluations()
 
+    def backfill_extracted_events(
+        self,
+        *,
+        signal_date: str = "",
+        limit: int = 500,
+        only_missing: bool = True,
+    ) -> Dict[str, Any]:
+        """Backfill structured events from the relational source of truth."""
+
+        cards = self.repo.list_cards(
+            signal_date=signal_date or None,
+            limit=max(1, min(int(limit or 500), 500)),
+        )
+        cards_updated = 0
+        events_upserted = 0
+        skipped_existing = 0
+        errors: List[Dict[str, Any]] = []
+
+        for summary in cards:
+            card_id = str(summary.get("card_id") or "").strip()
+            if not card_id:
+                continue
+            try:
+                card = self.repo.get_card(card_id)
+                if not card:
+                    continue
+                existing_events = card.get("extracted_events") if isinstance(card.get("extracted_events"), list) else []
+                if only_missing and existing_events:
+                    skipped_existing += 1
+                    continue
+                raw_episodes = card.get("raw_episodes") if isinstance(card.get("raw_episodes"), list) else []
+                raw = raw_episodes[0] if raw_episodes else {
+                    "episode_id": (card.get("raw_episode_ids") or [f"card:{card_id}"])[0],
+                    "source": "news_signal_card",
+                    "signal_date": card.get("signal_date"),
+                    "title": card.get("summary_short"),
+                    "summary": card.get("summary_short"),
+                }
+                text = _normalize_news_content(
+                    card.get("summary_short"),
+                    raw.get("normalized_content"),
+                    raw.get("summary"),
+                    raw.get("content"),
+                    raw.get("title"),
+                )
+                primary_industries = _unique_strings(card.get("primary_industries") or [])
+                secondary_industries = _unique_strings(card.get("secondary_industries") or [])
+                company_impacts = card.get("company_impacts") if isinstance(card.get("company_impacts"), list) else []
+                events = _extract_news_events(
+                    raw=raw,
+                    card_id=card_id,
+                    primary_theme=primary_industries[0] if primary_industries else "实时消息",
+                    text=text or str(card.get("summary_short") or ""),
+                    related_boards=secondary_industries,
+                    company_impacts=company_impacts,
+                    tone=str(card.get("news_tone") or "neutral"),
+                    mapping_confidence=_float_or_none(card.get("mapping_confidence")) or 0.0,
+                    subject_names=_unique_strings(raw.get("subjects") or []),
+                    llm_extractor=self._event_llm_extractor,
+                )
+                if not events:
+                    errors.append({"card_id": card_id, "error": "no_events_extracted"})
+                    continue
+                saved_events = self.repo.upsert_extracted_events(events)
+                transmission_paths = _transmission_paths(
+                    primary_industries[0] if primary_industries else "实时消息",
+                    secondary_industries,
+                    company_impacts,
+                    text or str(card.get("summary_short") or ""),
+                    extracted_events=events,
+                )
+                diagnostics = card.get("diagnostics") if isinstance(card.get("diagnostics"), dict) else {}
+                diagnostics["event_extraction"] = _event_extraction_summary(events)
+                diagnostics["event_backfill"] = {
+                    "backfilled_at": datetime.now().isoformat(),
+                    "raw_episode_id": raw.get("episode_id"),
+                }
+                self.repo.update_event_projection(
+                    card_id,
+                    transmission_paths=transmission_paths,
+                    diagnostics=diagnostics,
+                )
+                cards_updated += 1
+                events_upserted += len(saved_events)
+            except Exception as exc:
+                logger.warning("news event backfill failed for %s: %s", card_id, exc, exc_info=True)
+                errors.append({"card_id": card_id, "error": str(exc)})
+
+        return {
+            "status": "ok" if not errors else ("partial" if cards_updated else "failed"),
+            "signal_date": signal_date or None,
+            "cards_scanned": len(cards),
+            "cards_updated": cards_updated,
+            "events_upserted": events_upserted,
+            "skipped_existing": skipped_existing,
+            "errors": errors,
+        }
+
+    def repair_company_mapping_gates(
+        self,
+        *,
+        signal_date: str = "",
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Remove legacy company mappings that are not explicit in source text."""
+
+        cards = self.repo.list_cards(
+            signal_date=signal_date or None,
+            limit=max(1, min(int(limit or 500), 500)),
+        )
+        updated_cards: List[Dict[str, Any]] = []
+        companies_removed = 0
+        for summary in cards:
+            card_id = str(summary.get("card_id") or "").strip()
+            card = self.repo.get_card(card_id) if card_id else None
+            if not card:
+                continue
+            existing_impacts = card.get("company_impacts") if isinstance(card.get("company_impacts"), list) else []
+            raw_episodes = card.get("raw_episodes") if isinstance(card.get("raw_episodes"), list) else []
+            source_text = _normalize_news_content(
+                card.get("summary_short"),
+                *[
+                    value
+                    for raw in raw_episodes
+                    if isinstance(raw, dict)
+                    for value in (
+                        raw.get("normalized_content"),
+                        raw.get("title"),
+                        raw.get("summary"),
+                        raw.get("content"),
+                    )
+                ],
+            )
+            accepted_impacts = _stocks_explicitly_mentioned(existing_impacts, source_text)
+            generic_company_teaser = _is_unresolved_company_teaser(source_text, accepted_impacts)
+            if len(accepted_impacts) == len(existing_impacts) and not generic_company_teaser:
+                continue
+            removed_count = len(existing_impacts) - len(accepted_impacts)
+            companies_removed += removed_count
+            mapping_confidence = max(
+                (_float_or_none(item.get("confidence")) or 0.0 for item in accepted_impacts),
+                default=0.35,
+            )
+            mapping_status = "mapped" if accepted_impacts else "industry_only"
+            signal_layer = "macro" if _macro_theme_for_text(source_text) else ("company" if accepted_impacts else "industry")
+            current_score = _float_or_none(card.get("signal_score")) or 0.0
+            signal_score = current_score if accepted_impacts else min(current_score, 49.0)
+            if generic_company_teaser:
+                signal_score = min(signal_score, 35.0)
+            evidence_grade = str(card.get("evidence_grade") or "plausible")
+            if not accepted_impacts and evidence_grade == "confirmed":
+                evidence_grade = "plausible" if card.get("primary_industries") else "speculative"
+            if generic_company_teaser:
+                evidence_grade = "speculative"
+            diagnostics = dict(card.get("diagnostics") or {})
+            diagnostics["company_mapping_gate"] = {
+                **_company_mapping_gate(
+                    candidate_count=len(existing_impacts),
+                    accepted_count=len(accepted_impacts),
+                ),
+                "repaired_at": datetime.now().isoformat(),
+                "removed_count": removed_count,
+                "suppression_reason": "generic_company_teaser_without_explicit_company" if generic_company_teaser else "",
+            }
+            extracted_events = card.get("extracted_events") if isinstance(card.get("extracted_events"), list) else []
+            primary_industries = _unique_strings(card.get("primary_industries") or [])
+            transmission_paths = _transmission_paths(
+                primary_industries[0] if primary_industries else "实时消息",
+                _unique_strings(card.get("secondary_industries") or []),
+                accepted_impacts,
+                source_text,
+                extracted_events=extracted_events,
+            )
+            saved = self.repo.update_company_mapping_projection(
+                card_id,
+                company_impacts=accepted_impacts,
+                mapping_status=mapping_status,
+                mapping_confidence=mapping_confidence,
+                signal_layer=signal_layer,
+                signal_score=signal_score,
+                evidence_grade=evidence_grade,
+                status="suppressed" if generic_company_teaser else str(card.get("status") or "active"),
+                transmission_paths=transmission_paths,
+                diagnostics=diagnostics,
+            )
+            if saved:
+                updated_cards.append(saved)
+
+        affected_dates = sorted(
+            {
+                str(card.get("signal_date") or "")
+                for card in updated_cards
+                if card.get("signal_date")
+            }
+        )
+        outbox_enqueued = self._enqueue_graphiti_jobs(
+            updated_cards,
+            signal_dates=affected_dates,
+        )
+        return {
+            "status": "ok",
+            "cards_scanned": len(cards),
+            "cards_updated": len(updated_cards),
+            "companies_removed": companies_removed,
+            "affected_dates": affected_dates,
+            "outbox_enqueued": outbox_enqueued,
+        }
+
+    def reconcile_same_event_clusters(
+        self,
+        *,
+        signal_date: str = "",
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Merge strong same-event card clusters into one canonical active card."""
+
+        capped_limit = max(1, min(int(limit or 500), 500))
+        self.rebuild_edges(signal_date=signal_date, limit=capped_limit)
+        cards = self.repo.list_cards(
+            signal_date=signal_date or None,
+            status="active",
+            limit=capped_limit,
+        )
+        card_by_id = {
+            str(card.get("card_id") or ""): card
+            for card in cards
+            if str(card.get("card_id") or "").strip()
+        }
+        edges = self.repo.list_edges(
+            signal_date=signal_date or None,
+            edge_class="event_clue",
+            limit=10000,
+        )
+        adjacency: Dict[str, set[str]] = {}
+        for edge in edges:
+            if str(edge.get("edge_type") or "") != "same_event":
+                continue
+            source_id = str(edge.get("source_card_id") or "").strip()
+            target_id = str(edge.get("target_card_id") or "").strip()
+            if source_id not in card_by_id or target_id not in card_by_id:
+                continue
+            adjacency.setdefault(source_id, set()).add(target_id)
+            adjacency.setdefault(target_id, set()).add(source_id)
+
+        visited: set[str] = set()
+        clusters: List[List[str]] = []
+        for card_id in sorted(adjacency):
+            if card_id in visited:
+                continue
+            stack = [card_id]
+            members: List[str] = []
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                members.append(current)
+                stack.extend(sorted(adjacency.get(current, set()) - visited))
+            if len(members) > 1:
+                clusters.append(sorted(members))
+
+        canonical_cards: List[Dict[str, Any]] = []
+        suppressed = 0
+        cluster_details = []
+        for members in clusters:
+            canonical_id = max(
+                members,
+                key=lambda value: (
+                    _card_signal_score(card_by_id[value]),
+                    _card_quality_score(card_by_id[value]),
+                    str(card_by_id[value].get("signal_date") or ""),
+                ),
+            )
+            duplicate_ids = [value for value in members if value != canonical_id]
+            cluster_id = _stable_id("event-cluster", *members)
+            canonical = self.repo.merge_same_event_cluster(
+                canonical_card_id=canonical_id,
+                duplicate_card_ids=duplicate_ids,
+                cluster_id=cluster_id,
+            )
+            if not canonical:
+                continue
+            canonical_cards.append(canonical)
+            suppressed += len(duplicate_ids)
+            cluster_details.append(
+                {
+                    "cluster_id": cluster_id,
+                    "canonical_card_id": canonical_id,
+                    "duplicate_card_ids": duplicate_ids,
+                }
+            )
+
+        affected_dates = sorted(
+            {
+                str(card.get("signal_date") or "")
+                for card in canonical_cards
+                if card.get("signal_date")
+            }
+        )
+        edge_sync = [
+            self.rebuild_edges(signal_date=value, limit=capped_limit)
+            for value in affected_dates
+        ]
+        outbox_enqueued = self._enqueue_graphiti_jobs(
+            canonical_cards,
+            signal_dates=affected_dates,
+        )
+        return {
+            "status": "ok",
+            "cards_scanned": len(cards),
+            "clusters_merged": len(canonical_cards),
+            "cards_suppressed": suppressed,
+            "clusters": cluster_details,
+            "edge_sync": edge_sync,
+            "outbox_enqueued": outbox_enqueued,
+        }
+
     def sync_graphiti(
         self,
         *,
@@ -656,6 +1280,7 @@ class NewsSignalService:
         signal_date: str = "",
         limit: int = 100,
         include_semantic_edges: bool = False,
+        include_episodes: bool = True,
     ) -> Dict[str, Any]:
         """Synchronize news signal cards into Graphiti episodes."""
 
@@ -680,12 +1305,16 @@ class NewsSignalService:
                 if card:
                     cards.append(card)
         else:
-            cards = self.repo.list_graph_sync_candidates(signal_date=signal_date or None, limit=limit)
+            cards = (
+                self.repo.list_graph_sync_candidates(signal_date=signal_date or None, limit=limit)
+                if include_episodes
+                else self.repo.list_cards(signal_date=signal_date or None, limit=limit)
+            )
 
         edge_sync = {"status": "skipped", "reason": "no_cards"}
         if cards:
             edge_sync = self.rebuild_edges(
-                signal_date=signal_date or str(cards[0].get("signal_date") or ""),
+                signal_date=signal_date,
                 limit=max(limit, len(cards)),
                 include_semantic=include_semantic_edges,
             )
@@ -693,30 +1322,39 @@ class NewsSignalService:
             self.repo,
             card_ids=[str(card.get("card_id") or "") for card in cards],
             signal_date=signal_date,
-            limit=2000,
+            limit=max(2000, min(10000, len(cards) * 40)),
         )
 
         synced = 0
         failed = 0
         skipped = 0
         details: List[Dict[str, Any]] = []
-        for card in cards[: max(1, min(int(limit or 100), 500))]:
-            card_id = str(card.get("card_id") or "")
-            if card.get("status") != "active":
-                skipped += 1
-                details.append({"card_id": card_id, "status": "skipped", "reason": "card_not_active"})
-                continue
-            result = graphiti.ingest_news_signal_card_sync(card=card, market="cn")
-            result_status = str(result.get("status") or "")
-            if result_status == "synced":
-                self.repo.update_graph_sync_status(card_id, status="synced")
-                synced += 1
-            elif result_status == "failed":
-                self.repo.update_graph_sync_status(card_id, status="failed", error=str(result.get("error") or "graphiti sync failed"))
-                failed += 1
-            else:
-                skipped += 1
-            details.append({"card_id": card_id, **result})
+        episode_sync: Dict[str, Any] = {"status": "skipped", "reason": "disabled_by_request"}
+        if include_episodes:
+            for card in cards[: max(1, min(int(limit or 100), 500))]:
+                card_id = str(card.get("card_id") or "")
+                if card.get("status") != "active":
+                    skipped += 1
+                    details.append({"card_id": card_id, "status": "skipped", "reason": "card_not_active"})
+                    continue
+                result = graphiti.ingest_news_signal_card_sync(card=card, market="cn")
+                result_status = str(result.get("status") or "")
+                if result_status == "synced":
+                    self.repo.update_graph_sync_status(card_id, status="synced")
+                    synced += 1
+                elif result_status == "failed":
+                    self.repo.update_graph_sync_status(card_id, status="failed", error=str(result.get("error") or "graphiti sync failed"))
+                    failed += 1
+                else:
+                    skipped += 1
+                details.append({"card_id": card_id, **result})
+            episode_sync = {
+                "status": "ok" if failed == 0 else ("partial" if synced or skipped else "failed"),
+                "requested": len(cards),
+                "synced": synced,
+                "failed": failed,
+                "skipped": skipped,
+            }
 
         graph_edge_sync = {"status": "skipped", "reason": "no_edges"}
         if graph_edges and hasattr(graphiti, "sync_news_signal_edges_sync"):
@@ -725,12 +1363,26 @@ class NewsSignalService:
             except Exception as exc:
                 graph_edge_sync = {"status": "failed", "error": str(exc)}
 
+        phase_statuses = {
+            str(episode_sync.get("status") or "skipped"),
+            str(edge_sync.get("status") or "skipped"),
+            str(graph_edge_sync.get("status") or "skipped"),
+        }
+        incomplete_statuses = phase_statuses - {"ok", "skipped"}
+        if "failed" in phase_statuses:
+            status = "partial" if {"ok", "skipped"} & phase_statuses else "failed"
+        elif incomplete_statuses or failed:
+            status = "partial"
+        else:
+            status = "ok"
+
         return {
-            "status": "ok" if failed == 0 else ("partial" if synced or skipped else "failed"),
+            "status": status,
             "requested": len(cards),
             "synced": synced,
             "failed": failed,
             "skipped": skipped,
+            "episode_sync": episode_sync,
             "edge_sync": edge_sync,
             "graph_edge_sync": graph_edge_sync,
             "details": details,
@@ -766,7 +1418,12 @@ class NewsSignalService:
 
         by_id = {str(card.get("card_id") or ""): card for card in cards if card.get("card_id")}
         edges: List[Dict[str, Any]] = []
-        threshold = 0.76
+        threshold_profile = resolve_semantic_threshold(
+            model,
+            profiles_json=str(getattr(config, "news_signal_embedding_thresholds_json", "") or ""),
+        )
+        threshold = float(threshold_profile["threshold"])
+        similarities: List[float] = []
         for idx, left in enumerate(cards):
             left_id = str(left.get("card_id") or "")
             left_vec = vectors.get(left_id)
@@ -778,6 +1435,7 @@ class NewsSignalService:
                 if not right_id or not right_vec:
                     continue
                 similarity = _cosine_similarity(left_vec, right_vec)
+                similarities.append(similarity)
                 if similarity < threshold:
                     continue
                 source, target = _ordered_card_pair(by_id[left_id], by_id[right_id])
@@ -797,7 +1455,7 @@ class NewsSignalService:
                     rationale=f"新闻卡片语义相似度 {similarity:.3f}，仅作为弱语义线索，需要实体或事件证据确认。",
                     evidence=evidence,
                     embedding_model=model or "test-vector",
-                    threshold_profile="news-card-similarity.v1",
+                    threshold_profile=str(threshold_profile["profile"]),
                     decay_rule="14d",
                 )
                 if float(edge.get("edge_quality") or 0.0) >= SEMANTIC_EDGE_MIN_QUALITY:
@@ -807,6 +1465,8 @@ class NewsSignalService:
             "status": "ok",
             "embedding_model": model or "provided_vectors",
             "threshold": threshold,
+            "threshold_profile": threshold_profile,
+            "similarity_distribution": _similarity_distribution(similarities),
             "min_quality": SEMANTIC_EDGE_MIN_QUALITY,
             "top_k_per_card": SEMANTIC_EDGE_TOP_K_PER_CARD,
             "edges": len(edges),
@@ -966,6 +1626,8 @@ class NewsSignalService:
         concept_payload = self._concept_mapping.get(theme, {}) if isinstance(self._concept_mapping.get(theme), dict) else {}
         related_boards = _unique_strings(item.get("related_boards") or concept_payload.get("related_boards") or [])
         mapped_stocks = item.get("mapped_stocks") if isinstance(item.get("mapped_stocks"), list) else concept_payload.get("mapped_stocks") or []
+        mapped_stock_count = len(mapped_stocks)
+        mapped_stocks = _stocks_explicitly_mentioned(mapped_stocks, evidence)
         tone = _tone_from_polarity(item.get("polarity") or _infer_tone(evidence))
         horizon, decay, valid_until = _horizon_for_text(evidence, datetime.combine(target, time(hour=9)))
         company_impacts, mapping_status, mapping_confidence = _company_impacts_from_mapped_stocks(mapped_stocks, tone)
@@ -1039,6 +1701,10 @@ class NewsSignalService:
                 "keywords": item.get("keywords") or [],
                 "high_impact_terms": item.get("high_impact_terms") or [],
                 "mapping_source": "concept_mapping.json",
+                "company_mapping_gate": _company_mapping_gate(
+                    candidate_count=mapped_stock_count,
+                    accepted_count=len(company_impacts),
+                ),
                 "raw_quality": raw_quality,
                 "quality_gate": _quality_gate(raw_quality),
                 "event_extraction": _event_extraction_summary(extracted_events),
@@ -1060,9 +1726,18 @@ class NewsSignalService:
             secondary.extend(_unique_strings(payload.get("related_boards") or []))
             mapped = payload.get("mapped_stocks") if isinstance(payload.get("mapped_stocks"), list) else []
             mapped_stocks.extend(mapped[:5])
-        explicit_company_impacts, explicit_status, explicit_confidence = _company_impacts_from_cls_stocks(item.get("stocks") or [], _infer_tone(text))
-        mapped_company_impacts, mapped_status, mapped_confidence = _company_impacts_from_mapped_stocks(mapped_stocks, _infer_tone(text))
+        source_stocks = item.get("stocks") if isinstance(item.get("stocks"), list) else []
+        company_candidate_count = len(source_stocks) + len(mapped_stocks)
+        explicit_stocks = _stocks_explicitly_mentioned(source_stocks, text)
+        explicitly_mapped_stocks = _stocks_explicitly_mentioned(mapped_stocks, text)
+        explicit_company_impacts, explicit_status, explicit_confidence = _company_impacts_from_cls_stocks(explicit_stocks, _infer_tone(text))
+        mapped_company_impacts, mapped_status, mapped_confidence = _company_impacts_from_mapped_stocks(explicitly_mapped_stocks, _infer_tone(text))
         company_impacts = _merge_company_impacts(explicit_company_impacts + mapped_company_impacts)
+        company_mapping_gate = _company_mapping_gate(
+            candidate_count=company_candidate_count,
+            accepted_count=len(company_impacts),
+        )
+        generic_company_teaser = _is_unresolved_company_teaser(text, company_impacts)
         mapping_status, mapping_confidence = _combine_mapping_status(
             explicit_status,
             explicit_confidence,
@@ -1091,6 +1766,9 @@ class NewsSignalService:
             mapping_confidence=mapping_confidence,
         )
         adjusted_score = _score_with_quality(base_score, raw_quality)
+        if generic_company_teaser:
+            adjusted_score = min(adjusted_score, 35.0)
+            evidence_grade = "speculative"
         card_id = _stable_id(f"card:{raw_prefix}", item.get("id"), item.get("url"), item.get("title"), item.get("published_at"))
         extracted_events = _extract_news_events(
             raw=raw,
@@ -1123,7 +1801,7 @@ class NewsSignalService:
             "mapping_status": mapping_status,
             "mapping_confidence": mapping_confidence,
             "signal_score": adjusted_score,
-            "status": _status_from_quality(raw_quality),
+            "status": "suppressed" if generic_company_teaser else _status_from_quality(raw_quality),
             "primary_industries": primary,
             "secondary_industries": _unique_strings(secondary)[:6],
             "explicit_entities": _unique_strings(subject_names + [stock.get("name") for stock in item.get("stocks") or [] if isinstance(stock, dict)]),
@@ -1139,6 +1817,8 @@ class NewsSignalService:
                 "signal_layer": signal_layer,
                 "concepts": [concept for concept, _ in concepts],
                 "mapping_source": "concept_mapping.json",
+                "company_mapping_gate": company_mapping_gate,
+                "suppression_reason": "generic_company_teaser_without_explicit_company" if generic_company_teaser else "",
                 "important": bool(item.get("is_important")),
                 "score": item.get("score"),
                 "rank": item.get("rank"),
@@ -1266,6 +1946,21 @@ def _resolve_target_date(value: str) -> date:
     if parsed:
         return parsed
     return get_effective_trading_date("cn")
+
+
+def _normalize_stock_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    if "." in text:
+        parts = [part for part in text.split(".") if part]
+        for part in parts:
+            if part.isdigit() and 5 <= len(part) <= 6:
+                return part.zfill(6)
+    digits = "".join(char for char in text if char.isdigit())
+    if 5 <= len(digits) <= 6:
+        return digits.zfill(6)
+    return text
 
 
 def _signal_date_and_session(value: datetime) -> Tuple[date, str]:
@@ -1703,6 +2398,47 @@ def _company_impacts_from_mapped_stocks(stocks: Any, tone: str) -> Tuple[List[Di
     if any(item.get("mapping_status") == "ambiguous" for item in impacts):
         return impacts, "ambiguous", 0.55
     return impacts, "mapped", 0.78
+
+
+def _stocks_explicitly_mentioned(stocks: Any, text: str) -> List[Dict[str, Any]]:
+    if not isinstance(stocks, list) or not stocks:
+        return []
+    haystack = str(text or "").upper()
+    accepted: List[Dict[str, Any]] = []
+    for stock in stocks:
+        if not isinstance(stock, dict):
+            continue
+        code = str(stock.get("code") or stock.get("symbol") or stock.get("ts_code") or "").strip().upper()
+        name = str(stock.get("name") or stock.get("stock_name") or "").strip()
+        code_variants = {code, code.split(".")[0]} if code else set()
+        code_mentioned = any(value and value in haystack for value in code_variants)
+        name_mentioned = len(name) >= 2 and name.upper() in haystack
+        if code_mentioned or name_mentioned:
+            accepted.append(stock)
+    return accepted
+
+
+def _is_unresolved_company_teaser(text: str, company_impacts: Any) -> bool:
+    if isinstance(company_impacts, list) and company_impacts:
+        return False
+    normalized = str(text or "")
+    return any(term in normalized for term in GENERIC_COMPANY_TEASER_TERMS)
+
+
+def _company_mapping_gate(*, candidate_count: int, accepted_count: int) -> Dict[str, Any]:
+    if accepted_count > 0:
+        status = "explicit_company_only"
+    elif candidate_count > 0:
+        status = "blocked_no_explicit_company"
+    else:
+        status = "no_company_candidates"
+    return {
+        "status": status,
+        "candidate_count": int(candidate_count or 0),
+        "accepted_count": int(accepted_count or 0),
+        "dropped_count": max(0, int(candidate_count or 0) - int(accepted_count or 0)),
+        "rule": "company_name_or_stock_code_must_appear_in_news_text",
+    }
 
 
 def _company_impacts_from_cls_stocks(stocks: Any, tone: str) -> Tuple[List[Dict[str, Any]], str, float]:
@@ -2456,7 +3192,11 @@ def _build_typed_relation_edges(cards: List[Dict[str, Any]]) -> List[Dict[str, A
         card_id = str(card.get("card_id") or "")
         if not card_id:
             continue
-        for industry in _unique_strings(card.get("primary_industries") or []):
+        for industry in (
+            value
+            for value in _unique_strings(card.get("primary_industries") or [])
+            if value not in GENERIC_RELATION_THEMES
+        ):
             target_type = "macro_theme" if card.get("signal_layer") == "macro" else "industry"
             edge_type = "affects_macro_theme" if target_type == "macro_theme" else "impacts_industry"
             edges.append(_edge_payload(
@@ -2476,7 +3216,11 @@ def _build_typed_relation_edges(cards: List[Dict[str, Any]]) -> List[Dict[str, A
                 },
                 decay_rule=str(card.get("decay_rule") or "3d"),
             ))
-        for industry in _unique_strings(card.get("secondary_industries") or []):
+        for industry in (
+            value
+            for value in _unique_strings(card.get("secondary_industries") or [])
+            if value not in GENERIC_RELATION_THEMES
+        ):
             edges.append(_edge_payload(
                 source_card_id=card_id,
                 target_type="industry",
@@ -2564,11 +3308,17 @@ def _build_event_clue_edges(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             if common_companies:
                 weight = max(weight, 0.88)
                 reasons.append(f"共同公司：{'、'.join(common_companies[:5])}")
-            common_primary = sorted(set(_unique_strings(left.get("primary_industries") or [])) & set(_unique_strings(right.get("primary_industries") or [])))
+            common_primary = sorted(
+                _meaningful_relation_themes(left.get("primary_industries"))
+                & _meaningful_relation_themes(right.get("primary_industries"))
+            )
             if common_primary:
                 weight = max(weight, 0.74)
                 reasons.append(f"共同主主题：{'、'.join(common_primary[:5])}")
-            common_secondary = sorted(set(_unique_strings(left.get("secondary_industries") or [])) & set(_unique_strings(right.get("secondary_industries") or [])))
+            common_secondary = sorted(
+                _meaningful_relation_themes(left.get("secondary_industries"))
+                & _meaningful_relation_themes(right.get("secondary_industries"))
+            )
             if common_secondary:
                 weight = max(weight, 0.62)
                 reasons.append(f"共同次级主题：{'、'.join(common_secondary[:5])}")
@@ -2577,8 +3327,30 @@ def _build_event_clue_edges(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 reasons.append("同类宏观变量线索")
             if not reasons:
                 continue
+            common_event_categories = sorted(_event_categories(left) & _event_categories(right))
+            common_entities = sorted(
+                set(_unique_strings(left.get("explicit_entities") or []))
+                & set(_unique_strings(right.get("explicit_entities") or []))
+            )
+            text_similarity = _character_shingle_similarity(
+                str(left.get("summary_short") or ""),
+                str(right.get("summary_short") or ""),
+            )
+            time_distance_days = _time_distance_days(left, right)
+            same_event = bool(
+                common_event_categories
+                and (common_companies or common_entities)
+                and text_similarity >= 0.22
+                and (time_distance_days is None or time_distance_days <= 3)
+            )
+            if same_event:
+                weight = max(weight, 0.92)
+                reasons.insert(
+                    0,
+                    f"同一事件演化候选：事件类型 {'、'.join(common_event_categories[:3])}，文本相似度 {text_similarity:.2f}",
+                )
             source, target = _ordered_card_pair(left, right)
-            edge_type = "same_company" if common_companies else ("same_macro_theme" if left.get("signal_layer") == right.get("signal_layer") == "macro" else "same_theme")
+            edge_type = "same_event" if same_event else ("same_company" if common_companies else ("same_macro_theme" if left.get("signal_layer") == right.get("signal_layer") == "macro" else "same_theme"))
             edges.append(_edge_payload(
                 source_card_id=source,
                 target_type="card",
@@ -2593,12 +3365,46 @@ def _build_event_clue_edges(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     "common_companies": common_companies,
                     "common_primary_industries": common_primary,
                     "common_secondary_industries": common_secondary,
+                    "common_event_categories": common_event_categories,
+                    "common_entities": common_entities,
+                    "text_similarity": round(text_similarity, 6),
+                    "same_event": same_event,
                     **_edge_pair_evidence(left, right),
                 },
-                threshold_profile="news-card-event-clue.v1",
+                threshold_profile="news-card-event-clue.v2",
                 decay_rule="14d",
             ))
     return _dedupe_edges(edges)
+
+
+def _event_categories(card: Dict[str, Any]) -> set[str]:
+    return {
+        str(path.get("event_category") or "").strip()
+        for path in card.get("transmission_paths") or []
+        if isinstance(path, dict) and str(path.get("event_category") or "").strip()
+    }
+
+
+def _meaningful_relation_themes(values: Any) -> set[str]:
+    return {
+        value
+        for value in _unique_strings(values or [])
+        if value not in GENERIC_RELATION_THEMES
+    }
+
+
+def _character_shingle_similarity(left: str, right: str) -> float:
+    def _shingles(value: str) -> set[str]:
+        normalized = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
+        if len(normalized) < 2:
+            return {normalized} if normalized else set()
+        return {normalized[index:index + 2] for index in range(len(normalized) - 1)}
+
+    left_values = _shingles(left)
+    right_values = _shingles(right)
+    if not left_values or not right_values:
+        return 0.0
+    return len(left_values & right_values) / len(left_values | right_values)
 
 
 def _card_quality_score(card: Dict[str, Any]) -> float:
@@ -2906,6 +3712,24 @@ def _cosine_similarity(left: List[float], right: List[float]) -> float:
     if left_norm == 0 or right_norm == 0:
         return 0.0
     return round(dot / (left_norm * right_norm), 6)
+
+
+def _similarity_distribution(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {"sample_count": 0, "min": None, "p50": None, "p90": None, "max": None}
+    ordered = sorted(float(value) for value in values)
+
+    def _percentile(fraction: float) -> float:
+        index = max(0, min(len(ordered) - 1, round((len(ordered) - 1) * fraction)))
+        return round(ordered[index], 6)
+
+    return {
+        "sample_count": len(ordered),
+        "min": round(ordered[0], 6),
+        "p50": _percentile(0.5),
+        "p90": _percentile(0.9),
+        "max": round(ordered[-1], 6),
+    }
 
 
 def _run_async(coro):

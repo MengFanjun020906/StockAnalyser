@@ -1,6 +1,6 @@
 # Graphiti 时序知识图谱集成计划
 
-> 实施状态：最小可用路径已接入。当前实现包含 Graphiti/Neo4j 配置、LiteLLM LLM/Embedding 适配器、Graphiti 服务封装、普通/Agent 分析结果入图、新闻信号卡片 Graphiti episode 投影、新闻卡片确定性边表与 Neo4j 显式关系投影、Agent `search_knowledge_graph` 检索工具、Docker Neo4j profile、`test_env.py --graph` 连通性检查和基础单元测试。选股 Prompt 直接注入图谱证据、用户画像图谱仍按后续阶段推进。
+> 实施状态：新闻信号与选股图谱链路已闭环。当前实现包含 Graphiti/Neo4j 配置、LiteLLM LLM/Embedding 适配器、Graphiti 服务封装、普通/Agent 分析结果入图、新闻信号关系型真源、严格公司映射门、同事件归并、可读关联与传导展示、确定性边 Neo4j 投影、durable outbox、财联社增量调度、Agent `search_knowledge_graph`，以及选股 Prompt 1/5 的强制图谱证据注入和降级护栏。用户画像图谱按需求暂缓。
 
 ## 1. 背景与目标
 
@@ -1083,11 +1083,11 @@ volumes:
 - [x] 新增 `news_signal_edges` 关系型真源表，支持 `typed_relation`、`event_clue` 和显式 `semantic_similarity` 三类边。
 - [x] 新增 `/api/v1/news-signals/edges`、`/api/v1/news-signals/edges/rebuild` 和 `/api/v1/news-signals/{card_id}/graph`，用于页面读取边、重建边和展示单卡局部图。
 - [x] Graphiti 同步会将 `news_signal_edges` best-effort 投影到 Neo4j，生成 `NEWS_SIGNAL_TYPED_RELATION`、`NEWS_SIGNAL_EVENT_CLUE`、`NEWS_SIGNAL_SEMANTIC_SIMILARITY` 显式关系。
-- [ ] 让新闻卡片作为 `theme_catalyst_desk` / seed pool 的证据输入，不新增独立新闻选股直通链路。
-- [ ] 将新闻卡片自动链接到 seed item，并让 `SelectionSeedPoolEvaluation` 结果稳定回流到 `news_signal_outcomes`。
-- [ ] 实现 `daily_run.sh` 盘后批处理调度、财联社电报定时增量、预算配置和限流开关。
-- [ ] 完整 Graphiti outbox worker、定时 repair 和幂等区间 rebuild。
-- [ ] embedding 阈值 per-model 校准、跨模型重算审计和同事件归并；当前已支持显式 semantic edge rebuild，但不默认阻塞卡片生成。
+- [x] 让新闻卡片作为 `theme_catalyst_desk` / seed pool 的证据输入，不新增独立新闻选股直通链路；当前只增强已由其它来源召回的同代码 seed。
+- [x] 将新闻卡片自动链接到 seed item，并让 `SelectionSeedPoolEvaluation` 结果通过维护任务回流到 `news_signal_outcomes`。
+- [x] 完成新闻信号调度：`daily_run.sh` 盘后 opt-in 批处理，以及 `main.py --schedule` 下财联社电报 5-10 分钟增量入库。
+- [x] 完成 durable Graphiti outbox worker、指数退避、死信、单任务超时、删除优先级、指标/API 和幂等 repair。
+- [x] 完成 embedding per-model 阈值配置与分布审计、同事件强门槛和物理归并；跨模型重算仍通过显式 rebuild 人工触发，不阻塞卡片生成。
 
 ### 6.1 2026-07-04 当前进度记录
 
@@ -1126,7 +1126,7 @@ volumes:
 - [x] 对新闻正文做规范化：清理 JSON 包装、HTML/多余空白、重复标题、截断异常、来源模板话术，生成更适合阅读和 embedding 的 `normalized_content` 或等价投影字段。
 - 增加重要性过滤：宏观层优先保留非农、CPI/PPI/PMI、央行公开市场、MLF/LPR、降准降息、汇率/利率等；产业层优先保留价格、供需、政策、订单、技术路线、制裁/禁令、产能变化等。
 - 改进 `signal_layer` 判定：避免人民银行行政处罚等普通公司新闻被误判为宏观流动性；宏观消息避免被概念词典错误映射到公司。
-- 改进公司映射质量：显式股票 > 权威来源关联 > 主题词典映射；低置信度或同名歧义时只保留产业级证据，不注入具体股票。
+- [x] 改进公司映射质量：公司名或股票代码必须在新闻正文出现；主题词典只保留显式命中的公司，代称式公司导语无明确主体时降为 `suppressed` 和产业级审计证据。
 - [x] 增加第一版低质量处理：低质量原始消息保留审计，但生成卡片时标记 `low_quality` 并显著降权，不进入 active 图谱主路径。
 - [x] Web 卡片详情展示入库质量：展示来源质量分、质量等级、质量 flags 和规范化正文预览。
 - 增加人工反馈读路径：`wrong/noisy/duplicate/remove_company` 不只降权，还要进入后续入库过滤、映射黑名单或规则修正。
@@ -1155,8 +1155,8 @@ volumes:
 - 将边分层展示和使用：`typed_relation` 是实体事实边，`event_clue` 是规则事件线索，`semantic_similarity` 是弱语义相似；Agent 不得把弱语义边直接当成因果。
 - [x] 为边增加质量评分第一版：实体重叠、主题重叠、时间距离、来源质量、映射置信度、embedding 相似度共同决定 `edge_quality`、`quality_grade`、`quality_flags`。
 - [x] 限制语义边密度第一版：语义边先过最低质量门，再按每张卡 top-k 保留，避免小样本日期生成过密弱连接网。
-- 建立 per-model embedding 阈值校准：`mxbai-embed-large` 的 `0.76` 只作为当前实验阈值，后续需要用样本分布和人工反馈重新校准。
-- 区分“同一事件”“同一主题”“同一产业链传导”：同一事件才可强绑定；同主题只做弱边；产业链传导需要可解释路径。
+- [x] 建立 per-model embedding 阈值配置与审计：按模型解析阈值 profile，并在重建结果记录相似度 min/p50/p90/max 分布；后续仍可基于人工反馈调整 profile 数值。
+- [x] 区分“同一事件”“同一主题”“同一产业链传导”：`same_event` 同时要求事件类型、公司/实体锚点、文本相似度和三日窗口，并对高置信连通分量执行物理归并；同主题保持弱边，传导路径展示机制、目标和结论。
 - [x] 增加边审计展示第一版：Web 单卡事件线索展示强/中/弱边、质量分、生成理由和质量 flags；Neo4j 显式关系同步 `edge_quality` 与 `quality_grade`。
 - 建立边质量指标：平均每卡边数、强/弱边比例、人工否定率、语义边命中率、同事件误连率、孤立卡片比例。
 
@@ -1272,6 +1272,45 @@ volumes:
 - LLM 输出的实体链接还没有进入公司映射黑名单/消歧表；后续应把低置信度公司降级为产业级证据。
 - 事件类型仍是一组固定枚举，后续要为“国外供应链”和“国产替代”补专门模板和验证字段。
 
+### 6.9 2026-07-10 检索、选股证据与运行态 repair 实施记录
+
+已落地：
+
+- Graphiti `search_` 改用 `COMBINED_HYBRID_SEARCH_RRF`，避免未配置的默认 OpenAI cross-encoder 导致真实检索超时。
+- `search_knowledge_graph` 在 Graphiti 禁用、索引初始化失败或查询异常时，降级查询本地 `analysis_history` 与 active `news_signal_cards`，返回 `degraded=true` 和降级原因。
+- 新闻卡片新增 seed evidence gate：只匹配已由行情/资金/量价等来源召回的股票，不从新闻卡片直接新增候选；要求 active、非 speculative、明确公司映射、置信度/分数达标、未过期且公司方向为 benefit。
+- Seed Pool 快照保存时从 `trigger_signals` 提取 `news_signal_card` 引用，事务内自动写入 `news_signal_seed_links`；同日期快照重建会清理旧 link/outcome，避免悬空关系。
+- 新增 `/api/v1/news-signals/events/backfill`，可从关系型 RawNewsEpisode/NewsSignalCard 幂等补齐 `NewsExtractedEvent` 和事件传导路径。
+- `/api/v1/news-signals/graph-sync` 支持 `include_episodes=false`，日常 repair 可只重建确定性边并投影 Neo4j，不等待 Graphiti Core LLM 抽取。
+- 新增 `scripts/maintain_news_signals.py`；`scripts/daily_run.sh` 第三步在 `NEWS_SIGNAL_DAILY_ENABLED=true` 时执行当日重建、事件回填、outcome 刷新和可配置 Graphiti repair。
+- 2026-07-10 本地运行态 repair：关系库 195 张卡片全部扫描，158 张补齐事件；184 张 active 卡片重建并投影 3385 条显式关系到 Neo4j。
+
+后续状态：
+
+- 财联社增量调度、独立 Graphiti outbox、Prompt 1/5 图谱证据、per-model 阈值和同事件归并已于 2026-07-11 完成，见 6.10。
+- 反馈/收益驱动的自动权重校准仍是后续优化项，不影响当前确定性闭环。
+- 用户画像记忆按需求暂缓，不纳入本轮完成标准。
+
+### 6.10 2026-07-11 新闻质量、传导展示与异步图谱闭环
+
+已落地：
+
+- 公司映射改为严格显式门：公司名称或股票代码必须出现在新闻文本中，主题词典和来源候选不能再把“这家公司”扩散为一组股票。
+- 无明确公司主体的代称式导语降为 `suppressed`、信号分不高于 35、证据等级为 `speculative`；历史库 repair 扫描 230 张卡片，更新 125 张并移除 684 个无正文锚点的公司映射。
+- `same_event` 增加事件类型、实体锚点、字符片段相似度和三日窗口门槛；本地历史库归并 4 个高置信事件簇并压制 8 张重复卡。
+- `实时快讯`、`市场资讯`、`行业动态` 等泛化兜底主题不再生成 typed relation 或 `same_theme`，避免支付罚单、黄金和半导体等无关卡片互连。
+- Web 单卡事件线索展示关联新闻标题、日期、关系中文名、建边理由和传导机制/目标/结论，不再以 `card:xueqiu:...` 原始 ID 作为主要信息。
+- 财联社电报支持 5-10 分钟增量入库；Graphiti 使用关系库 outbox 独立消费，支持租约恢复、指数退避、死信、删除优先和 10-600 秒单任务超时。
+- suppressed 卡片在 outbox 消费端二次校验，旧 Graphiti episode 通过删除任务清理；Neo4j 显式边投影只接受 active 卡片，并清除非活跃卡关系。
+- 选股 Prompt 1 在候选发现前批量读取图谱证据，Prompt 5 单独读取风险/历史证据；图谱失败时使用关系型 fallback，并明确 `degraded` 与“弱语义边非因果”护栏。
+- embedding 语义边阈值支持按模型配置，重建结果输出相似度分布；默认仍不让 semantic edge 阻塞卡片生成。
+
+2026-07-11 真实运行态验证：
+
+- active 卡从 218 收敛到 179，模糊公司代称 active 残留为 0。
+- 关系库全量 rebuild 已物理清理 400 条涉及 suppressed 卡的旧边，最终保留并向 Neo4j 投影 1566 条 active 关系，同时清理 51 张非活跃卡范围；泛主题过滤后 event clue 从 1942 条收敛到 907 条。
+- 51 个 Graphiti 删除任务和 8 个按日边投影任务全部成功，无失败和死信；active episode 慢调用已验证会按单任务超时进入 `retry`，不再阻塞 worker。
+
 ### 阶段 0：基础设施
 
 - [x] `docker/docker-compose.yml` 加 Neo4j 服务（profile: graphiti），`start_all.sh` / `stop_all.sh` 支持 `START_NEO4J` / `STOP_NEO4J` 控制
@@ -1286,14 +1325,14 @@ volumes:
 - [x] `src/services/graphiti/litellm_client.py`：实现 `LLMClient`，桥接 LiteLLM
 - [x] `src/services/graphiti/litellm_embedder.py`：实现 `EmbedderClient`，桥接 LiteLLM
 - [x] 单元测试：`tests/test_graphiti_service.py` 覆盖 wrapper、序列化、初始化与离线检索路径
-- [ ] 在线验证：真实 Neo4j + LLM / Embedding 配置下执行 `python test_env.py --graph`
+- [x] 在线验证：真实 Neo4j + LLM / Embedding 配置下执行 `python test_env.py --graph`
 
 ### 阶段 2：GraphService 封装
 
 - [x] `src/services/graphiti/graph_service.py`：客户端管理、同步/异步桥接、开关控制
 - [x] `src/services/graphiti/ontology.py`：自定义实体类型
 - [x] 单元测试：禁用态、Neo4j 不可达、ingest / search 初始化、ontology 校验
-- [ ] 在线集成测试：真实 `add_episode` + `search` 端到端可用性
+- [x] 在线集成测试：真实 Neo4j + Ollama 下 RRF `search` 返回 edges / nodes / episodes；episode 写入已有 Agent Trace / event-watch 运行数据
 
 ### 阶段 3：Pipeline 接入
 
@@ -1312,16 +1351,18 @@ volumes:
 
 ### 阶段 5：新闻入图（可选）
 
-- [ ] `src/core/pipeline.py`：情报搜索后批量写入图谱
-- [ ] 验证：同一事件的多篇新闻被合并为一个事件节点
+- [x] 新闻信号通过 durable outbox 异步写入 Graphiti，关系型真源和显式边投影不受 episode 慢调用阻塞。
+- [x] 验证：同一事件强门槛连通分量物理归并，重复卡压制并合并来源、事件和传导信息。
 
 ### 阶段 6：选股链路增强（可选）
 
-- [ ] 选股 Prompt 1（候选发现）接入图谱查询
-- [ ] 选股 Prompt 5（反方审查）接入历史分析记录
-- [ ] 验证：选股结论引用了图谱中的关联证据
+- [x] 选股 Prompt 1（候选发现）接入批量图谱证据查询。
+- [x] 选股 Prompt 5（反方审查）接入独立风险/历史图谱查询。
+- [x] 验证：阶段上下文和 Trace 保存图谱证据、来源、降级状态与非因果护栏，候选席只增强已有 seed。
 
 ### 阶段 7：用户画像记忆（可选）
+
+> 本阶段按 2026-07-11 需求明确暂缓，不计入本轮闭环。
 
 - [ ] Agent 对话写入图谱（按用户 group_id 隔离）
 - [ ] 对话时先查用户 context graph 注入个性化上下文

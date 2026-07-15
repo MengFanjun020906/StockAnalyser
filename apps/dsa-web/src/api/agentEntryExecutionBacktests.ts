@@ -298,14 +298,14 @@ export const agentEntryExecutionBacktestsApi = {
   syncMinuteBars: async (options: EntryExecutionMinuteSyncOptions = {}): Promise<EntryExecutionMinuteSyncResponse> => {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/agent-entry-execution-backtests/minute-bars/sync', undefined, {
       params: {
-        limit: options.limit ?? 300,
+        limit: options.limit,
         decision_date: options.decisionDate || undefined,
         symbol: options.symbol || undefined,
         frequency: options.frequency ?? '5',
         adjustflag: options.adjustflag ?? '3',
         rebuild: options.rebuild ?? true,
       },
-      timeout: 180000,
+      timeout: 600000,
     });
     return toCamelCase<EntryExecutionMinuteSyncResponse>(response.data);
   },

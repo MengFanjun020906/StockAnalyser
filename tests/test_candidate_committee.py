@@ -1046,8 +1046,130 @@ def test_build_seed_pool_result_caps_total_limit_to_thirty_two():
             total_limit=32,
         )
 
-    assert result.total_limit == 32
-    assert len(result.seeds) <= 32
+        assert result.total_limit == 32
+        assert len(result.seeds) <= 32
+
+
+def test_build_seed_pool_enriches_existing_seed_with_news_signal_card_evidence():
+    service_instance = MagicMock()
+    service_instance.seed_evidence_for_codes.return_value = {
+        "requested_codes": 1,
+        "matched_codes": 1,
+        "attached_cards": 1,
+        "skipped": {},
+        "items_by_code": {
+            "600001": [
+                {
+                    "card_id": "card:news:600001",
+                    "summary_short": "订单催化已获得多源确认",
+                    "signal_date": "2026-07-10",
+                    "signal_layer": "company",
+                    "impact_horizon": "medium",
+                    "evidence_grade": "confirmed",
+                    "inference_level": "explicit",
+                    "mapping_confidence": 0.92,
+                    "signal_score": 82.0,
+                    "company_direction": "benefit",
+                    "company_confidence": 0.9,
+                    "company_rationale": "公告明确点名公司",
+                    "primary_industries": ["AI服务器"],
+                    "raw_episode_ids": ["raw:1"],
+                    "gate_result": "matched_existing_seed",
+                }
+            ]
+        },
+    }
+
+    with patch("src.services.news_signal_service.NewsSignalService", return_value=service_instance):
+        result = _build_seed_pool_result(
+            market="cn",
+            seed_symbols=["600001"],
+            tool_registry={},
+            today="20260710",
+            total_limit=1,
+        )
+
+    seed = result.seeds[0]
+    signal = next(item for item in seed.trigger_signals if item.get("signal_type") == "news_signal_card")
+    assert signal["value"]["card_id"] == "card:news:600001"
+    assert signal["value"]["gate_result"] == "matched_existing_seed"
+    assert "持久化新闻信号卡" in seed.context_hint
+    assert any(item.get("source") == "news_signal_cards" for item in result.diagnostics)
+
+
+def test_news_signal_evidence_matches_seed_code_with_exchange_suffix():
+    service_instance = MagicMock()
+    service_instance.seed_evidence_for_codes.return_value = {
+        "items_by_code": {
+            "600001": [
+                {
+                    "card_id": "card:news:600001",
+                    "summary_short": "后缀代码兼容",
+                    "signal_score": 80.0,
+                    "mapping_confidence": 0.9,
+                    "gate_result": "matched_existing_seed",
+                }
+            ]
+        },
+        "skipped": {},
+    }
+    buckets = {
+        "user_watchlist": [
+            committee_module.SeedItem(
+                code="600001.SH",
+                name="测试股票",
+                source="user_watchlist",
+            )
+        ]
+    }
+
+    with patch("src.services.news_signal_service.NewsSignalService", return_value=service_instance):
+        diagnostic = committee_module._attach_news_signal_card_evidence(
+            buckets,
+            signal_date="20260710",
+        )
+
+    seed = buckets["user_watchlist"][0]
+    signal = next(item for item in seed.trigger_signals if item.get("signal_type") == "news_signal_card")
+    assert signal["value"]["card_id"] == "card:news:600001"
+    assert diagnostic["status"] == "ok"
+    service_instance.seed_evidence_for_codes.assert_called_once_with(
+        ["600001"],
+        signal_date="2026-07-10",
+    )
+
+
+def test_build_seed_pool_attaches_required_knowledge_graph_evidence_to_seed():
+    graph_evidence = {
+        "required": True,
+        "status": "ok",
+        "source": "graphiti",
+        "degraded": False,
+        "by_code": {
+            "600001": [
+                {
+                    "type": "analysis_history",
+                    "code": "600001",
+                    "analysis_summary": "历史相似情形中订单兑现后趋势延续",
+                }
+            ]
+        },
+    }
+
+    result = _build_seed_pool_result(
+        market="cn",
+        seed_symbols=["600001"],
+        tool_registry={},
+        today="20260711",
+        total_limit=1,
+        graph_evidence=graph_evidence,
+    )
+
+    seed = result.seeds[0]
+    signal = next(item for item in seed.trigger_signals if item.get("signal_type") == "knowledge_graph_evidence")
+    assert signal["value"]["source"] == "graphiti"
+    assert signal["value"]["items"][0]["analysis_summary"].startswith("历史相似情形")
+    assert any(item.get("source") == "knowledge_graph" for item in result.diagnostics)
 
 
 def test_seed_pool_attaches_theme_momentum_profiles_with_partial_stockapi_sources():

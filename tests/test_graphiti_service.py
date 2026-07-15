@@ -5,7 +5,7 @@ import asyncio
 import json
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.litellm_stub import ensure_litellm_stub
 
@@ -14,6 +14,7 @@ ensure_litellm_stub()
 from graphiti_core.llm_client.config import ModelSize
 from graphiti_core.prompts.extract_nodes import ExtractedEntities
 from graphiti_core.prompts.models import Message
+from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
 
 from src.services.graphiti.graph_service import GraphitiService
 from src.services.graphiti.litellm_client import LiteLLMGraphitiClient
@@ -21,15 +22,27 @@ from src.services.graphiti.ontology import DEFAULT_ENTITY_TYPES, validate_entity
 
 
 class GraphitiServiceTestCase(unittest.TestCase):
-    def test_disabled_service_search_returns_disabled_error(self):
+    def test_disabled_service_search_uses_relational_fallback(self):
+        fallback = MagicMock()
+        fallback.search.return_value = {
+            "success": True,
+            "source": "relational_fallback",
+            "degraded": True,
+            "query": "贵州茅台",
+            "edges": [],
+            "nodes": [],
+            "episodes": [{"type": "analysis_history", "code": "600519"}],
+        }
         with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
             mock_get_config.return_value.graphiti_enabled = False
-            service = GraphitiService()
+            service = GraphitiService(fallback_search=fallback)
 
         result = service.search_sync("贵州茅台")
 
-        self.assertFalse(result["success"])
-        self.assertEqual(result["error"], "Graphiti is disabled")
+        self.assertTrue(result["success"])
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["source"], "relational_fallback")
+        fallback.search.assert_called_once_with("贵州茅台", market=None, limit=10, reason="graphiti_disabled")
 
     def test_litellm_client_uses_json_schema_and_recovers_schema_echo(self):
         seen = {}
@@ -203,6 +216,26 @@ class GraphitiServiceTestCase(unittest.TestCase):
         service._client.build_indices_and_constraints.assert_awaited_once()
         service._client.add_episode.assert_awaited_once()
 
+    def test_remove_news_signal_card_deletes_matching_group_episode(self):
+        with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
+            cfg = mock_get_config.return_value
+            cfg.graphiti_enabled = False
+            cfg.graphiti_group_strategy = "market"
+            service = GraphitiService()
+
+        service.enabled = True
+        service._client = AsyncMock()
+        service._client.driver.execute_query.return_value = ([{"uuid": "episode-1"}], None, None)
+
+        result = asyncio.run(service.remove_news_signal_card(card_id="card:cls:bad", market="cn"))
+
+        self.assertEqual(result["status"], "removed")
+        self.assertEqual(result["removed"], 1)
+        service._client.remove_episode.assert_awaited_once_with("episode-1")
+        query_kwargs = service._client.driver.execute_query.await_args.kwargs
+        self.assertEqual(query_kwargs["name"], "news_signal:card_cls_bad")
+        self.assertEqual(query_kwargs["group_id"], "market_cn")
+
     def test_sync_ingest_reuses_event_loop_for_loop_bound_client(self):
         class LoopBoundClient:
             def __init__(self):
@@ -266,6 +299,43 @@ class GraphitiServiceTestCase(unittest.TestCase):
         self.assertTrue(result["success"])
         service._client.build_indices_and_constraints.assert_awaited_once()
         service._client.search_.assert_awaited_once()
+        self.assertIs(
+            service._client.search_.await_args.kwargs["config"],
+            COMBINED_HYBRID_SEARCH_RRF,
+        )
+
+    def test_search_timeout_uses_relational_fallback(self):
+        fallback = MagicMock()
+        fallback.search.return_value = {
+            "success": True,
+            "source": "relational_fallback",
+            "degraded": True,
+            "query": "半导体 相关事件",
+            "edges": [],
+            "nodes": [],
+            "episodes": [{"type": "news_signal_card", "card_id": "card:1"}],
+        }
+        with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
+            cfg = mock_get_config.return_value
+            cfg.graphiti_enabled = False
+            cfg.graphiti_group_strategy = "market"
+            service = GraphitiService(fallback_search=fallback)
+
+        service.enabled = True
+        service._client = AsyncMock()
+        service._client.search_.side_effect = TimeoutError("reranker timeout")
+
+        result = asyncio.run(service.search("半导体 相关事件", market="cn", limit=5))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["degraded"])
+        self.assertIn("reranker timeout", result["graphiti_error"])
+        fallback.search.assert_called_once_with(
+            "半导体 相关事件",
+            market="cn",
+            limit=5,
+            reason="graphiti_search_failed",
+        )
 
     def test_sync_news_signal_edges_projects_explicit_neo4j_relationships(self):
         class FakeResult:
@@ -316,6 +386,7 @@ class GraphitiServiceTestCase(unittest.TestCase):
                 cards=[
                     {"card_id": "card:a", "summary_short": "机器人订单增长", "signal_date": "2026-07-04"},
                     {"card_id": "card:b", "summary_short": "机器人零部件涨价", "signal_date": "2026-07-04"},
+                    {"card_id": "card:c", "summary_short": "模糊公司导语", "signal_date": "2026-07-04", "status": "suppressed"},
                 ],
                 edges=[
                     {
@@ -339,17 +410,31 @@ class GraphitiServiceTestCase(unittest.TestCase):
                         "weight": 0.91,
                         "method": "embedding",
                     },
+                    {
+                        "edge_id": "edge:suppressed",
+                        "source_card_id": "card:c",
+                        "target_type": "industry",
+                        "target_id": "industry:机器人",
+                        "edge_class": "typed_relation",
+                        "edge_type": "impacts_industry",
+                        "weight": 0.72,
+                        "method": "rule",
+                    },
                 ],
                 market="cn",
             )
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["edges"], 2)
+        self.assertEqual(result["input_edges"], 3)
+        self.assertEqual(result["skipped_inactive_edges"], 1)
+        self.assertEqual(result["inactive_cards_pruned"], 1)
         self.assertTrue(fake_driver.closed)
         queries = "\n".join(query for query, _params in fake_driver.session_obj.calls)
         self.assertIn("NEWS_SIGNAL_TYPED_RELATION", queries)
         self.assertIn("NEWS_SIGNAL_SEMANTIC_SIMILARITY", queries)
         self.assertIn("NewsSignalTarget", queries)
+        self.assertIn("inactive_card_ids", str(fake_driver.session_obj.calls))
 
     def test_enabled_graphiti_disables_when_neo4j_unreachable(self):
         with patch("src.services.graphiti.graph_service.get_config") as mock_get_config, \

@@ -1231,14 +1231,8 @@ def _build_search_service_for_candidates():
     try:
         config = get_config()
         return SearchService(
-            bocha_keys=getattr(config, "bocha_api_keys", []),
-            tavily_keys=getattr(config, "tavily_api_keys", []),
-            anspire_keys=getattr(config, "anspire_api_keys", []),
-            brave_keys=getattr(config, "brave_api_keys", []),
-            serpapi_keys=getattr(config, "serpapi_keys", []),
-            minimax_keys=getattr(config, "minimax_api_keys", []),
-            searxng_base_urls=getattr(config, "searxng_base_urls", []),
-            searxng_public_instances_enabled=getattr(config, "searxng_public_instances_enabled", True),
+            anysearch_api_key=getattr(config, "anysearch_api_key", None),
+            searxng_public_instances_enabled=False,
             news_max_age_days=getattr(config, "news_max_age_days", 3),
             news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
         )

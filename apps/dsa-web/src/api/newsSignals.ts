@@ -174,6 +174,13 @@ export type NewsSignalEdge = {
   method?: string;
   rationale?: string;
   evidence?: Record<string, unknown>;
+  targetLabel?: string;
+  targetSignalDate?: string;
+  targetTransmissionPaths?: NewsSignalTransmissionPath[];
+  relatedCardId?: string;
+  relatedLabel?: string;
+  relatedSignalDate?: string;
+  relatedTransmissionPaths?: NewsSignalTransmissionPath[];
 };
 
 export type NewsSignalGraphNode = {
@@ -183,6 +190,13 @@ export type NewsSignalGraphNode = {
   signalDate?: string;
   signalLayer?: string;
   signalScore?: number;
+  transmissionPaths?: NewsSignalTransmissionPath[];
+  sourcePreviews?: Array<{
+    title?: string;
+    publishedAt?: string;
+    source?: string;
+    url?: string;
+  }>;
 };
 
 export type NewsSignalGraph = {

@@ -70,6 +70,16 @@ class ConfigImportError(Exception):
 class SystemConfigService:
     """Service layer for reading, validating, and updating runtime configuration."""
 
+    _HIDDEN_CONFIG_KEYS: Set[str] = {
+        "ANSPIRE_API_KEYS",
+        "BOCHA_API_KEYS",
+        "BRAVE_API_KEYS",
+        "MINIMAX_API_KEYS",
+        "SEARXNG_BASE_URLS",
+        "SEARXNG_PUBLIC_INSTANCES_ENABLED",
+        "SERPAPI_API_KEYS",
+        "TAVILY_API_KEYS",
+    }
     _DISPLAY_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
         "AGENT_SKILL_DIR": ("AGENT_SKILL_DIR", "AGENT_STRATEGY_DIR"),
         "AGENT_SKILL_AUTOWEIGHT": ("AGENT_SKILL_AUTOWEIGHT", "AGENT_STRATEGY_AUTOWEIGHT"),
@@ -116,7 +126,7 @@ class SystemConfigService:
         display_map: Dict[str, str] = {}
 
         for key, value in raw_upper.items():
-            if key in aliased_keys:
+            if key in aliased_keys or key in cls._HIDDEN_CONFIG_KEYS:
                 continue
             display_map[key] = cls._normalize_display_value(key, value)
 

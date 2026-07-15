@@ -368,21 +368,22 @@ class TestValidateStructuredNotification:
         info = [i for i in issues if i.severity == "info"]
         assert any("搜索引擎" in i.message for i in info)
         search_issue = next(i for i in info if "搜索引擎" in i.message)
-        assert search_issue.field == "BOCHA_API_KEYS"
+        assert search_issue.field == "ANYSEARCH_API_KEY"
 
-    def test_searxng_configured_no_search_info(self):
-        """When searxng_base_urls is configured, no 'unconfigured search engine' info."""
-        cfg = _make_config(searxng_base_urls=["https://searx.example.org"])
+    def test_anysearch_configured_no_search_info(self):
+        cfg = _make_config(anysearch_api_key="secret")
         issues = cfg.validate_structured()
         info = [i for i in issues if i.severity == "info"]
         assert not any("搜索引擎" in i.message and "未配置" in i.message for i in info)
 
-    def test_public_searxng_enabled_no_search_info(self):
-        """Public SearXNG mode also counts as search capability."""
-        cfg = _make_config(searxng_public_instances_enabled=True)
+    def test_legacy_searxng_config_does_not_enable_runtime_search(self):
+        cfg = _make_config(
+            searxng_base_urls=["https://searx.example.org"],
+            searxng_public_instances_enabled=True,
+        )
         issues = cfg.validate_structured()
         info = [i for i in issues if i.severity == "info"]
-        assert not any("搜索引擎" in i.message and "未配置" in i.message for i in info)
+        assert any("ANYSEARCH_API_KEY" in i.message for i in info)
 
 
 # ---------------------------------------------------------------------------

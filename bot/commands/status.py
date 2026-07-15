@@ -104,12 +104,9 @@ class StatusCommand(BotCommand):
         )
         
         # 搜索服务状态
-        status["search_bocha"] = len(config.bocha_api_keys) > 0
-        status["search_tavily"] = len(config.tavily_api_keys) > 0
-        status["search_brave"] = len(config.brave_api_keys) > 0
-        status["search_serpapi"] = len(config.serpapi_keys) > 0
-        status["search_minimax"] = len(config.minimax_api_keys) > 0
-        status["search_searxng"] = config.has_searxng_enabled()
+        status["search_anysearch"] = bool(
+            str(getattr(config, "anysearch_api_key", None) or "").strip()
+        )
         
         # 通知渠道状态
         status["notify_wechat"] = bool(config.wechat_webhook_url)
@@ -181,12 +178,7 @@ class StatusCommand(BotCommand):
             ),
             "",
             "**🔍 搜索服务**",
-            f"• Bocha: {icon(status['search_bocha'])}",
-            f"• Tavily: {icon(status['search_tavily'])}",
-            f"• Brave: {icon(status['search_brave'])}",
-            f"• SerpAPI: {icon(status['search_serpapi'])}",
-            f"• MiniMax: {icon(status['search_minimax'])}",
-            f"• SearXNG: {icon(status['search_searxng'])}",
+            f"• AnySearch: {icon(status['search_anysearch'])}",
             "",
             "**📢 通知渠道**",
             f"• 企业微信: {icon(status['notify_wechat'])}",

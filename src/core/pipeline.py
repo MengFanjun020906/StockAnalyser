@@ -106,14 +106,8 @@ class StockAnalysisPipeline:
         # 初始化搜索服务（可选，初始化失败不应阻断主分析流程）
         try:
             self.search_service = SearchService(
-                bocha_keys=self.config.bocha_api_keys,
-                tavily_keys=self.config.tavily_api_keys,
-                anspire_keys=self.config.anspire_api_keys,
-                brave_keys=self.config.brave_api_keys,
-                serpapi_keys=self.config.serpapi_keys,
-                minimax_keys=self.config.minimax_api_keys,
-                searxng_base_urls=self.config.searxng_base_urls,
-                searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
+                anysearch_api_key=getattr(self.config, "anysearch_api_key", None),
+                searxng_public_instances_enabled=False,
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )

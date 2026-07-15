@@ -6,8 +6,8 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG 多种搜索引擎
-3. 多 Key 负载均衡和故障转移
+2. 生产运行统一使用 AnySearch；旧 provider 仅保留直接构造兼容
+3. API Key 状态管理和网络重试
 4. 搜索结果缓存和格式化
 """
 
@@ -270,6 +270,155 @@ class BaseSearchProvider(ABC):
             SearchResponse 对象
         """
         return self._execute_search(query, max_results=max_results, days=days)
+
+
+class AnySearchProvider(BaseSearchProvider):
+    """AnySearch adapter for the project's existing search interface."""
+
+    API_URL = "https://api.anysearch.com/v1/search"
+    REQUEST_TIMEOUT_SECONDS = 20
+
+    def __init__(self, api_keys: List[str]):
+        super().__init__(api_keys, "AnySearch")
+
+    def _record_error(self, key: str) -> None:
+        with self._state_lock:
+            self._key_errors[key] = self._key_errors.get(key, 0) + 1
+            error_count = self._key_errors[key]
+        logger.warning("[AnySearch] API Key 错误计数: %s", error_count)
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        *,
+        tag: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> SearchResponse:
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            tag=tag,
+            params=params,
+        )
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        tag: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> SearchResponse:
+        del days  # AnySearch currently exposes no documented freshness parameter.
+        payload: Dict[str, Any] = {
+            "query": query,
+            "max_results": max(1, min(int(max_results or 5), 50)),
+        }
+        if tag:
+            payload["tag"] = str(tag).strip()
+        if params:
+            payload["params"] = dict(params)
+
+        response = _post_with_retry(
+            self.API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.REQUEST_TIMEOUT_SECONDS,
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+
+        if response.status_code != 200:
+            message = body.get("message") if isinstance(body, dict) else ""
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=message or f"HTTP {response.status_code}",
+            )
+        if not isinstance(body, dict) or body.get("code") != 0:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=(body.get("message") if isinstance(body, dict) else "") or "AnySearch 返回无效响应",
+            )
+
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        raw_results = data.get("results") if isinstance(data.get("results"), list) else []
+        results: List[SearchResult] = []
+        for item in raw_results[: payload["max_results"]]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if not title and not url:
+                continue
+            content = str(item.get("content") or "").strip()
+            snippet = str(item.get("snippet") or content).strip()[:1000]
+            results.append(
+                SearchResult(
+                    title=title or url,
+                    snippet=snippet,
+                    url=url,
+                    source=self._extract_domain(url),
+                    published_date=self._extract_published_date(item),
+                )
+            )
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+        )
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            return urlparse(url).netloc or "AnySearch"
+        except Exception:
+            return "AnySearch"
+
+    @staticmethod
+    def _extract_published_date(item: Dict[str, Any]) -> Optional[str]:
+        candidates = [
+            item.get("published_date"),
+            item.get("published_at"),
+            item.get("date"),
+            item.get("title"),
+            item.get("snippet"),
+            item.get("content"),
+            item.get("url"),
+        ]
+        for candidate in candidates:
+            text = str(candidate or "")
+            for pattern in (
+                r"(?<!\d)(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?!\d)",
+                r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)",
+            ):
+                match = re.search(pattern, text)
+                if not match:
+                    continue
+                try:
+                    return date(
+                        int(match.group(1)),
+                        int(match.group(2)),
+                        int(match.group(3)),
+                    ).isoformat()
+                except ValueError:
+                    continue
+        return None
 
 
 class TavilySearchProvider(BaseSearchProvider):
@@ -2136,6 +2285,7 @@ class SearchService:
         searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
+        anysearch_api_key: Optional[str] = None,
     ):
         """
         初始化搜索服务
@@ -2151,6 +2301,7 @@ class SearchService:
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
+            anysearch_api_key: AnySearch API Key；配置后运行时只使用 AnySearch
         """
         self._providers: List[BaseSearchProvider] = []
         self.news_max_age_days = max(1, news_max_age_days)
@@ -2170,46 +2321,52 @@ class SearchService:
             NEWS_STRATEGY_WINDOWS["short"],
         )
 
-        # 初始化搜索引擎（按优先级排序）
+        normalized_anysearch_key = str(anysearch_api_key or "").strip()
+        if normalized_anysearch_key:
+            self._providers.append(AnySearchProvider([normalized_anysearch_key]))
+            logger.info("已配置 AnySearch 搜索")
+
+        # 旧 provider 仅保留直接构造兼容；生产配置传入 AnySearch 后不再注册。
         # 1. Bocha 优先（中文搜索优化，AI摘要）
-        if bocha_keys:
+        if not normalized_anysearch_key and bocha_keys:
             self._providers.append(BochaSearchProvider(bocha_keys))
             logger.info(f"已配置 Bocha 搜索，共 {len(bocha_keys)} 个 API Key")
 
         # 2. Tavily（免费额度更多，每月 1000 次）
-        if tavily_keys:
+        if not normalized_anysearch_key and tavily_keys:
             self._providers.append(TavilySearchProvider(tavily_keys))
             logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
 
         # 3. Brave Search（隐私优先，全球覆盖）
-        if brave_keys:
+        if not normalized_anysearch_key and brave_keys:
             self._providers.append(BraveSearchProvider(brave_keys))
             logger.info(f"已配置 Brave 搜索，共 {len(brave_keys)} 个 API Key")
 
         # 4. SerpAPI 作为备选（每月 100 次）
-        if serpapi_keys:
+        if not normalized_anysearch_key and serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
 
         # 5. MiniMax（Coding Plan Web Search，结构化结果）
-        if minimax_keys:
+        if not normalized_anysearch_key and minimax_keys:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
         # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
-        searxng_provider = SearXNGSearchProvider(
-            searxng_base_urls,
-            use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
-        )
-        if searxng_provider.is_available:
-            self._providers.append(searxng_provider)
-            if searxng_base_urls:
-                logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
-            else:
-                logger.info("已启用 SearXNG 公共实例自动发现模式")
+        if not normalized_anysearch_key:
+            searxng_provider = SearXNGSearchProvider(
+                searxng_base_urls,
+                use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
+            )
+            if searxng_provider.is_available:
+                self._providers.append(searxng_provider)
+                if searxng_base_urls:
+                    logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
+                else:
+                    logger.info("已启用 SearXNG 公共实例自动发现模式")
 
         # 7. Anspire Search（实时智能搜索优化）
-        if anspire_keys:
+        if not normalized_anysearch_key and anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
             
@@ -3548,14 +3705,8 @@ def get_search_service() -> SearchService:
                 config = get_config()
                 
                 _search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    anspire_keys=config.anspire_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    anysearch_api_key=getattr(config, "anysearch_api_key", None),
+                    searxng_public_instances_enabled=False,
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

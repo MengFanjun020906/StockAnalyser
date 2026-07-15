@@ -98,6 +98,7 @@ def build_candidate_discovery_prompt(payload: Dict[str, Any]) -> str:
 {_dump(STRATEGY_THRESHOLDS)}
 
 执行规则：
+0. 必须先读取 knowledge_graph_evidence。若其 degraded=true，必须披露降级来源；若为空或失败，写入 missing_evidence。图谱证据只用于关联召回和历史核验，弱语义边不得作为因果或直接买入依据。
 1. 如果 target_symbols 非空，必须优先使用用户给出的股票作为候选，不得擅自替换。
 2. 如果用户给出的股票代码无法被工具确认存在，标记为 invalid_input，不要替用户自动换成其他股票。
 3. 如果 target_symbols 为空，必须按 candidate_strategy 生成候选：
@@ -744,6 +745,7 @@ def build_adversarial_review_prompt(payload: Dict[str, Any]) -> str:
 {_dump(payload)}
 
 反方必须检查候选池是否过度依赖单一热点板块、是否把板块强误当成个股可买、追高风险、证据缺口、亏损股/高估值包装、仓位风险、休市或行情时效、回滚条件。若输入包含 balanced_candidate_evidence，优先基于该统一证据包审查，不要要求重复取证。若输入包含 Meta/点位计算结果，必须检查 hard_constraints 是否被组合配置遵守、If-Then 条件单是否缺失失败场景。
+必须审查 knowledge_graph_evidence 中的历史分析、相似事件和失效案例；degraded=true 时明确写出降级来源。semantic_similarity 和低质量边只能作为待核验线索，弱语义边不得作为因果反证。
 
 {META_POINT_CALC_FIELD_GUIDE}
 

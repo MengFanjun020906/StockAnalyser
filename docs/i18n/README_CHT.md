@@ -58,7 +58,7 @@
 |------|------|
 | AI 模型 | [AIHubMix](https://aihubmix.com/?aff=CfMq)、Gemini、OpenAI 兼容、DeepSeek、通義千問、Claude、Ollama 本地模型等 |
 | 行情數據 | [TickFlow](https://tickflow.org/auth/register?ref=WDSGSPS5XC)、AkShare、Tushare、Pytdx、Baostock、YFinance、Longbridge |
-| 新聞搜尋 | [Anspire](https://aisearch.anspire.cn/)、[SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)、[Tavily](https://tavily.com/)、[Bocha](https://open.bocha.cn/)、[Brave](https://brave.com/search/api/)、[MiniMax](https://platform.minimaxi.com/)、SearXNG |
+| 新聞搜尋 | [AnySearch](https://api.anysearch.com/v1/search) |
 | 社交輿情 | [Stock Sentiment API](https://api.adanos.org/docs)（Reddit / X / Polymarket，僅美股，可選） |
 
 > 完整規則見 [數據源配置](../full-guide.md#数据源配置)。
@@ -114,19 +114,13 @@
 
 **新聞源配置（推薦）**
 
-新聞源會顯著影響輿情、公告、事件和催化因素品質，建議至少配置一個搜尋服務。
+新聞源會顯著影響輿情、公告、事件和催化因素品質，需要此能力時請配置 AnySearch。
 
 | Secret 名稱 | 說明 | 必填 |
 |-------------|------|:----:|
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/)：中文內容特別優化，可增強 A 股分析效果 | 推薦 |
-| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)：搜尋引擎結果補強，適合即時金融新聞 | 推薦 |
-| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/)：通用新聞搜尋 API | 可選 |
-| `BOCHA_API_KEYS` | [博查搜尋](https://open.bocha.cn/)：中文搜尋優化，支援 AI 摘要 | 可選 |
-| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/)：隱私優先，美股資訊補強 | 可選 |
-| `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/)：結構化搜尋結果 | 可選 |
-| `SEARXNG_BASE_URLS` | SearXNG 自建實例：無配額兜底，適合私有部署 | 可選 |
+| `ANYSEARCH_API_KEY` | [AnySearch](https://api.anysearch.com/v1/search)：統一股票新聞、市場復盤、Agent 與網頁搜尋 | 推薦 |
 
-更多搜尋源、社交輿情和降級規則見 [搜尋服務配置](../full-guide.md#搜索服务配置)。
+搜尋行為與社交輿情配置見 [搜尋服務配置](../full-guide.md#搜索服务配置)。
 
 #### 3. 啟用 Actions
 
