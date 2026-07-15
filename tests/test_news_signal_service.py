@@ -74,7 +74,10 @@ class NewsSignalServiceTestCase(unittest.TestCase):
 
     def test_seed_evidence_only_returns_actionable_cards_for_existing_codes(self) -> None:
         raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
-        eligible = cards[0]
+        eligible = {
+            **cards[0],
+            "valid_until": datetime(2099, 12, 31, 23, 59, 59),
+        }
         speculative = {
             **eligible,
             "card_id": "card:speculative:603019",
