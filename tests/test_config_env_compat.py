@@ -69,6 +69,17 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
                 "GRAPHITI_EMBEDDING_BASE_URL": "https://embed.example.com/v1",
                 "GRAPHITI_EMBEDDING_API_KEY": "embed-secret",
                 "GRAPHITI_GROUP_STRATEGY": "single",
+                "GRAPHITI_OUTBOX_WORKER_ENABLED": "true",
+                "GRAPHITI_OUTBOX_INTERVAL_SECONDS": "90",
+                "GRAPHITI_OUTBOX_BATCH_SIZE": "15",
+                "GRAPHITI_OUTBOX_MAX_ATTEMPTS": "6",
+                "GRAPHITI_OUTBOX_RETRY_BASE_SECONDS": "45",
+                "GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS": "180",
+                "GRAPHITI_SELECTION_SEARCH_TIMEOUT_SECONDS": "9",
+                "NEWS_SIGNAL_CLS_INCREMENTAL_ENABLED": "true",
+                "NEWS_SIGNAL_CLS_INCREMENTAL_INTERVAL_MINUTES": "7",
+                "NEWS_SIGNAL_CLS_INCREMENTAL_LIMIT": "40",
+                "NEWS_SIGNAL_EMBEDDING_THRESHOLDS_JSON": '{"default":0.8,"custom":0.73}',
             },
             clear=True,
         ):
@@ -84,6 +95,17 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.graphiti_embedding_base_url, "https://embed.example.com/v1")
         self.assertEqual(config.graphiti_embedding_api_key, "embed-secret")
         self.assertEqual(config.graphiti_group_strategy, "single")
+        self.assertTrue(config.graphiti_outbox_worker_enabled)
+        self.assertEqual(config.graphiti_outbox_interval_seconds, 90)
+        self.assertEqual(config.graphiti_outbox_batch_size, 15)
+        self.assertEqual(config.graphiti_outbox_max_attempts, 6)
+        self.assertEqual(config.graphiti_outbox_retry_base_seconds, 45)
+        self.assertEqual(config.graphiti_outbox_job_timeout_seconds, 180)
+        self.assertEqual(config.graphiti_selection_search_timeout_seconds, 9.0)
+        self.assertTrue(config.news_signal_cls_incremental_enabled)
+        self.assertEqual(config.news_signal_cls_incremental_interval_minutes, 7)
+        self.assertEqual(config.news_signal_cls_incremental_limit, 40)
+        self.assertIn('"custom":0.73', config.news_signal_embedding_thresholds_json)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

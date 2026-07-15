@@ -117,16 +117,14 @@ describe('AgentEntryExecutionBacktestsPage', () => {
     });
   });
 
-  it('syncs baostock minute bars and reloads rebuilt results', async () => {
+  it('syncs all historical report minute bars through the latest date', async () => {
     render(<AgentEntryExecutionBacktestsPage />);
 
     await screen.findByDisplayValue('2024-01-01');
-    fireEvent.click(screen.getByRole('button', { name: '同步当前日期分钟线' }));
+    fireEvent.click(screen.getByRole('button', { name: '同步历史分钟线至最新' }));
 
-    expect(await screen.findByText(/已同步 1\/1 只最终报告标的分钟线/)).toBeInTheDocument();
+    expect(await screen.findByText(/已同步 1\/1 只历史最终报告标的分钟线至最新/)).toBeInTheDocument();
     expect(mocks.syncMinuteBars).toHaveBeenCalledWith({
-      limit: 300,
-      decisionDate: '2024-01-01',
       symbol: undefined,
       frequency: '5',
       adjustflag: '3',
@@ -139,6 +137,25 @@ describe('AgentEntryExecutionBacktestsPage', () => {
       page: 1,
       pageSize: 20,
       limit: 300,
+    });
+  });
+
+  it('allows historical minute sync before any decision date is available', async () => {
+    mocks.list.mockResolvedValue({ exists: false, total: 0, summary: {}, items: [], availableDates: [] });
+
+    render(<AgentEntryExecutionBacktestsPage />);
+
+    const syncButton = await screen.findByRole('button', { name: '同步历史分钟线至最新' });
+    expect(syncButton).toBeEnabled();
+    fireEvent.click(syncButton);
+
+    await waitFor(() => {
+      expect(mocks.syncMinuteBars).toHaveBeenCalledWith({
+        symbol: undefined,
+        frequency: '5',
+        adjustflag: '3',
+        rebuild: true,
+      });
     });
   });
 

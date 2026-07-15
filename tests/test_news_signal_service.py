@@ -72,6 +72,34 @@ class NewsSignalServiceTestCase(unittest.TestCase):
             raw_count = session.execute(select(func.count(RawNewsEpisode.id))).scalar()
         self.assertEqual(raw_count, 1)
 
+    def test_seed_evidence_only_returns_actionable_cards_for_existing_codes(self) -> None:
+        raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
+        eligible = {
+            **cards[0],
+            "valid_until": datetime(2099, 12, 31, 23, 59, 59),
+        }
+        speculative = {
+            **eligible,
+            "card_id": "card:speculative:603019",
+            "evidence_grade": "speculative",
+            "signal_score": 99.0,
+        }
+        self.service.repo.upsert_raw_episodes(raw)
+        self.service.repo.upsert_cards([eligible, speculative])
+
+        result = self.service.seed_evidence_for_codes(
+            ["603019", "000001"],
+            signal_date="2026-07-01",
+        )
+
+        self.assertEqual(result["matched_codes"], 1)
+        self.assertEqual(result["attached_cards"], 1)
+        self.assertEqual(list(result["items_by_code"]), ["603019"])
+        evidence = result["items_by_code"]["603019"][0]
+        self.assertEqual(evidence["card_id"], eligible["card_id"])
+        self.assertEqual(evidence["gate_result"], "matched_existing_seed")
+        self.assertEqual(evidence["company_direction"], "benefit")
+
     def test_cjzc_builds_theme_level_raw_episode_and_actionable_chain(self) -> None:
         payload = _cjzc_payload()
         payload["themes"] = [
@@ -125,6 +153,26 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         self.assertIsNotNone(detail)
         self.assertEqual(detail["extracted_events"][0]["event_type"], "价格/供需")
         self.assertEqual(detail["extracted_events"][0]["raw_episode_id"], storage_raw["episode_id"])
+
+    def test_backfill_extracted_events_uses_existing_relational_sources(self) -> None:
+        raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
+        for card in cards:
+            card["extracted_events"] = []
+            card["diagnostics"].pop("event_extraction", None)
+        self.service.repo.upsert_raw_episodes(raw)
+        saved_cards = self.service.repo.upsert_cards(cards)
+
+        result = self.service.backfill_extracted_events(
+            signal_date="2026-07-01",
+            limit=20,
+        )
+        detail = self.service.get_card(saved_cards[0]["card_id"])
+
+        self.assertEqual(result["cards_scanned"], 1)
+        self.assertEqual(result["cards_updated"], 1)
+        self.assertGreater(result["events_upserted"], 0)
+        self.assertGreater(len(detail["extracted_events"]), 0)
+        self.assertEqual(detail["transmission_paths"][0]["event_id"], detail["extracted_events"][0]["event_id"])
 
     def test_llm_event_extractor_normalizes_json_events_when_enabled(self) -> None:
         os.environ["NEWS_EVENT_EXTRACTOR_MODE"] = "llm"
@@ -218,6 +266,41 @@ class NewsSignalServiceTestCase(unittest.TestCase):
             raw_count = session.execute(select(func.count(RawNewsEpisode.id))).scalar()
         self.assertEqual(raw_count, 1)
 
+    def test_cls_incremental_ingest_only_persists_unseen_feed_items(self) -> None:
+        first_payload = _dailynews_payload(
+            title="存储芯片报价上调",
+            content="存储芯片报价上调，产业链关注度提升。",
+            published_at="2026-07-11T09:10:00+08:00",
+            provider="orz.dailynews.cls",
+        )
+        second_payload = _dailynews_payload(
+            title="服务器订单新增",
+            content="服务器订单新增，相关公司进入交付阶段。",
+            published_at="2026-07-11T09:16:00+08:00",
+            provider="orz.dailynews.cls",
+        )
+        second_payload["results"][0]["id"] = "2"
+        second_payload["results"][0]["url"] = "https://example.test/news/2"
+        second_payload["results"][0]["published_ts"] = 1783135060
+        combined = {
+            **first_payload,
+            "results": [*first_payload["results"], *second_payload["results"]],
+        }
+
+        with patch.object(self.service, "_fetch_cls", return_value=(first_payload, None)):
+            first = self.service.ingest_cls_incremental(limit=50)
+        with patch.object(self.service, "_fetch_cls", return_value=(combined, None)):
+            second = self.service.ingest_cls_incremental(limit=50)
+            repeated = self.service.ingest_cls_incremental(limit=50)
+
+        self.assertEqual(first["new_raw_episodes"], 1)
+        self.assertEqual(second["new_raw_episodes"], 1)
+        self.assertEqual(repeated["new_raw_episodes"], 0)
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(second["source"], "cls_telegraph")
+        self.assertGreaterEqual(second["outbox_enqueued"], 2)
+        self.assertIsNotNone(second["cursor"]["published_at"])
+
     def test_dailynews_normalizes_raw_content_and_marks_low_quality_without_deleting(self) -> None:
         raw, cards = self.service._build_from_cls(
             _dailynews_payload(
@@ -245,6 +328,157 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         detail = self.service.get_card(listed["items"][0]["card_id"])
         self.assertIsNotNone(detail)
         self.assertEqual(detail["raw_episodes"][0]["quality_grade"], "low")
+
+    def test_generic_company_teaser_does_not_expand_theme_mapping_to_companies(self) -> None:
+        self.service._concept_mapping = {
+            "存储芯片": {
+                "keywords": ["存储芯片", "先进封装", "华为"],
+                "related_boards": ["半导体"],
+                "mapped_stocks": [
+                    {"code": "301308", "name": "江波龙", "role": "存储模组"},
+                    {"code": "688525", "name": "佰维存储", "role": "存储芯片"},
+                ],
+            }
+        }
+        payload = _dailynews_payload(
+            title="存储芯片+先进封装+AI应用+华为！这家公司推出相关平台",
+            content="公司上半年净利同比最高预增超2倍，算力芯片产品已在多个领域应用。",
+            published_at="2026-07-11T09:20:00+08:00",
+        )
+
+        _raw, cards = self.service._build_from_cls(payload)
+
+        self.assertEqual(cards[0]["company_impacts"], [])
+        self.assertEqual(cards[0]["mapping_status"], "industry_only")
+        self.assertEqual(cards[0]["signal_layer"], "industry")
+        self.assertEqual(cards[0]["status"], "suppressed")
+        self.assertLessEqual(cards[0]["signal_score"], 35.0)
+        self.assertEqual(cards[0]["diagnostics"]["company_mapping_gate"]["status"], "blocked_no_explicit_company")
+
+    def test_generic_company_teaser_without_mapping_candidates_is_suppressed(self) -> None:
+        raw, cards = self.service._build_from_cls(
+            _dailynews_payload(
+                title="AI编程市场高速增长，这家公司平台已实现快速开发落地",
+                content="工信部发布安全风险提示，行业市场年均复合增长率达38%。",
+                published_at="2026-07-11T09:22:00+08:00",
+            )
+        )
+
+        self.assertEqual(len(raw), 1)
+        self.assertEqual(cards[0]["company_impacts"], [])
+        self.assertEqual(cards[0]["diagnostics"]["company_mapping_gate"]["status"], "no_company_candidates")
+        self.assertEqual(cards[0]["status"], "suppressed")
+        self.assertEqual(cards[0]["evidence_grade"], "speculative")
+        self.assertLessEqual(cards[0]["signal_score"], 35.0)
+
+    def test_theme_mapping_keeps_only_company_explicitly_named_in_news_text(self) -> None:
+        self.service._concept_mapping = {
+            "存储芯片": {
+                "keywords": ["存储芯片"],
+                "related_boards": ["半导体"],
+                "mapped_stocks": [
+                    {"code": "301308", "name": "江波龙", "role": "存储模组"},
+                    {"code": "688525", "name": "佰维存储", "role": "存储芯片"},
+                ],
+            }
+        }
+        payload = _dailynews_payload(
+            title="江波龙存储芯片订单增长",
+            content="江波龙披露存储芯片相关业务收入增长。",
+            published_at="2026-07-11T09:25:00+08:00",
+        )
+
+        _raw, cards = self.service._build_from_cls(payload)
+
+        self.assertEqual([item["symbol"] for item in cards[0]["company_impacts"]], ["301308"])
+        self.assertEqual(cards[0]["mapping_status"], "mapped")
+
+    def test_company_mapping_repair_removes_legacy_theme_expansion(self) -> None:
+        raw = {
+            "episode_id": "raw:legacy:generic-company",
+            "dedup_key": "dedup:legacy:generic-company",
+            "source": "cls_telegraph",
+            "title": "存储芯片+先进封装！这家公司净利预增",
+            "summary": "公司上半年净利同比预增超2倍。",
+            "content": "公司上半年净利同比预增超2倍，相关平台支持异构集成封装设计。",
+            "normalized_content": "存储芯片+先进封装！这家公司净利预增。公司上半年净利同比预增超2倍。",
+            "published_at": datetime(2026, 7, 11, 9, 30),
+            "signal_date": date(2026, 7, 11),
+            "session": "intraday",
+        }
+        card = _edge_card(
+            "card:legacy:generic-company",
+            "存储芯片+先进封装！这家公司净利预增",
+            "存储芯片",
+            "301308",
+            "江波龙",
+        )
+        card["signal_date"] = date(2026, 7, 11)
+        card["raw_episode_ids"] = [raw["episode_id"]]
+        card["company_impacts"].append(
+            {
+                "symbol": "688525",
+                "name": "佰维存储",
+                "direction": "benefit",
+                "confidence": 0.78,
+                "mapping_status": "mapped",
+                "rationale": "旧主题词典扩散",
+            }
+        )
+        self.service.repo.upsert_raw_episodes([raw])
+        self.service.repo.upsert_cards([card])
+
+        result = self.service.repair_company_mapping_gates(signal_date="2026-07-11")
+        repaired = self.service.get_card(card["card_id"])
+
+        self.assertEqual(result["cards_updated"], 1)
+        self.assertEqual(result["companies_removed"], 2)
+        self.assertEqual(repaired["company_impacts"], [])
+        self.assertEqual(repaired["mapping_status"], "industry_only")
+        self.assertEqual(repaired["signal_layer"], "industry")
+        self.assertEqual(repaired["status"], "suppressed")
+        self.assertLessEqual(repaired["signal_score"], 35.0)
+        self.assertEqual(repaired["diagnostics"]["company_mapping_gate"]["status"], "blocked_no_explicit_company")
+
+    def test_company_mapping_repair_suppresses_legacy_teaser_without_existing_impacts(self) -> None:
+        raw = {
+            "episode_id": "raw:legacy:generic-company-no-impacts",
+            "dedup_key": "dedup:legacy:generic-company-no-impacts",
+            "source": "cls_telegraph",
+            "title": "AI应用加速落地，这家公司平台已实现快速开发",
+            "summary": "行业市场年均复合增长率达38%。",
+            "content": "该公司平台已实现应用快速开发落地，但正文未披露公司名称。",
+            "normalized_content": "AI应用加速落地，这家公司平台已实现快速开发。",
+            "published_at": datetime(2026, 7, 11, 9, 31),
+            "signal_date": date(2026, 7, 11),
+            "session": "intraday",
+        }
+        card = _edge_card(
+            "card:legacy:generic-company-no-impacts",
+            "AI应用加速落地，这家公司平台已实现快速开发",
+            "AI应用",
+            "",
+            "",
+        )
+        card["signal_date"] = date(2026, 7, 11)
+        card["raw_episode_ids"] = [raw["episode_id"]]
+        card["company_impacts"] = []
+        self.service.repo.upsert_raw_episodes([raw])
+        self.service.repo.upsert_cards([card])
+
+        result = self.service.repair_company_mapping_gates(signal_date="2026-07-11")
+        repaired = self.service.get_card(card["card_id"])
+
+        self.assertEqual(result["cards_updated"], 1)
+        self.assertEqual(result["companies_removed"], 0)
+        self.assertEqual(repaired["company_impacts"], [])
+        self.assertEqual(repaired["status"], "suppressed")
+        self.assertEqual(repaired["evidence_grade"], "speculative")
+        self.assertLessEqual(repaired["signal_score"], 35.0)
+        self.assertEqual(
+            repaired["diagnostics"]["company_mapping_gate"]["suppression_reason"],
+            "generic_company_teaser_without_explicit_company",
+        )
 
     def test_evidence_adapter_and_feedback_read_path(self) -> None:
         raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
@@ -350,6 +584,7 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         graphiti = MagicMock()
         graphiti.is_available.return_value = True
         graphiti.ingest_news_signal_card_sync.return_value = {"status": "synced", "episode_name": "news_signal:test"}
+        graphiti.sync_news_signal_edges_sync.return_value = {"status": "ok", "edges": 3}
 
         with patch("src.services.graphiti.graph_service.get_graphiti_service", return_value=graphiti):
             result = self.service.sync_graphiti(signal_date="2026-07-01")
@@ -363,6 +598,65 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         self.assertEqual(call_kwargs["market"], "cn")
         self.assertEqual(call_kwargs["card"]["card_id"], card_id)
         self.assertEqual(call_kwargs["card"]["raw_episodes"][0]["episode_id"], raw[0]["episode_id"])
+
+    def test_sync_graphiti_can_project_edges_without_slow_episode_ingestion(self) -> None:
+        raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
+        self.service.repo.upsert_raw_episodes(raw)
+        self.service.repo.upsert_cards(cards)
+        graphiti = MagicMock()
+        graphiti.is_available.return_value = True
+        graphiti.sync_news_signal_edges_sync.return_value = {"status": "ok", "edges": 3}
+
+        with patch("src.services.graphiti.graph_service.get_graphiti_service", return_value=graphiti):
+            result = self.service.sync_graphiti(
+                signal_date="2026-07-01",
+                include_episodes=False,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["episode_sync"]["reason"], "disabled_by_request")
+        graphiti.ingest_news_signal_card_sync.assert_not_called()
+        graphiti.sync_news_signal_edges_sync.assert_called_once()
+
+    def test_sync_graphiti_reports_partial_when_edge_projection_fails(self) -> None:
+        raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
+        self.service.repo.upsert_raw_episodes(raw)
+        self.service.repo.upsert_cards(cards)
+        graphiti = MagicMock()
+        graphiti.is_available.return_value = True
+        graphiti.sync_news_signal_edges_sync.return_value = {
+            "status": "failed",
+            "error": "neo4j unavailable",
+            "edges": 0,
+        }
+
+        with patch("src.services.graphiti.graph_service.get_graphiti_service", return_value=graphiti):
+            result = self.service.sync_graphiti(
+                signal_date="2026-07-01",
+                include_episodes=False,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["graph_edge_sync"]["status"], "failed")
+
+    def test_projection_only_without_date_rebuilds_all_active_card_dates(self) -> None:
+        for target in (date(2026, 7, 1), date(2026, 7, 2)):
+            raw, cards = self.service._build_from_cjzc(_cjzc_payload(), target)
+            self.service.repo.upsert_raw_episodes(raw)
+            self.service.repo.upsert_cards(cards)
+        graphiti = MagicMock()
+        graphiti.is_available.return_value = True
+        graphiti.sync_news_signal_edges_sync.return_value = {"status": "ok", "edges": 6}
+
+        with patch("src.services.graphiti.graph_service.get_graphiti_service", return_value=graphiti):
+            result = self.service.sync_graphiti(
+                include_episodes=False,
+                limit=500,
+            )
+
+        self.assertEqual(result["edge_sync"]["cards"], 2)
+        projected_cards = graphiti.sync_news_signal_edges_sync.call_args.kwargs["cards"]
+        self.assertEqual(len(projected_cards), 2)
 
     def test_sync_graphiti_disabled_keeps_card_pending(self) -> None:
         raw, cards = self.service._build_from_cjzc(_cjzc_payload(), date(2026, 7, 1))
@@ -385,6 +679,18 @@ class NewsSignalServiceTestCase(unittest.TestCase):
             _edge_card("card:test:a", "机器人订单增长，产业链客户验证加速", "机器人", "300024", "机器人公司"),
             _edge_card("card:test:b", "机器人核心零部件涨价，机器人公司受益", "机器人", "300024", "机器人公司"),
         ]
+        cards[1]["transmission_paths"] = [
+            {
+                "event_category": "价格/供需",
+                "mechanism": "核心零部件涨价传导",
+                "target": "机器人产业链公司",
+                "conclusion": "涨价需要订单和利润率继续验证",
+                "chain_steps": [
+                    {"label": "事件", "text": "核心零部件涨价"},
+                    {"label": "传导", "text": "产业链成本与议价能力变化"},
+                ],
+            }
+        ]
         self.service.repo.upsert_cards(cards)
 
         first = self.service.rebuild_edges(signal_date="2026-07-04")
@@ -402,6 +708,12 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         graph = self.service.card_graph("card:test:a")
         self.assertGreaterEqual(graph["summary"]["edge_count"], 3)
         self.assertIn("edge_quality_counts", graph["summary"])
+        related_node = next(node for node in graph["nodes"] if node["id"] == "card:test:b")
+        self.assertEqual(related_node["label"], "机器人核心零部件涨价，机器人公司受益")
+        self.assertEqual(related_node["transmission_paths"][0]["event_category"], "价格/供需")
+        related_edge = next(edge for edge in graph["edges"] if edge.get("target_card_id") == "card:test:b")
+        self.assertEqual(related_edge["target_label"], "机器人核心零部件涨价，机器人公司受益")
+        self.assertEqual(related_edge["target_signal_date"], "2026-07-04")
 
         with DatabaseManager.get_instance().get_session() as session:
             edge_count = session.execute(select(func.count(NewsSignalEdge.id))).scalar()
@@ -433,6 +745,142 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         self.assertGreaterEqual(edges[0]["edge_quality"], 55)
         self.assertIn("semantic_not_causal", edges[0]["quality_flags"])
         self.assertEqual(result["semantic"]["top_k_per_card"], 4)
+
+    def test_rebuild_edges_distinguishes_same_event_from_same_theme(self) -> None:
+        first = _edge_card(
+            "card:event:a",
+            "江波龙披露存储芯片订单增长并进入客户交付",
+            "存储芯片",
+            "301308",
+            "江波龙",
+        )
+        second = _edge_card(
+            "card:event:b",
+            "江波龙存储芯片订单增长，客户交付进度更新",
+            "存储芯片",
+            "301308",
+            "江波龙",
+        )
+        theme_only = _edge_card(
+            "card:event:c",
+            "存储芯片行业报价变化，关注供需拐点",
+            "存储芯片",
+            "688525",
+            "佰维存储",
+        )
+        for card in (first, second, theme_only):
+            card["transmission_paths"] = [{"event_category": "大客户/订单"}]
+        theme_only["transmission_paths"] = [{"event_category": "价格/供需"}]
+        self.service.repo.upsert_cards([first, second, theme_only])
+
+        self.service.rebuild_edges(signal_date="2026-07-04")
+        edges = self.service.list_edges(signal_date="2026-07-04", limit=100)["items"]
+        by_pair = {
+            frozenset((edge["source_card_id"], edge.get("target_card_id"))): edge
+            for edge in edges
+            if edge.get("target_type") == "card"
+        }
+
+        self.assertEqual(by_pair[frozenset(("card:event:a", "card:event:b"))]["edge_type"], "same_event")
+        self.assertEqual(by_pair[frozenset(("card:event:a", "card:event:c"))]["edge_type"], "same_theme")
+
+    def test_rebuild_edges_does_not_connect_unrelated_cards_through_generic_fallback_theme(self) -> None:
+        payment = _edge_card(
+            "card:generic:payment",
+            "第三方支付机构因清算违规被处罚",
+            "实时快讯",
+            "",
+            "",
+        )
+        semiconductor = _edge_card(
+            "card:generic:semiconductor",
+            "电子特气板块调整，半导体材料走弱",
+            "实时快讯",
+            "",
+            "",
+        )
+        self.service.repo.upsert_cards([payment, semiconductor])
+
+        self.service.rebuild_edges(signal_date="2026-07-04")
+        event_edges = self.service.list_edges(
+            signal_date="2026-07-04",
+            edge_class="event_clue",
+            limit=100,
+        )["items"]
+        all_edges = self.service.list_edges(signal_date="2026-07-04", limit=100)["items"]
+
+        self.assertEqual(event_edges, [])
+        self.assertNotIn("industry:实时快讯", {edge["target_id"] for edge in all_edges})
+
+    def test_rebuild_edges_removes_relations_for_cards_that_are_no_longer_active(self) -> None:
+        active = _edge_card(
+            "card:cleanup:active",
+            "商业航天订单增长",
+            "商业航天",
+            "",
+            "",
+        )
+        removed = _edge_card(
+            "card:cleanup:removed",
+            "商业航天融资推进",
+            "商业航天",
+            "",
+            "",
+        )
+        self.service.repo.upsert_cards([active, removed])
+        self.service.rebuild_edges(signal_date="2026-07-04")
+        self.assertTrue(self.service.repo.list_edges(card_id=removed["card_id"], limit=20))
+
+        removed["status"] = "suppressed"
+        self.service.repo.upsert_cards([removed])
+        self.service.rebuild_edges(signal_date="2026-07-04")
+
+        self.assertEqual(self.service.repo.list_edges(card_id=removed["card_id"], limit=20), [])
+
+    def test_same_event_reconciliation_merges_sources_and_suppresses_duplicates(self) -> None:
+        first = _edge_card(
+            "card:merge:a",
+            "江波龙披露存储芯片订单增长并进入客户交付",
+            "存储芯片",
+            "301308",
+            "江波龙",
+        )
+        second = _edge_card(
+            "card:merge:b",
+            "江波龙存储芯片订单增长，客户交付进度更新",
+            "存储芯片",
+            "301308",
+            "江波龙",
+        )
+        first["signal_score"] = 85.0
+        second["signal_score"] = 75.0
+        for index, card in enumerate((first, second), start=1):
+            raw = {
+                "episode_id": f"raw:merge:{index}",
+                "dedup_key": f"dedup:merge:{index}",
+                "source": "cls_telegraph",
+                "title": card["summary_short"],
+                "published_at": datetime(2026, 7, 4, 10, index),
+                "signal_date": date(2026, 7, 4),
+                "session": "intraday",
+            }
+            self.service.repo.upsert_raw_episodes([raw])
+            card["raw_episode_ids"] = [raw["episode_id"]]
+            card["transmission_paths"] = [{"event_category": "大客户/订单"}]
+        self.service.repo.upsert_cards([first, second])
+
+        result = self.service.reconcile_same_event_clusters(signal_date="2026-07-04")
+        active = self.service.list_cards(signal_date="2026-07-04", status="active")["items"]
+        canonical = self.service.get_card("card:merge:a")
+        duplicate = self.service.get_card("card:merge:b")
+
+        self.assertEqual(result["clusters_merged"], 1)
+        self.assertEqual(result["cards_suppressed"], 1)
+        self.assertEqual([item["card_id"] for item in active], ["card:merge:a"])
+        self.assertEqual(len(canonical["raw_episode_ids"]), 2)
+        self.assertEqual(canonical["source_count"], 2)
+        self.assertEqual(duplicate["status"], "suppressed")
+        self.assertEqual(duplicate["diagnostics"]["event_cluster"]["merged_into_card_id"], "card:merge:a")
 
     def test_semantic_similarity_edges_are_limited_by_quality_top_k(self) -> None:
         cards = [
@@ -470,7 +918,7 @@ def _cjzc_payload() -> dict:
         "status": "ok",
         "matched_publish_date": "2026-07-01",
         "title": "财经早餐：AI服务器订单增长",
-        "summary": "AI服务器订单增长，算力产业链景气。",
+        "summary": "中科曙光AI服务器订单增长，算力产业链景气。",
         "publish_time": "2026-07-01 06:00:00",
         "link": "https://example.test/cjzc",
         "themes": [
@@ -478,13 +926,13 @@ def _cjzc_payload() -> dict:
                 "theme": "AI服务器",
                 "keywords": ["AI服务器", "算力"],
                 "polarity": "positive",
-                "evidence": "AI服务器订单增长，客户验证加速。",
+                "evidence": "中科曙光AI服务器订单增长，客户验证加速。",
                 "mapped_stocks": [{"code": "603019", "name": "中科曙光", "role": "算力服务器"}],
                 "related_boards": ["算力"],
                 "theme_score": 30,
             }
         ],
-        "article_sections": [{"section": "热点题材", "text": "AI服务器订单增长，客户验证加速。"}],
+        "article_sections": [{"section": "热点题材", "text": "中科曙光AI服务器订单增长，客户验证加速。"}],
         "errors": [],
     }
 

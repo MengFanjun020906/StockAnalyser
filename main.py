@@ -873,14 +873,8 @@ def main() -> int:
 
             if config.has_search_capability_enabled():
                 search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    anspire_keys=config.anspire_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    anysearch_api_key=getattr(config, "anysearch_api_key", None),
+                    searxng_public_instances_enabled=False,
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
@@ -925,6 +919,9 @@ def main() -> int:
                 run_full_analysis(runtime_config, args, scheduled_stock_codes)
 
             background_tasks = []
+            from src.services.news_signal_scheduler import build_news_signal_background_tasks
+
+            background_tasks.extend(build_news_signal_background_tasks(config))
             if getattr(config, 'agent_event_monitor_enabled', False):
                 from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
 

@@ -114,14 +114,8 @@ class MarketCommand(BotCommand):
             search_service = None
             if config.has_search_capability_enabled():
                 search_service = SearchService(
-                    anspire_keys=config.anspire_api_keys,
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    anysearch_api_key=getattr(config, "anysearch_api_key", None),
+                    searxng_public_instances_enabled=False,
                     news_max_age_days=config.news_max_age_days,
                 )
 

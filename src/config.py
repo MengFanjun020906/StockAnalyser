@@ -713,6 +713,7 @@ class Config:
     vision_provider_priority: str = "gemini,anthropic,openai"
 
     # === 搜索引擎配置（支持多 Key 负载均衡）===
+    anysearch_api_key: Optional[str] = None  # Unified AnySearch API key
     anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
@@ -734,6 +735,10 @@ class Config:
     news_event_extractor_timeout_seconds: int = 12
     news_event_extractor_max_tokens: int = 900
     news_event_extractor_temperature: float = 0.0
+    news_signal_cls_incremental_enabled: bool = False
+    news_signal_cls_incremental_interval_minutes: int = 10
+    news_signal_cls_incremental_limit: int = 50
+    news_signal_embedding_thresholds_json: str = '{"default":0.78,"mxbai-embed-large":0.76}'
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === Graphiti 知识图谱配置 ===
@@ -746,6 +751,13 @@ class Config:
     graphiti_embedding_base_url: Optional[str] = None
     graphiti_embedding_api_key: Optional[str] = None
     graphiti_group_strategy: str = "market"
+    graphiti_outbox_worker_enabled: bool = True
+    graphiti_outbox_interval_seconds: int = 60
+    graphiti_outbox_batch_size: int = 10
+    graphiti_outbox_max_attempts: int = 5
+    graphiti_outbox_retry_base_seconds: int = 30
+    graphiti_outbox_job_timeout_seconds: int = 120
+    graphiti_selection_search_timeout_seconds: float = 12.0
 
     # === Agent 模式配置 ===
     agent_litellm_model: str = ""  # Optional Agent-only primary model; empty inherits LITELLM_MODEL
@@ -1457,6 +1469,7 @@ class Config:
                 or ""
             ),
             vision_provider_priority=os.getenv('VISION_PROVIDER_PRIORITY', 'gemini,anthropic,openai'),
+            anysearch_api_key=os.getenv('ANYSEARCH_API_KEY') or None,
             anspire_api_keys=anspire_api_keys,
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
@@ -1494,6 +1507,27 @@ class Config:
                 minimum=0.0,
                 maximum=2.0,
             ),
+            news_signal_cls_incremental_enabled=os.getenv(
+                'NEWS_SIGNAL_CLS_INCREMENTAL_ENABLED', 'false'
+            ).lower() == 'true',
+            news_signal_cls_incremental_interval_minutes=parse_env_int(
+                os.getenv('NEWS_SIGNAL_CLS_INCREMENTAL_INTERVAL_MINUTES'),
+                10,
+                field_name='NEWS_SIGNAL_CLS_INCREMENTAL_INTERVAL_MINUTES',
+                minimum=5,
+                maximum=10,
+            ),
+            news_signal_cls_incremental_limit=parse_env_int(
+                os.getenv('NEWS_SIGNAL_CLS_INCREMENTAL_LIMIT'),
+                50,
+                field_name='NEWS_SIGNAL_CLS_INCREMENTAL_LIMIT',
+                minimum=1,
+                maximum=50,
+            ),
+            news_signal_embedding_thresholds_json=os.getenv(
+                'NEWS_SIGNAL_EMBEDDING_THRESHOLDS_JSON',
+                '{"default":0.78,"mxbai-embed-large":0.76}',
+            ).strip(),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             graphiti_enabled=os.getenv('GRAPHITI_ENABLED', 'false').lower() == 'true',
             graphiti_neo4j_uri=os.getenv('NEO4J_URI', 'bolt://localhost:7687'),
@@ -1504,6 +1538,51 @@ class Config:
             graphiti_embedding_base_url=os.getenv('GRAPHITI_EMBEDDING_BASE_URL') or None,
             graphiti_embedding_api_key=os.getenv('GRAPHITI_EMBEDDING_API_KEY') or None,
             graphiti_group_strategy=normalize_graphiti_group_strategy(os.getenv('GRAPHITI_GROUP_STRATEGY', 'market')),
+            graphiti_outbox_worker_enabled=os.getenv(
+                'GRAPHITI_OUTBOX_WORKER_ENABLED', 'true'
+            ).lower() == 'true',
+            graphiti_outbox_interval_seconds=parse_env_int(
+                os.getenv('GRAPHITI_OUTBOX_INTERVAL_SECONDS'),
+                60,
+                field_name='GRAPHITI_OUTBOX_INTERVAL_SECONDS',
+                minimum=30,
+                maximum=3600,
+            ),
+            graphiti_outbox_batch_size=parse_env_int(
+                os.getenv('GRAPHITI_OUTBOX_BATCH_SIZE'),
+                10,
+                field_name='GRAPHITI_OUTBOX_BATCH_SIZE',
+                minimum=1,
+                maximum=100,
+            ),
+            graphiti_outbox_max_attempts=parse_env_int(
+                os.getenv('GRAPHITI_OUTBOX_MAX_ATTEMPTS'),
+                5,
+                field_name='GRAPHITI_OUTBOX_MAX_ATTEMPTS',
+                minimum=1,
+                maximum=20,
+            ),
+            graphiti_outbox_retry_base_seconds=parse_env_int(
+                os.getenv('GRAPHITI_OUTBOX_RETRY_BASE_SECONDS'),
+                30,
+                field_name='GRAPHITI_OUTBOX_RETRY_BASE_SECONDS',
+                minimum=1,
+                maximum=3600,
+            ),
+            graphiti_outbox_job_timeout_seconds=parse_env_int(
+                os.getenv('GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS'),
+                120,
+                field_name='GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS',
+                minimum=10,
+                maximum=600,
+            ),
+            graphiti_selection_search_timeout_seconds=parse_env_float(
+                os.getenv('GRAPHITI_SELECTION_SEARCH_TIMEOUT_SECONDS'),
+                12.0,
+                field_name='GRAPHITI_SELECTION_SEARCH_TIMEOUT_SECONDS',
+                minimum=1.0,
+                maximum=60.0,
+            ),
             agent_litellm_model=agent_litellm_model,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
@@ -2375,16 +2454,8 @@ class Config:
         return bool(self.searxng_base_urls) or bool(self.searxng_public_instances_enabled)
 
     def has_search_capability_enabled(self) -> bool:
-        """Whether any search provider is configured or SearXNG fallback is enabled."""
-        return bool(
-            self.anspire_api_keys
-            or self.bocha_api_keys
-            or self.minimax_api_keys
-            or self.tavily_api_keys
-            or self.brave_api_keys
-            or self.serpapi_keys
-            or self.has_searxng_enabled()
-        )
+        """Whether the unified AnySearch provider is configured."""
+        return bool(str(self.anysearch_api_key or "").strip())
 
     def is_agent_available(self) -> bool:
         """Check whether agent capabilities are usable.
@@ -2652,8 +2723,8 @@ class Config:
         if not self.has_search_capability_enabled():
             issues.append(ConfigIssue(
                 severity="info",
-                message="未配置搜索引擎能力 (Bocha/MiniMax/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
-                field="BOCHA_API_KEYS",
+                message="未配置搜索引擎 ANYSEARCH_API_KEY，新闻搜索功能将不可用",
+                field="ANYSEARCH_API_KEY",
             ))
 
         # --- Notification channels ---

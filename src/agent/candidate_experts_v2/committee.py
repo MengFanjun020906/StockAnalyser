@@ -163,6 +163,14 @@ def _format_stockapi_date(value: Any) -> str:
     return text
 
 
+def _news_signal_evidence_code(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    digits = "".join(char for char in text if char.isdigit())
+    if 5 <= len(digits) <= 6:
+        return digits.zfill(6)
+    return text
+
+
 def _annotate_seed_buckets_with_theme(
     seeds_by_source: Dict[str, List[SeedItem]],
     theme_momentum: Dict[str, Any],
@@ -173,6 +181,157 @@ def _annotate_seed_buckets_with_theme(
                 apply_theme_profile_to_seed(seed, theme_momentum)
             except Exception as exc:
                 logger.debug("theme profile annotation failed for %s: %s", getattr(seed, "code", ""), exc)
+
+
+def _attach_news_signal_card_evidence(
+    seeds_by_source: Dict[str, List[SeedItem]],
+    *,
+    signal_date: str,
+) -> Dict[str, Any]:
+    codes = sorted(
+        {
+            _news_signal_evidence_code(seed.code)
+            for bucket in seeds_by_source.values()
+            for seed in bucket
+            if _news_signal_evidence_code(seed.code)
+        }
+    )
+    if not codes:
+        return _source_diagnostic("news_signal_cards", "empty", count=0)
+
+    try:
+        from src.services.news_signal_service import NewsSignalService
+
+        evidence_result = NewsSignalService().seed_evidence_for_codes(
+            codes,
+            signal_date=_format_stockapi_date(signal_date),
+        )
+        items_by_code = evidence_result.get("items_by_code") if isinstance(evidence_result, dict) else {}
+        items_by_code = items_by_code if isinstance(items_by_code, dict) else {}
+        attached = 0
+        matched_seeds: set[str] = set()
+
+        for source, bucket in list(seeds_by_source.items()):
+            enriched_bucket: List[SeedItem] = []
+            for seed in bucket:
+                code = str(seed.code or "").strip()
+                lookup_code = _news_signal_evidence_code(code)
+                evidence_items = items_by_code.get(lookup_code) if isinstance(items_by_code.get(lookup_code), list) else []
+                if not evidence_items:
+                    enriched_bucket.append(seed)
+                    continue
+                trigger_signals = list(seed.trigger_signals or [])
+                existing_card_ids = {
+                    str((signal.get("value") or {}).get("card_id") or "")
+                    for signal in trigger_signals
+                    if isinstance(signal, dict) and isinstance(signal.get("value"), dict)
+                }
+                for evidence in evidence_items:
+                    if not isinstance(evidence, dict):
+                        continue
+                    card_id = str(evidence.get("card_id") or "").strip()
+                    if not card_id or card_id in existing_card_ids:
+                        continue
+                    trigger_signals.append(
+                        _build_signal(
+                            dimension="news_event",
+                            signal_type="news_signal_card",
+                            value=evidence,
+                            threshold="matched_existing_seed",
+                            deviation=evidence.get("signal_score"),
+                            label=str(evidence.get("summary_short") or "持久化新闻信号卡")[:80],
+                        )
+                    )
+                    existing_card_ids.add(card_id)
+                    attached += 1
+                context_hint = str(seed.context_hint or "").strip()
+                note = "持久化新闻信号卡仅作为既有 seed 的补充证据，仍需价格、资金和风险核验。"
+                if note not in context_hint:
+                    context_hint = f"{context_hint} {note}".strip()
+                enriched_bucket.append(
+                    seed.model_copy(
+                        update={
+                            "trigger_signals": trigger_signals,
+                            "context_hint": context_hint,
+                        }
+                    )
+                )
+                matched_seeds.add(lookup_code)
+            seeds_by_source[source] = enriched_bucket
+
+        status = "ok" if attached else "empty"
+        return _source_diagnostic(
+            "news_signal_cards",
+            status,
+            count=attached,
+            detail={
+                "signal_date": _format_stockapi_date(signal_date),
+                "requested_codes": len(codes),
+                "matched_seed_codes": len(matched_seeds),
+                "skipped": evidence_result.get("skipped") if isinstance(evidence_result, dict) else {},
+                "mode": "evidence_only_no_direct_seed",
+            },
+        )
+    except Exception as exc:
+        logger.warning("news signal seed evidence attachment failed: %s", exc)
+        return _source_diagnostic(
+            "news_signal_cards",
+            "failed",
+            count=0,
+            error=f"{type(exc).__name__}: {exc}",
+            detail={"signal_date": _format_stockapi_date(signal_date)},
+        )
+
+
+def _attach_knowledge_graph_evidence(
+    seeds_by_source: Dict[str, List[SeedItem]],
+    graph_evidence: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    evidence = graph_evidence if isinstance(graph_evidence, dict) else {}
+    items_by_code = evidence.get("by_code") if isinstance(evidence.get("by_code"), dict) else {}
+    attached = 0
+    matched_codes: set[str] = set()
+    for source, bucket in list(seeds_by_source.items()):
+        enriched_bucket: List[SeedItem] = []
+        for seed in bucket:
+            code = _news_signal_evidence_code(seed.code)
+            items = items_by_code.get(code) if isinstance(items_by_code.get(code), list) else []
+            if not items:
+                enriched_bucket.append(seed)
+                continue
+            trigger_signals = list(seed.trigger_signals or [])
+            trigger_signals.append(
+                _build_signal(
+                    dimension="knowledge_graph",
+                    signal_type="knowledge_graph_evidence",
+                    value={
+                        "source": evidence.get("source"),
+                        "degraded": bool(evidence.get("degraded", False)),
+                        "fallback_reason": evidence.get("fallback_reason"),
+                        "items": items[:3],
+                        "guardrails": evidence.get("guardrails") or [],
+                    },
+                    threshold="required_context_only",
+                    deviation=len(items[:3]),
+                    label="历史分析与关联事件证据",
+                )
+            )
+            enriched_bucket.append(seed.model_copy(update={"trigger_signals": trigger_signals}))
+            attached += len(items[:3])
+            matched_codes.add(code)
+        seeds_by_source[source] = enriched_bucket
+    return _source_diagnostic(
+        "knowledge_graph",
+        "ok" if attached else str(evidence.get("status") or "empty"),
+        count=attached,
+        error=str(evidence.get("error") or ""),
+        detail={
+            "graph_source": evidence.get("source"),
+            "degraded": bool(evidence.get("degraded", False)),
+            "matched_seed_codes": len(matched_codes),
+            "required": bool(evidence.get("required", True)),
+        },
+    )
 
 
 def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[str, Any]:
@@ -1461,6 +1620,7 @@ def _build_seed_pool_result(
     today: Optional[str] = None,
     limit_per_source: int = 15,
     total_limit: int = SEED_BUILD_LIMIT,
+    graph_evidence: Optional[Dict[str, Any]] = None,
 ) -> SeedPoolBuildResult:
     """Build the shared seed pool with deterministic local scan plus online supplements.
 
@@ -1515,6 +1675,23 @@ def _build_seed_pool_result(
             freshness="request",
         )
     if user_seed_count >= max(1, int(total_limit or 1)):
+        news_signal_diagnostic = _attach_news_signal_card_evidence(
+            seeds_by_source,
+            signal_date=today or "",
+        )
+        diagnostics.append(news_signal_diagnostic)
+        source_quality["news_signal_cards"] = _source_quality(
+            str(news_signal_diagnostic.get("status") or "unknown"),
+            freshness=_format_stockapi_date(today),
+            error=str(news_signal_diagnostic.get("error") or ""),
+        )
+        graph_diagnostic = _attach_knowledge_graph_evidence(seeds_by_source, graph_evidence)
+        diagnostics.append(graph_diagnostic)
+        source_quality["knowledge_graph"] = _source_quality(
+            str(graph_diagnostic.get("status") or "unknown"),
+            freshness="temporal_graph",
+            error=str(graph_diagnostic.get("error") or ""),
+        )
         theme_momentum = build_theme_momentum_snapshot()
         _annotate_seed_buckets_with_theme(seeds_by_source, theme_momentum)
         result_pool = _assemble_seed_pool(
@@ -2285,6 +2462,24 @@ def _build_seed_pool_result(
         diagnostics.append(diagnostic)
         _log_seed_source_diagnostic(diagnostic)
         source_quality["discover_watchlist_candidates_auto"] = _source_quality("failed", freshness="online_or_cached", error=message)
+
+    news_signal_diagnostic = _attach_news_signal_card_evidence(
+        seeds_by_source,
+        signal_date=today or trade_date,
+    )
+    diagnostics.append(news_signal_diagnostic)
+    source_quality["news_signal_cards"] = _source_quality(
+        str(news_signal_diagnostic.get("status") or "unknown"),
+        freshness=_format_stockapi_date(today or trade_date),
+        error=str(news_signal_diagnostic.get("error") or ""),
+    )
+    graph_diagnostic = _attach_knowledge_graph_evidence(seeds_by_source, graph_evidence)
+    diagnostics.append(graph_diagnostic)
+    source_quality["knowledge_graph"] = _source_quality(
+        str(graph_diagnostic.get("status") or "unknown"),
+        freshness="temporal_graph",
+        error=str(graph_diagnostic.get("error") or ""),
+    )
 
     theme_momentum = build_theme_momentum_snapshot(
         hot_sectors=theme_payloads.get("hot_sectors"),

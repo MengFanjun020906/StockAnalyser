@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] Web 入场执行回测的分钟线同步不再受当前决策日期筛选限制，默认扫描全部历史最终报告，并补齐各报告所需回测窗口至当前最新可用日期。
+- [改进] 股票新闻、市场复盘、Agent 与通用网页搜索统一切换到 AnySearch `v1/search`，新增 `ANYSEARCH_API_KEY` 配置，生产入口不再注册旧搜索 provider，并兼容 `tag`/`params` 专用查询。
+- [修复] 新闻公司映射要求公司名或股票代码在正文中显式出现，无主体的“这家公司/该公司”导语降为 suppressed，并提供历史映射 repair 清理错误公司扩散。
+- [改进] 新闻事件线索改为展示关联新闻标题、日期、关系理由和传导机制/目标/结论，同事件边增加事件类型、实体锚点、文本相似度与时间窗口门槛并支持重复卡归并；`实时快讯` 等兜底标签不再制造 typed/same-theme 噪声边。
+- [新功能] 财联社电报支持 5-10 分钟增量调度，Graphiti 新增 durable outbox worker、租约恢复、指数退避、死信、删除优先、单任务超时及运行指标/API。
+- [修复] Graphiti episode 与显式边投影在消费端复核卡片状态，suppressed 卡片会删除旧 episode，Neo4j 投影过滤并清理非活跃卡关系。
+- [修复] 新闻关系库 rebuild 同步删除非 active 卡片的历史边，避免关系指标、手动查询与 Neo4j 投影状态不一致。
+- [新功能] 选股 Prompt 1/5 强制读取批量图谱证据并记录降级来源，候选席仅增强已有 seed；语义边阈值支持按 embedding 模型配置和分布审计。
+- [修复] Graphiti 检索改用无需外部 OpenAI reranker 的 RRF 混合检索，并在图谱禁用或查询失败时降级检索本地分析历史与新闻卡片。
+- [新功能] 新闻信号卡片可作为已召回 seed 的补充证据进入选股链路，保存 Seed Pool 快照时自动生成 `news_signal_seed_links` 并支持 outcome 刷新。
+- [新功能] 新增新闻事件关系库回填接口和 `scripts/maintain_news_signals.py`，`daily_run.sh` 可 opt-in 执行卡片重建、事件回填、outcome 刷新及 Graphiti repair。
+- [改进] 新闻图谱同步支持只投影确定性边而跳过慢 Graphiti episode 抽取，未指定日期时会重建全部 active 卡片关系。
 - [新功能] 新闻消息面新增可选轻量 LLM 事件抽取器，支持 `deepseek/deepseek-v4-flash` JSON 事件事实抽取，失败时自动降级到规则兜底并记录 diagnostics。
 - [新功能] 新闻消息面新增 `NewsExtractedEvent` 事件抽取层，重建时保存结构化事件事实，Web“消息”详情展示事件事实、核验状态、置信度和实体链接。
 - [修复] 入场执行回测缺失信号有效期时默认 5 个交易日买入窗口，并将默认成交后超时退出从 20 个交易日调整为 30 个交易日。

@@ -13,6 +13,8 @@ from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import is_meaningful_stock_name
 from src.storage import (
     DatabaseManager,
+    NewsSignalOutcome,
+    NewsSignalSeedLink,
     SelectionSeedPoolDeskOutcome,
     SelectionSeedPoolEvaluation,
     SelectionSeedPoolItem,
@@ -95,6 +97,16 @@ class SeedPoolQualityRepository:
                 snapshot = existing
                 item_id_select = select(SelectionSeedPoolItem.id).where(SelectionSeedPoolItem.snapshot_id == snapshot.id)
                 session.execute(
+                    delete(NewsSignalOutcome).where(
+                        NewsSignalOutcome.seed_item_id.in_(item_id_select)
+                    )
+                )
+                session.execute(
+                    delete(NewsSignalSeedLink).where(
+                        NewsSignalSeedLink.seed_item_id.in_(item_id_select)
+                    )
+                )
+                session.execute(
                     delete(SelectionSeedPoolEvaluation).where(
                         SelectionSeedPoolEvaluation.item_id.in_(item_id_select)
                     )
@@ -129,6 +141,16 @@ class SeedPoolQualityRepository:
                 ]
                 if stale_item_ids:
                     session.execute(
+                        delete(NewsSignalOutcome).where(
+                            NewsSignalOutcome.seed_item_id.in_(stale_item_ids)
+                        )
+                    )
+                    session.execute(
+                        delete(NewsSignalSeedLink).where(
+                            NewsSignalSeedLink.seed_item_id.in_(stale_item_ids)
+                        )
+                    )
+                    session.execute(
                         delete(SelectionSeedPoolEvaluation).where(
                             SelectionSeedPoolEvaluation.item_id.in_(stale_item_ids)
                         )
@@ -157,6 +179,7 @@ class SeedPoolQualityRepository:
             snapshot.diagnostics_json = _json_dumps(diagnostics)
 
             saved_items = 0
+            seed_link_count = 0
             for idx, item in enumerate(items):
                 code = str(item.get("code") or item.get("stock_code") or "").strip()
                 if not code:
@@ -181,6 +204,19 @@ class SeedPoolQualityRepository:
                 session.add(row)
                 session.flush()
                 saved_items += 1
+                for link in _extract_news_signal_seed_refs(item):
+                    session.add(
+                        NewsSignalSeedLink(
+                            card_id=link["card_id"],
+                            seed_item_id=row.id,
+                            source_desk=str(item.get("source") or item.get("primary_source") or "unknown"),
+                            gate_result=link["gate_result"],
+                            signal_score_snapshot=link["signal_score_snapshot"],
+                            mapping_confidence=link["mapping_confidence"],
+                            evidence_grade=link["evidence_grade"],
+                        )
+                    )
+                    seed_link_count += 1
                 for outcome in desk_outcomes_by_code.get(_normalize_code(code), []):
                     session.add(
                         SelectionSeedPoolDeskOutcome(
@@ -197,7 +233,11 @@ class SeedPoolQualityRepository:
                             elapsed_ms=_coerce_int(outcome.get("elapsed_ms"), default=None),
                         )
                     )
-            return {"snapshot_id": snapshot.id, "item_count": saved_items}
+            return {
+                "snapshot_id": snapshot.id,
+                "item_count": saved_items,
+                "seed_link_count": seed_link_count,
+            }
 
         return self.db._run_write_transaction("seed_pool_quality.save_snapshot", _write)
 
@@ -565,6 +605,31 @@ def _extract_catalyst_tags(item: Dict[str, Any]) -> List[str]:
             if text and text not in tags:
                 tags.append(text)
     return tags[:8]
+
+
+def _extract_news_signal_seed_refs(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for signal in item.get("trigger_signals") or item.get("signals") or []:
+        if not isinstance(signal, dict):
+            continue
+        if str(signal.get("signal_type") or "").strip() != "news_signal_card":
+            continue
+        value = signal.get("value") if isinstance(signal.get("value"), dict) else {}
+        card_id = str(value.get("card_id") or signal.get("card_id") or "").strip()
+        if not card_id or card_id in seen:
+            continue
+        seen.add(card_id)
+        refs.append(
+            {
+                "card_id": card_id,
+                "gate_result": str(value.get("gate_result") or "matched_existing_seed"),
+                "signal_score_snapshot": _pct(value.get("signal_score")),
+                "mapping_confidence": _pct(value.get("mapping_confidence")),
+                "evidence_grade": str(value.get("evidence_grade") or ""),
+            }
+        )
+    return refs
 
 
 def _coerce_int(value: Any, *, default: Optional[int] = 0) -> Optional[int]:

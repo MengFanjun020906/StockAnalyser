@@ -382,6 +382,32 @@ class NewsSignalCard(Base):
     )
 
 
+class GraphitiOutbox(Base):
+    """Durable queue for asynchronous Graphiti projection work."""
+
+    __tablename__ = 'graphiti_outbox'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String(180), nullable=False, unique=True, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    aggregate_id = Column(String(128), nullable=False, index=True)
+    market = Column(String(24), default='cn', index=True)
+    payload_json = Column(Text)
+    status = Column(String(24), default='pending', index=True)
+    attempt_count = Column(Integer, default=0)
+    available_at = Column(DateTime, default=datetime.now, index=True)
+    locked_at = Column(DateTime, index=True)
+    completed_at = Column(DateTime, index=True)
+    last_error = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_graphiti_outbox_ready', 'status', 'available_at'),
+        Index('ix_graphiti_outbox_aggregate', 'event_type', 'aggregate_id'),
+    )
+
+
 class NewsSignalFeedback(Base):
     """User feedback overlay for a news signal card."""
 
@@ -1204,7 +1230,43 @@ class DatabaseManager:
         self._migrate_news_extracted_events()
         self._migrate_news_signal_edge_quality()
         self._migrate_news_signal_card_layer()
+        self._migrate_graphiti_outbox()
         self._migrate_seed_pool_snapshot_unique_key()
+
+    def _migrate_graphiti_outbox(self) -> None:
+        with self._engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS graphiti_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key VARCHAR(180) NOT NULL UNIQUE,
+                    event_type VARCHAR(64) NOT NULL,
+                    aggregate_id VARCHAR(128) NOT NULL,
+                    market VARCHAR(24) DEFAULT 'cn',
+                    payload_json TEXT,
+                    status VARCHAR(24) DEFAULT 'pending',
+                    attempt_count INTEGER DEFAULT 0,
+                    available_at DATETIME,
+                    locked_at DATETIME,
+                    completed_at DATETIME,
+                    last_error TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_event_key ON graphiti_outbox (event_key)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_event_type ON graphiti_outbox (event_type)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_aggregate_id ON graphiti_outbox (aggregate_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_market ON graphiti_outbox (market)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_status ON graphiti_outbox (status)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_available_at ON graphiti_outbox (available_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_locked_at ON graphiti_outbox (locked_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_completed_at ON graphiti_outbox (completed_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_created_at ON graphiti_outbox (created_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_updated_at ON graphiti_outbox (updated_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_ready ON graphiti_outbox (status, available_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_graphiti_outbox_aggregate ON graphiti_outbox (event_type, aggregate_id)")
 
     def _migrate_raw_news_episode_quality(self) -> None:
         with self._engine.begin() as conn:

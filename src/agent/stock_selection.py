@@ -37,6 +37,7 @@ from src.agent.stock_selection_prompts import (
     build_portfolio_allocation_prompt,
     build_pricing_agent_prompt,
 )
+from src.agent.stock_selection_graph import StockSelectionGraphEvidence
 from src.agent.tools.registry import ToolRegistry
 from src.config import Config
 from src.schemas.agent_context import AgentUserContext
@@ -163,6 +164,7 @@ class SelectionRunContext:
     next_step: str = "candidate_discovery"
     total_tokens: int = 0
     models_used: List[str] = field(default_factory=list)
+    knowledge_graph_evidence: Dict[str, Any] = field(default_factory=dict)
 
     def set_stage(self, stage_name: str, payload: Dict[str, Any]) -> None:
         full_ref = payload.get("full_ref") or f"{stage_name}.json"
@@ -199,6 +201,7 @@ class SelectionRunContext:
             "market_regime": self.market_regime,
             "orchestration_mode": self.orchestration_mode,
             "candidate_discovery_mode": self.candidate_discovery_mode,
+            "knowledge_graph_evidence": self.knowledge_graph_evidence,
             "expert_state": self.expert_state.to_trace_dict() if self.expert_state else None,
             "stock_identity_audit": _stock_identity_audit(self),
             "next_step": self.next_step,
@@ -284,6 +287,11 @@ def run_stock_selection_pipeline(
     )
     result = StockSelectionResult(enabled=True, context=ctx)
     base_evidence: Dict[str, Any] = {}
+    graph_search_timeout = float(
+        getattr(Config.get_instance(), "graphiti_selection_search_timeout_seconds", 12.0) or 12.0
+    )
+    graph_evidence_collector = StockSelectionGraphEvidence(timeout_seconds=graph_search_timeout)
+    discovery_graph_evidence: Dict[str, Any] = {}
     resume_state = _load_stock_selection_resume_state(resume_artifact_dir)
     try:
         _emit(progress_callback, "selection_start", message="开始五阶段选股流水线。")
@@ -301,6 +309,18 @@ def run_stock_selection_pipeline(
                     "warnings": resume_state.get("warnings", []),
                 },
             )
+
+        discovery_graph_evidence = graph_evidence_collector.collect_discovery(
+            task=task,
+            market=ctx.market,
+            target_symbols=list(agent_user_context.report.target_symbols or []),
+        )
+        ctx.knowledge_graph_evidence["candidate_discovery"] = discovery_graph_evidence
+        _emit(
+            progress_callback,
+            "selection_graph_evidence_discovery",
+            payload=discovery_graph_evidence,
+        )
 
         if ctx.candidate_discovery_mode != "thesis_desk_committee":
             ctx.next_step = "stop_non_thesis_desk_mode"
@@ -359,12 +379,15 @@ def run_stock_selection_pipeline(
                         "candidate_strategy": ctx.candidate_strategy,
                         "strategy_thresholds": ctx.strategy_thresholds,
                         "tool_seed_result": _compact_candidate_seed(discovery_seed),
+                        "knowledge_graph_evidence": discovery_graph_evidence,
                         "available_tools": tool_registry.list_names(),
                     }),
                     fallback=_fallback_candidate_discovery(ctx, discovery_seed),
                     timeout_seconds=timeout_seconds,
                 )
                 _merge_discovery_candidates(discovery_payload, discovery_seed)
+            if isinstance(discovery_payload, dict):
+                discovery_payload["knowledge_graph_evidence"] = discovery_graph_evidence
             _enforce_stage_stock_identity(ctx, discovery_payload, "candidate_discovery")
             ctx.set_stage("candidate_discovery", discovery_payload)
             _emit_stage_done(progress_callback, "selection_candidate_discovery_done", ctx, "candidate_discovery")
@@ -617,6 +640,19 @@ def run_stock_selection_pipeline(
             reused_stages.append("adversarial_review")
             _emit_resumed_stage(progress_callback, "adversarial_review", ctx, adversarial_payload, reused_stages)
         else:
+            adversarial_graph_evidence = graph_evidence_collector.collect_adversarial(
+                candidate_codes=_candidate_codes(
+                    ctx.stage_full("candidate_discovery"),
+                    limit=PROMPT_STOCK_LIMIT,
+                ),
+                market=ctx.market,
+            )
+            ctx.knowledge_graph_evidence["adversarial_review"] = adversarial_graph_evidence
+            _emit(
+                progress_callback,
+                "selection_graph_evidence_adversarial",
+                payload=adversarial_graph_evidence,
+            )
             adversarial_payload = _call_stage_json(
                 ctx=ctx,
                 llm_adapter=llm_adapter,
@@ -637,11 +673,14 @@ def run_stock_selection_pipeline(
                     "allocation_plan_summary": ctx.stage_summary("portfolio_allocation"),
                     "market_regime": _summarize_market_regime(ctx.market_regime),
                     "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
+                    "knowledge_graph_evidence": adversarial_graph_evidence,
                 }),
                 fallback=_fallback_adversarial_review(ctx),
                 timeout_seconds=timeout_seconds,
             )
             _enforce_stage_stock_identity(ctx, adversarial_payload, "adversarial_review")
+            if isinstance(adversarial_payload, dict):
+                adversarial_payload["knowledge_graph_evidence"] = adversarial_graph_evidence
             ctx.set_stage("adversarial_review", adversarial_payload)
             _emit_stage_done(progress_callback, "selection_adversarial_done", ctx, "adversarial_review")
 
@@ -2193,6 +2232,7 @@ def _run_candidate_discovery_tool(
                 tool_registry=tool_registry,  # original ToolRegistry with .execute()
                 today=today_str,
                 total_limit=max(1, min(40, seed_pool_total_limit)),
+                graph_evidence=ctx.knowledge_graph_evidence.get("candidate_discovery"),
             )
             _emit(
                 ctx.progress_callback,

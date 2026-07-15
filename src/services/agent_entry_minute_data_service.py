@@ -78,14 +78,14 @@ class AgentEntryMinuteDataService:
         self,
         *,
         trace_root: Optional[Path] = None,
-        limit: Optional[int] = 300,
+        limit: Optional[int] = None,
         decision_date: Optional[date] = None,
         symbol: Optional[str] = None,
         frequency: str = DEFAULT_MINUTE_FREQUENCY,
         adjustflag: str = DEFAULT_MINUTE_ADJUSTFLAG,
         current_date: Optional[date] = None,
     ) -> EntryMinuteSyncResult:
-        """Fetch and persist minute bars for final-report stocks only."""
+        """Fetch final-report minute bars through today; scan all traces by default."""
         normalized_frequency = _normalize_frequency(frequency)
         normalized_adjustflag = str(adjustflag or DEFAULT_MINUTE_ADJUSTFLAG)
         plans = self.backtest_service.collect_trade_plans(trace_root=trace_root, limit=limit)

@@ -81,11 +81,57 @@ def _json_dict(value: Any) -> Dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _unique_values(values: Iterable[Any]) -> List[Any]:
+    result: List[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        key = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _unique_dicts(values: Any) -> List[Dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    return [item for item in _unique_values(values) if isinstance(item, dict)]
+
+
 class NewsSignalRepository:
     """Database access for raw news episodes, signal cards and overlays."""
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None) -> None:
         self.db = db_manager or DatabaseManager.get_instance()
+
+    def existing_raw_episode_ids(self, episode_ids: Iterable[str]) -> set[str]:
+        keys = {str(value or "").strip() for value in episode_ids if str(value or "").strip()}
+        if not keys:
+            return set()
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(RawNewsEpisode.episode_id).where(RawNewsEpisode.episode_id.in_(keys))
+            ).scalars().all()
+            return {str(value) for value in rows}
+
+    def latest_raw_episode_cursor(self, source: str) -> Dict[str, Any]:
+        source_key = str(source or "").strip()
+        if not source_key:
+            return {"published_at": None, "episode_id": None}
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(RawNewsEpisode)
+                .where(RawNewsEpisode.source == source_key)
+                .order_by(desc(RawNewsEpisode.published_at), desc(RawNewsEpisode.id))
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return {"published_at": None, "episode_id": None}
+            return {
+                "published_at": _iso(row.published_at),
+                "episode_id": row.episode_id,
+            }
 
     def upsert_raw_episodes(self, episodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         payloads = [item for item in episodes if item.get("episode_id") and item.get("dedup_key")]
@@ -251,6 +297,12 @@ class NewsSignalRepository:
             item["feedback_counts"] = self._feedback_counts(session, [key]).get(key, {})
             item["raw_episodes"] = self.raw_episodes_for_card(session, item)
             item["extracted_events"] = self.extracted_events_for_card(session, item)
+            seed_links = session.execute(
+                select(NewsSignalSeedLink)
+                .where(NewsSignalSeedLink.card_id == key)
+                .order_by(desc(NewsSignalSeedLink.created_at), desc(NewsSignalSeedLink.id))
+            ).scalars().all()
+            item["seed_links"] = [self.seed_link_to_dict(link) for link in seed_links]
             return item
 
     def add_feedback(
@@ -429,6 +481,187 @@ class NewsSignalRepository:
             return self.card_to_dict(row)
 
         return self.db._run_write_transaction("news_signal.update_graph_sync_status", _write)
+
+    def update_event_projection(
+        self,
+        card_id: str,
+        *,
+        transmission_paths: List[Dict[str, Any]],
+        diagnostics: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        key = str(card_id or "").strip()
+        if not key:
+            return None
+
+        def _write(session):
+            row = session.execute(select(NewsSignalCard).where(NewsSignalCard.card_id == key)).scalar_one_or_none()
+            if row is None:
+                return None
+            row.transmission_paths_json = _json_dumps(transmission_paths)
+            row.diagnostics_json = _json_dumps(diagnostics)
+            row.updated_at = datetime.now()
+            session.flush()
+            return self.card_to_dict(row)
+
+        return self.db._run_write_transaction("news_signal.update_event_projection", _write)
+
+    def update_company_mapping_projection(
+        self,
+        card_id: str,
+        *,
+        company_impacts: List[Dict[str, Any]],
+        mapping_status: str,
+        mapping_confidence: float,
+        signal_layer: str,
+        signal_score: float,
+        evidence_grade: str,
+        status: str,
+        transmission_paths: List[Dict[str, Any]],
+        diagnostics: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        key = str(card_id or "").strip()
+        if not key:
+            return None
+        allowed_symbols = {
+            str(item.get("symbol") or item.get("code") or "").strip().upper()
+            for item in company_impacts
+            if isinstance(item, dict) and str(item.get("symbol") or item.get("code") or "").strip()
+        }
+        allowed_names = {
+            str(item.get("name") or "").strip()
+            for item in company_impacts
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        }
+
+        def _write(session):
+            row = session.execute(select(NewsSignalCard).where(NewsSignalCard.card_id == key)).scalar_one_or_none()
+            if row is None:
+                return None
+            row.company_impacts_json = _json_dumps(company_impacts)
+            row.mapping_status = str(mapping_status or "industry_only")
+            row.mapping_confidence = float(mapping_confidence or 0.0)
+            row.signal_layer = str(signal_layer or "industry")
+            row.signal_score = float(signal_score or 0.0)
+            row.evidence_grade = str(evidence_grade or "plausible")
+            row.status = str(status or row.status or "active")
+            row.transmission_paths_json = _json_dumps(transmission_paths)
+            row.diagnostics_json = _json_dumps(diagnostics)
+            row.graph_sync_status = "pending"
+            row.updated_at = datetime.now()
+
+            event_rows = session.execute(
+                select(NewsExtractedEvent).where(NewsExtractedEvent.card_id == key)
+            ).scalars().all()
+            for event in event_rows:
+                links = _json_loads(event.entity_links_json, [])
+                if not isinstance(links, list):
+                    continue
+                filtered = []
+                for link in links:
+                    if not isinstance(link, dict):
+                        continue
+                    if str(link.get("entity_type") or "").strip().lower() != "company":
+                        filtered.append(link)
+                        continue
+                    symbol = str(link.get("symbol") or link.get("code") or "").strip().upper()
+                    name = str(link.get("name") or "").strip()
+                    if (symbol and symbol in allowed_symbols) or (name and name in allowed_names):
+                        filtered.append(link)
+                event.entity_links_json = _json_dumps(filtered)
+                event.updated_at = datetime.now()
+            session.flush()
+            return self.card_to_dict(row)
+
+        return self.db._run_write_transaction("news_signal.update_company_mapping_projection", _write)
+
+    def merge_same_event_cluster(
+        self,
+        *,
+        canonical_card_id: str,
+        duplicate_card_ids: Iterable[str],
+        cluster_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        canonical_key = str(canonical_card_id or "").strip()
+        duplicate_keys = sorted(
+            {
+                str(value or "").strip()
+                for value in duplicate_card_ids
+                if str(value or "").strip() and str(value or "").strip() != canonical_key
+            }
+        )
+        if not canonical_key or not duplicate_keys:
+            return None
+
+        def _write(session):
+            canonical = session.execute(
+                select(NewsSignalCard).where(NewsSignalCard.card_id == canonical_key)
+            ).scalar_one_or_none()
+            duplicates = session.execute(
+                select(NewsSignalCard).where(NewsSignalCard.card_id.in_(duplicate_keys))
+            ).scalars().all()
+            if canonical is None or not duplicates:
+                return None
+
+            raw_episode_ids = _json_loads(canonical.raw_episode_ids_json, [])
+            source_chain = _json_loads(canonical.source_chain_json, [])
+            transmission_paths = _json_loads(canonical.transmission_paths_json, [])
+            raw_episode_ids = raw_episode_ids if isinstance(raw_episode_ids, list) else []
+            source_chain = source_chain if isinstance(source_chain, list) else []
+            transmission_paths = transmission_paths if isinstance(transmission_paths, list) else []
+            member_ids = [canonical_key]
+
+            for duplicate in duplicates:
+                member_ids.append(str(duplicate.card_id))
+                raw_episode_ids.extend(_json_loads(duplicate.raw_episode_ids_json, []))
+                source_chain.extend(_json_loads(duplicate.source_chain_json, []))
+                transmission_paths.extend(_json_loads(duplicate.transmission_paths_json, []))
+                diagnostics = _json_dict(duplicate.diagnostics_json)
+                diagnostics["event_cluster"] = {
+                    "cluster_id": cluster_id,
+                    "role": "duplicate",
+                    "merged_into_card_id": canonical_key,
+                    "member_card_ids": sorted(member_ids + duplicate_keys),
+                    "merged_at": datetime.now().isoformat(),
+                }
+                duplicate.diagnostics_json = _json_dumps(diagnostics)
+                duplicate.status = "suppressed"
+                duplicate.graph_sync_status = "pending"
+                duplicate.updated_at = datetime.now()
+
+            canonical_diagnostics = _json_dict(canonical.diagnostics_json)
+            canonical_diagnostics["event_cluster"] = {
+                "cluster_id": cluster_id,
+                "role": "canonical",
+                "canonical_card_id": canonical_key,
+                "member_card_ids": sorted(set(member_ids)),
+                "merged_at": datetime.now().isoformat(),
+            }
+            canonical.raw_episode_ids_json = _json_dumps(_unique_values(raw_episode_ids))
+            canonical.source_chain_json = _json_dumps(_unique_dicts(source_chain))
+            canonical.transmission_paths_json = _json_dumps(_unique_dicts(transmission_paths))
+            canonical.source_count = len(_unique_values(raw_episode_ids))
+            canonical.diagnostics_json = _json_dumps(canonical_diagnostics)
+            canonical.graph_sync_status = "pending"
+            canonical.updated_at = datetime.now()
+
+            event_rows = session.execute(
+                select(NewsExtractedEvent).where(NewsExtractedEvent.card_id.in_(duplicate_keys))
+            ).scalars().all()
+            for event in event_rows:
+                event.card_id = canonical_key
+                event.updated_at = datetime.now()
+            session.execute(
+                delete(NewsSignalEdge).where(
+                    or_(
+                        NewsSignalEdge.source_card_id.in_(duplicate_keys),
+                        NewsSignalEdge.target_card_id.in_(duplicate_keys),
+                    )
+                )
+            )
+            session.flush()
+            return self.card_to_dict(canonical)
+
+        return self.db._run_write_transaction("news_signal.merge_same_event_cluster", _write)
 
     def replace_edges_for_cards(self, card_ids: Iterable[str], edges: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         keys = sorted({str(card_id or "").strip() for card_id in card_ids if str(card_id or "").strip()})

@@ -195,8 +195,7 @@ journalctl -u stock-analyzer -f
 | `SCHEDULE_ENABLED` | `false` | Enable scheduled tasks |
 | `SCHEDULE_TIME` | `18:00` | Daily execution time |
 | `MARKET_REVIEW_ENABLED` | `true` | Enable market review |
-| `TAVILY_API_KEYS` | - | News search (optional) |
-| `MINIMAX_API_KEYS` | - | MiniMax search (optional) |
+| `ANYSEARCH_API_KEY` | - | Unified news and web search (optional) |
 
 ---
 
@@ -360,9 +359,7 @@ Add these Secrets:
 | `SERVERCHAN3_SENDKEY` | ServerChan v3 Sendkey | Optional* |
 | `CUSTOM_WEBHOOK_URLS` | Custom Webhook (comma-separated for multiple) | Optional* |
 | `STOCK_LIST` | Watchlist, e.g., `600519,300750` | ✅ |
-| `TAVILY_API_KEYS` | Tavily Search API Key | Recommended |
-| `MINIMAX_API_KEYS` | MiniMax Coding Plan Web Search | Optional |
-| `SERPAPI_API_KEYS` | SerpAPI Key | Optional |
+| `ANYSEARCH_API_KEY` | AnySearch unified search API key | Recommended |
 | `TUSHARE_TOKEN` | Tushare Token | Optional |
 | `GEMINI_MODEL` | Model name (default gemini-2.0-flash) | Optional |
 

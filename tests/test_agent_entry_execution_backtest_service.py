@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from src.config import Config
-from src.services.agent_entry_minute_data_service import AgentEntryMinuteDataService
+from src.services.agent_entry_minute_data_service import AgentEntryMinuteDataService, EntryMinuteSyncResult
 from src.services.agent_entry_execution_backtest_service import (
     AgentEntryExecutionBacktestService,
     _attach_signal_validity,
@@ -577,6 +577,31 @@ def test_entry_minute_data_service_syncs_baostock_rows_for_final_report_only():
         assert coverage["count"] == 2
 
         DatabaseManager.reset_instance()
+
+
+def test_entry_minute_sync_api_defaults_to_all_historical_reports():
+    app = create_app()
+    client = TestClient(app)
+    sync_result = EntryMinuteSyncResult()
+
+    with patch.object(
+        AgentEntryMinuteDataService,
+        "sync_for_latest_reports",
+        return_value=sync_result,
+    ) as sync_mock:
+        response = client.post(
+            "/api/v1/agent-entry-execution-backtests/minute-bars/sync",
+            params={"rebuild": "false"},
+        )
+
+    assert response.status_code == 200
+    sync_mock.assert_called_once_with(
+        limit=None,
+        decision_date=None,
+        symbol=None,
+        frequency="5",
+        adjustflag="3",
+    )
 
 
 def test_entry_execution_backtest_query_and_api_rebuild():

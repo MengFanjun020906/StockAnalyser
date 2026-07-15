@@ -23,6 +23,8 @@ import src.auth as auth
 from src.data import stock_index_loader
 from api.app import create_app
 from src.config import Config
+from src.repositories.news_signal_repo import NewsSignalRepository
+from src.services.news_signal_service import NewsSignalService
 from src.services.seed_pool_quality_service import SeedPoolQualityService
 from src.services.seed_pool_quality_service import effective_seed_pool_date
 from src.storage import DatabaseManager
@@ -170,6 +172,7 @@ class SeedPoolQualityTestCase(unittest.TestCase):
                 {"date": eval_date, "open": 10.2, "high": 11.0, "low": 9.5, "close": 10.5, "volume": 1, "amount": 10.5},
             ],
         )
+
         self._save_bars(
             "600002",
             [
@@ -217,6 +220,64 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         dates_resp = self.client.get("/api/v1/seed-pool-quality/dates")
         self.assertEqual(dates_resp.status_code, 200)
         self.assertEqual(dates_resp.json()["dates"][0]["seed_date"], "2026-06-05")
+
+    def test_snapshot_persists_news_signal_seed_link(self) -> None:
+        card_id = "card:seed-link:600001"
+        NewsSignalRepository(self.db).upsert_cards(
+            [
+                {
+                    "card_id": card_id,
+                    "signal_date": date(2026, 7, 10),
+                    "summary_short": "订单催化已确认",
+                    "status": "active",
+                    "evidence_grade": "confirmed",
+                    "mapping_status": "mapped",
+                    "mapping_confidence": 0.92,
+                    "signal_score": 82.0,
+                }
+            ]
+        )
+        payload = {
+            "status": "ok",
+            "seed_pool_summary": {
+                "seed_count": 1,
+                "preview": [
+                    {
+                        "code": "600001",
+                        "name": "测试一",
+                        "source": "daily_screener",
+                        "trigger_signals": [
+                            {
+                                "dimension": "news_event",
+                                "signal_type": "news_signal_card",
+                                "value": {
+                                    "card_id": card_id,
+                                    "gate_result": "matched_existing_seed",
+                                    "signal_score": 82.0,
+                                    "mapping_confidence": 0.92,
+                                    "evidence_grade": "confirmed",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        saved = SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id="run-news-link",
+            trace_id="trace-news-link",
+            seed_date=date(2026, 7, 10),
+            generated_at=datetime(2026, 7, 10, 15, 30),
+            market="cn",
+        )
+        detail = NewsSignalService().get_card(card_id)
+
+        self.assertEqual(saved["seed_link_count"], 1)
+        self.assertEqual(len(detail["seed_links"]), 1)
+        self.assertEqual(detail["seed_links"][0]["source_desk"], "daily_screener")
+        self.assertEqual(detail["seed_links"][0]["gate_result"], "matched_existing_seed")
 
     def test_snapshot_persists_full_seed_fact_packets_beyond_preview(self):
         seed_date = date(2026, 6, 5)

@@ -50,10 +50,15 @@ def rebuild_agent_entry_execution_backtests(
         raise HTTPException(status_code=500, detail={"error": "internal_error", "message": str(exc)})
 
 
-@router.post("/minute-bars/sync", summary="Sync baostock minute bars for final-report stocks")
+@router.post("/minute-bars/sync", summary="Sync historical baostock minute bars through the latest date")
 def sync_agent_entry_execution_minute_bars(
-    limit: int | None = Query(300, ge=1, le=2000, description="Newest trace count to scan"),
-    decision_date: date | None = Query(None, description="Only sync final-report stocks for this decision date"),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        le=2000,
+        description="Newest trace count to scan; omitted scans all traces",
+    ),
+    decision_date: date | None = Query(None, description="Optional targeted sync for one decision date"),
     symbol: str | None = Query(None, description="Only sync this stock code"),
     frequency: str = Query("5", pattern="^(5|15|30|60)$", description="Baostock minute frequency"),
     adjustflag: str = Query("3", pattern="^[123]$", description="1 后复权，2 前复权，3 不复权"),
