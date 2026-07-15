@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] Docker 镜像在安装 `requirements.txt` 前复制 Graphiti 子模块，避免本地可编辑依赖 `./graphiti` 在 CI 构建阶段不存在。
 - [修复] Web 入场执行回测的分钟线同步不再受当前决策日期筛选限制，默认扫描全部历史最终报告，并补齐各报告所需回测窗口至当前最新可用日期。
 - [改进] 股票新闻、市场复盘、Agent 与通用网页搜索统一切换到 AnySearch `v1/search`，新增 `ANYSEARCH_API_KEY` 配置，生产入口不再注册旧搜索 provider，并兼容 `tag`/`params` 专用查询。
 - [修复] 新闻公司映射要求公司名或股票代码在正文中显式出现，无主体的“这家公司/该公司”导语降为 suppressed，并提供历史映射 repair 清理错误公司扩散。
