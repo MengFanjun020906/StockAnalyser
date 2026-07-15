@@ -23,6 +23,44 @@ def _isolated_candidate_env(tmp_path, **overrides):
     return env
 
 
+def _candidate_expert_fallback_result(limit):
+    candidates = market_tools._dedupe_candidates(
+        [
+            {**item, "source": "fallback_seed_pool"}
+            for item in market_tools.DEFAULT_WATCHLIST_SEEDS
+        ],
+        limit,
+    )
+    return {
+        "status": "partial",
+        "candidates": candidates,
+        "discovery_steps": [
+            {
+                "source": "candidate_expert:strategy_factor_expert",
+                "status": "unavailable",
+                "count": 0,
+            },
+            {
+                "source": "candidate_expert:technical_candidate_expert",
+                "status": "unavailable",
+                "count": 0,
+            },
+            {
+                "source": "fallback",
+                "status": "ok",
+                "count": len(candidates),
+            },
+        ],
+        "fallback_used": True,
+        "candidate_source": "fallback",
+        "expert_packets": [],
+        "themes": [],
+        "capacity": {},
+        "quality": {},
+        "hard_exclusion": {},
+    }
+
+
 def _write_daily_db(path, rows):
     import sqlite3
 
@@ -199,6 +237,9 @@ def test_discover_watchlist_candidates_falls_back_when_sector_lookup_empty(tmp_p
     with patch.dict("os.environ", _isolated_candidate_env(tmp_path, SEQUOIA_CANDIDATE_DB_PATH="/tmp/not-exists-sequoia.db", ALPHASIFT_CANDIDATE_DB_PATH="/tmp/not-exists-alphasift.db")), patch(
         "src.agent.tools.market_tools._top_sector_names",
         return_value=[],
+    ), patch(
+        "src.agent.tools.market_tools.CandidateExpertOrchestrator.discover",
+        return_value=_candidate_expert_fallback_result(3),
     ):
         result = _handle_discover_watchlist_candidates(limit=3)
 
@@ -862,6 +903,9 @@ def test_discover_watchlist_candidates_falls_back_when_candidate_expert_sources_
     ), patch(
         "src.agent.tools.market_tools._discover_news_momentum_candidates",
         return_value={"status": "empty", "candidates": [], "queries": [], "diagnostics": []},
+    ), patch(
+        "src.agent.tools.market_tools.CandidateExpertOrchestrator.discover",
+        return_value=_candidate_expert_fallback_result(2),
     ):
         result = _handle_discover_watchlist_candidates(limit=2)
 

@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -142,6 +143,9 @@ class TestGetChipDistributionContract(unittest.TestCase):
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=_DummyManagerTimeout(),
+        ), patch(
+            "src.config.get_config",
+            return_value=SimpleNamespace(enable_chip_distribution=True, tushare_token="test-token"),
         ), patch("src.agent.tools.data_tools._query_tushare_chip_distribution", return_value=fast_result):
             result = _handle_get_chip_distribution("603418")
 
@@ -154,6 +158,9 @@ class TestGetChipDistributionContract(unittest.TestCase):
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=_DummyManagerTimeout(),
+        ), patch(
+            "src.config.get_config",
+            return_value=SimpleNamespace(enable_chip_distribution=True, tushare_token="test-token"),
         ), patch(
             "src.agent.tools.data_tools._query_tushare_chip_distribution",
             side_effect=lambda _code: (time.sleep(0.2) or {"status": "ok"}),
