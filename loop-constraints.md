@@ -8,13 +8,15 @@
 - Default mode: don't push before telling me.
 - Autonomous loop mode: after the maintainer provides a target document and grants loop autonomy, commit, push to `dev`, create/update PR/MR, create issues, and prepare releases without per-action approval.
 - Never push directly to `main`; use `dev` plus PR/MR as the integration surface.
-- Main merge or release is allowed only after target acceptance conditions and required checks pass. If branch protection, credentials, or platform permissions require human action, stop and report the exact blocker.
+- Before final acceptance, never merge to `main` and never publish a formal release.
+- After final acceptance, main merge or release is allowed only after target acceptance conditions and required checks pass. If branch protection, credentials, or platform permissions require human action, stop and report the exact blocker.
 
 ## Paths
 - Never edit .env, .env.*, auth/, payments/, secrets/, credentials/
 - Never edit infrastructure configs without human approval
 - Treat `AGENTS.md` as the repository-wide agent behavior source. `LOOP.md`, `STATE.md`, and `loop-*` files may narrow loop behavior but must not override `AGENTS.md`.
 - Require human review before changing `src/agent/`, `src/services/`, `data_provider/`, `api/`, `apps/dsa-web/`, `.github/`, `docker/`, `.env.example`, or AI governance assets.
+- If a target document conflicts with loop rules, use this priority: target document > `LOOP.md` > `AGENTS.md`; hard safety rules still cannot be overridden.
 
 ## Code
 - Always run tests before proposing a fix
@@ -26,10 +28,17 @@
 - Do not make source edits from a triage-only loop.
 - For goal development loops, generate a goal and plan from the target document, then own implementation and verification end-to-end.
 - Stop immediately on unhandled tool failure, silent fallback, lower-quality data, unknown data quality, auth/permission blocker, destructive ambiguity, or unverifiable acceptance criteria.
+- Convert vague target language into observable acceptance checks before building.
+- Fallback success is degraded success. Do not present it as full success unless evidence quality remains equivalent.
+- For finance, stock selection, entry-point, backtest, and news-signal work, expose evidence quality, data freshness, assumptions, and look-ahead-bias risk.
+- Large targets may be split into staged issues and PRs; keep `STATE.md` and PR descriptions current.
+- Add targeted diagnostics, logs, fixtures, scripts, docs, and small internal tools when they directly support verification or maintainability.
 
 ## Communication
 - Always tell me what you're about to do before doing it
-- Never close an issue or PR without my approval
+- Ask only questions that change direction or unblock unverifiable acceptance criteria.
+- Never close an issue or PR without final acceptance unless it was created only as an internal loop tracking duplicate.
+- Final delivery must include PR link, completion level, key changes, validation evidence, unfinished/degraded items, risks, rollback, and next-stage recommendations.
 
 ## Budget
 - If token spend hits 80% of daily cap, switch to report-only

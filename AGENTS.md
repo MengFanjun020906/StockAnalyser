@@ -12,6 +12,7 @@
   - 桌面端改动在 `apps/dsa-desktop/`
   - 部署与流水线改动在 `scripts/`、`.github/workflows/`、`docker/`
 - 未经明确确认，不执行 `git commit`、`git tag`、`git push`；若 maintainer 明确开启 autonomous loop 并授权当前目标，则该目标范围内可自主执行 commit、dev 分支 push、PR/MR、issue 与 release 操作，但必须保留验证证据，并在无法处理的问题、工具失败、fallback 数据质量下降或权限阻塞时立即停下升级给 maintainer。
+- autonomous loop 目标执行时，优先级为：目标文档 > `LOOP.md` 当前 loop 合同 > 本文件通用规则；但不泄露密钥、不隐瞒错误、不伪造测试结果、不直接破坏数据、fallback 质量未知即升级等硬安全底线永远不可覆盖。
 - commit message 使用英文，不添加 `Co-Authored-By`。
 - 不写死密钥、账号、路径、模型名、端口或环境差异逻辑。
 - 优先复用现有模块、配置入口、脚本和测试，不新增平行实现。

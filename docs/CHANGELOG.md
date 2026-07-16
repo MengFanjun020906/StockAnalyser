@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [chore] 接入 loop-engineering Codex daily-triage 脚手架，新增 LOOP/STATE/loop-budget/loop-constraints 与 Codex loop skill/verifier 运行资产。
 - [chore] 将 loop-engineering 运行约束更新为 maintainer 授权后的 autonomous dev loop 模式，允许目标范围内自主提交、推送 dev、创建 PR/MR、issue 和 release，并要求遇到工具失败或数据质量降级立即升级。
+- [chore] 固化 autonomous goal loop 合同，明确目标文档归一化、验收标准、fallback 质量升级、金融证据风险披露、阶段拆分和最终交付格式。
 - [修复] Agent 识别 Tushare Token 过期/无效后会在进程内隔离该凭据，避免资金流、筹码和板块工具在同一 Trace 中重复请求必然失败的接口。
 - [修复] `get_chip_distribution` 使用独立超时 worker 池，局部线程池繁忙不再触发数据源熔断；连续上游超时仍按筹码专用熔断器快速降级。
 - [改进] `get_capital_flow`、`get_chip_distribution` 和 `get_sector_rankings` 持久化最近成功结果；实时数据源失败时明确返回 `stale` 与现场诊断，无缓存时返回不可作为证据的 `unavailable`，不再误报为工具代码执行失败。

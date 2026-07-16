@@ -8,6 +8,23 @@ This file configures operational loops only. `AGENTS.md` remains the single sour
 - The maintainer supplies goals and final acceptance only; the loop owns planning, implementation, tests, dev-branch push, PR/MR, issue creation, and release steps inside the active target scope.
 - Stop immediately and escalate when an error cannot be handled, a tool silently degrades, fallback data quality is lower or unknown, credentials/permissions block required work, or verification cannot prove the result.
 
+## Autonomous Goal Loop Contract
+
+When the maintainer provides a target document, run this contract unless the maintainer explicitly overrides it for that target:
+
+1. Rewrite the target document into a concrete goal, staged plan, and acceptance criteria before implementation.
+2. Treat vague requirements such as "better quality", "optimize", or "do not fail" as incomplete until they are converted into observable checks.
+3. The maintainer participates at goal input and final acceptance only; the loop owns implementation decisions in between.
+4. Before final acceptance, the loop may commit, push to `dev`, update PR/MR, create issues, and prepare release notes without per-action approval.
+5. Before final acceptance, do not merge to `main` and do not publish a formal release.
+6. Fallback success is not full success. Record it as degraded success and stop if data quality is lower or unknown.
+7. For financial analysis, stock selection, entry points, backtests, and news signals, expose evidence quality, data freshness, assumptions, and look-ahead-bias risk instead of only conclusions.
+8. If the target document conflicts with loop rules, use this priority: target document > `LOOP.md` > `AGENTS.md`; hard safety rules still cannot be overridden.
+9. Large targets may be split into staged issues and PRs. Keep `STATE.md` and PR descriptions current with progress, validation, and residual risk.
+10. Add targeted diagnostics, logs, fixtures, scripts, docs, and small internal tools when they directly support verification or maintainability.
+11. A target document should have target outcome, non-goals, acceptance criteria, priorities/stages, and known constraints. Draft missing pieces and ask only direction-changing questions.
+12. Final delivery must include PR link, completion level, key changes, validation evidence, unfinished/degraded items, risks, rollback, and next-stage recommendations.
+
 ## Active Loops
 
 | Pattern | Cadence | Status | Automation prompt |
