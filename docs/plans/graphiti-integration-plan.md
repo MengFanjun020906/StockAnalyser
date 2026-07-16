@@ -1129,8 +1129,8 @@ volumes:
 - [x] 改进公司映射质量：公司名或股票代码必须在新闻正文出现；主题词典只保留显式命中的公司，代称式公司导语无明确主体时降为 `suppressed` 和产业级审计证据。
 - [x] 增加第一版低质量处理：低质量原始消息保留审计，但生成卡片时标记 `low_quality` 并显著降权，不进入 active 图谱主路径。
 - [x] Web 卡片详情展示入库质量：展示来源质量分、质量等级、质量 flags 和规范化正文预览。
-- 增加人工反馈读路径：`wrong/noisy/duplicate/remove_company` 不只降权，还要进入后续入库过滤、映射黑名单或规则修正。
-- 建立入库指标：来源成功率、去重率、无正文率、宏观命中率、公司映射命中率、歧义率、被人工标噪比例。
+- [x] 增加人工反馈读路径：`wrong/noisy/duplicate` 会压制 active 卡片并清理相关边，`remove_company` 会移除对应公司映射、降级为产业级证据并触发 Graphiti outbox / 边重建。
+- [x] 建立入库指标第一版：`/api/v1/news-signals/metrics` 汇总原始新闻质量分布、来源分布、质量 flags、低质量率、反馈控制和人工标噪比例。
 
 ### 6.3 2026-07-06 P1 入库质量门实施记录
 
@@ -1145,20 +1145,19 @@ volumes:
 
 仍需继续提高：
 
-- 当前质量评分是规则版，缺少按来源/日期的统计分布校准。
-- 当前低质量只影响分数和状态，还没有沉淀到反馈驱动的过滤规则、映射黑名单或来源权重自适应。
-- 当前 `quality_flags` 已进入边质量评分第一版，但还没有结合人工反馈和回测结果做动态校准。
-- 当前未新增入库质量聚合指标 API；后续应在 `/api/v1/news-signals/metrics` 或独立 metrics 中展示质量分布。
+- 当前质量评分是规则版，已有按日期/来源的聚合可观测指标，但尚未用结果收益或人工反馈自动调整来源权重。
+- 人工 `wrong/noisy/duplicate/remove_company` 已进入读路径并触发压制、公司映射移除和边重建；后续还需要沉淀到长期来源黑名单、映射黑名单和自适应过滤规则。
+- 当前 `quality_flags` 已进入边质量评分和 metrics 第一版，但还没有结合 `news_signal_outcomes` 做动态校准。
 
 边质量 TODO：
 
-- 将边分层展示和使用：`typed_relation` 是实体事实边，`event_clue` 是规则事件线索，`semantic_similarity` 是弱语义相似；Agent 不得把弱语义边直接当成因果。
+- [x] 将边分层展示和使用：`typed_relation` 是实体事实边，`event_clue` 是规则事件线索，`semantic_similarity` 是弱语义相似；Agent 证据包区分 `strong_edges` 与 `weak_edges`，不得把弱语义边直接当成因果。
 - [x] 为边增加质量评分第一版：实体重叠、主题重叠、时间距离、来源质量、映射置信度、embedding 相似度共同决定 `edge_quality`、`quality_grade`、`quality_flags`。
 - [x] 限制语义边密度第一版：语义边先过最低质量门，再按每张卡 top-k 保留，避免小样本日期生成过密弱连接网。
 - [x] 建立 per-model embedding 阈值配置与审计：按模型解析阈值 profile，并在重建结果记录相似度 min/p50/p90/max 分布；后续仍可基于人工反馈调整 profile 数值。
 - [x] 区分“同一事件”“同一主题”“同一产业链传导”：`same_event` 同时要求事件类型、公司/实体锚点、文本相似度和三日窗口，并对高置信连通分量执行物理归并；同主题保持弱边，传导路径展示机制、目标和结论。
 - [x] 增加边审计展示第一版：Web 单卡事件线索展示强/中/弱边、质量分、生成理由和质量 flags；Neo4j 显式关系同步 `edge_quality` 与 `quality_grade`。
-- 建立边质量指标：平均每卡边数、强/弱边比例、人工否定率、语义边命中率、同事件误连率、孤立卡片比例。
+- [x] 建立边质量指标第一版：平均每卡边数、强/弱边比例、孤立卡片比例、人工否定率、边质量分布、边类型/等级/flags 分布进入 metrics；语义边命中率和同事件误连率先保留为待 outcome/edge-level 反馈驱动的观测槽位。
 
 ### 6.4 2026-07-06 P2-1 边质量收敛实施记录
 
@@ -1173,10 +1172,10 @@ volumes:
 
 仍需继续提高：
 
-- 质量评分仍是规则版，尚未使用人工 `wrong/noisy/duplicate` 反馈和 `news_signal_outcomes` 做权重校准。
-- 语义阈值仍绑定当前实验值 `0.76`，尚未按 embedding 模型做 per-model 分布校准。
-- Agent 检索和选股链路尚未读取 `quality_grade` 来约束弱语义边的使用语义。
-- 还未新增全局边质量指标面板，例如平均每卡边数、强弱边比例、孤立卡片比例和人工否定率。
+- 质量评分仍是规则版，人工 `wrong/noisy/duplicate/remove_company` 已可影响 active 状态、公司映射和边重建；但尚未使用 `news_signal_outcomes` 做自动权重校准。
+- 语义阈值已有 per-model profile 和分布审计；后续仍需基于人工反馈和 outcome 定期调整 profile 数值。
+- Agent 检索和选股证据包已读取边类型、质量等级与 flags，并将弱语义边单独放入 `weak_edges`；后续要把这套约束继续扩展到更多报告段落。
+- 全局边质量指标和 Web 面板已落地第一版；语义边命中率、同事件误连率还需要 edge-level 反馈或结果归因数据支持。
 
 ### 6.5 2026-07-07 P2-2 消息面有效链路实施记录
 
@@ -1195,7 +1194,7 @@ volumes:
 仍需继续提高：
 
 - 事件类型和分数仍是规则版，尚未接入搜索引擎二次核验和来源可信度打分。
-- “国外供应链”和“国产替代”两条主线需要沉淀成专门规则：海外大客户/海外限制/海外扩产对应国内替代、二供、材料设备、模组封测等不同落点。
+- “国外供应链”和“国产替代”两条主线已沉淀为专门传导模板：海外限制/海外出口/海外供给变化 -> 国内可替代环节 -> 产业链落点；后续仍需接搜索核验、来源可信度和公司产品/客户证据库。
 - 公司映射仍依赖显式股票和主题词典，后续要补“客户关系/供应链认证/产品相似性”的证据来源，避免仅因同主题而映射到公司。
 
 ### 6.6 后续技术路线：减少硬关键词，转向事件抽取 + 证据核验
@@ -1228,7 +1227,7 @@ volumes:
 - [x] 新增 `NewsExtractedEvent` 结构，作为 `RawNewsEpisode -> NewsSignalCard` 之间的事件层。
 - [x] 先对 `news_theme_daily`、财联社电报、宏观新闻做事件抽取 JSON schema，不急着替换全部逻辑。
 - [x] 接入可选轻量 LLM JSON 抽取器，默认规则兜底，配置后可用 `deepseek/deepseek-v4-flash` 抽取事件事实。
-- 对“国外供应链”和“国产替代”两条主线建立证据模板：海外限制/海外提价/海外大客户扩产/海外公司订单变化 -> 国内可替代环节 -> 公司产品和客户证据 -> 置信度。
+- [x] 对“国外供应链”和“国产替代”两条主线建立证据模板：海外限制/海外提价/海外出口或供给变化 -> 国内可替代环节 -> 产业链落点 -> 置信度；公司层产品和客户证据仍必须由后续显式证据补强。
 - [x] Web 页面展示事件事实和推理分层：事实、推理、待核验，不把推理伪装成事实。
 
 ### 6.7 2026-07-08 P2-3 事件抽取层闭环实施记录
@@ -1270,7 +1269,7 @@ volumes:
 
 - 当前 LLM 只替换事件事实抽取，不负责搜索核验；高影响事件仍需接入搜索引擎或权威源二次确认。
 - LLM 输出的实体链接还没有进入公司映射黑名单/消歧表；后续应把低置信度公司降级为产业级证据。
-- 事件类型仍是一组固定枚举，后续要为“国外供应链”和“国产替代”补专门模板和验证字段。
+- 事件类型仍是一组固定枚举；“国外供应链”和“国产替代”已有专门模板和链路字段，后续要补搜索核验字段、来源可信度和公司产品/客户证据字段。
 
 ### 6.9 2026-07-10 检索、选股证据与运行态 repair 实施记录
 
@@ -1311,6 +1310,30 @@ volumes:
 - 关系库全量 rebuild 已物理清理 400 条涉及 suppressed 卡的旧边，最终保留并向 Neo4j 投影 1566 条 active 关系，同时清理 51 张非活跃卡范围；泛主题过滤后 event clue 从 1942 条收敛到 907 条。
 - 51 个 Graphiti 删除任务和 8 个按日边投影任务全部成功，无失败和死信；active episode 慢调用已验证会按单任务超时进入 `retry`，不再阻塞 worker。
 
+### 6.11 2026-07-16 反馈闭环、质量指标与在线验证收口
+
+已落地：
+
+- 人工反馈不再只是计数：`wrong/noisy/duplicate` 会压制卡片、清理相关边并把卡片/边投影加入 Graphiti outbox；`remove_company` 会按 payload、备注或单公司兜底选择器移除公司映射，若无剩余公司则降级为产业级证据、降低分数和证据等级。
+- `/api/v1/news-signals/metrics` 新增 `raw_quality`、`edge_quality`、`feedback_quality` 聚合，覆盖原始新闻质量分布、来源质量、低质量率、边强弱比例、孤立卡片、人工否定率和反馈控制规则命中。
+- Web“消息”页新增入库质量、边质量和反馈控制指标面板，列表指标与详情中的来源质量/事件线索形成闭环。
+- Agent 选股图谱证据包新增 `edge_quality_summary`，并将非低质业务/事件边放入 `strong_edges`，把 `semantic_similarity` 或带 `semantic_not_causal` 的弱边放入 `weak_edges`，避免选股 Prompt 把相似关系当成因果。
+- 消息面传导路径补充“国外供应链/国产替代”模板，能识别海外供给、出口、限制、断供、进口替代、自主可控、二供等线索，并在 `chain_steps` 中标出“海外供给/出口线索 -> 国产替代验证 -> 映射落点”。
+- Graphiti 同步入口 `ingest_analysis_sync`、`ingest_trace_sync`、`ingest_market_event_sync` 支持调用方传入 bounded timeout；主分析、Agent Trace 和事件 watch 均使用 `GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS` 约束慢 episode 抽取，避免 Graphiti Core 卡住主流程。
+- 新增 `scripts/validate_graphiti_online.py`，使用临时关系库和独立 `market_loop_smoke` group 做在线 smoke：重建确定性边、投影 Neo4j、写入分析 episode，并通过 `search_knowledge_graph` 工具检索上下文。
+
+2026-07-16 真实运行态验证：
+
+- `python test_env.py --graph` 在真实 Neo4j + Graphiti embedding 配置下通过。
+- `python scripts/validate_graphiti_online.py --market loop_smoke --timeout-seconds 45` 返回 `status=ok`：投影 3 条显式边，Neo4j 查到 3 条 `NewsSignalCard` 关系，分析 episode count 为 1，`search_knowledge_graph` 返回 `success=true`、`degraded=false`、`context_count=9`。
+- `python main.py --stocks 600519 --workers 1 --no-notify --no-market-review --force-run` 首次暴露同步 Graphiti episode 慢调用会长时间阻塞；修复后使用 `GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS=10` 复跑，主分析完成 `success=1 failed=0`，Graphiti 超时被记录为 warning，不再拖垮分析链路。
+
+仍需继续提高：
+
+- 来源权重、边质量和事件分数仍是规则 + 反馈控制第一版，尚未用 `news_signal_outcomes` 做自动校准。
+- 语义边命中率、同事件误连率需要 edge-level 人工反馈或结果归因数据，当前 metrics 先保留状态槽位。
+- 用户画像记忆仍按 2026-07-11 决策暂缓；启用前需要单独设计隐私边界、group_id 隔离、数据删除和验收标准。
+
 ### 阶段 0：基础设施
 
 - [x] `docker/docker-compose.yml` 加 Neo4j 服务（profile: graphiti），`start_all.sh` / `stop_all.sh` 支持 `START_NEO4J` / `STOP_NEO4J` 控制
@@ -1340,14 +1363,14 @@ volumes:
 - [x] `src/core/pipeline.py`：Agent 分析保存历史后追加入图
 - [x] `api/v1/endpoints/agent.py`：Agent Trace finalize 后写入 Graphiti
 - [x] 单元测试：`tests/test_agent_models_api.py::test_trace_finalize_ingests_graphiti_episode`
-- [ ] 在线验证：跑一次完整分析，确认 Neo4j 中有正确实体和关系
+- [x] 在线验证：2026-07-16 真实 `main.py --stocks 600519 --workers 1 --no-notify --no-market-review --force-run` 跑通主分析；独立 `loop_smoke` 在线脚本确认 Neo4j 中有分析 episode 和新闻显式关系。同步 Graphiti episode 慢调用已加 bounded timeout，超时只记录 warning 不阻塞主流程。
 
 ### 阶段 4：Agent 工具
 
 - [x] `src/agent/tools/graph_tools.py`：实现 `search_knowledge_graph` 工具
 - [x] `src/agent/factory.py` 注册到 ToolRegistry
 - [x] 工具 schema 纳入 Agent registry 测试
-- [ ] 在线验证：Agent 分析时能调用图谱检索并获得有意义的上下文
+- [x] 在线验证：2026-07-16 `scripts/validate_graphiti_online.py` 在真实 Neo4j/Graphiti 下调用 `search_knowledge_graph`，返回 `success=true`、`degraded=false`、`context_count=9`。
 
 ### 阶段 5：新闻入图（可选）
 

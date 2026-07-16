@@ -1759,15 +1759,21 @@ def _ingest_event_watch_to_graphiti(events: List[Dict[str, Any]], *, market: str
         service = get_graphiti_service()
         if not service.is_available():
             return
+        timeout_seconds = max(
+            10.0,
+            min(600.0, float(getattr(config, "graphiti_outbox_job_timeout_seconds", 120) or 120)),
+        )
         for event in events[:8]:
             service.ingest_market_event_sync(
                 event_id=str(event.get("event_id") or "event"),
                 title=str(event.get("title") or "market event"),
                 event_payload=event,
                 market=market,
+                timeout_seconds=timeout_seconds,
             )
     except Exception as exc:
-        logger.debug("Graphiti market event ingest skipped: %s", exc)
+        message = str(exc) or exc.__class__.__name__
+        logger.debug("Graphiti market event ingest skipped: %s", message)
 
 
 def _discover_event_impact_candidates(*, market: str, limit: int) -> Dict[str, Any]:

@@ -148,7 +148,7 @@ describe('NewsSignalsPage', () => {
     expect((await screen.findAllByText('央行开展逆回购操作，维护流动性合理充裕。')).length).toBeGreaterThan(0);
     expect(await screen.findByText('事件得分 72.5')).toBeInTheDocument();
     expect((await screen.findAllByText(/\[政策\/宏观\]/)).length).toBeGreaterThan(0);
-    expect(await screen.findByText('入库质量')).toBeInTheDocument();
+    expect((await screen.findAllByText('入库质量')).length).toBeGreaterThan(0);
     expect(await screen.findByText('medium')).toBeInTheDocument();
   });
 });

@@ -69,6 +69,8 @@ class StockSelectionGraphEvidence:
             for item in edges[:20]
             if isinstance(item, dict) and str(item.get("quality_grade") or "medium") != "low"
         ]
+        strong_edges = [item for item in compact_edges if not _is_weak_semantic_edge(item)]
+        weak_edges = [item for item in compact_edges if _is_weak_semantic_edge(item)]
         by_code: Dict[str, List[Dict[str, Any]]] = {}
         for item in compact_items:
             for code in _codes_from_item(item):
@@ -81,7 +83,9 @@ class StockSelectionGraphEvidence:
             "fallback_reason": result.get("fallback_reason"),
             "query": query,
             "items": compact_items,
-            "strong_edges": compact_edges,
+            "strong_edges": strong_edges,
+            "weak_edges": weak_edges,
+            "edge_quality_summary": _edge_quality_summary(edges),
             "by_code": by_code,
             "error": result.get("error") or result.get("graphiti_error"),
             "guardrails": [
@@ -127,6 +131,8 @@ def _compact_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "analysis_summary",
         "operation_advice",
         "trend_prediction",
+        "edge_class",
+        "edge_type",
         "signal_date",
         "signal_layer",
         "evidence_grade",
@@ -135,10 +141,48 @@ def _compact_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "primary_industries",
         "quality_grade",
         "edge_quality",
+        "quality_flags",
         "rationale",
         "relevance_score",
+        "target_id",
+        "target_type",
+        "target_card_id",
     )
     compact = {key: item.get(key) for key in allowed if item.get(key) not in (None, "", [], {})}
     if isinstance(compact.get("company_impacts"), list):
         compact["company_impacts"] = compact["company_impacts"][:5]
     return compact
+
+
+def _is_weak_semantic_edge(item: Dict[str, Any]) -> bool:
+    edge_class = str(item.get("edge_class") or "")
+    edge_type = str(item.get("edge_type") or "")
+    flags = item.get("quality_flags") if isinstance(item.get("quality_flags"), list) else []
+    return edge_class == "semantic_similarity" or edge_type == "semantic_similarity" or "semantic_not_causal" in flags
+
+
+def _edge_quality_summary(edges: List[Any]) -> Dict[str, Any]:
+    total = 0
+    skipped_low_quality = 0
+    semantic_edges = 0
+    grade_counts: Dict[str, int] = {}
+    class_counts: Dict[str, int] = {}
+    for item in edges:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        grade = str(item.get("quality_grade") or "unknown")
+        edge_class = str(item.get("edge_class") or "unknown")
+        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+        class_counts[edge_class] = class_counts.get(edge_class, 0) + 1
+        if grade == "low":
+            skipped_low_quality += 1
+        if _is_weak_semantic_edge(item):
+            semantic_edges += 1
+    return {
+        "edge_count": total,
+        "skipped_low_quality_edges": skipped_low_quality,
+        "semantic_similarity_edges": semantic_edges,
+        "quality_grade_counts": grade_counts,
+        "edge_class_counts": class_counts,
+    }

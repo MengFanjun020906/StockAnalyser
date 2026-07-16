@@ -65,6 +65,11 @@ function fmtNum(value?: number | null, digits = 1): string {
   return Number(value).toFixed(digits);
 }
 
+function fmtPct(value?: number | null, digits = 0): string {
+  if (value == null || !Number.isFinite(Number(value))) return '--';
+  return `${(Number(value) * 100).toFixed(digits)}%`;
+}
+
 function fmtDateTime(value?: string | null): string {
   if (!value) return '--';
   return value.replace('T', ' ').slice(0, 16);
@@ -117,6 +122,20 @@ const MetricTile: React.FC<{ label: string; value: string; icon: React.ReactNode
     </div>
     <div className="mt-3 text-2xl font-semibold tabular-nums text-foreground">{value}</div>
     {hint ? <div className="mt-1 text-xs text-secondary-text">{hint}</div> : null}
+  </div>
+);
+
+const MetricBreakdown: React.FC<{ title: string; items: Array<{ label: string; value: string }> }> = ({ title, items }) => (
+  <div className="border border-border/70 bg-card/60 px-4 py-3">
+    <div className="text-xs font-medium uppercase tracking-[0.08em] text-secondary-text">{title}</div>
+    <div className="mt-3 grid gap-2">
+      {items.map((item) => (
+        <div key={item.label} className="flex items-center justify-between gap-3 text-sm">
+          <span className="min-w-0 truncate text-secondary-text">{item.label}</span>
+          <span className="shrink-0 font-medium tabular-nums text-foreground">{item.value}</span>
+        </div>
+      ))}
+    </div>
   </div>
 );
 
@@ -612,6 +631,10 @@ const NewsSignalsPage: React.FC = () => {
   }, [loadSelected]);
 
   const rows = useMemo(() => data?.items ?? [], [data]);
+  const rawQuality = metrics?.rawQuality;
+  const edgeQuality = metrics?.edgeQuality;
+  const feedbackQuality = metrics?.feedbackQuality;
+  const totalFeedback = Object.values(metrics?.feedbackCounts || {}).reduce((sum, value) => sum + Number(value || 0), 0);
 
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 py-6">
@@ -678,11 +701,40 @@ const NewsSignalsPage: React.FC = () => {
         </div>
       ) : null}
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
         <MetricTile label="卡片" value={String(metrics?.totalCards ?? data?.total ?? 0)} icon={<Newspaper className="h-4 w-4" />} hint={`有效 ${metrics?.activeCards ?? data?.summary?.active ?? 0}`} />
         <MetricTile label="均分" value={fmtNum(metrics?.avgSignalScore)} icon={<GitBranch className="h-4 w-4" />} hint={`降权 ${metrics?.suppressedCards ?? data?.summary?.suppressed ?? 0}`} />
         <MetricTile label="层级" value={String(Object.keys(data?.summary?.layerCounts || {}).length || Object.keys(metrics?.layerCounts || {}).length)} icon={<Layers3 className="h-4 w-4" />} hint={`产业 ${data?.summary?.layerCounts?.industry ?? metrics?.layerCounts?.industry ?? 0} / 公司 ${data?.summary?.layerCounts?.company ?? metrics?.layerCounts?.company ?? 0} / 宏观 ${data?.summary?.layerCounts?.macro ?? metrics?.layerCounts?.macro ?? 0}`} />
-        <MetricTile label="反馈" value={String(Object.values(metrics?.feedbackCounts || {}).reduce((sum, value) => sum + Number(value || 0), 0))} icon={<ThumbsUp className="h-4 w-4" />} hint={`Graph ${metrics?.graphSyncCounts?.pending ?? 0} pending`} />
+        <MetricTile label="反馈" value={String(totalFeedback)} icon={<ThumbsUp className="h-4 w-4" />} hint={`否定 ${fmtPct(feedbackQuality?.negativeFeedbackRate)}`} />
+        <MetricTile label="入库质量" value={fmtNum(rawQuality?.avgQualityScore, 0)} icon={<AlertTriangle className="h-4 w-4" />} hint={`低质 ${fmtPct(rawQuality?.lowQualityRate)}`} />
+        <MetricTile label="边质量" value={fmtNum(edgeQuality?.avgEdgeQuality, 0)} icon={<Network className="h-4 w-4" />} hint={`弱边 ${fmtPct(edgeQuality?.weakEdgeRatio)} / 孤立 ${edgeQuality?.isolatedCardCount ?? 0}`} />
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-3">
+        <MetricBreakdown
+          title="入库质量分布"
+          items={[
+            { label: '原始消息', value: String(rawQuality?.rawEpisodeCount ?? 0) },
+            { label: 'high / medium / low', value: `${rawQuality?.qualityCounts?.high ?? 0} / ${rawQuality?.qualityCounts?.medium ?? 0} / ${rawQuality?.qualityCounts?.low ?? 0}` },
+            { label: '来源数', value: String(Object.keys(rawQuality?.sourceCounts || {}).length) },
+          ]}
+        />
+        <MetricBreakdown
+          title="边质量指标"
+          items={[
+            { label: '总边数 / 每卡边', value: `${edgeQuality?.edgeCount ?? 0} / ${fmtNum(edgeQuality?.avgEdgesPerCard, 2)}` },
+            { label: '强边 / 弱边', value: `${fmtPct(edgeQuality?.strongEdgeRatio)} / ${fmtPct(edgeQuality?.weakEdgeRatio)}` },
+            { label: '语义边 / 同事件边', value: `${edgeQuality?.semanticEdgeCount ?? 0} / ${edgeQuality?.sameEventEdgeCount ?? 0}` },
+          ]}
+        />
+        <MetricBreakdown
+          title="反馈控制"
+          items={[
+            { label: '否定反馈 / 涉及卡片', value: `${feedbackQuality?.negativeFeedbackTotal ?? 0} / ${feedbackQuality?.negativeCardCount ?? 0}` },
+            { label: '压制 / 移除公司', value: `${feedbackQuality?.controlRuleCounts?.suppressCard ?? 0} / ${feedbackQuality?.controlRuleCounts?.removeCompany ?? 0}` },
+            { label: 'Graph pending', value: String(metrics?.graphSyncCounts?.pending ?? 0) },
+          ]}
+        />
       </div>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(360px,0.95fr)_minmax(0,1.25fr)]">

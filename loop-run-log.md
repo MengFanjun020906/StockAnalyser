@@ -20,3 +20,16 @@ Append one entry per run. Prune entries older than 30 days.
 ## Recent Runs
 
 <!-- Loop appends below this line -->
+
+```json
+{
+  "run_id": "2026-07-16T00:00:00+08:00",
+  "pattern": "autonomous-graphiti-integration",
+  "duration_s": 3300,
+  "items_found": 6,
+  "actions_taken": 6,
+  "escalations": 2,
+  "tokens_estimate": 330000,
+  "outcome": "fix-implemented-pr-update-pending"
+}
+```

@@ -99,6 +99,10 @@ def _unique_dicts(values: Any) -> List[Dict[str, Any]]:
     return [item for item in _unique_values(values) if isinstance(item, dict)]
 
 
+NEGATIVE_FEEDBACK_TYPES = {"wrong", "noisy", "duplicate", "remove_company"}
+SUPPRESSING_FEEDBACK_TYPES = {"wrong", "noisy", "duplicate"}
+
+
 class NewsSignalRepository:
     """Database access for raw news episodes, signal cards and overlays."""
 
@@ -334,11 +338,51 @@ class NewsSignalRepository:
                 user_id=str(user_id or ""),
             )
             session.add(row)
-            if feedback in {"wrong", "noisy"} and card.status == "active":
-                card.status = "suppressed"
+            diagnostics = _json_dict(card.diagnostics_json)
+            control = _feedback_control_entry(feedback, payload or {}, note)
+            effect = "record_only"
+            if feedback in SUPPRESSING_FEEDBACK_TYPES:
+                if card.status == "active":
+                    card.status = "suppressed"
+                card.graph_sync_status = "pending"
+                session.execute(
+                    delete(NewsSignalEdge).where(
+                        (NewsSignalEdge.source_card_id == key) | (NewsSignalEdge.target_card_id == key)
+                    )
+                )
+                effect = "suppress_card_and_remove_edges"
+            elif feedback == "remove_company":
+                removed, remaining = _remove_feedback_company(card, payload or {}, note)
+                control["removed_companies"] = removed
+                if removed:
+                    card.company_impacts_json = _json_dumps(remaining)
+                    card.mapping_status = "mapped" if remaining else "industry_only"
+                    if not remaining and card.signal_layer != "macro":
+                        card.signal_layer = "industry"
+                    if not remaining:
+                        card.mapping_confidence = min(float(card.mapping_confidence or 0.0), 0.35)
+                        card.signal_score = min(float(card.signal_score or 0.0), 45.0)
+                        if str(card.evidence_grade or "") == "confirmed":
+                            card.evidence_grade = "plausible"
+                    card.graph_sync_status = "pending"
+                    session.execute(
+                        delete(NewsSignalEdge).where(
+                            (NewsSignalEdge.source_card_id == key) | (NewsSignalEdge.target_card_id == key)
+                        )
+                    )
+                    effect = "remove_company_mapping_and_rebuild_edges"
+                else:
+                    effect = "remove_company_no_match"
+            elif feedback == "adjust_industries":
+                effect = "record_industry_adjustment"
+            control["effect"] = effect
+            _append_feedback_control(diagnostics, control)
+            card.diagnostics_json = _json_dumps(diagnostics)
             card.updated_at = datetime.now()
             session.flush()
-            return self.feedback_to_dict(row)
+            result = self.feedback_to_dict(row)
+            result["effect"] = effect
+            return result
 
         return self.db._run_write_transaction("news_signal.add_feedback", _write)
 
@@ -413,9 +457,38 @@ class NewsSignalRepository:
             if target_date:
                 base = base.where(NewsSignalCard.signal_date == target_date)
             rows = session.execute(base).scalars().all()
-            feedback_rows = session.execute(
-                select(NewsSignalFeedback.feedback_type, func.count(NewsSignalFeedback.id)).group_by(NewsSignalFeedback.feedback_type)
-            ).all()
+            card_ids = [str(row.card_id) for row in rows if row.card_id]
+            feedback_stmt = select(NewsSignalFeedback.feedback_type, func.count(NewsSignalFeedback.id)).group_by(NewsSignalFeedback.feedback_type)
+            feedback_detail_stmt = select(NewsSignalFeedback)
+            if target_date:
+                if card_ids:
+                    feedback_stmt = feedback_stmt.where(NewsSignalFeedback.card_id.in_(card_ids))
+                    feedback_detail_stmt = feedback_detail_stmt.where(NewsSignalFeedback.card_id.in_(card_ids))
+                else:
+                    feedback_stmt = feedback_stmt.where(NewsSignalFeedback.card_id == "__none__")
+                    feedback_detail_stmt = feedback_detail_stmt.where(NewsSignalFeedback.card_id == "__none__")
+            feedback_rows = session.execute(feedback_stmt).all()
+            feedback_details = session.execute(feedback_detail_stmt).scalars().all()
+
+            raw_stmt = select(RawNewsEpisode)
+            if target_date:
+                raw_stmt = raw_stmt.where(RawNewsEpisode.signal_date == target_date)
+            raw_rows = session.execute(raw_stmt).scalars().all()
+
+            edge_stmt = select(NewsSignalEdge)
+            if target_date:
+                if card_ids:
+                    edge_stmt = edge_stmt.where(
+                        (NewsSignalEdge.source_card_id.in_(card_ids))
+                        | (NewsSignalEdge.target_card_id.in_(card_ids))
+                    )
+                else:
+                    edge_stmt = edge_stmt.where(NewsSignalEdge.source_card_id == "__none__")
+            edge_rows = session.execute(edge_stmt).scalars().all()
+        feedback_counts = {str(row[0] or "unknown"): int(row[1] or 0) for row in feedback_rows}
+        raw_quality = _raw_quality_metrics(raw_rows)
+        edge_quality = _edge_quality_metrics(rows, edge_rows, feedback_counts)
+        feedback_quality = _feedback_quality_metrics(feedback_counts, feedback_details, card_count=len(rows))
         return {
             "total_cards": len(rows),
             "active_cards": sum(1 for row in rows if row.status == "active"),
@@ -425,7 +498,10 @@ class NewsSignalRepository:
             "mapping_counts": _count_by(rows, "mapping_status"),
             "horizon_counts": _count_by(rows, "impact_horizon"),
             "graph_sync_counts": _count_by(rows, "graph_sync_status"),
-            "feedback_counts": {str(row[0] or "unknown"): int(row[1] or 0) for row in feedback_rows},
+            "feedback_counts": feedback_counts,
+            "raw_quality": raw_quality,
+            "edge_quality": edge_quality,
+            "feedback_quality": feedback_quality,
         }
 
     def list_graph_sync_candidates(
@@ -1068,3 +1144,228 @@ def _count_by(rows: Iterable[NewsSignalCard], attr: str) -> Dict[str, int]:
         key = str(getattr(row, attr, None) or "unknown")
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _count_row_attr(rows: Iterable[Any], attr: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        key = str(getattr(row, attr, None) or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _avg_attr(rows: Iterable[Any], attr: str) -> Optional[float]:
+    values = [
+        float(value)
+        for value in (_float_or_none(getattr(row, attr, None)) for row in rows)
+        if value is not None
+    ]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 4)
+
+
+def _ratio(numerator: int, denominator: int) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 4)
+
+
+def _flag_counts(rows: Iterable[Any], attr: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        for flag in _json_list(getattr(row, attr, None)):
+            key = str(flag or "unknown")
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _raw_quality_metrics(rows: List[RawNewsEpisode]) -> Dict[str, Any]:
+    by_source: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        source = str(row.source or "unknown")
+        item = by_source.setdefault(
+            source,
+            {
+                "count": 0,
+                "avg_quality_score": None,
+                "quality_counts": {},
+                "status_counts": {},
+                "quality_flag_counts": {},
+                "_scores": [],
+            },
+        )
+        item["count"] += 1
+        score = _float_or_none(row.quality_score)
+        if score is not None:
+            item["_scores"].append(score)
+        quality_key = str(row.quality_grade or "unknown")
+        status_key = str(row.status or "unknown")
+        item["quality_counts"][quality_key] = int(item["quality_counts"].get(quality_key, 0)) + 1
+        item["status_counts"][status_key] = int(item["status_counts"].get(status_key, 0)) + 1
+        for flag in _json_list(row.quality_flags_json):
+            flag_key = str(flag or "unknown")
+            item["quality_flag_counts"][flag_key] = int(item["quality_flag_counts"].get(flag_key, 0)) + 1
+    for item in by_source.values():
+        scores = item.pop("_scores", [])
+        item["avg_quality_score"] = round(sum(scores) / len(scores), 4) if scores else None
+    low_count = sum(1 for row in rows if str(row.quality_grade or "") == "low" or str(row.status or "") == "low_quality")
+    return {
+        "raw_episode_count": len(rows),
+        "avg_quality_score": _avg_attr(rows, "quality_score"),
+        "quality_counts": _count_row_attr(rows, "quality_grade"),
+        "status_counts": _count_row_attr(rows, "status"),
+        "source_counts": _count_row_attr(rows, "source"),
+        "quality_flag_counts": _flag_counts(rows, "quality_flags_json"),
+        "low_quality_rate": _ratio(low_count, len(rows)),
+        "by_source": by_source,
+        "calibration": {
+            "method": "rule_distribution_v1",
+            "scope": "source_date_distribution",
+            "automatic_weight_adjustment": "disabled_until_minimum_feedback_and_outcome_sample",
+        },
+    }
+
+
+def _edge_quality_metrics(
+    cards: List[NewsSignalCard],
+    edges: List[NewsSignalEdge],
+    feedback_counts: Dict[str, int],
+) -> Dict[str, Any]:
+    card_ids = {str(row.card_id) for row in cards if row.card_id}
+    connected_ids: set[str] = set()
+    for edge in edges:
+        if edge.source_card_id:
+            connected_ids.add(str(edge.source_card_id))
+        if edge.target_card_id:
+            connected_ids.add(str(edge.target_card_id))
+    isolated = sorted(card_ids - connected_ids)
+    edge_count = len(edges)
+    high_count = sum(1 for row in edges if str(row.quality_grade or "") == "high")
+    low_count = sum(1 for row in edges if str(row.quality_grade or "") == "low")
+    semantic_count = sum(1 for row in edges if str(row.edge_class or "") == "semantic_similarity")
+    same_event_count = sum(1 for row in edges if str(row.edge_type or "") == "same_event")
+    negative_feedback = sum(int(feedback_counts.get(key) or 0) for key in NEGATIVE_FEEDBACK_TYPES)
+    return {
+        "edge_count": edge_count,
+        "avg_edges_per_card": round(edge_count / len(cards), 4) if cards else 0.0,
+        "avg_edge_quality": _avg_attr(edges, "edge_quality"),
+        "edge_class_counts": _count_row_attr(edges, "edge_class"),
+        "edge_type_counts": _count_row_attr(edges, "edge_type"),
+        "edge_quality_counts": _count_row_attr(edges, "quality_grade"),
+        "quality_flag_counts": _flag_counts(edges, "quality_flags_json"),
+        "strong_edge_ratio": _ratio(high_count, edge_count),
+        "weak_edge_ratio": _ratio(low_count, edge_count),
+        "semantic_edge_count": semantic_count,
+        "semantic_edge_ratio": _ratio(semantic_count, edge_count),
+        "same_event_edge_count": same_event_count,
+        "isolated_card_count": len(isolated),
+        "isolated_card_ratio": _ratio(len(isolated), len(cards)),
+        "sample_isolated_card_ids": isolated[:12],
+        "human_negative_feedback_count": negative_feedback,
+        "human_negative_feedback_per_card": _ratio(negative_feedback, len(cards)),
+        "semantic_edge_hit_rate": None,
+        "semantic_edge_hit_rate_status": "requires_seed_outcome_or_edge_level_feedback",
+        "same_event_mislink_rate": None,
+        "same_event_mislink_rate_status": "requires_edge_level_feedback",
+    }
+
+
+def _feedback_quality_metrics(
+    feedback_counts: Dict[str, int],
+    feedback_rows: List[NewsSignalFeedback],
+    *,
+    card_count: int,
+) -> Dict[str, Any]:
+    total_feedback = sum(int(value or 0) for value in feedback_counts.values())
+    negative_counts = {
+        key: int(feedback_counts.get(key) or 0)
+        for key in sorted(NEGATIVE_FEEDBACK_TYPES)
+        if int(feedback_counts.get(key) or 0) > 0
+    }
+    negative_total = sum(negative_counts.values())
+    card_ids_with_negative = {
+        str(row.card_id)
+        for row in feedback_rows
+        if str(row.feedback_type or "") in NEGATIVE_FEEDBACK_TYPES
+    }
+    return {
+        "total_feedback": total_feedback,
+        "negative_feedback_counts": negative_counts,
+        "negative_feedback_total": negative_total,
+        "negative_feedback_rate": _ratio(negative_total, total_feedback),
+        "negative_card_count": len(card_ids_with_negative),
+        "negative_card_rate": _ratio(len(card_ids_with_negative), card_count),
+        "control_rule_counts": {
+            "suppress_card": sum(int(feedback_counts.get(key) or 0) for key in SUPPRESSING_FEEDBACK_TYPES),
+            "remove_company": int(feedback_counts.get("remove_company") or 0),
+            "adjust_industries": int(feedback_counts.get("adjust_industries") or 0),
+        },
+    }
+
+
+def _feedback_control_entry(feedback_type: str, payload: Dict[str, Any], note: str) -> Dict[str, Any]:
+    return {
+        "schema_version": "news_feedback_control.v1",
+        "feedback_type": str(feedback_type or ""),
+        "payload": payload if isinstance(payload, dict) else {},
+        "note": str(note or "")[:500],
+        "created_at": datetime.now().isoformat(),
+    }
+
+
+def _append_feedback_control(diagnostics: Dict[str, Any], control: Dict[str, Any]) -> None:
+    controls = diagnostics.get("feedback_controls")
+    if not isinstance(controls, list):
+        controls = []
+    controls.append(control)
+    diagnostics["feedback_controls"] = controls[-20:]
+    latest = dict(control)
+    latest.pop("payload", None)
+    diagnostics["feedback_control_latest"] = latest
+
+
+def _remove_feedback_company(
+    card: NewsSignalCard,
+    payload: Dict[str, Any],
+    note: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    impacts = _json_list(card.company_impacts_json)
+    companies = [item for item in impacts if isinstance(item, dict)]
+    selectors = _feedback_company_selectors(payload, note)
+    if not selectors and len(companies) == 1:
+        selectors = {
+            str(companies[0].get("symbol") or companies[0].get("code") or companies[0].get("name") or "").strip().lower()
+        }
+    if not selectors:
+        return [], companies
+    removed: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    for company in companies:
+        keys = {
+            str(company.get("symbol") or "").strip().lower(),
+            str(company.get("code") or "").strip().lower(),
+            str(company.get("name") or "").strip().lower(),
+        }
+        keys = {value for value in keys if value}
+        if keys & selectors:
+            removed.append(company)
+        else:
+            remaining.append(company)
+    return removed, remaining
+
+
+def _feedback_company_selectors(payload: Dict[str, Any], note: str) -> set[str]:
+    selectors: set[str] = set()
+    if isinstance(payload, dict):
+        for key in ("symbol", "code", "ts_code", "name", "company", "company_name"):
+            value = str(payload.get(key) or "").strip().lower()
+            if value:
+                selectors.add(value)
+        values = payload.get("companies") or payload.get("symbols") or payload.get("names")
+        if isinstance(values, list):
+            selectors.update(str(value or "").strip().lower() for value in values if str(value or "").strip())
+    note_text = str(note or "").strip().lower()
+    if note_text and len(note_text) <= 32:
+        selectors.add(note_text)
+    return {value for value in selectors if value}

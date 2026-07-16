@@ -2271,6 +2271,10 @@ def _ingest_trace_to_graphiti(
             getattr(result, "tool_calls_log", []) if result is not None else []
         )
         market = _resolve_trace_market(context)
+        timeout_seconds = max(
+            10.0,
+            min(600.0, float(getattr(get_config(), "graphiti_outbox_job_timeout_seconds", 120) or 120)),
+        )
         service.ingest_trace_sync(
             session_id=session_id,
             trace_type=trace_type,
@@ -2303,9 +2307,11 @@ def _ingest_trace_to_graphiti(
             artifact_dir=artifact_dir,
             market=market,
             user_id=str(request.account_id) if request.account_id is not None else None,
+            timeout_seconds=timeout_seconds,
         )
     except Exception as exc:
-        logger.warning("Agent trace Graphiti ingestion failed for %s: %s", session_id, exc, exc_info=True)
+        message = str(exc) or exc.__class__.__name__
+        logger.warning("Agent trace Graphiti ingestion failed for %s: %s", session_id, message, exc_info=True)
 
 
 def _resolve_trace_market(context: Dict[str, Any]) -> str | None:
