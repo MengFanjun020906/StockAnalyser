@@ -5,10 +5,10 @@
 > Constraints here are **binding** — the agent MUST follow them.
 
 ## Push & Merge
-- Don't push before telling me
-- Never auto-merge to main without human approval
-- Always create a draft PR first; let me review before marking ready
-- Never run `git commit`, `git tag`, `git push`, `gh pr create`, merge, or release actions without explicit human approval
+- Default mode: don't push before telling me.
+- Autonomous loop mode: after the maintainer provides a target document and grants loop autonomy, commit, push to `dev`, create/update PR/MR, create issues, and prepare releases without per-action approval.
+- Never push directly to `main`; use `dev` plus PR/MR as the integration surface.
+- Main merge or release is allowed only after target acceptance conditions and required checks pass. If branch protection, credentials, or platform permissions require human action, stop and report the exact blocker.
 
 ## Paths
 - Never edit .env, .env.*, auth/, payments/, secrets/, credentials/
@@ -24,6 +24,8 @@
 - Enforce the attempt limit mechanically: log each try to `loop-ledger.json` and run `loop-context --check` before retrying (see the `loop-guard` skill)
 - Keep the daily triage loop report-only until L2 is explicitly enabled.
 - Do not make source edits from a triage-only loop.
+- For goal development loops, generate a goal and plan from the target document, then own implementation and verification end-to-end.
+- Stop immediately on unhandled tool failure, silent fallback, lower-quality data, unknown data quality, auth/permission blocker, destructive ambiguity, or unverifiable acceptance criteria.
 
 ## Communication
 - Always tell me what you're about to do before doing it

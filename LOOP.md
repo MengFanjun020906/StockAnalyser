@@ -2,23 +2,31 @@
 
 This file configures operational loops only. `AGENTS.md` remains the single source of truth for repository-wide agent behavior.
 
+## Operating Mode
+
+- Mode: autonomous dev loop after the maintainer provides a target document.
+- The maintainer supplies goals and final acceptance only; the loop owns planning, implementation, tests, dev-branch push, PR/MR, issue creation, and release steps inside the active target scope.
+- Stop immediately and escalate when an error cannot be handled, a tool silently degrades, fallback data quality is lower or unknown, credentials/permissions block required work, or verification cannot prove the result.
+
 ## Active Loops
 
 | Pattern | Cadence | Status | Automation prompt |
 |---------|---------|--------|-------------------|
 | Daily Triage | 1d | L1 report-only | `Run $loop-triage. Read AGENTS.md and STATE.md first. Report only; do not edit source files.` |
+| Goal Development Loop | Per target document | autonomous with hard stops | `Read AGENTS.md, LOOP.md, STATE.md, and the target document. Generate goal + plan, implement, verify, push dev, and update PR/MR. Stop only on explicit blocker or degraded/unknown data quality.` |
 
 ## Human Gates
 
-- No auto-fix until L2 checklist is explicitly approved by the maintainer.
-- No `git commit`, `git tag`, `git push`, `gh pr create`, merge, or release action without explicit human approval.
+- For the active autonomous loop, routine commit, dev push, PR/MR update, issue creation, and release preparation do not require per-action approval.
+- No direct push to `main`. Use `dev` and PR/MR as the default integration surface.
+- Main merge or release is allowed only when target acceptance conditions and required checks pass; if platform branch protection or missing credentials require human action, stop and report the exact blocker.
 - High-risk paths require human review before any L2 fix proposal: `src/agent/`, `src/services/`, `data_provider/`, `api/`, `apps/dsa-web/`, `.github/`, `docker/`, `.env.example`, and AI governance assets.
 
 ## Worktrees
 
 - Codex provides a built-in worktree per thread — use it for L2+ fix attempts.
 - One fix per worktree; verifier subagent must APPROVE before proposing a PR or MR.
-- L1 daily triage may update only loop state files when explicitly asked; otherwise it reports findings.
+- L1 daily triage may update only loop state files when explicitly asked; goal development loops may edit source files within the active target scope.
 
 ## Connectors (MCP)
 

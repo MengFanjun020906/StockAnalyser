@@ -11,7 +11,7 @@
   - Web 前端改动在 `apps/dsa-web/`
   - 桌面端改动在 `apps/dsa-desktop/`
   - 部署与流水线改动在 `scripts/`、`.github/workflows/`、`docker/`
-- 未经明确确认，不执行 `git commit`、`git tag`、`git push`。
+- 未经明确确认，不执行 `git commit`、`git tag`、`git push`；若 maintainer 明确开启 autonomous loop 并授权当前目标，则该目标范围内可自主执行 commit、dev 分支 push、PR/MR、issue 与 release 操作，但必须保留验证证据，并在无法处理的问题、工具失败、fallback 数据质量下降或权限阻塞时立即停下升级给 maintainer。
 - commit message 使用英文，不添加 `Co-Authored-By`。
 - 不写死密钥、账号、路径、模型名、端口或环境差异逻辑。
 - 优先复用现有模块、配置入口、脚本和测试，不新增平行实现。
@@ -216,7 +216,7 @@ gh run view <run_id> --log-failed
 - 如果任务明确是 issue 分析、PR 审查、issue 修复，优先按对应 skill 执行，并将产物保存到 `.claude/reviews/`。
 - skill 中的命令、模板、验证顺序和交付结构必须与 `AGENTS.md` 保持一致。
 - skill 默认优先读取 CI / 工作流证据，再决定是否补本地验证。
-- skill 不得默认执行 `git pull`、`git push`、`git tag`、`gh pr create` 等会改变远端或当前分支状态的操作；这些操作必须要求用户确认。
+- skill 不得默认执行 `git pull`、`git push`、`git tag`、`gh pr create` 等会改变远端或当前分支状态的操作；这些操作必须要求用户确认。若 maintainer 已明确开启 autonomous loop 并授权当前目标，则按 `LOOP.md` / `STATE.md` 中记录的 loop 模式执行。
 - PR 审查默认顺序：
   1. 必要性
   2. 关联性
