@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [chore] 接入 loop-engineering Codex daily-triage 脚手架，新增 LOOP/STATE/loop-budget/loop-constraints 与 Codex loop skill/verifier 运行资产。
+- [修复] Agent 识别 Tushare Token 过期/无效后会在进程内隔离该凭据，避免资金流、筹码和板块工具在同一 Trace 中重复请求必然失败的接口。
+- [修复] `get_chip_distribution` 使用独立超时 worker 池，局部线程池繁忙不再触发数据源熔断；连续上游超时仍按筹码专用熔断器快速降级。
+- [改进] `get_capital_flow`、`get_chip_distribution` 和 `get_sector_rankings` 持久化最近成功结果；实时数据源失败时明确返回 `stale` 与现场诊断，无缓存时返回不可作为证据的 `unavailable`，不再误报为工具代码执行失败。
+- [修复] 板块排行在 StockAPI Token 无接口权限时自动匿名重试，并对异常 URL 中的 Token/API Key 做脱敏；模型压缩事实卡保留板块 Top/Bottom、筹码区间和降级诊断。
+- [修复] 市场状态概率不再把仅一条记录的短缓存视为完整历史，Sequoia 指数刷新同时维护 `000001.SH` 与 `000300.SH`，并可通过 Baostock 补齐沪深 300 历史。
 - [修复] Docker 镜像在安装 `requirements.txt` 前复制 Graphiti 子模块，避免本地可编辑依赖 `./graphiti` 在 CI 构建阶段不存在。
 - [修复] Web 入场执行回测的分钟线同步不再受当前决策日期筛选限制，默认扫描全部历史最终报告，并补齐各报告所需回测窗口至当前最新可用日期。
 - [改进] 股票新闻、市场复盘、Agent 与通用网页搜索统一切换到 AnySearch `v1/search`，新增 `ANYSEARCH_API_KEY` 配置，生产入口不再注册旧搜索 provider，并兼容 `tag`/`params` 专用查询。

@@ -550,6 +550,60 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertTrue(_is_failed_tool_result(compact))
         self.assertEqual(compact["result"]["status"], "failed")
 
+    def test_unavailable_provider_result_is_completed_without_becoming_evidence(self):
+        result = {
+            "status": "unavailable",
+            "data_available": False,
+            "provider_errors": ["upstream unavailable"],
+        }
+
+        self.assertFalse(_is_failed_tool_result(result))
+
+    def test_compact_degraded_tools_keep_cache_and_provider_diagnostics(self):
+        capital = json.loads(compact_tool_result_for_model(
+            "get_capital_flow",
+            json.dumps({
+                "status": "stale",
+                "stock_code": "600519",
+                "main_net_inflow": 123.0,
+                "cache_hit": True,
+                "cache_age_seconds": 120,
+                "live_diagnostics": {"status": "failed", "errors": ["token expired"]},
+            }),
+        ))["result"]
+        chip = json.loads(compact_tool_result_for_model(
+            "get_chip_distribution",
+            json.dumps({
+                "status": "unavailable",
+                "stock_code": "600519",
+                "data_available": False,
+                "provider_errors": ["endpoint timeout"],
+                "cost_90_low": 10.0,
+                "cost_90_high": 12.0,
+            }),
+        ))["result"]
+
+        self.assertTrue(capital["cache_hit"])
+        self.assertEqual(capital["live_diagnostics"]["status"], "failed")
+        self.assertFalse(chip["data_available"])
+        self.assertEqual(chip["provider_errors"], ["endpoint timeout"])
+        self.assertEqual(chip["cost_90_low"], 10.0)
+
+    def test_compact_sector_rankings_keeps_top_and_bottom_lists(self):
+        compact = json.loads(compact_tool_result_for_model(
+            "get_sector_rankings",
+            json.dumps({
+                "status": "ok",
+                "data_source": "stockapi:hotBkJlrDr",
+                "top_sectors": [{"name": "机器人", "change_pct": 3.2}],
+                "bottom_sectors": [{"name": "银行", "change_pct": -1.1}],
+            }),
+        ))["result"]
+
+        self.assertEqual(compact["data_source"], "stockapi:hotBkJlrDr")
+        self.assertEqual(compact["top_sectors"]["items"][0]["name"], "机器人")
+        self.assertEqual(compact["bottom_sectors"]["items"][0]["name"], "银行")
+
     def test_capital_flow_compact_context_keeps_only_effective_fields(self):
         raw = {
             "stock_code": "002156",

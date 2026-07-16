@@ -8,7 +8,16 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
-EvidenceStatus = Literal["ok", "partial", "empty", "stale", "failed", "timeout", "not_supported"]
+EvidenceStatus = Literal[
+    "ok",
+    "partial",
+    "empty",
+    "stale",
+    "failed",
+    "timeout",
+    "unavailable",
+    "not_supported",
+]
 Freshness = Literal["realtime", "intraday", "eod_current", "recent", "stale", "unknown"]
 EvidenceStance = Literal["support", "oppose", "neutral", "wait_confirm", "invalid"]
 ActionBias = Literal["open", "add", "hold", "reduce", "exit", "wait", "reject"]

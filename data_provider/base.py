@@ -511,6 +511,8 @@ class DataFetcherManager:
         self._fundamental_cache_lock = RLock()
         self._fundamental_timeout_worker_limit = 8
         self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
+        self._chip_timeout_worker_limit = 8
+        self._chip_timeout_slots = BoundedSemaphore(self._chip_timeout_worker_limit)
 
     def _ensure_concurrency_guards(self) -> None:
         """Lazily initialize thread-safety primitives for test scaffolds using __new__."""
@@ -524,6 +526,12 @@ class DataFetcherManager:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
             self._stock_name_cache_lock = RLock()
+        if not hasattr(self, "_fundamental_timeout_slots") or self._fundamental_timeout_slots is None:
+            self._fundamental_timeout_worker_limit = 8
+            self._fundamental_timeout_slots = BoundedSemaphore(self._fundamental_timeout_worker_limit)
+        if not hasattr(self, "_chip_timeout_slots") or self._chip_timeout_slots is None:
+            self._chip_timeout_worker_limit = 8
+            self._chip_timeout_slots = BoundedSemaphore(self._chip_timeout_worker_limit)
 
     def _get_fetchers_snapshot(self) -> List[BaseFetcher]:
         self._ensure_concurrency_guards()
@@ -1508,6 +1516,22 @@ class DataFetcherManager:
 
             fetcher_name = fetcher.name
             source_key = f"{fetcher_name.replace('Fetcher', '').lower()}_chip"
+            if fetcher_name == "TushareFetcher":
+                try:
+                    from .tushare_client import get_tushare_runtime_health
+
+                    tushare_health = get_tushare_runtime_health()
+                except Exception:
+                    tushare_health = {"available": True}
+                if not tushare_health.get("available"):
+                    source_chain.append({
+                        "provider": source_key,
+                        "result": "unavailable",
+                        "duration_ms": 0,
+                        "reason": tushare_health.get("status"),
+                    })
+                    errors.append(f"{source_key}:{tushare_health.get('status') or 'unavailable'}")
+                    continue
             if not circuit_breaker.is_available(source_key):
                 source_chain.append({
                     "provider": source_key,
@@ -1523,12 +1547,17 @@ class DataFetcherManager:
                     lambda: self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code),
                     min(per_source_timeout, remaining_timeout),
                     f"{source_key}_chip",
+                    slot_pool=self._chip_timeout_slots,
                 )
                 if call_err:
                     error_text = f"{source_key}:{call_err}"
-                    result_label = "timeout" if "timeout" in call_err.lower() else "failed"
+                    local_busy = "worker pool exhausted" in call_err.lower()
+                    result_label = "busy" if local_busy else ("timeout" if "timeout" in call_err.lower() else "failed")
                     logger.warning(f"[筹码分布] {fetcher_name} 获取 {stock_code} 失败: {call_err}")
-                    circuit_breaker.record_failure(source_key, error_text)
+                    if local_busy:
+                        circuit_breaker.record_inconclusive(source_key)
+                    else:
+                        circuit_breaker.record_failure(source_key, error_text)
                     source_chain.append({
                         "provider": source_key,
                         "result": result_label,
@@ -1844,6 +1873,8 @@ class DataFetcherManager:
         task: Callable[[], Any],
         timeout_seconds: float,
         task_name: str,
+        *,
+        slot_pool: Optional[BoundedSemaphore] = None,
     ) -> Tuple[Optional[Any], Optional[str], int]:
         """
         Execute a task in a short-lived thread and enforce a timeout.
@@ -1858,7 +1889,8 @@ class DataFetcherManager:
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
 
-        if not self._fundamental_timeout_slots.acquire(blocking=False):
+        slots = slot_pool or self._fundamental_timeout_slots
+        if not slots.acquire(blocking=False):
             return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
 
         def runner() -> None:
@@ -1868,7 +1900,7 @@ class DataFetcherManager:
                 error_holder["value"] = exc
             finally:
                 try:
-                    self._fundamental_timeout_slots.release()
+                    slots.release()
                 except ValueError:
                     pass
 
@@ -1877,7 +1909,7 @@ class DataFetcherManager:
             worker.start()
         except Exception as exc:
             try:
-                self._fundamental_timeout_slots.release()
+                slots.release()
             except ValueError:
                 pass
             return None, str(exc), int((time.time() - start) * 1000)

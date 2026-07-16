@@ -47,6 +47,26 @@ def test_build_expert_packet_degrades_missing_dimension():
     assert "get_capital_flow/get_chip_distribution" in packet.missing_evidence
 
 
+def test_unavailable_tool_result_is_not_treated_as_evidence():
+    cards = build_evidence_cards_for_stock(
+        run_id="run-unavailable",
+        stock_code="600519",
+        stock_name="贵州茅台",
+        evidence={
+            "get_capital_flow": {
+                "status": "unavailable",
+                "data_available": False,
+                "provider_errors": ["upstream unavailable"],
+                "source_chain": [{"provider": "tushare:moneyflow", "result": "failed"}],
+            }
+        },
+    )
+
+    assert cards[0].data_quality.status == "unavailable"
+    assert cards[0].impact.stance == "invalid"
+    assert cards[0].impact.confidence == 0
+
+
 def test_trace_artifact_extractor_lands_compact_evidence_packets():
     artifacts = _extract_evidence_artifacts({
         "expert_state": {

@@ -35,6 +35,7 @@ from src.agent.regime_probability import (
 )
 from src.agent.sentiment.news_events import score_news_items
 from src.agent.tools.registry import ToolParameter, ToolDefinition
+from src.agent.tools.result_cache import read_tool_result_cache, write_tool_result_cache
 from src.data.stock_index_loader import get_index_stock_name, get_stock_name_index_map
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
@@ -46,6 +47,7 @@ _MARKET_HISTORY_RUN_CACHE_TTL_SECONDS = 900.0
 _MARKET_HISTORY_RUN_CACHE_MAX_ITEMS = 16
 _MARKET_HISTORY_RUN_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]], str]] = {}
 _MARKET_HISTORY_RUN_CACHE_LOCK = Lock()
+_SECTOR_RANKINGS_RESULT_CACHE_MAX_AGE_SECONDS = 36 * 60 * 60
 
 
 def _run_with_timeout(
@@ -1900,6 +1902,44 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
+    cache_key = str(max(1, int(top_n or 10)))
+
+    def finish(response: Dict[str, Any]) -> Dict[str, Any]:
+        status = str(response.get("status") or "").lower()
+        if status == "ok" and (response.get("top_sectors") or response.get("bottom_sectors")):
+            write_tool_result_cache("get_sector_rankings", cache_key, response)
+            return response
+        cached, age_seconds = read_tool_result_cache(
+            "get_sector_rankings",
+            cache_key,
+            max_age_seconds=_SECTOR_RANKINGS_RESULT_CACHE_MAX_AGE_SECONDS,
+        )
+        if isinstance(cached, dict):
+            stale = dict(cached)
+            stale.pop("error", None)
+            stale.pop("errors", None)
+            stale["status"] = "stale"
+            stale["cache_hit"] = True
+            stale["cache_age_seconds"] = int(age_seconds)
+            stale["live_diagnostics"] = {
+                key: response.get(key)
+                for key in ("status", "error_summary", "errors", "source_chain", "duration_ms")
+                if response.get(key) not in (None, [], {})
+            }
+            stale["source_chain"] = list(stale.get("source_chain") or []) + [{
+                "provider": "agent_tool_cache",
+                "result": "stale",
+                "age_seconds": int(age_seconds),
+            }]
+            return stale
+        unavailable = dict(response)
+        errors = unavailable.pop("errors", None)
+        unavailable["status"] = "unavailable"
+        unavailable["data_available"] = False
+        if errors:
+            unavailable["provider_errors"] = errors
+        return unavailable
+
     timeout = max(3.0, _get_agent_timeout_attr("agent_sector_rankings_timeout_seconds", 10.0))
     started_at = time.time()
     tushare_timeout = min(timeout, max(1.0, min(4.5, timeout * 0.45)))
@@ -1911,7 +1951,7 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     if isinstance(tushare_result, tuple) and len(tushare_result) == 4:
         top_sectors, bottom_sectors, source_chain, chain_error = tushare_result
         if top_sectors or bottom_sectors:
-            return {
+            return finish({
                 "status": "ok",
                 "top_sectors": top_sectors or [],
                 "bottom_sectors": bottom_sectors or [],
@@ -1921,7 +1961,7 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
                 "ranking_basis": "THS热榜:market=行业板块",
                 "bottom_basis": "lowest pct_change within returned THS hot industry-board rows",
                 "errors": [chain_error] if chain_error else [],
-            }
+            })
 
     remaining_timeout = max(0.0, timeout - (time.time() - started_at))
     eastmoney_timeout = min(remaining_timeout, max(0.75, min(3.0, timeout * 0.30)))
@@ -1933,13 +1973,15 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     if isinstance(eastmoney_result, tuple) and len(eastmoney_result) == 4:
         top_sectors, bottom_sectors, source_chain, chain_error = eastmoney_result
         if top_sectors or bottom_sectors:
-            return {
+            return finish({
                 "status": "ok",
                 "top_sectors": top_sectors or [],
                 "bottom_sectors": bottom_sectors or [],
                 "source_chain": source_chain,
+                "data_source": "eastmoney:stock_board_industry_name_em",
+                "ranking_market": "行业板块",
                 "errors": [chain_error] if chain_error else [],
-            }
+            })
 
     remaining_timeout = max(0.0, timeout - (time.time() - started_at))
     stockapi_timeout = min(remaining_timeout, max(0.5, min(2.5, timeout * 0.25)))
@@ -1951,13 +1993,15 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     if isinstance(stockapi_result, tuple) and len(stockapi_result) == 4:
         top_sectors, bottom_sectors, source_chain, chain_error = stockapi_result
         if top_sectors or bottom_sectors:
-            return {
+            return finish({
                 "status": "ok",
                 "top_sectors": top_sectors or [],
                 "bottom_sectors": bottom_sectors or [],
                 "source_chain": source_chain,
+                "data_source": "stockapi:hotBkJlrDr",
+                "ranking_market": "热门板块",
                 "errors": [chain_error] if chain_error else [],
-            }
+            })
 
     source_chain: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -2043,7 +2087,7 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
 
     elapsed_ms = int((time.time() - started_at) * 1000)
     if any("timeout" in str(error).lower() for error in errors):
-        return {
+        return finish({
             "status": "timeout",
             "top_sectors": [],
             "bottom_sectors": [],
@@ -2051,8 +2095,8 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
             "errors": errors or ["sector_rankings timeout"],
             "error_summary": " | ".join(errors) or "sector_rankings timeout",
             "duration_ms": elapsed_ms,
-        }
-    return {
+        })
+    return finish({
         "status": "failed" if errors else "empty",
         "top_sectors": [],
         "bottom_sectors": [],
@@ -2060,7 +2104,7 @@ def _handle_get_sector_rankings(top_n: int = 10) -> dict:
         "errors": errors or ["No sector ranking data available"],
         "error_summary": " | ".join(errors) if errors else "No sector ranking data available",
         "duration_ms": elapsed_ms,
-    }
+    })
 
 
 get_sector_rankings_tool = ToolDefinition(
@@ -2175,24 +2219,29 @@ def _load_market_history(
     cache_first: bool = False,
 ) -> tuple[List[Dict[str, Any]], str]:
     ts_code = _normalize_index_ts_code(index_code)
+    minimum_records = min(max(1, int(lookback_days)), 260)
+    short_candidates: List[Tuple[List[Dict[str, Any]], str]] = []
     if cache_first:
         cached_rows, cached_source = _load_market_history_cache_only(
             ts_code,
             lookback_days,
             source_suffix="cache_first",
         )
-        if cached_rows:
+        if len(cached_rows) >= minimum_records:
             return cached_rows, cached_source
+        if cached_rows:
+            short_candidates.append((cached_rows, cached_source))
 
     fast_rows, fast_source = _load_index_history_from_tushare(index_code, lookback_days)
-    if fast_rows:
+    if len(fast_rows) >= minimum_records:
         _store_market_history_run_cache(_normalize_index_ts_code(index_code), fast_rows, fast_source)
         return fast_rows, fast_source
+    if fast_rows:
+        short_candidates.append((fast_rows, fast_source))
 
     from src.services.history_loader import load_history_df
 
-    fallback_to_network = not _is_supported_cn_index_proxy(index_code)
-    df, source = load_history_df(index_code, days=lookback_days, fallback_to_network=fallback_to_network)
+    df, source = load_history_df(index_code, days=lookback_days, fallback_to_network=True)
     if df is not None and not df.empty:
         rows = df.tail(lookback_days).to_dict(orient="records")
         for row in rows:
@@ -2201,15 +2250,84 @@ def _load_market_history(
         _store_market_history_run_cache(ts_code, rows, source)
         return rows, source
 
+    baostock_rows, baostock_source = _load_index_history_from_baostock(index_code, lookback_days)
+    if len(baostock_rows) >= minimum_records:
+        _write_index_history_cache(ts_code, baostock_rows, source=baostock_source)
+        _store_market_history_run_cache(ts_code, baostock_rows, baostock_source)
+        return baostock_rows, baostock_source
+    if baostock_rows:
+        short_candidates.append((baostock_rows, baostock_source))
+
     sdk_source = ""
-    if fallback_to_network:
+    if not _is_supported_cn_index_proxy(index_code):
         sdk_rows, sdk_source = _load_index_history_from_tushare_sdk(index_code, lookback_days)
         if sdk_rows:
             _store_market_history_run_cache(ts_code, sdk_rows, sdk_source)
             return sdk_rows, sdk_source
 
-    sources = [s for s in [fast_source, source, sdk_source] if s]
+    if short_candidates:
+        return max(short_candidates, key=lambda item: len(item[0]))
+    sources = [s for s in [fast_source, source, baostock_source, sdk_source] if s]
     return [], ";".join(sources) if sources else "all_sources_failed"
+
+
+def _load_index_history_from_baostock(index_code: str, lookback_days: int) -> tuple[List[Dict[str, Any]], str]:
+    normalized = str(index_code or "000300").strip().upper().replace("SH", "").replace("SZ", "")
+    normalized = normalized.split(".", 1)[0]
+    code_map = {
+        "000001": "sh.000001",
+        "000300": "sh.000300",
+        "000905": "sh.000905",
+        "000852": "sh.000852",
+        "399001": "sz.399001",
+        "399006": "sz.399006",
+    }
+    baostock_code = code_map.get(normalized)
+    if not baostock_code:
+        return [], "baostock:index_not_supported"
+    try:
+        import baostock as bs
+    except Exception:
+        return [], "baostock:import_unavailable"
+
+    login = bs.login()
+    if getattr(login, "error_code", "") != "0":
+        return [], f"baostock:login_failed:{getattr(login, 'error_msg', '')}"
+    end_day = datetime.now().date()
+    start_day = end_day - timedelta(days=int(max(lookback_days, 120) * 1.8) + 10)
+    rows: List[Dict[str, Any]] = []
+    try:
+        result = bs.query_history_k_data_plus(
+            baostock_code,
+            "date,open,high,low,close,volume,amount",
+            start_date=start_day.isoformat(),
+            end_date=end_day.isoformat(),
+            frequency="d",
+            adjustflag="1",
+        )
+        if getattr(result, "error_code", "") != "0":
+            return [], f"baostock:index_daily_failed:{getattr(result, 'error_msg', '')}"
+        while result.next():
+            raw = result.get_row_data()
+            if len(raw) < 7 or not raw[4]:
+                continue
+            rows.append({
+                "date": raw[0],
+                "open": float(raw[1]) if raw[1] else None,
+                "high": float(raw[2]) if raw[2] else None,
+                "low": float(raw[3]) if raw[3] else None,
+                "close": float(raw[4]),
+                "volume": float(raw[5]) if raw[5] else None,
+                "amount": float(raw[6]) if raw[6] else None,
+            })
+    except Exception as exc:
+        return [], f"baostock:index_daily_error:{type(exc).__name__}:{exc}"
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+    return rows[-int(max(1, lookback_days)):], "baostock:index_daily"
 
 
 def _load_market_history_cache_only(

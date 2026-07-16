@@ -5,8 +5,10 @@ Contract tests for get_capital_flow tool output semantics.
 
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -113,6 +115,16 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         with data_tools._capital_flow_audit_lock:
             data_tools._capital_flow_audit_cache.clear()
             data_tools._capital_flow_audit_inflight.clear()
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self._cache_patch = patch(
+            "src.agent.tools.result_cache._CACHE_ROOT",
+            Path(self._cache_dir.name),
+        )
+        self._cache_patch.start()
+
+    def tearDown(self) -> None:
+        self._cache_patch.stop()
+        self._cache_dir.cleanup()
 
     def test_ok_response_shape(self) -> None:
         """Happy path: key fields are present and values match the source data."""
@@ -233,7 +245,7 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertIn("note", result)
 
     def test_exception_path_formatting(self) -> None:
-        """Fetch errors are caught and returned with status=error."""
+        """Provider exceptions are completed as unavailable observations."""
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=_DummyManagerRaises(),
@@ -241,9 +253,8 @@ class TestGetCapitalFlowContract(unittest.TestCase):
             result = _handle_get_capital_flow("600519")
 
         self.assertEqual(result["stock_code"], "600519")
-        self.assertEqual(result["status"], "error")
-        self.assertIn("capital flow fetch failed", result["error"])
-        self.assertIn("network timeout", result["error"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("network timeout", result["provider_errors"][0])
 
     def test_explicit_stockapi_window_is_passed_to_manager(self) -> None:
         manager = _DummyManagerOk()
@@ -284,9 +295,9 @@ class TestGetCapitalFlowContract(unittest.TestCase):
             result = _handle_get_capital_flow("688469")
 
         self.assertEqual(result["stock_code"], "688469")
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["error_summary"], "Tushare moneyflow capital-flow endpoints failed")
-        self.assertIn("tushare_moneyflow", result["errors"][0])
+        self.assertIn("tushare_moneyflow", result["provider_errors"][0])
 
     def test_tushare_empty_has_clear_error_summary(self) -> None:
         with patch(
@@ -295,9 +306,9 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         ):
             result = _handle_get_capital_flow("301028")
 
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["error_summary"], "Tushare moneyflow endpoints returned no capital-flow rows for the queried window")
-        self.assertEqual(result["errors"], ["tushare_moneyflow:empty_data"])
+        self.assertEqual(result["provider_errors"], ["tushare_moneyflow:empty_data"])
 
     def test_stockapi_empty_is_reported_when_fallback_also_has_no_rows(self) -> None:
         with patch(
@@ -306,10 +317,30 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         ), patch("src.agent.tools.data_tools._query_tushare_stock_moneyflow") as tushare_mock:
             result = _handle_get_capital_flow("301028")
 
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["error_summary"], "StockAPI codeFlow returned no capital-flow rows for the queried window")
-        self.assertEqual(result["errors"], ["stockapi_codeFlow:empty_data"])
+        self.assertEqual(result["provider_errors"], ["stockapi_codeFlow:empty_data"])
         tushare_mock.assert_not_called()
+
+    def test_failed_live_fetch_uses_recent_successful_cache(self) -> None:
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerOk(),
+        ):
+            live = _handle_get_capital_flow("600519")
+
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerEmptyStockAPI(),
+        ):
+            stale = _handle_get_capital_flow("600519")
+
+        self.assertEqual(live["status"], "ok")
+        self.assertEqual(stale["status"], "stale")
+        self.assertEqual(stale["main_net_inflow"], 1500000.0)
+        self.assertTrue(stale["cache_hit"])
+        self.assertEqual(stale["live_diagnostics"]["status"], "failed")
+        self.assertNotIn("errors", stale)
 
     def test_tushare_moneyflow_fallback_uses_weekday_without_trade_cal(self) -> None:
         seen = {}

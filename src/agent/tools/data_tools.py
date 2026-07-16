@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 
 from src.agent.tools.registry import ToolParameter, ToolDefinition
+from src.agent.tools.result_cache import read_tool_result_cache, write_tool_result_cache
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ _CAPITAL_FLOW_AUDIT_CACHE_TTL_SECONDS = 1800.0
 _CAPITAL_FLOW_AUDIT_CACHE_MAX_ITEMS = 128
 _DAILY_HISTORY_DEFAULT_DAYS = 60
 _DAILY_HISTORY_MAX_DAYS = 365
+_CAPITAL_FLOW_RESULT_CACHE_MAX_AGE_SECONDS = 5 * 24 * 60 * 60
+_CHIP_DISTRIBUTION_RESULT_CACHE_MAX_AGE_SECONDS = 5 * 24 * 60 * 60
 _TUSHARE_NEWS_SOURCES = {
     "sina",
     "wallstreetcn",
@@ -200,6 +203,70 @@ def _append_history_metadata(response: dict, metadata: Dict[str, Any]) -> dict:
     if metadata:
         response.update(metadata)
     return response
+
+
+def _agent_tool_cache_stock_key(stock_code: str) -> str:
+    """Return a stable stock key without making cache use market-specific."""
+    try:
+        from data_provider.base import canonical_stock_code, normalize_stock_code
+
+        normalized = canonical_stock_code(normalize_stock_code(str(stock_code or "").strip()))
+        if normalized:
+            return normalized
+    except Exception:
+        pass
+    return str(stock_code or "").strip().upper() or "unknown"
+
+
+def _stale_tool_result(
+    tool_name: str,
+    cache_key: str,
+    live_result: Dict[str, Any],
+    *,
+    max_age_seconds: float,
+) -> Optional[Dict[str, Any]]:
+    cached, age_seconds = read_tool_result_cache(
+        tool_name,
+        cache_key,
+        max_age_seconds=max_age_seconds,
+    )
+    if not isinstance(cached, dict):
+        return None
+
+    stale = dict(cached)
+    stale.pop("error", None)
+    stale.pop("errors", None)
+    stale["status"] = "stale"
+    stale["cache_hit"] = True
+    stale["cache_age_seconds"] = int(age_seconds)
+    stale["live_diagnostics"] = {
+        key: live_result.get(key)
+        for key in ("status", "error", "error_summary", "errors", "source_chain", "duration_ms")
+        if live_result.get(key) not in (None, [], {})
+    }
+    stale["source_chain"] = list(stale.get("source_chain") or []) + [{
+        "provider": "agent_tool_cache",
+        "result": "stale",
+        "age_seconds": int(age_seconds),
+    }]
+    stale["warnings"] = list(stale.get("warnings") or []) + [
+        "live providers unavailable; using the most recent successful cached result"
+    ]
+    return stale
+
+
+def _unavailable_tool_result(live_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark provider exhaustion as a completed but unusable tool observation."""
+    unavailable = dict(live_result)
+    errors = unavailable.pop("errors", None)
+    error = unavailable.pop("error", None)
+    unavailable["status"] = "unavailable"
+    unavailable["data_available"] = False
+    if errors:
+        unavailable["provider_errors"] = errors
+    elif error:
+        unavailable["provider_errors"] = [str(error)]
+    return unavailable
 
 
 def _compact_fundamental_context(fundamental_context: dict) -> dict:
@@ -630,6 +697,23 @@ get_daily_history_tool = ToolDefinition(
 def _handle_get_chip_distribution(stock_code: str) -> dict:
     """Get chip distribution data."""
     manager = _get_fetcher_manager()
+    cache_key = _agent_tool_cache_stock_key(stock_code)
+
+    def finish(response: Dict[str, Any]) -> Dict[str, Any]:
+        status = str(response.get("status") or "").lower()
+        if status in {"ok", "partial"}:
+            write_tool_result_cache("get_chip_distribution", cache_key, response)
+            return response
+        if status in {"disabled", "not_supported"}:
+            return response
+        stale = _stale_tool_result(
+            "get_chip_distribution",
+            cache_key,
+            response,
+            max_age_seconds=_CHIP_DISTRIBUTION_RESULT_CACHE_MAX_AGE_SECONDS,
+        )
+        return stale or _unavailable_tool_result(response)
+
     fast_result: Optional[dict] = None
     timeout = _get_agent_timeout_attr("agent_chip_distribution_timeout_seconds", 3.0)
     started_at = time.time()
@@ -641,6 +725,10 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
             fast_path_enabled = bool(getattr(config, "enable_chip_distribution", True)) and bool(
                 getattr(config, "tushare_token", None)
             )
+            if fast_path_enabled:
+                from data_provider.tushare_client import get_tushare_runtime_health
+
+                fast_path_enabled = bool(get_tushare_runtime_health().get("available", True))
         except Exception:
             fast_path_enabled = False
     else:
@@ -664,7 +752,7 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
                 }],
             }
         if fast_result.get("status") == "ok":
-            return fast_result
+            return finish(fast_result)
 
     remaining_timeout = max(0.0, timeout - (time.time() - started_at))
     if hasattr(manager, "get_chip_distribution_context"):
@@ -683,7 +771,7 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
                 "result": "timeout" if err and "timeout" in str(err).lower() else "failed",
                 "duration_ms": cost_ms,
             })
-            return {
+            return finish({
                 "stock_code": stock_code,
                 "status": "timeout" if err and "timeout" in str(err).lower() else "failed",
                 "error_summary": str(err or "chip distribution unavailable"),
@@ -697,14 +785,14 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
                 "cost_70_low": None,
                 "cost_70_high": None,
                 "concentration_70": None,
-            }
+            })
         chip = ctx.get("data")
         if chip is None:
             source_chain = list(fast_result.get("source_chain", [])) if fast_result else []
             source_chain.extend(ctx.get("source_chain", []))
             errors = list(fast_result.get("errors", [])) if fast_result else []
             errors.extend(ctx.get("errors", []))
-            return {
+            return finish({
                 "stock_code": ctx.get("stock_code", stock_code),
                 "status": ctx.get("status", "failed"),
                 "error_summary": ctx.get("error_summary") or "chip distribution unavailable",
@@ -718,7 +806,7 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
                 "cost_70_low": None,
                 "cost_70_high": None,
                 "concentration_70": None,
-            }
+            })
     else:
         remaining_timeout = max(0.0, timeout - (time.time() - started_at))
         chip, err, cost_ms = _run_manager_task_with_timeout(
@@ -728,7 +816,7 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
             "chip_distribution",
         )
         if err:
-            return {
+            return finish({
                 "stock_code": stock_code,
                 "status": "timeout" if "timeout" in str(err).lower() else "failed",
                 "error_summary": str(err),
@@ -738,17 +826,17 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
                     "result": "timeout" if "timeout" in str(err).lower() else "failed",
                     "duration_ms": cost_ms,
                 }],
-            }
+            })
 
     if chip is None:
-        return {
+        return finish({
             "stock_code": stock_code,
             "status": "failed",
             "error_summary": f"No chip distribution data available for {stock_code}",
             "errors": [f"No chip distribution data available for {stock_code}"],
-        }
+        })
 
-    return {
+    return finish({
         "stock_code": chip.code,
         "status": "ok",
         "code": chip.code,
@@ -762,7 +850,7 @@ def _handle_get_chip_distribution(stock_code: str) -> dict:
         "cost_70_low": chip.cost_70_low,
         "cost_70_high": chip.cost_70_high,
         "concentration_70": chip.concentration_70,
-    }
+    })
 
 
 get_chip_distribution_tool = ToolDefinition(
@@ -1433,6 +1521,39 @@ def _handle_get_capital_flow(
         normalized_end_date = _normalize_stockapi_date_arg(end_date, "end_date")
         normalized_page_no = _normalize_stockapi_page_arg(page_no, default=1)
         normalized_page_size = _normalize_stockapi_page_arg(page_size, default=50)
+    except Exception as exc:
+        return {
+            "stock_code": stock_code,
+            "status": "error",
+            "error": f"capital flow fetch failed: {exc}",
+            "errors": [str(exc)],
+            "source_chain": [{"provider": "capital_flow", "result": "failed"}],
+        }
+
+    cache_key = ":".join([
+        _agent_tool_cache_stock_key(stock_code),
+        normalized_start_date or "latest",
+        normalized_end_date or "latest",
+        str(normalized_page_no),
+        str(normalized_page_size),
+    ])
+
+    def finish(response: Dict[str, Any]) -> Dict[str, Any]:
+        status_value = str(response.get("status") or "").lower()
+        if status_value in {"ok", "partial"} and response.get("selected_flow_source"):
+            write_tool_result_cache("get_capital_flow", cache_key, response)
+            return response
+        if status_value in {"not_supported", "disabled"}:
+            return response
+        stale = _stale_tool_result(
+            "get_capital_flow",
+            cache_key,
+            response,
+            max_age_seconds=_CAPITAL_FLOW_RESULT_CACHE_MAX_AGE_SECONDS,
+        )
+        return stale or _unavailable_tool_result(response)
+
+    try:
         try:
             from src.config import get_config
             timeout = float(getattr(get_config(), "agent_capital_flow_timeout_seconds", 3.0))
@@ -1448,7 +1569,7 @@ def _handle_get_capital_flow(
         )
     except Exception as exc:
         logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
-        return {
+        return finish({
             "stock_code": stock_code,
             "status": "error",
             "error": f"capital flow fetch failed: {exc}",
@@ -1457,7 +1578,7 @@ def _handle_get_capital_flow(
                 "provider": "capital_flow",
                 "result": "failed",
             }],
-        }
+        })
 
     status = ctx.get("status", "not_supported")
     if status == "not_supported":
@@ -1555,7 +1676,7 @@ def _handle_get_capital_flow(
             end_date=normalized_end_date,
         )
         response = _attach_capital_flow_audit(response, audit)
-    return response
+    return finish(response)
 
 
 get_capital_flow_tool = ToolDefinition(

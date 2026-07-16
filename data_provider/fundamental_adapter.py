@@ -31,6 +31,7 @@ _STOCKAPI_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
 _STOCKAPI_CACHE_TTL_SECONDS = 15.0
 _STOCKAPI_REQUEST_LOCK = threading.Lock()
 _STOCKAPI_RESPONSE_CACHE: Dict[Tuple[str, Tuple[Tuple[str, str], ...], bool], Tuple[float, Dict[str, Any]]] = {}
+_STOCKAPI_TOKEN_DENIED_ENDPOINTS: set[str] = set()
 _stockapi_last_request_at = 0.0
 _CAPITAL_FLOW_AUDIT_SOURCES = (
     "tushare_moneyflow_dc",
@@ -142,6 +143,24 @@ def _stockapi_default_completed_date() -> str:
     if now.hour < 16:
         return (now.date() - timedelta(days=1)).isoformat()
     return now.date().isoformat()
+
+
+def _stockapi_hot_sector_completed_date(now: Optional[datetime] = None) -> date:
+    """Use the previous weekday until the hot-sector feed has a publish buffer."""
+    current = now or datetime.now()
+    publish_cutoff = current.replace(hour=17, minute=0, second=0, microsecond=0)
+    target = current.date() if current >= publish_cutoff else current.date() - timedelta(days=1)
+    return _previous_weekday(target)
+
+
+def _redact_stockapi_error(error: Any) -> str:
+    text = str(error or "")
+    return re.sub(
+        r"([?&](?:token|api[_-]?key)=)[^&\s)]+",
+        r"\1<redacted>",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def _stockapi_code_flow_completed_date(now: Optional[datetime] = None) -> datetime.date:
@@ -587,7 +606,7 @@ class AkshareFundamentalAdapter:
             if value is not None and str(value).strip() != ""
         }
         token = os.getenv("STOCKAPI_TOKEN", "").strip()
-        if token:
+        if token and endpoint not in _STOCKAPI_TOKEN_DENIED_ENDPOINTS:
             request_params["token"] = token
         cache_key = _stockapi_cache_key(endpoint, request_params, has_token=bool(token))
         if use_cache:
@@ -597,6 +616,7 @@ class AkshareFundamentalAdapter:
 
         errors: List[str] = []
         attempts = 1 + len(_STOCKAPI_RETRY_BACKOFF_SECONDS)
+        retry_anonymous = False
         with _STOCKAPI_REQUEST_LOCK:
             for attempt in range(attempts):
                 now = time.monotonic()
@@ -613,10 +633,16 @@ class AkshareFundamentalAdapter:
                     response.raise_for_status()
                     payload = response.json()
                 except Exception as exc:
-                    return None, [f"stockapi:{endpoint}:{type(exc).__name__}:{exc}"]
+                    return None, [
+                        f"stockapi:{endpoint}:{type(exc).__name__}:{_redact_stockapi_error(exc)}"
+                    ]
 
                 if not isinstance(payload, dict):
                     return None, [f"stockapi:{endpoint}:invalid_response"]
+                if payload.get("code") == 60050 and request_params.get("token"):
+                    _STOCKAPI_TOKEN_DENIED_ENDPOINTS.add(endpoint)
+                    retry_anonymous = True
+                    break
                 if not _stockapi_is_rate_limited(payload):
                     if payload.get("code") == 20000 and use_cache:
                         _stockapi_set_cached_payload(cache_key, payload)
@@ -625,6 +651,15 @@ class AkshareFundamentalAdapter:
                 if attempt >= attempts - 1:
                     return payload, errors
                 time.sleep(_STOCKAPI_RETRY_BACKOFF_SECONDS[attempt])
+
+        if retry_anonymous:
+            return self._stockapi_get_json(
+                endpoint,
+                params=params,
+                timeout=timeout,
+                use_cache=use_cache,
+                cache_ttl_s=cache_ttl_s,
+            )
 
         if not isinstance(payload, dict):
             return None, [f"stockapi:{endpoint}:invalid_response"]
@@ -700,9 +735,30 @@ class AkshareFundamentalAdapter:
         allow_fallback: bool = True,
     ) -> Dict[str, Any]:
         """Return StockAPI hot sectors ranked by capital inflow / strength."""
-        trade_date = _safe_str(date) or _stockapi_default_completed_date()
+        if date:
+            candidate_dates = [_safe_str(date)]
+        else:
+            candidate_dates = []
+            candidate = _stockapi_hot_sector_completed_date()
+            while len(candidate_dates) < 4:
+                candidate_dates.append(candidate.isoformat())
+                candidate = _previous_weekday(candidate - timedelta(days=1))
+        trade_date = candidate_dates[0]
         effective_limit = max(1, min(int(limit or 20), 100))
-        rows, errors = self._stockapi_data_rows("/v1/hotBkJlrDr", {"date": trade_date})
+        rows: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for candidate_date in candidate_dates:
+            candidate_rows, candidate_errors = self._stockapi_data_rows(
+                "/v1/hotBkJlrDr",
+                {"date": candidate_date},
+                use_cache=True,
+                cache_ttl_s=900.0,
+            )
+            if candidate_rows:
+                trade_date = candidate_date
+                rows = candidate_rows
+                break
+            errors.extend(candidate_errors)
 
         sectors: List[Dict[str, Any]] = []
         for row in rows[:effective_limit]:

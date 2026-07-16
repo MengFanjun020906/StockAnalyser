@@ -17,16 +17,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from data_provider.fundamental_adapter import (
     AkshareFundamentalAdapter,
     _STOCKAPI_RESPONSE_CACHE,
+    _STOCKAPI_TOKEN_DENIED_ENDPOINTS,
     _akshare_fund_flow_market,
     _build_dividend_payload,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
     _stockapi_code_flow_completed_date,
     _stockapi_default_completed_date,
+    _stockapi_hot_sector_completed_date,
 )
 
 
 class TestFundamentalAdapter(unittest.TestCase):
+    def setUp(self) -> None:
+        _STOCKAPI_TOKEN_DENIED_ENDPOINTS.clear()
+
     def test_parse_dividend_plan_to_per_share_supports_cn_patterns(self) -> None:
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("10派3元(含税)"), 0.3, places=6)
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("每10股派发2.5元"), 0.25, places=6)
@@ -759,6 +764,57 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertEqual(result["sectors"][0]["bk_code"], "BK1234")
         self.assertEqual(result["sectors"][0]["net_inflow"], 1000000.0)
         self.assertIn("/v1/hotBkJlrDr", mock_get.call_args.args[0])
+
+    def test_stockapi_permission_denied_token_retries_anonymous(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        denied = unittest.mock.MagicMock()
+        denied.raise_for_status.return_value = None
+        denied.json.return_value = {
+            "code": 60050,
+            "msg": "接口路径或参数不正确，或套餐权限不够",
+            "data": [],
+        }
+        anonymous = unittest.mock.MagicMock()
+        anonymous.raise_for_status.return_value = None
+        anonymous.json.return_value = {
+            "code": 20000,
+            "msg": "success",
+            "data": [{"bkCode": "BK1234", "bkName": "机器人"}],
+        }
+
+        with patch.dict("os.environ", {"STOCKAPI_TOKEN": "limited-token"}, clear=False), patch(
+            "data_provider.fundamental_adapter.requests.get",
+            side_effect=[denied, anonymous],
+        ) as mock_get:
+            result = adapter.get_stockapi_hot_sectors(date="2026-07-15", limit=5)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["sectors"][0]["bk_name"], "机器人")
+        self.assertIn("token", mock_get.call_args_list[0].kwargs["params"])
+        self.assertNotIn("token", mock_get.call_args_list[1].kwargs["params"])
+        self.assertIn("/v1/hotBkJlrDr", _STOCKAPI_TOKEN_DENIED_ENDPOINTS)
+
+    def test_stockapi_request_errors_redact_token(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+        with patch.dict("os.environ", {"STOCKAPI_TOKEN": "secret-token"}, clear=False), patch(
+            "data_provider.fundamental_adapter.requests.get",
+            side_effect=RuntimeError("failed url?token=secret-token&code=600001"),
+        ):
+            _payload, errors = adapter._stockapi_get_json("/v1/base/codeFlow", {"code": "600001"})
+
+        self.assertNotIn("secret-token", " ".join(errors))
+        self.assertIn("token=<redacted>", " ".join(errors))
+
+    def test_hot_sector_completed_date_waits_for_publish_buffer(self) -> None:
+        self.assertEqual(
+            _stockapi_hot_sector_completed_date(datetime(2026, 7, 15, 16, 18)),
+            datetime(2026, 7, 14).date(),
+        )
+        self.assertEqual(
+            _stockapi_hot_sector_completed_date(datetime(2026, 7, 15, 17, 5)),
+            datetime(2026, 7, 15).date(),
+        )
 
     def test_stockapi_hot_sectors_fallbacks_when_permission_denied(self) -> None:
         adapter = AkshareFundamentalAdapter()
