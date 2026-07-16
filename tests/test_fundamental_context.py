@@ -510,6 +510,41 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["error_summary"], "chip distribution disabled")
         self.assertIn("ENABLE_CHIP_DISTRIBUTION=false", ctx["errors"])
 
+    def test_chip_timeout_pool_is_isolated_from_fundamental_pool(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        manager._fundamental_timeout_slots.acquire()
+        try:
+            acquired = manager._chip_timeout_slots.acquire(blocking=False)
+        finally:
+            manager._fundamental_timeout_slots.release()
+            if acquired:
+                manager._chip_timeout_slots.release()
+
+        self.assertTrue(acquired)
+
+    def test_chip_local_worker_exhaustion_does_not_open_provider_circuit(self) -> None:
+        from data_provider.realtime_types import get_chip_circuit_breaker
+
+        fetcher = _DummyChipFetcher("AkshareFetcher", priority=0)
+        manager = DataFetcherManager(fetchers=[fetcher])
+        circuit = get_chip_circuit_breaker()
+        circuit.reset()
+        manager._chip_timeout_slots = BoundedSemaphore(1)
+        manager._chip_timeout_slots.acquire()
+        cfg = SimpleNamespace(
+            enable_chip_distribution=True,
+            agent_chip_distribution_timeout_seconds=1.0,
+            fundamental_fetch_timeout_seconds=0.5,
+        )
+        try:
+            with patch("src.config.get_config", return_value=cfg):
+                ctx = manager.get_chip_distribution_context("600519")
+        finally:
+            manager._chip_timeout_slots.release()
+
+        self.assertEqual(ctx["source_chain"][0]["result"], "busy")
+        self.assertEqual(circuit.get_status().get("akshare_chip"), "closed")
+
     def test_get_belong_boards_from_capability_probe(self) -> None:
         fetcher = _DummyBoardFetcher(
             "EfinanceFetcher",

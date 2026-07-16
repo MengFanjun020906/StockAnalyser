@@ -50,6 +50,12 @@ DEFAULT_INCREMENTAL_THRESHOLD = 30
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 50
 BENCHMARK_INDEX_SYMBOL = "000001.SH"
 BENCHMARK_INDEX_BAOSTOCK_CODE = "sh.000001"
+REGIME_INDEX_SYMBOL = "000300.SH"
+REGIME_INDEX_BAOSTOCK_CODE = "sh.000300"
+INDEX_SYMBOLS = (
+    (BENCHMARK_INDEX_SYMBOL, BENCHMARK_INDEX_BAOSTOCK_CODE),
+    (REGIME_INDEX_SYMBOL, REGIME_INDEX_BAOSTOCK_CODE),
+)
 BAOSTOCK_SESSION_EXPIRED_MARKERS = (
     "用户未登录",
     "not login",
@@ -93,9 +99,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=200,
                         help="Print progress every N symbols (default: 200)")
     parser.add_argument("--skip-benchmark-index", action="store_true",
-                        help="Skip fetching the benchmark index row (default fetches 上证指数 000001.SH)")
+                        help="Skip fetching local index rows (default fetches 000001.SH and 000300.SH)")
     parser.add_argument("--index-only", action="store_true",
-                        help="Only fetch the benchmark index, without updating stock symbols")
+                        help="Only fetch local index rows, without updating stock symbols")
     return parser.parse_args()
 
 
@@ -493,22 +499,28 @@ def main() -> int:
                 )
 
         if not aborted and not args.skip_benchmark_index:
-            try:
-                index_rows = fetch_index_rows(start_date=start_text, end_date=end_text)
-                index_written_rows = upsert_rows(db_path, index_rows)
-                index_status = "ok" if index_written_rows > 0 else "empty"
-                print(
-                    f"benchmark_index {BENCHMARK_INDEX_SYMBOL} status={index_status} "
-                    f"written_rows={index_written_rows}",
-                    flush=True,
-                )
-            except Exception as exc:
-                index_status = "failed"
-                failed += 1
-                print(
-                    f"[WARN] benchmark_index {BENCHMARK_INDEX_SYMBOL} failed: {exc}",
-                    flush=True,
-                )
+            index_statuses = []
+            for index_symbol, baostock_code in INDEX_SYMBOLS:
+                try:
+                    index_rows = fetch_index_rows(
+                        symbol=index_symbol,
+                        baostock_code=baostock_code,
+                        start_date=start_text,
+                        end_date=end_text,
+                    )
+                    written = upsert_rows(db_path, index_rows)
+                    status = "ok" if written > 0 else "empty"
+                    index_statuses.append(status)
+                    index_written_rows += written
+                    print(
+                        f"benchmark_index {index_symbol} status={status} written_rows={written}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    index_statuses.append("failed")
+                    failed += 1
+                    print(f"[WARN] benchmark_index {index_symbol} failed: {exc}", flush=True)
+            index_status = "ok" if index_statuses and all(item == "ok" for item in index_statuses) else "partial"
     finally:
         bs.logout()
 
@@ -523,7 +535,7 @@ def main() -> int:
         f"Done. success={success} empty={empty} failed={failed} skipped_complete={skipped_complete} "
         f"aborted={aborted} written_rows={written_rows} "
         f"baostock_relogin={relogin_count} "
-        f"benchmark_index={BENCHMARK_INDEX_SYMBOL} index_status={index_status} "
+        f"benchmark_indexes={','.join(symbol for symbol, _code in INDEX_SYMBOLS)} index_status={index_status} "
         f"index_written_rows={index_written_rows} "
         f"pruned_by_date={deleted_by_date} pruned_by_symbol={deleted_by_symbol} "
         f"cutoff={cutoff} db_rows={total_rows} "

@@ -22,10 +22,13 @@ if not json_repair_available and "json_repair" not in sys.modules:
     sys.modules["json_repair"] = MagicMock()
 
 from data_provider.tushare_client import (
+    TushareCredentialError,
     TushareHttpClient,
     TushareQueryTimeout,
+    get_tushare_runtime_health,
     get_tushare_http_url,
     query_tushare_api,
+    reset_tushare_runtime_health,
     should_bypass_proxy_for_tushare_url,
 )
 from data_provider.tushare_fetcher import TushareFetcher
@@ -33,6 +36,9 @@ from data_provider.tushare_fetcher import TushareFetcher
 
 class TestTushareHttpClient(unittest.TestCase):
     """Ensure the lightweight HTTP client preserves Tushare Pro request semantics."""
+
+    def setUp(self) -> None:
+        reset_tushare_runtime_health()
 
     def test_default_endpoint_is_private_gateway(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -103,6 +109,24 @@ class TestTushareHttpClient(unittest.TestCase):
 
         self.assertNotIn("proxies", post_mock.call_args.kwargs)
 
+    def test_expired_credential_is_quarantined_after_first_response(self) -> None:
+        client = TushareHttpClient(token="expired-token", timeout=15)
+        response = MagicMock(
+            status_code=200,
+            text=json.dumps({"code": 2002, "msg": "token已过期", "data": {}}),
+        )
+
+        with patch("data_provider.tushare_client.requests.post", return_value=response) as post_mock:
+            with self.assertRaises(TushareCredentialError):
+                client.index_basic(limit=1)
+            with self.assertRaises(TushareCredentialError):
+                client.index_basic(limit=1)
+
+        self.assertEqual(post_mock.call_count, 1)
+        health = get_tushare_runtime_health(token="expired-token", api_url=client.api_url)
+        self.assertEqual(health["status"], "credential_invalid")
+        self.assertFalse(health["available"])
+
     def test_query_tushare_api_prefers_sdk_endpoint_override(self) -> None:
         pro = MagicMock()
         pro.index_basic.return_value = "sdk-result"
@@ -126,6 +150,16 @@ class TestTushareHttpClient(unittest.TestCase):
 
         self.assertEqual(result, "http-result")
         http_client.query.assert_called_once_with("index_basic", fields="ts_code", limit=5)
+
+    def test_query_tushare_api_does_not_retry_http_after_sdk_auth_failure(self) -> None:
+        with patch(
+            "data_provider.tushare_client.query_tushare_api_via_sdk",
+            side_effect=RuntimeError("token已过期"),
+        ), patch("data_provider.tushare_client.build_tushare_http_client") as http_mock:
+            with self.assertRaises(TushareCredentialError):
+                query_tushare_api("index_basic", params={"limit": 5}, timeout=15)
+
+        http_mock.assert_not_called()
 
     def test_query_tushare_api_falls_back_when_sdk_times_out(self) -> None:
         with patch("data_provider.tushare_client.query_tushare_api_via_sdk", side_effect=TushareQueryTimeout("slow")), \

@@ -712,6 +712,10 @@ class StockAnalysisPipeline:
 
             market = get_market_for_stock(normalize_stock_code(code)) or "cn"
             service = get_graphiti_service()
+            timeout_seconds = max(
+                10.0,
+                min(600.0, float(getattr(self.config, "graphiti_outbox_job_timeout_seconds", 120) or 120)),
+            )
             service.ingest_analysis_sync(
                 code=code,
                 stock_name=stock_name,
@@ -721,9 +725,11 @@ class StockAnalysisPipeline:
                 news_context=news_context,
                 market=market,
                 user_id=getattr(self.source_message, "sender_id", None),
+                timeout_seconds=timeout_seconds,
             )
         except Exception as exc:
-            logger.warning("%s(%s) Graphiti 入图调用失败: %s", stock_name, code, exc, exc_info=True)
+            message = str(exc) or exc.__class__.__name__
+            logger.warning("%s(%s) Graphiti 入图调用失败: %s", stock_name, code, message, exc_info=True)
 
     def _attach_belong_boards_to_fundamental_context(
         self,

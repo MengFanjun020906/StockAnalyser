@@ -8,6 +8,9 @@ import pandas as pd
 
 from scripts.update_sequoia_candidates import (
     BENCHMARK_INDEX_SYMBOL,
+    INDEX_SYMBOLS,
+    REGIME_INDEX_BAOSTOCK_CODE,
+    REGIME_INDEX_SYMBOL,
     db_summary,
     filter_resume_symbols,
     get_global_max_date_in_db,
@@ -88,6 +91,13 @@ def test_update_sequoia_candidates_keeps_benchmark_index_distinct_from_stock_cod
     assert stored["000001"] == 10.5
     assert stored[BENCHMARK_INDEX_SYMBOL] == 3205
     assert db_summary(str(db_path)) == (2, 2, "2026-01-02", "2026-01-02")
+
+
+def test_update_sequoia_candidates_refreshes_distinct_benchmark_and_regime_indices():
+    assert BENCHMARK_INDEX_SYMBOL != REGIME_INDEX_SYMBOL
+    assert REGIME_INDEX_SYMBOL == "000300.SH"
+    assert (REGIME_INDEX_SYMBOL, REGIME_INDEX_BAOSTOCK_CODE) in INDEX_SYMBOLS
+    assert len({symbol for symbol, _code in INDEX_SYMBOLS}) == len(INDEX_SYMBOLS)
 
 
 def test_update_sequoia_candidates_prunes_to_latest_dates_and_per_symbol_limit(tmp_path):

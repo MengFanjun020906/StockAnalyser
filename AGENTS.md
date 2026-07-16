@@ -11,7 +11,8 @@
   - Web 前端改动在 `apps/dsa-web/`
   - 桌面端改动在 `apps/dsa-desktop/`
   - 部署与流水线改动在 `scripts/`、`.github/workflows/`、`docker/`
-- 未经明确确认，不执行 `git commit`、`git tag`、`git push`。
+- 未经明确确认，不执行 `git commit`、`git tag`、`git push`；若 maintainer 明确开启 autonomous loop 并授权当前目标，则该目标范围内可自主执行 commit、dev 分支 push、PR/MR、issue 与 release 操作，但必须保留验证证据，并在无法处理的问题、工具失败、fallback 数据质量下降或权限阻塞时立即停下升级给 maintainer。
+- autonomous loop 目标执行时，优先级为：目标文档 > `LOOP.md` 当前 loop 合同 > 本文件通用规则；但不泄露密钥、不隐瞒错误、不伪造测试结果、不直接破坏数据、fallback 质量未知即升级等硬安全底线永远不可覆盖。
 - commit message 使用英文，不添加 `Co-Authored-By`。
 - 不写死密钥、账号、路径、模型名、端口或环境差异逻辑。
 - 优先复用现有模块、配置入口、脚本和测试，不新增平行实现。
@@ -30,6 +31,7 @@
 - `CLAUDE.md` 必须是指向 `AGENTS.md` 的软链接，用于兼容 Claude 生态。
 - `.github/copilot-instructions.md` 与 `.github/instructions/*.instructions.md` 是 GitHub Copilot / Coding Agent 的镜像或分层补充；若与本文件冲突，以 `AGENTS.md` 为准。
 - 仓库协作 skill 存放在 `.claude/skills/`，分析产物存放在 `.claude/reviews/`；前者可以入库，后者默认视为本地产物。
+- `.codex/skills/loop-*`、`.codex/agents/verifier.toml`、`LOOP.md`、`STATE.md`、`loop-budget.md`、`loop-constraints.md` 和 `loop-run-log.md` 是 loop-engineering 运行资产；它们只描述自动化状态、预算、约束和 Codex 专用执行入口，不能覆盖 `AGENTS.md`。
 - 根目录 `SKILL.md` 与 `docs/integrations/openclaw-skill-integration.md` 属于产品或外部集成说明，不是仓库协作规则真源。
 - 若未来新增 `.agents/skills/` 或其他 agent 专用目录，必须先明确单一真源，再通过脚本或镜像同步；禁止手工长期维护多份同义内容。
 - 修改 AI 协作治理资产时，执行：
@@ -215,7 +217,7 @@ gh run view <run_id> --log-failed
 - 如果任务明确是 issue 分析、PR 审查、issue 修复，优先按对应 skill 执行，并将产物保存到 `.claude/reviews/`。
 - skill 中的命令、模板、验证顺序和交付结构必须与 `AGENTS.md` 保持一致。
 - skill 默认优先读取 CI / 工作流证据，再决定是否补本地验证。
-- skill 不得默认执行 `git pull`、`git push`、`git tag`、`gh pr create` 等会改变远端或当前分支状态的操作；这些操作必须要求用户确认。
+- skill 不得默认执行 `git pull`、`git push`、`git tag`、`gh pr create` 等会改变远端或当前分支状态的操作；这些操作必须要求用户确认。若 maintainer 已明确开启 autonomous loop 并授权当前目标，则按 `LOOP.md` / `STATE.md` 中记录的 loop 模式执行。
 - PR 审查默认顺序：
   1. 必要性
   2. 关联性

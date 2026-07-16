@@ -146,6 +146,48 @@ export type NewsSignalMetrics = {
   layerCounts?: Record<string, number>;
   graphSyncCounts?: Record<string, number>;
   feedbackCounts?: Record<string, number>;
+  rawQuality?: {
+    rawEpisodeCount?: number;
+    avgQualityScore?: number | null;
+    qualityCounts?: Record<string, number>;
+    statusCounts?: Record<string, number>;
+    sourceCounts?: Record<string, number>;
+    qualityFlagCounts?: Record<string, number>;
+    lowQualityRate?: number | null;
+    bySource?: Record<string, Record<string, unknown>>;
+    calibration?: Record<string, unknown>;
+  };
+  edgeQuality?: {
+    edgeCount?: number;
+    avgEdgesPerCard?: number;
+    avgEdgeQuality?: number | null;
+    edgeClassCounts?: Record<string, number>;
+    edgeTypeCounts?: Record<string, number>;
+    edgeQualityCounts?: Record<string, number>;
+    qualityFlagCounts?: Record<string, number>;
+    strongEdgeRatio?: number | null;
+    weakEdgeRatio?: number | null;
+    semanticEdgeCount?: number;
+    semanticEdgeRatio?: number | null;
+    sameEventEdgeCount?: number;
+    isolatedCardCount?: number;
+    isolatedCardRatio?: number | null;
+    humanNegativeFeedbackCount?: number;
+    humanNegativeFeedbackPerCard?: number | null;
+    semanticEdgeHitRate?: number | null;
+    semanticEdgeHitRateStatus?: string;
+    sameEventMislinkRate?: number | null;
+    sameEventMislinkRateStatus?: string;
+  };
+  feedbackQuality?: {
+    totalFeedback?: number;
+    negativeFeedbackCounts?: Record<string, number>;
+    negativeFeedbackTotal?: number;
+    negativeFeedbackRate?: number | null;
+    negativeCardCount?: number;
+    negativeCardRate?: number | null;
+    controlRuleCounts?: Record<string, number>;
+  };
 };
 
 export type NewsSignalRebuildResult = {

@@ -628,23 +628,23 @@ class GraphitiService:
             logger.warning("Graphiti news signal removal failed for %s: %s", normalized_card_id, exc, exc_info=True)
             return {"status": "failed", "error": str(exc), "card_id": normalized_card_id}
 
-    def ingest_analysis_sync(self, **kwargs: Any) -> None:
+    def ingest_analysis_sync(self, *, timeout_seconds: float | None = None, **kwargs: Any) -> None:
         if not self.is_available():
             return
 
-        self._run_sync(self.ingest_analysis(**kwargs))
+        self._run_sync(self.ingest_analysis(**kwargs), timeout_seconds=timeout_seconds)
 
-    def ingest_trace_sync(self, **kwargs: Any) -> None:
+    def ingest_trace_sync(self, *, timeout_seconds: float | None = None, **kwargs: Any) -> None:
         if not self.is_available():
             return
 
-        self._run_sync(self.ingest_trace(**kwargs))
+        self._run_sync(self.ingest_trace(**kwargs), timeout_seconds=timeout_seconds)
 
-    def ingest_market_event_sync(self, **kwargs: Any) -> None:
+    def ingest_market_event_sync(self, *, timeout_seconds: float | None = None, **kwargs: Any) -> None:
         if not self.is_available():
             return
 
-        self._run_sync(self.ingest_market_event(**kwargs))
+        self._run_sync(self.ingest_market_event(**kwargs), timeout_seconds=timeout_seconds)
 
     def ingest_news_signal_card_sync(
         self,

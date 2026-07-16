@@ -498,6 +498,80 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         self.assertEqual(listed["items"][0]["status"], "suppressed")
         self.assertLess(listed["items"][0]["adjusted_signal_score"], listed["items"][0]["signal_score"])
 
+    def test_feedback_controls_remove_company_duplicate_and_metrics(self) -> None:
+        first = _edge_card(
+            "card:feedback:a",
+            "机器人订单增长，产业链客户验证加速",
+            "机器人",
+            "300024",
+            "机器人公司",
+        )
+        second = _edge_card(
+            "card:feedback:b",
+            "机器人订单增长，客户验证进度更新",
+            "机器人",
+            "300024",
+            "机器人公司",
+        )
+        self.service.repo.upsert_cards([first, second])
+        self.service.rebuild_edges(signal_date="2026-07-04")
+        self.assertTrue(self.service.repo.list_edges(card_id=second["card_id"], limit=20))
+
+        duplicate = self.service.add_feedback(card_id=second["card_id"], feedback_type="duplicate", note="同一事件重复卡")
+        remove_company = self.service.add_feedback(
+            card_id=first["card_id"],
+            feedback_type="remove_company",
+            note="机器人公司",
+            payload={"symbol": "300024"},
+        )
+
+        repaired = self.service.get_card(first["card_id"])
+        duplicate_card = self.service.get_card(second["card_id"])
+        metrics = self.service.metrics(signal_date="2026-07-04")
+
+        self.assertEqual(duplicate["effect"], "suppress_card_and_remove_edges")
+        self.assertEqual(remove_company["effect"], "remove_company_mapping_and_rebuild_edges")
+        self.assertEqual(duplicate_card["status"], "suppressed")
+        self.assertEqual(repaired["company_impacts"], [])
+        self.assertEqual(repaired["mapping_status"], "industry_only")
+        self.assertEqual(repaired["signal_layer"], "industry")
+        self.assertLessEqual(repaired["mapping_confidence"], 0.35)
+        self.assertEqual(repaired["diagnostics"]["feedback_controls"][-1]["feedback_type"], "remove_company")
+        self.assertEqual(metrics["feedback_counts"]["duplicate"], 1)
+        self.assertEqual(metrics["feedback_counts"]["remove_company"], 1)
+        self.assertEqual(metrics["feedback_quality"]["negative_feedback_total"], 2)
+        self.assertEqual(metrics["feedback_quality"]["control_rule_counts"]["remove_company"], 1)
+        self.assertIn("raw_quality", metrics)
+        self.assertIn("edge_quality", metrics)
+        self.assertIn("isolated_card_ratio", metrics["edge_quality"])
+
+    def test_foreign_supply_chain_and_domestic_substitution_template(self) -> None:
+        self.service._concept_mapping = {
+            "MLCC": {
+                "aliases": ["MLCC", "片式多层陶瓷电容"],
+                "related_boards": ["被动元件", "电子元件"],
+                "mapped_stocks": [],
+            }
+        }
+        raw, cards = self.service._build_from_cls(
+            _dailynews_payload(
+                title="日本MLCC厂商出口受限，国产替代窗口打开",
+                content="日本MLCC厂商因出口管制供应受限，下游客户加速导入国产替代和二供认证。",
+                published_at="2026-07-11T09:20:00+08:00",
+            )
+        )
+
+        event = cards[0]["extracted_events"][0]
+        path = cards[0]["transmission_paths"][0]
+
+        self.assertEqual(len(raw), 1)
+        self.assertEqual(event["event_type"], "供应链/替代")
+        self.assertEqual(path["event_category"], "供应链/替代")
+        self.assertEqual(path["template_id"], "foreign_supply_to_domestic_substitution")
+        self.assertEqual(path["evidence_template"]["confidence_rule"], "industry_level_until_company_product_customer_evidence_is_explicit")
+        self.assertEqual(path["chain_steps"][0]["label"], "海外供给/出口线索")
+        self.assertEqual(path["chain_steps"][1]["label"], "国产替代验证")
+
     def test_dailynews_macro_card_uses_macro_layer(self) -> None:
         raw, cards = self.service._build_from_cls(
             _dailynews_payload(

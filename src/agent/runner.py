@@ -169,7 +169,7 @@ def _compact_tool_payload(tool_name: str, payload: Any) -> Any:
     if profile == "price_structure":
         return _compact_price_structure_payload(payload)
     if profile == "chip":
-        return _compact_keep_fields(payload, _CHIP_FIELDS, include_errors=True)
+        return _compact_chip_payload(payload)
     if profile == "stock_info":
         return _compact_stock_info_payload(payload)
     if profile == "business_context":
@@ -179,7 +179,19 @@ def _compact_tool_payload(tool_name: str, payload: Any) -> Any:
     if profile == "capital_flow":
         return _compact_capital_flow_payload(payload)
     if profile == "market_flow":
-        return _compact_table_payload(payload, item_keys=("items", "data", "top", "bottom", "top_inflow_sectors", "top_outflow_sectors"))
+        return _compact_table_payload(
+            payload,
+            item_keys=(
+                "items",
+                "data",
+                "top",
+                "bottom",
+                "top_sectors",
+                "bottom_sectors",
+                "top_inflow_sectors",
+                "top_outflow_sectors",
+            ),
+        )
     if profile == "tushare_table":
         return _compact_table_payload(payload)
     if profile == "news":
@@ -220,8 +232,10 @@ _TECHNICAL_FIELDS = (
     "price_volume_relation", "patterns", "summary", "error", "status",
 )
 _CHIP_FIELDS = (
-    "stock_code", "code", "status", "as_of", "latest_date", "profit_ratio",
+    "stock_code", "code", "status", "date", "as_of", "latest_date", "source", "profit_ratio",
     "avg_cost", "concentration", "chip_concentration", "cost_90", "cost_70",
+    "cost_90_low", "cost_90_high", "concentration_90",
+    "cost_70_low", "cost_70_high", "concentration_70",
     "winner_rate", "support_price", "pressure_price", "error_summary", "error",
 )
 _BUSINESS_CONTEXT_FIELDS = (
@@ -315,6 +329,35 @@ def _copy_error_fields(payload: Dict[str, Any], out: Dict[str, Any]) -> None:
         out["errors"] = [_truncate_text(str(item), 240) for item in errors[:3] if str(item).strip()]
 
 
+def _copy_degradation_fields(payload: Dict[str, Any], out: Dict[str, Any]) -> None:
+    status = str(payload.get("status") or "").strip().lower()
+    degraded = status in {"stale", "failed", "error", "timeout", "unavailable"} or bool(
+        payload.get("cache_hit") or payload.get("provider_errors") or payload.get("live_diagnostics")
+    )
+    for key in ("data_available", "cache_hit", "cache_age_seconds"):
+        if key in payload and payload.get(key) is not None:
+            out[key] = payload.get(key)
+    provider_errors = payload.get("provider_errors")
+    if isinstance(provider_errors, list) and provider_errors:
+        out["provider_errors"] = [
+            _truncate_text(str(item), 240)
+            for item in provider_errors[:3]
+            if str(item).strip()
+        ]
+    if not degraded:
+        return
+    for key in ("warnings", "live_diagnostics", "source_chain"):
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            out[key] = _compact_value_for_model(value, depth=2)
+
+
+def _compact_chip_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = _compact_keep_fields(payload, _CHIP_FIELDS, include_errors=True)
+    _copy_degradation_fields(payload, out)
+    return _drop_empty(out)
+
+
 def _compact_history_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = payload.get("data") if isinstance(payload.get("data"), list) else []
     closes = [_safe_number(item.get("close")) for item in data if isinstance(item, dict)]
@@ -346,6 +389,7 @@ def _compact_capital_flow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "net_inflow_10d": payload.get("net_inflow_10d"),
         "amount_unit": payload.get("amount_unit", "CNY"),
         "latest_date": payload.get("latest_date"),
+        "selected_flow_source": payload.get("selected_flow_source"),
     }
     if payload.get("main_inflow_definition"):
         result["main_inflow_definition"] = payload.get("main_inflow_definition")
@@ -358,6 +402,7 @@ def _compact_capital_flow_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     errors = payload.get("errors")
     if isinstance(errors, list) and errors:
         result["errors"] = [_truncate_text(str(item), 240) for item in errors[:3] if str(item).strip()]
+    _copy_degradation_fields(payload, result)
     return _drop_empty(result)
 
 
@@ -409,11 +454,13 @@ def _compact_table_payload(
     for key in (
         "status", "api_name", "stock_code", "code", "ts_code", "trade_date",
         "ann_date", "start_date", "end_date", "latest_date", "date", "total",
-        "count", "summary", "error", "error_summary",
+        "count", "summary", "error", "error_summary", "data_source",
+        "ranking_market", "ranking_basis", "bottom_basis", "duration_ms",
     ):
         if key in payload and payload.get(key) not in (None, "", [], {}):
             out[key] = _compact_value_for_model(payload.get(key), depth=1)
     _copy_error_fields(payload, out)
+    _copy_degradation_fields(payload, out)
     for key in item_keys:
         value = payload.get(key)
         if isinstance(value, list):
@@ -475,7 +522,8 @@ def _compact_market_regime_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "trend", "volatility", "breadth", "liquidity", "risk_level", "as_of",
         "stock_code", "windows", "forward_probability", "path_profile",
         "reentry_reference", "sample_quality_summary", "low_confidence",
-        "summary", "signals", "warnings", "error",
+        "history_source", "history_records", "sample_count", "duration_ms",
+        "brief", "summary", "signals", "warnings", "error",
     )
     return _compact_keep_fields(payload, fields, include_errors=True)
 

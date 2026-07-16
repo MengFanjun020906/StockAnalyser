@@ -798,13 +798,45 @@ class NewsSignalService:
         }
 
     def add_feedback(self, *, card_id: str, feedback_type: str, note: str = "", payload: Optional[Dict[str, Any]] = None, user_id: str = "") -> Dict[str, Any]:
-        return self.repo.add_feedback(
+        feedback = self.repo.add_feedback(
             card_id=card_id,
             feedback_type=feedback_type,
             note=note,
             payload=payload or {},
             user_id=user_id,
         )
+        card = self.repo.get_card(card_id)
+        if card:
+            feedback["card_status"] = card.get("status")
+            feedback["card_effective_signal_score"] = card.get("adjusted_signal_score", card.get("signal_score"))
+            try:
+                if str(card.get("status") or "") == "active":
+                    self.outbox_repo.enqueue(
+                        event_type="news_signal_card_episode",
+                        aggregate_id=card_id,
+                        payload={"card_id": card_id},
+                        market="cn",
+                    )
+                else:
+                    self.outbox_repo.enqueue(
+                        event_type="news_signal_card_delete",
+                        aggregate_id=card_id,
+                        payload={"card_id": card_id},
+                        market="cn",
+                    )
+                signal_date = str(card.get("signal_date") or "")
+                if signal_date:
+                    self.outbox_repo.enqueue(
+                        event_type="news_signal_edge_projection",
+                        aggregate_id=signal_date,
+                        payload={"signal_date": signal_date},
+                        market="cn",
+                    )
+                feedback["graph_outbox_enqueued"] = True
+            except Exception as exc:
+                feedback["graph_outbox_enqueued"] = False
+                feedback["graph_outbox_error"] = _compact_text(str(exc), 240)
+        return feedback
 
     def metrics(self, *, signal_date: str = "") -> Dict[str, Any]:
         return self.repo.metrics(signal_date=signal_date or None)
@@ -2804,7 +2836,7 @@ def _event_trigger_for_text(event_type: str, text: str) -> str:
         "价格/供需": ("提价", "涨价", "价格上涨", "售价", "均价", "合约价格", "合同价格", "ASP", "报价"),
         "大客户/订单": ("量产", "投产", "交付", "出货", "供货", "订单", "定点", "认证", "客户导入"),
         "技术突破": ("突破", "路线", "工艺", "技术", "专利", "良率", "验证"),
-        "供应链/替代": ("制裁", "禁令", "封锁", "限制", "关税", "出口管制", "国产替代"),
+        "供应链/替代": ("制裁", "禁令", "封锁", "限制", "关税", "出口管制", "供应受限", "断供", "国产替代", "进口替代", "自主可控", "二供", "出口"),
         "政策/宏观": ("政策", "规划", "征求意见", "补贴", "审评审批", "降准", "降息", "逆回购", "MLF", "LPR"),
         "业绩验证": ("净利润", "业绩", "预告", "同比", "环比", "盈利"),
         "产能变化": ("扩产", "产能", "建厂", "项目", "投建"),
@@ -2924,6 +2956,9 @@ def _transmission_paths(
         return []
     primary_event = (extracted_events or [{}])[0] if extracted_events else {}
     category = str(primary_event.get("event_type") or _event_category_for_text(rationale))
+    template = _supply_chain_template_for_text(rationale)
+    if template:
+        category = "供应链/替代"
     catalyst_score = _catalyst_score(category, rationale)
     transmission_score = _transmission_score(theme, related_boards, company_impacts)
     mapping_score = _mapping_score(company_impacts)
@@ -2952,9 +2987,13 @@ def _transmission_paths(
             "score": round(mapping_score, 1),
         },
     ]
+    if template:
+        chain_steps = _supply_chain_template_steps(template, company_impacts, related_boards, theme, mapping_score)
+        transmission_score = min(24.0, transmission_score + 3.0)
+        event_score = round(catalyst_score + transmission_score + mapping_score + timeliness_score, 1)
+        mechanism = template["mechanism"]
     conclusion = _chain_conclusion(category, theme, primary_targets, event_score)
-    return [
-        {
+    path = {
             "source": theme,
             "event_id": primary_event.get("event_id"),
             "event_category": category,
@@ -2979,18 +3018,122 @@ def _transmission_paths(
             "conclusion": conclusion,
             "rationale": _compact_text(rationale, 220),
         }
+    if template:
+        path["evidence_template"] = template
+        path["template_id"] = template["template_id"]
+    return [path]
+
+
+def _supply_chain_template_for_text(text: str) -> Optional[Dict[str, Any]]:
+    haystack = str(text or "")
+    if not haystack:
+        return None
+    foreign_terms = (
+        "海外",
+        "国外",
+        "美国",
+        "欧洲",
+        "日本",
+        "韩国",
+        "日韩",
+        "欧美",
+        "台厂",
+        "海外大厂",
+        "国际大厂",
+        "出口",
+        "进口",
+    )
+    disruption_terms = (
+        "限制",
+        "管制",
+        "禁令",
+        "制裁",
+        "封锁",
+        "关税",
+        "断供",
+        "供应受限",
+        "停产",
+        "涨价",
+        "提价",
+        "扩产",
+        "订单",
+        "认证",
+        "客户导入",
+    )
+    substitution_terms = (
+        "国产替代",
+        "进口替代",
+        "自主可控",
+        "本土替代",
+        "国产化",
+        "二供",
+        "第二供应商",
+        "卡脖子",
+        "替代窗口",
+    )
+    has_foreign_signal = any(term in haystack for term in foreign_terms) and any(term in haystack for term in disruption_terms)
+    has_substitution_signal = any(term in haystack for term in substitution_terms)
+    if has_foreign_signal and has_substitution_signal:
+        template_id = "foreign_supply_to_domestic_substitution"
+        mechanism = "海外供给、出口或客户变化先改变进口链条约束，再验证国内替代产品、二供认证、材料设备或模组封测承接能力。"
+        required_evidence = ["海外限制/提价/扩产/订单变化", "国内可替代环节", "客户认证或二供资格", "公司产品或产能证据"]
+    elif has_substitution_signal:
+        template_id = "domestic_substitution_policy"
+        mechanism = "国产替代或自主可控信号需要落到明确产品环节，再用政策、客户验证和公司产品证据确认可承接份额。"
+        required_evidence = ["替代政策或自主可控表述", "被替代产品/环节", "国内产品成熟度", "公司客户或产能证据"]
+    elif has_foreign_signal:
+        template_id = "foreign_supply_chain_signal"
+        mechanism = "海外供应、出口、提价或客户动作先影响供需预期，国内映射必须经过产品相似性、认证关系和产能承接证据确认。"
+        required_evidence = ["海外供应链动作", "受影响产品/环节", "国内替代或二供可能性", "后续订单/认证验证"]
+    else:
+        return None
+    return {
+        "schema_version": "news_supply_chain_template.v1",
+        "template_id": template_id,
+        "mechanism": mechanism,
+        "required_evidence": required_evidence,
+        "confidence_rule": "industry_level_until_company_product_customer_evidence_is_explicit",
+    }
+
+
+def _supply_chain_template_steps(
+    template: Dict[str, Any],
+    company_impacts: List[Dict[str, Any]],
+    related_boards: List[str],
+    theme: str,
+    mapping_score: float,
+) -> List[Dict[str, Any]]:
+    landing = _mapping_step_text(company_impacts, related_boards, theme)
+    return [
+        {
+            "label": "海外供给/出口线索",
+            "text": "识别海外限制、提价、扩产、出口或客户变化；先作为产业链扰动，不直接推断单家公司受益。",
+            "score": 23.0,
+        },
+        {
+            "label": "国产替代验证",
+            "text": "必须继续核验国内可替代产品、客户认证、二供资格、材料设备或模组封测承接能力。",
+            "score": 21.0,
+        },
+        {
+            "label": "映射落点",
+            "text": landing,
+            "score": round(mapping_score, 1),
+        },
     ]
 
 
 def _event_category_for_text(text: str) -> str:
     haystack = str(text or "")
+    if _supply_chain_template_for_text(haystack):
+        return "供应链/替代"
     if any(term in haystack for term in ("提价", "涨价", "价格上涨", "售价", "均价", "合约价格", "合同价格", "ASP", "报价")):
         return "价格/供需"
     if any(term in haystack for term in ("量产", "投产", "交付", "出货", "供货", "订单", "定点", "认证", "客户导入")):
         return "大客户/订单"
     if any(term in haystack for term in ("突破", "路线", "工艺", "技术", "专利", "良率", "验证")):
         return "技术突破"
-    if any(term in haystack for term in ("制裁", "禁令", "封锁", "限制", "关税", "出口管制", "国产替代")):
+    if any(term in haystack for term in ("制裁", "禁令", "封锁", "限制", "关税", "出口管制", "供应受限", "断供", "国产替代", "进口替代", "自主可控", "二供", "出口")):
         return "供应链/替代"
     if any(term in haystack for term in ("政策", "规划", "征求意见", "补贴", "审评审批", "降准", "降息", "逆回购", "MLF", "LPR")):
         return "政策/宏观"

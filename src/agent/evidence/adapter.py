@@ -208,7 +208,7 @@ def _quality_status(raw: Dict[str, Any]) -> str:
     status = str(raw.get("status") or "").strip().lower()
     if raw.get("timeout") is True:
         return "timeout"
-    if status in {"ok", "partial", "empty", "stale", "failed", "timeout", "not_supported"}:
+    if status in {"ok", "partial", "empty", "stale", "failed", "timeout", "unavailable", "not_supported"}:
         return status
     if raw.get("error") or raw.get("errors"):
         return "failed"
@@ -441,7 +441,7 @@ def _signal(name: str, value: Any, unit: Optional[str], delta: float, interpreta
 
 
 def _impact_from_signals(tool_name: str, status: str, signals: List[EvidenceSignal], missing_fields: List[str]) -> EvidenceImpact:
-    if status in {"failed", "timeout", "empty", "not_supported"}:
+    if status in {"failed", "timeout", "empty", "unavailable", "not_supported"}:
         return EvidenceImpact(
             stance="invalid",
             action_bias="wait",
@@ -535,7 +535,7 @@ def _recommended_tools(cards: List[EvidenceCard]) -> List[Dict[str, Any]]:
     tools = []
     for card in cards:
         tool = str(card.producer.get("tool") or "")
-        if card.data_quality.status in {"failed", "timeout", "empty", "stale"} and tool:
+        if card.data_quality.status in {"failed", "timeout", "empty", "stale", "unavailable"} and tool:
             tools.append({"tool": tool, "reason": "刷新缺失或过期证据"})
     return tools[:3]
 

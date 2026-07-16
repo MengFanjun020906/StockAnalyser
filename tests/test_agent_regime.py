@@ -279,7 +279,7 @@ def test_market_history_prefers_tushare_index_daily_fast_path():
     with patch("data_provider.tushare_client.get_tushare_token", return_value="token"), \
          patch("data_provider.tushare_client.build_tushare_http_client", return_value=FakeTushareHttpClient()) as build_client, \
          patch("src.services.history_loader.load_history_df") as fallback_loader:
-        history, source = market_tools._load_market_history("000300", 260)
+        history, source = market_tools._load_market_history("000300", 1)
 
     assert source == "tushare:index_daily"
     assert history[0]["date"] == "2026-05-15"
@@ -292,12 +292,48 @@ def test_market_history_skips_stock_fallback_for_supported_index():
     from src.agent.tools import market_tools
 
     with patch("src.agent.tools.market_tools._load_index_history_from_tushare", return_value=([], "tushare:index_daily_failed")), \
-         patch("src.services.history_loader.load_history_df", return_value=(None, "db_cache_miss")) as fallback_loader:
+         patch("src.services.history_loader.load_history_df", return_value=(None, "db_cache_miss")) as fallback_loader, \
+         patch("src.agent.tools.market_tools._load_index_history_from_baostock", return_value=([], "baostock:index_daily_failed")):
         history, source = market_tools._load_market_history("000300", 260)
 
     assert history == []
-    assert source == "tushare:index_daily_failed;db_cache_miss"
-    fallback_loader.assert_called_once_with("000300", days=260, fallback_to_network=False)
+    assert source == "tushare:index_daily_failed;db_cache_miss;baostock:index_daily_failed"
+    fallback_loader.assert_called_once_with("000300", days=260, fallback_to_network=True)
+
+
+def test_market_history_ignores_short_cache_and_uses_baostock_fallback():
+    short_rows = [{"date": "2026-07-14", "open": 1, "high": 1, "low": 1, "close": 1}]
+    fallback_rows = [
+        {
+            "date": str(date(2025, 1, 1) + timedelta(days=idx)),
+            "open": 100 + idx,
+            "high": 101 + idx,
+            "low": 99 + idx,
+            "close": 100.5 + idx,
+            "volume": 1000,
+            "amount": 10000,
+        }
+        for idx in range(260)
+    ]
+
+    with patch(
+        "src.agent.tools.market_tools._load_market_history_cache_only",
+        return_value=(short_rows, "short-cache"),
+    ), patch(
+        "src.agent.tools.market_tools._load_index_history_from_tushare",
+        return_value=(short_rows, "short-tushare"),
+    ), patch(
+        "src.services.history_loader.load_history_df",
+        return_value=(None, "none"),
+    ), patch(
+        "src.agent.tools.market_tools._load_index_history_from_baostock",
+        return_value=(fallback_rows, "baostock:index_daily"),
+    ) as baostock_loader:
+        history, source = market_tools._load_market_history("000300", 1090, cache_first=True)
+
+    assert len(history) == 260
+    assert source == "baostock:index_daily"
+    baostock_loader.assert_called_once_with("000300", 1090)
 
 
 def test_market_history_uses_local_index_cache_when_tushare_fails(tmp_path):

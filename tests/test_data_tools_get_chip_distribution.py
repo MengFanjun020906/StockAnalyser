@@ -3,10 +3,12 @@
 
 import os
 import sys
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from pathlib import Path
 
 import pandas as pd
 
@@ -85,6 +87,18 @@ class _DummyManagerCaptureTimeout:
 
 
 class TestGetChipDistributionContract(unittest.TestCase):
+    def setUp(self) -> None:
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self._cache_patch = patch(
+            "src.agent.tools.result_cache._CACHE_ROOT",
+            Path(self._cache_dir.name),
+        )
+        self._cache_patch.start()
+
+    def tearDown(self) -> None:
+        self._cache_patch.stop()
+        self._cache_dir.cleanup()
+
     def test_ok_response_shape(self) -> None:
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
@@ -105,9 +119,9 @@ class TestGetChipDistributionContract(unittest.TestCase):
             result = _handle_get_chip_distribution("688469")
 
         self.assertEqual(result["stock_code"], "688469")
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["error_summary"], "Eastmoney chip distribution endpoint disconnected")
-        self.assertIn("RemoteDisconnected", result["errors"][0])
+        self.assertIn("RemoteDisconnected", result["provider_errors"][0])
         self.assertEqual(result["source_chain"][0]["provider"], "akshare_chip")
         self.assertIsNone(result["profit_ratio"])
 
@@ -129,8 +143,8 @@ class TestGetChipDistributionContract(unittest.TestCase):
         ), patch("src.agent.tools.data_tools._query_tushare_chip_distribution", return_value={"status": "failed", "errors": [], "source_chain": []}):
             result = _handle_get_chip_distribution("603418")
 
-        self.assertEqual(result["status"], "timeout")
-        self.assertIn("chip_distribution timeout", result["errors"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("chip_distribution timeout", result["provider_errors"])
         self.assertEqual(result["source_chain"][0]["result"], "timeout")
         self.assertIsNone(result["profit_ratio"])
 
@@ -149,8 +163,8 @@ class TestGetChipDistributionContract(unittest.TestCase):
         ), patch("src.agent.tools.data_tools._query_tushare_chip_distribution", return_value=fast_result):
             result = _handle_get_chip_distribution("603418")
 
-        self.assertEqual(result["status"], "timeout")
-        self.assertIn("tushare:cyq_chips timed out", result["errors"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("tushare:cyq_chips timed out", result["provider_errors"])
         self.assertEqual(result["source_chain"][0]["provider"], "tushare:cyq_chips")
         self.assertEqual(result["source_chain"][-1]["provider"], "chip_distribution")
 
@@ -167,9 +181,27 @@ class TestGetChipDistributionContract(unittest.TestCase):
         ), patch("src.agent.tools.data_tools._get_agent_timeout_attr", return_value=0.05):
             result = _handle_get_chip_distribution("603418")
 
-        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["source_chain"][0]["provider"], "tushare:cyq_chips")
         self.assertEqual(result["source_chain"][0]["result"], "timeout")
+
+    def test_tushare_fast_path_skips_runtime_quarantined_credentials(self) -> None:
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerDisabled(),
+        ), patch(
+            "src.config.get_config",
+            return_value=SimpleNamespace(enable_chip_distribution=True, tushare_token="expired-token"),
+        ), patch(
+            "data_provider.tushare_client.get_tushare_runtime_health",
+            return_value={"available": False, "status": "invalid_credentials"},
+        ), patch(
+            "src.agent.tools.data_tools._query_tushare_chip_distribution",
+        ) as fast_path:
+            result = _handle_get_chip_distribution("603418")
+
+        self.assertEqual(result["status"], "disabled")
+        fast_path.assert_not_called()
 
     def test_manager_fallback_uses_remaining_timeout_budget(self) -> None:
         manager = _DummyManagerCaptureTimeout()
@@ -182,9 +214,30 @@ class TestGetChipDistributionContract(unittest.TestCase):
         ), patch("src.agent.tools.data_tools._get_agent_timeout_attr", return_value=0.05):
             result = _handle_get_chip_distribution("603418")
 
-        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["status"], "unavailable")
         self.assertIsNotNone(manager.timeout_seconds)
         self.assertLess(manager.timeout_seconds, 0.05)
+
+    def test_failed_live_fetch_uses_recent_successful_cache(self) -> None:
+        config = SimpleNamespace(enable_chip_distribution=False, tushare_token=None)
+        with patch("src.config.get_config", return_value=config), patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerOk(),
+        ):
+            live = _handle_get_chip_distribution("600519")
+
+        with patch("src.config.get_config", return_value=config), patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerFailed(),
+        ):
+            stale = _handle_get_chip_distribution("600519")
+
+        self.assertEqual(live["status"], "ok")
+        self.assertEqual(stale["status"], "stale")
+        self.assertEqual(stale["profit_ratio"], 0.67)
+        self.assertTrue(stale["cache_hit"])
+        self.assertEqual(stale["live_diagnostics"]["status"], "failed")
+        self.assertNotIn("errors", stale)
 
     def test_tushare_fast_path_falls_back_to_recent_trade_date(self) -> None:
         responses = [

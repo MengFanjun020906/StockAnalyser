@@ -284,11 +284,11 @@ daily_stock_analysis/
 | `get_cls_telegraph_news` | Agent 工具：通过 `https://orz.ai/api/v1/dailynews/?platform=cls` 获取财联社电报/消息热榜，返回标题、内容、发布时间、热度分数、排名和 `source_chain` | - | 工具 |
 | `get_xueqiu_hot_news` | Agent 工具：通过 `https://orz.ai/api/v1/dailynews/?platform=xueqiu` 获取雪球热榜，用于观察市场讨论热度、热门主题扩散和情绪确认 | - | 工具 |
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
-| `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
+| `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；按 Tushare THS、Eastmoney、StockAPI 顺序降级，`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
 | `AGENT_SEED_FACT_MAX_WORKERS` | 三席位选股前 `SeedFactPacket` 取数层的 `(seed,tool)` 并发 worker 上限 | `12` | 可选 |
 | `AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS` | `SeedFactPacket` 单个工具调用预算；失败会写入 trace，不会伪造成成功 facts | `30.0` | 可选 |
 | `AGENT_SEED_FACT_TOOLS` | 三席位共享的预取工具列表，逗号分隔；默认覆盖趋势、结构、均线、量能、资金与轻量业务归属 | `analyze_price_structure,analyze_trend,calculate_ma,get_volume_analysis,get_capital_flow,get_stock_business_context` | 可选 |
-| `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
+| `ENABLE_CHIP_DISTRIBUTION` | 启用筹码分布分析。`get_chip_distribution` 默认优先使用 Tushare `cyq_chips`，失败时保留结构化诊断并回退 manager 数据源链路；筹码探测使用独立 timeout worker 池，不与基本面调用争用；GitHub Actions 用户需在 Repository Variables 中设置 `ENABLE_CHIP_DISTRIBUTION=true` 方可启用；workflow 默认关闭。 | `true` | 可选 |
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
@@ -321,10 +321,14 @@ daily_stock_analysis/
 > - Agent 最终报告会执行事实校验门禁：资金流精确值必须来自 `get_capital_flow` 的成功来源链，筹码分布精确值必须来自 `get_chip_distribution`，均线精确值必须来自 `calculate_ma` 或 `analyze_trend`。缺少对应工具证据时，最终 dashboard 会将这些字段替换为 `N/A` 并写入 `data_quality_warnings`。A 股买入股数还会按 100 股整数倍校验，模型输出的零散买入股数会被替换为“按100股整数倍”。
 > - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
 > - 四席位候选发现中，`momentum_desk` 的业务语义是“趋势/形态延续席”，优先消费 Sequoia、AlphaSift、涨停池和资金异常召回；`early_turn_desk` 代码名保留，但业务上降级为“结构反转席”，必须同时满足 `range_pct_120` 低位和明确转强证据，低位本身不再天然加分。防守 regime（`risk_off`/`panic`/`trending_down`）会跳过零配额动量席，避免无效席位消耗 LLM 预算。
-> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并额外写入上证指数 `000001.SH` 作为 Seed Pool 质量评估基准。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
+> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并额外维护 `000001.SH` 上证指数和 `000300.SH` 沪深 300。前者供 Seed Pool 质量页计算 Alpha，后者供市场状态与前向概率在主缓存不足时补历史。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
 > - Seed Pool 质量页按 `seed_date` 只保留最新一个池子；同一天多次生成候选池时，新池会替换旧池，T+1 评估和页面总览只针对最新池。候选池会优先使用 seed 自身的 `freshness`/`as_of`/`trade_date` 归属日期；缺少这些字段时，北京时间 09:00 前生成的候选池归属到前一自然日，例如 6 月 10 日 09:00 前生成的池子计入 6 月 9 日。
 > - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
 > - Agent 模型上下文使用压缩后的工具事实卡。资金流、筹码分布等容易被误读的高风险指标，会从 `src/agent/metric_semantics.py` 注入短 `field_semantics` 防误读说明；自解释字段不会重复解释，避免浪费上下文预算。
+> - Tushare 返回 Token 过期、无效或鉴权失败后，当前进程会短期隔离该凭据，后续工具直接跳过 Tushare 并继续其他来源，避免同一 Trace 重复消耗超时预算。更新有效 `TUSHARE_TOKEN` 并重启进程后恢复探测。
+> - `get_capital_flow`、`get_chip_distribution` 会保留最近 5 天内的成功结果，`get_sector_rankings` 保留最近 36 小时成功结果。实时来源失败但有缓存时返回 `status=stale`、`cache_age_seconds` 和 `live_diagnostics`；无缓存时返回 `status=unavailable` 和 `provider_errors`。`unavailable` 只表示工具已完成上游探测，不会被 EvidenceCard 当成可用证据；`stale` 也会触发刷新建议，报告必须保留原数据日期。
+> - StockAPI 热门板块接口若配置 Token 返回套餐/接口权限错误，会对该端点自动匿名重试；免费额度耗尽时仍按正常数据源失败降级。所有 StockAPI 异常 URL 在进入日志和 Trace 前会脱敏 `token`/`api_key` 查询参数。
+> - 市场状态与前向概率要求足够的指数历史；短缓存不会阻止继续读取 Sequoia 或 Baostock。`000300` 默认可从本地 `000300.SH` 补齐，避免单条缓存产生长期 `insufficient_data`。
 > - `get_tushare_stk_factor` 返回的 MACD/KDJ/RSI/BOLL/CCI 基于 Tushare `stk_factor` 的前复权价格计算；该接口的前复权行情是历史当日快照，可能与 `pro_bar` 动态前复权或本地行情重新计算结果不完全一致。报告引用时必须带日期和来源。
 > - `get_capital_flow` 会按 Tushare `moneyflow_dc`（东方财富口径）、`moneyflow_ths`（同花顺口径）和 legacy `moneyflow` 顺序获取个股资金流，首个可用来源成功即返回，金额原始单位均为“万元”，工具统一输出为 `CNY`；`selected_flow_source` 标明顶层字段采用哪套来源，`flow_sources` 保留已选成功来源的独立口径。顶层 `main_net_inflow/main_inflow_5d/main_inflow_10d` 始终采用选中来源自己的主力/大单定义，`net_inflow*` 采用选中来源自己的净流入定义，`inflow_5d/inflow_10d` 为主力口径兼容别名。不要把 DC、THS、legacy moneyflow 的数值混成同一统计定义；需要比较时先看 `selected_flow_source`、`main_inflow_definition` 和 `net_inflow_definition`。主返回后会以单线程后台任务 best-effort 审计未选中的 Tushare 来源；若发现最新日期、方向或量级冲突，仅写入 `warnings/source_conflicts/capital_flow_audit`，不会覆盖顶层资金流字段，也不会拖慢主链路。当 Tushare 三套来源都不可用时回退到 StockAPI 历史资金流 `codeFlow`。未配置 `STOCKAPI_TOKEN` 时，fallback 只能按免费额度查询滞后历史窗口，结果以 `latest_date` 标明数据日期。
 > - `get_tushare_moneyflow_mkt_dc` 是东财大盘资金流向底层工具，用于判断全市场主力资金水位；这是市场背景，不替代个股 `get_capital_flow` 或板块 `get_board_capital_flow`，也不能和个股/板块资金金额直接相加。

@@ -282,6 +282,31 @@ class GraphitiServiceTestCase(unittest.TestCase):
         self.assertEqual(second["status"], "synced")
         self.assertEqual(client.add_count, 2)
 
+    def test_sync_ingest_wrappers_forward_timeout(self):
+        with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
+            cfg = mock_get_config.return_value
+            cfg.graphiti_enabled = False
+            cfg.graphiti_group_strategy = "market"
+            service = GraphitiService()
+
+        service.enabled = True
+        service._client = MagicMock()
+        def _consume(coro, **_kwargs):
+            coro.close()
+            return None
+
+        with patch.object(service, "_run_sync", side_effect=_consume) as run_sync:
+            service.ingest_analysis_sync(
+                code="600519",
+                stock_name="贵州茅台",
+                report_type="daily",
+                result={},
+                context={},
+                timeout_seconds=42,
+            )
+
+        self.assertEqual(run_sync.call_args.kwargs["timeout_seconds"], 42)
+
     def test_search_initializes_indices_before_query(self):
         with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
             cfg = mock_get_config.return_value

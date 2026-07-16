@@ -4,8 +4,14 @@
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from src.agent.tools.market_tools import _get_tushare_sector_rankings_fast, _handle_get_sector_rankings
+
+
+@pytest.fixture(autouse=True)
+def isolated_tool_result_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.agent.tools.result_cache._CACHE_ROOT", tmp_path)
 
 
 def test_get_sector_rankings_returns_structured_timeout():
@@ -15,11 +21,11 @@ def test_get_sector_rankings_returns_structured_timeout():
     ):
         result = _handle_get_sector_rankings(top_n=10)
 
-    assert result["status"] == "timeout"
+    assert result["status"] == "unavailable"
     assert result["top_sectors"] == []
     assert result["bottom_sectors"] == []
     assert result["source_chain"][0]["result"] == "timeout"
-    assert "sector_rankings timeout" in result["errors"]
+    assert "sector_rankings timeout" in result["provider_errors"]
 
 
 def test_get_sector_rankings_prefers_tushare_ths_hot_industry_path():
@@ -84,12 +90,12 @@ def test_get_sector_rankings_does_not_call_manager_probe_after_fast_sources_fail
     ) as mock_timeout:
         result = _handle_get_sector_rankings(top_n=10)
 
-    assert result["status"] == "failed"
+    assert result["status"] == "unavailable"
     assert result["top_sectors"] == []
     assert result["bottom_sectors"] == []
-    assert "tushare quota exhausted" in result["errors"]
-    assert "eastmoney disconnected" in result["errors"]
-    assert "stockapi quota exhausted" in result["errors"]
+    assert "tushare quota exhausted" in result["provider_errors"]
+    assert "eastmoney disconnected" in result["provider_errors"]
+    assert "stockapi quota exhausted" in result["provider_errors"]
     assert mock_timeout.call_count == 3
 
 
@@ -110,13 +116,35 @@ def test_get_sector_rankings_preserves_stockapi_budget_when_total_timeout_is_low
     ):
         result = _handle_get_sector_rankings(top_n=10)
 
-    assert result["status"] == "failed"
+    assert result["status"] == "unavailable"
     assert [name for name, _timeout in calls] == [
         "tushare_ths_hot_industry_rankings",
         "eastmoney_industry_rankings",
         "stockapi_hot_sectors",
     ]
     assert calls[2][1] >= 1.0
+
+
+def test_get_sector_rankings_uses_recent_successful_cache_when_live_sources_fail():
+    success = (
+        [{"name": "机器人", "change_pct": 3.2, "source": "stockapi:hotBkJlrDr"}],
+        [],
+        [{"provider": "stockapi:hotBkJlrDr", "result": "ok"}],
+        "",
+    )
+    failure = ([], [], [{"provider": "stockapi:hotBkJlrDr", "result": "failed"}], "upstream unavailable")
+
+    with patch("src.agent.tools.market_tools._run_with_timeout", return_value=(success, None, 10)):
+        live = _handle_get_sector_rankings(top_n=10)
+    with patch("src.agent.tools.market_tools._run_with_timeout", return_value=(failure, None, 10)):
+        stale = _handle_get_sector_rankings(top_n=10)
+
+    assert live["status"] == "ok"
+    assert stale["status"] == "stale"
+    assert stale["top_sectors"][0]["name"] == "机器人"
+    assert stale["cache_hit"] is True
+    assert stale["live_diagnostics"]["status"] == "failed"
+    assert "errors" not in stale
 
 
 def test_tushare_sector_rankings_uses_ths_hot_industry_market():
