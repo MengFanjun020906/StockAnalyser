@@ -27,7 +27,6 @@ pandas>=2.0.0               # 数据分析
 pypinyin>=0.50.0            # Name-to-code resolver (pinyin matching)
 openpyxl>=3.1.0             # Excel (.xlsx) parsing for import
 numpy>=1.24.0               # 数值计算
-matplotlib>=3.8.0           # Static README/backtest chart rendering
 json-repair>=0.55.1         # JSON 修复
 jieba>=0.42.1               # 财经早餐主题/概念分词
 
