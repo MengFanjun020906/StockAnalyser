@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] README 新增 AI Operating Model、主/子 Agent 中英双语命名、完成报告样例和本地入场执行回测快照。
 - [文档] README 入场执行回测改为起始日至本地最新基准日的累计 PnL 与指数对比表。
 - [文档] README 新增由 `matplotlib` 生成的入场执行回测累计收益曲线，并提供可复用渲染脚本。
+- [文档] README 回测曲线收敛为 `strict_ai_entry` 每日累计 PnL，并移除其他入场策略对比。
 - [文档] 新增 Agent loop/workflow 概念词汇表，明确 `todo.md` 作为 Planning Ledger / 计划账本的复用边界。
 - [测试] 扩展 Agent 基础设施审计，校验 README、概念词汇表和 `todo.md` 复用契约。
 - [chore] 接入 loop-engineering Codex daily-triage 脚手架，新增 LOOP/STATE/loop-budget/loop-constraints 与 Codex loop skill/verifier 运行资产。

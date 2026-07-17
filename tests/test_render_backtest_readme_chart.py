@@ -23,7 +23,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
 
 
-def test_build_strategy_series_compounds_filled_trades_by_exit_date(tmp_path: Path) -> None:
+def test_build_strategy_series_compounds_filled_trades_and_carries_daily_values(tmp_path: Path) -> None:
     rows = [
         {
             "decision_date": "2026-01-01",
@@ -62,14 +62,25 @@ def test_build_strategy_series_compounds_filled_trades_by_exit_date(tmp_path: Pa
         key="strict_ai_entry",
         label="Strict AI Entry",
         start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 5),
+        calendar_dates=[
+            date(2026, 1, 1),
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+            date(2026, 1, 4),
+            date(2026, 1, 5),
+        ],
     )
 
     assert series is not None
     assert [point.date for point in series.points] == [
         date(2026, 1, 1),
+        date(2026, 1, 2),
         date(2026, 1, 3),
+        date(2026, 1, 4),
         date(2026, 1, 5),
     ]
+    assert [point.value_pct for point in series.points] == pytest.approx([0.0, 0.0, 10.0, 10.0, 4.5])
     assert series.points[-1].value_pct == pytest.approx(4.5)
 
 
@@ -114,6 +125,11 @@ def test_build_chart_series_reads_backtest_and_benchmark_inputs(tmp_path: Path) 
                         "status": "filled",
                         "exit_date": "2026-01-03 15:00:00",
                         "pnl_pct": 10,
+                    },
+                    "next_open_baseline": {
+                        "status": "filled",
+                        "exit_date": "2026-01-03 15:00:00",
+                        "pnl_pct": 50,
                     }
                 },
             }
@@ -145,3 +161,4 @@ def test_build_chart_series_reads_backtest_and_benchmark_inputs(tmp_path: Path) 
     assert start_date == date(2026, 1, 1)
     assert sample_end_date == date(2026, 1, 3)
     assert {item.key for item in series} == {"strict_ai_entry", "000001.SH", "000300.SH"}
+    assert next(item for item in series if item.key == "strict_ai_entry").latest_pct == pytest.approx(10.0)

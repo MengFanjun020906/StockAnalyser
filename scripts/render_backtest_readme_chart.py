@@ -12,7 +12,7 @@ import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -22,11 +22,7 @@ DEFAULT_BACKTEST_PATH = ROOT / "data/agent_reviews/entry_execution_backtest.json
 DEFAULT_BENCHMARK_DB_PATH = ROOT / "Sequoia-X/data/sequoia_v2.db"
 DEFAULT_OUTPUT_PATH = ROOT / "docs/assets/backtest-pnl-benchmark.svg"
 
-STRATEGIES = (
-    ("strict_ai_entry", "Strict AI Entry"),
-    ("next_open_baseline", "Next Open Baseline"),
-    ("atr_elastic_entry", "ATR Elastic Entry"),
-)
+STRICT_ENTRY_STRATEGY = ("strict_ai_entry", "Strict AI Entry")
 BENCHMARKS = (
     ("000001.SH", "SSE Composite"),
     ("000300.SH", "CSI 300"),
@@ -85,12 +81,14 @@ def load_backtest_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def resolve_sample_window(rows: Sequence[dict[str, Any]]) -> tuple[date, date]:
+def resolve_sample_window(rows: Sequence[dict[str, Any]], *, strategy_key: str) -> tuple[date, date]:
     decision_dates = [parsed for row in rows if (parsed := parse_date(row.get("decision_date")))]
     exit_dates = [
         parsed
         for row in rows
-        for strategy in _strategy_payloads(row)
+        if isinstance(row.get("strategies"), dict)
+        for strategy in [row["strategies"].get(strategy_key)]
+        if isinstance(strategy, dict)
         if strategy.get("status") == "filled"
         if (parsed := parse_date(strategy.get("exit_date")))
     ]
@@ -107,6 +105,8 @@ def build_strategy_series(
     key: str,
     label: str,
     start_date: date,
+    end_date: date,
+    calendar_dates: Sequence[date] | None = None,
 ) -> ChartSeries | None:
     grouped: dict[date, list[float]] = defaultdict(list)
     for row in rows:
@@ -122,12 +122,18 @@ def build_strategy_series(
     if not grouped:
         return None
 
+    series_dates = _daily_series_dates(
+        start_date=start_date,
+        end_date=end_date,
+        calendar_dates=calendar_dates,
+        event_dates=grouped.keys(),
+    )
     equity = 1.0
-    points = [SeriesPoint(start_date, 0.0)]
-    for event_date in sorted(grouped):
-        for pnl_pct in grouped[event_date]:
+    points: list[SeriesPoint] = []
+    for current_date in series_dates:
+        for pnl_pct in grouped.get(current_date, []):
             equity *= 1.0 + pnl_pct / 100.0
-        points.append(SeriesPoint(event_date, (equity - 1.0) * 100.0))
+        points.append(SeriesPoint(current_date, (equity - 1.0) * 100.0))
     return ChartSeries(key=key, label=label, kind="strategy", points=tuple(points))
 
 
@@ -173,24 +179,38 @@ def build_chart_series(
     benchmark_end_date: date,
 ) -> tuple[date, date, list[ChartSeries]]:
     rows = load_backtest_rows(backtest_path)
-    start_date, sample_end_date = resolve_sample_window(rows)
-    series: list[ChartSeries] = []
-
-    for key, label in STRATEGIES:
-        strategy_series = build_strategy_series(rows, key=key, label=label, start_date=start_date)
-        if strategy_series is not None:
-            series.append(strategy_series)
+    strategy_key, strategy_label = STRICT_ENTRY_STRATEGY
+    start_date, sample_end_date = resolve_sample_window(rows, strategy_key=strategy_key)
+    benchmark_items: list[ChartSeries] = []
 
     for symbol, label in BENCHMARKS:
-        benchmark_series = load_benchmark_series(
+        benchmark_item = load_benchmark_series(
             benchmark_db_path,
             symbol=symbol,
             label=label,
             start_date=start_date,
             end_date=benchmark_end_date,
         )
-        if benchmark_series is not None:
-            series.append(benchmark_series)
+        if benchmark_item is not None:
+            benchmark_items.append(benchmark_item)
+
+    benchmark_calendar = sorted(
+        {
+            point.date
+            for item in benchmark_items
+            for point in item.points
+            if start_date <= point.date <= sample_end_date
+        }
+    )
+    strategy_series = build_strategy_series(
+        rows,
+        key=strategy_key,
+        label=strategy_label,
+        start_date=start_date,
+        end_date=sample_end_date,
+        calendar_dates=benchmark_calendar,
+    )
+    series = ([strategy_series] if strategy_series is not None else []) + benchmark_items
 
     return start_date, sample_end_date, series
 
@@ -219,8 +239,6 @@ def render_svg(series: Sequence[ChartSeries], output_path: Path, *, start_date: 
 
     colors = {
         "strict_ai_entry": "#2563eb",
-        "next_open_baseline": "#dc2626",
-        "atr_elastic_entry": "#7c3aed",
         "000001.SH": "#059669",
         "000300.SH": "#d97706",
     }
@@ -239,13 +257,12 @@ def render_svg(series: Sequence[ChartSeries], output_path: Path, *, start_date: 
             color=colors.get(item.key),
             linewidth=2.4 if item.kind == "strategy" else 2.0,
             linestyle=linestyles.get(item.kind, "-"),
-            marker="o" if item.kind == "strategy" else None,
-            markersize=3.4 if item.kind == "strategy" else 0,
+            drawstyle="steps-post" if item.kind == "strategy" else "default",
             alpha=0.96,
         )
 
     ax.axhline(0, color="#111827", linewidth=0.9, alpha=0.55)
-    ax.set_title("Entry Execution Backtest: Cumulative PnL vs Benchmarks", loc="left", fontsize=15, pad=16)
+    ax.set_title("Strict Entry Backtest: Daily Cumulative PnL vs Benchmarks", loc="left", fontsize=15, pad=16)
     ax.set_ylabel("Cumulative return")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}%"))
     ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=8))
@@ -257,8 +274,8 @@ def render_svg(series: Sequence[ChartSeries], output_path: Path, *, start_date: 
     ax.legend(loc="lower left", frameon=False, fontsize=9)
 
     note = (
-        "Strategy curves compound filled trades by exit date; unfilled signals affect trigger rate, not PnL. "
-        f"Sample window: {start_date.isoformat()} to {sample_end_date.isoformat()}."
+        "Strict-entry PnL compounds filled trades by exit date and carries forward on trading days. "
+        f"Window: {start_date.isoformat()} to {sample_end_date.isoformat()}."
     )
     fig.text(0.075, 0.02, note, ha="left", va="bottom", fontsize=8.5, color="#4b5563")
     fig.tight_layout(rect=(0, 0.04, 1, 1))
@@ -266,6 +283,7 @@ def render_svg(series: Sequence[ChartSeries], output_path: Path, *, start_date: 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, format="svg", metadata={"Date": None})
     plt.close(fig)
+    _strip_trailing_whitespace(output_path)
 
 
 def summarize(series: Sequence[ChartSeries]) -> list[dict[str, Any]]:
@@ -323,11 +341,27 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def _strategy_payloads(row: dict[str, Any]) -> Iterable[dict[str, Any]]:
-    strategies = row.get("strategies")
-    if not isinstance(strategies, dict):
-        return []
-    return [value for value in strategies.values() if isinstance(value, dict)]
+def _daily_series_dates(
+    *,
+    start_date: date,
+    end_date: date,
+    calendar_dates: Sequence[date] | None,
+    event_dates: Iterable[date],
+) -> list[date]:
+    if calendar_dates:
+        dates = {day for day in calendar_dates if start_date <= day <= end_date}
+    else:
+        span_days = max(0, (end_date - start_date).days)
+        dates = {start_date + timedelta(days=offset) for offset in range(span_days + 1)}
+    dates.add(start_date)
+    dates.add(end_date)
+    dates.update(day for day in event_dates if start_date <= day <= end_date)
+    return sorted(dates)
+
+
+def _strip_trailing_whitespace(path: Path) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join(line.rstrip() for line in lines) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
