@@ -33,3 +33,16 @@ Append one entry per run. Prune entries older than 30 days.
   "outcome": "fix-implemented-pr-update-pending"
 }
 ```
+
+```json
+{
+  "run_id": "2026-07-16T18:11:28+08:00",
+  "pattern": "autonomous-infrastructure-diagnosis",
+  "duration_s": 2700,
+  "items_found": 4,
+  "actions_taken": 4,
+  "escalations": 0,
+  "tokens_estimate": 180000,
+  "outcome": "fix-implemented-validated"
+}
+```

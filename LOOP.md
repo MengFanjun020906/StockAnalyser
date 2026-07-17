@@ -19,7 +19,7 @@ When the maintainer provides a target document, run this contract unless the mai
 5. Before final acceptance, do not merge to `main` and do not publish a formal release.
 6. Fallback success is not full success. Record it as degraded success and stop if data quality is lower or unknown.
 7. For financial analysis, stock selection, entry points, backtests, and news signals, expose evidence quality, data freshness, assumptions, and look-ahead-bias risk instead of only conclusions.
-8. If the target document conflicts with loop rules, use this priority: target document > `LOOP.md` > `AGENTS.md`; hard safety rules still cannot be overridden.
+8. If the target document conflicts with loop-operating details, use this priority for target-scoped execution details only: target document > `LOOP.md` > `loop-*` files. `AGENTS.md` remains the repository-wide hard baseline and cannot be weakened by loop files.
 9. Large targets may be split into staged issues and PRs. Keep `STATE.md` and PR descriptions current with progress, validation, and residual risk.
 10. Add targeted diagnostics, logs, fixtures, scripts, docs, and small internal tools when they directly support verification or maintainability.
 11. A target document should have target outcome, non-goals, acceptance criteria, priorities/stages, and known constraints. Draft missing pieces and ask only direction-changing questions.
@@ -53,6 +53,7 @@ When the maintainer provides a target document, run this contract unless the mai
 ## Budget
 
 - Max sub-agent spawns per run: 0 (L1)
+- Autonomous Goal Loop checkpoint: update `STATE.md` and PR/MR notes every 200k estimated tokens or before each commit, whichever happens first.
 - Review STATE.md daily + Codex Triage inbox
 
 ## Links
