@@ -15,8 +15,9 @@
 - Never edit .env, .env.*, auth/, payments/, secrets/, credentials/
 - Never edit infrastructure configs without human approval
 - Treat `AGENTS.md` as the repository-wide agent behavior source. `LOOP.md`, `STATE.md`, and `loop-*` files may narrow loop behavior but must not override `AGENTS.md`.
-- Require human review before changing `src/agent/`, `src/services/`, `data_provider/`, `api/`, `apps/dsa-web/`, `.github/`, `docker/`, `.env.example`, or AI governance assets.
-- If a target document conflicts with loop rules, use this priority: target document > `LOOP.md` > `AGENTS.md`; hard safety rules still cannot be overridden.
+- In Default mode or report-only triage, require human approval before changing `src/agent/`, `src/services/`, `data_provider/`, `api/`, `apps/dsa-web/`, `.github/`, `docker/`, `.env.example`, or AI governance assets.
+- In maintainer-authorized Autonomous Goal Loop mode, these high-risk paths may be changed only inside the active target scope, with explicit validation, PR/final disclosure, residual-risk notes, and rollback instructions.
+- If a target document conflicts with loop-operating details, use this priority for target-scoped execution details only: target document > `LOOP.md` > `loop-*` files. `AGENTS.md` remains the repository-wide hard baseline and cannot be weakened by loop files.
 
 ## Code
 - Always run tests before proposing a fix
@@ -42,6 +43,7 @@
 
 ## Budget
 - If token spend hits 80% of daily cap, switch to report-only
+- For Autonomous Goal Loop runs without an explicit user token cap, checkpoint to `STATE.md` and PR/MR notes every 200k estimated tokens or before each commit, whichever happens first.
 - If loop-pause-all is active, exit immediately
 
 ---

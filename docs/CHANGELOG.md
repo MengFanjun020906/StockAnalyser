@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [chore] 接入 loop-engineering Codex daily-triage 脚手架，新增 LOOP/STATE/loop-budget/loop-constraints 与 Codex loop skill/verifier 运行资产。
 - [chore] 将 loop-engineering 运行约束更新为 maintainer 授权后的 autonomous dev loop 模式，允许目标范围内自主提交、推送 dev、创建 PR/MR、issue 和 release，并要求遇到工具失败或数据质量降级立即升级。
 - [chore] 固化 autonomous goal loop 合同，明确目标文档归一化、验收标准、fallback 质量升级、金融证据风险披露、阶段拆分和最终交付格式。
+- [文档] 新增基础设施诊断与硬化计划，覆盖 tools、context、memory、pipeline、planning-execute 和 loop-engineering。
+- [chore] 新增离线 Agent 基础设施审计脚本与测试，校验工具注册、ETL profile、planner 元数据、trace artifacts 和 loop state 契约。
+- [chore] 清理 loop state/budget/constraints 中上一轮目标残留，并区分 Daily Triage 与 Autonomous Goal Loop 的预算和高风险路径语义。
 - [改进] 新闻信号人工反馈会压制 `duplicate/wrong/noisy` 卡片、移除错误公司映射并触发 Graphiti outbox 与边重建，避免被否定证据继续污染图谱。
 - [新功能] 新闻信号 metrics 和 Web 页面新增入库质量、边质量、反馈控制聚合指标，并为国外供应链/国产替代生成专门传导模板。
 - [修复] Graphiti 同步入图入口新增 bounded timeout，避免主分析、Agent Trace 或事件 watch 被慢 episode 抽取阻塞。
