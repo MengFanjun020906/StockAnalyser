@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [改进] planning_execute 恢复历史 Trace 时生成 Planning Ledger 摘要，并在新 `todo.md` 写入复用来源、复用 payload、重验规则和失效条件。
+- [文档] README 新增 AI Operating Model、主/子 Agent 中英双语命名、完成报告样例和本地入场执行回测快照。
+- [文档] 新增 Agent loop/workflow 概念词汇表，明确 `todo.md` 作为 Planning Ledger / 计划账本的复用边界。
+- [测试] 扩展 Agent 基础设施审计，校验 README、概念词汇表和 `todo.md` 复用契约。
 - [chore] 接入 loop-engineering Codex daily-triage 脚手架，新增 LOOP/STATE/loop-budget/loop-constraints 与 Codex loop skill/verifier 运行资产。
 - [chore] 将 loop-engineering 运行约束更新为 maintainer 授权后的 autonomous dev loop 模式，允许目标范围内自主提交、推送 dev、创建 PR/MR、issue 和 release，并要求遇到工具失败或数据质量降级立即升级。
 - [chore] 固化 autonomous goal loop 合同，明确目标文档归一化、验收标准、fallback 质量升级、金融证据风险披露、阶段拆分和最终交付格式。

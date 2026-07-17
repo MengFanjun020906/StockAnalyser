@@ -18,6 +18,29 @@ StockAnalyser 不是“输入股票代码后生成一篇看似完整报告”的
 
 当前分支重点服务 A 股研究，同时保留港股、美股等原有能力。项目仍处于个人研究和开发调试阶段，不构成投资建议。
 
+## AI Operating Model
+
+StockAnalyser 把 AI 链路拆成可审计的 `workflow`、`pipeline` 和 `loop`：
+
+- `Workflow`：阶段顺序，例如 seed pool -> 四席位 -> Meta -> 点位计算 -> 组合配置 -> 反方审查 -> Judge。
+- `Pipeline`：阶段间 artifact 的输入输出，例如 `candidate_discovery.json`、`pricing_agent.json`、`final_report.json`。
+- `Loop`：plan -> execute -> evaluate -> replan -> stop 的反馈控制，用于决定补证、降级或停止。
+- `Planning Ledger / 计划账本`：`todo.md` 的正式语义。它保存工具预期结果、下游用途、失败降级、下一步和复用契约，恢复历史 Trace 时只复用计划摘要，不复用过期行情或旧新闻事实。
+
+主 Agent 命名为 **Serenity Investment Orchestrator / 静研投资编排官**。当前文档层命名如下，代码类名和 JSON 字段保持兼容：
+
+| 层级 | English / 中文 | 当前实现 |
+| --- | --- | --- |
+| 主 Agent | Serenity Investment Orchestrator / 静研投资编排官 | `AgentExecutor`, Trace API |
+| 计划层 | Planning Steward / 计划管控官 | `src.agent.planner` |
+| 技术层 | Market Structure Analyst / 市场结构分析师 | `TechnicalAgent` |
+| 消息层 | Intelligence Analyst / 消息情报分析师 | `IntelAgent` |
+| 风控层 | Risk Control Analyst / 风险控制分析师 | `RiskAgent`, `risk_gate` |
+| 四席位 | Structural Reversal / Momentum Continuation / Quality Repair / Theme Catalyst | 结构反转席、动量延续席、质量修复席、主题催化席 |
+| 裁决层 | Investment Arbiter / 投资裁决官 | `judge_decision` |
+
+完整概念边界和命名表见 [Agent Loop / Workflow Glossary](docs/architecture/agent-loop-workflow-glossary.md)。
+
 ## 核心能力
 
 | 能力 | 说明 |
@@ -60,6 +83,22 @@ StockAnalyser 不是“输入股票代码后生成一篇看似完整报告”的
 - `观察池`：未进入本轮深挖或证据不足的候选，只用于后续跟踪。
 
 完整链路、输入输出和字段契约见 [选股链路说明](docs/architecture/stock-selection-pipeline.md)。
+
+## 示例报告与回测快照
+
+- 完成报告样例：[2026-07-15 watchlist report snapshot](docs/examples/agent-watchlist-report-20260715.md)
+- 本地原始 Trace：`data/agent_traces/20260715-161824-trace-93c77fcb2ea64fec8c124304bf4c8719/final.md`
+- 回测数据集：`data/agent_reviews/entry_execution_backtest.jsonl`
+
+截至 2026-07-17 的本地入场执行回测快照覆盖 48 个 Trace、94 条最终计划，决策日期范围为 2026-05-15 至 2026-07-14。样本全部解析成功；严格 AI 入场策略成交 48 次、未触发 43 次、缺少起始价 3 次。
+
+| 策略 | 成交数 | 胜率 | 平均 PnL | 中位 PnL | 最好 | 最差 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `strict_ai_entry` | 48 | 18.75% | -1.09% | -2.45% | 20.00% | -11.67% |
+| `next_open_baseline` | 91 | 29.67% | -1.81% | -3.40% | 49.38% | -24.70% |
+| `atr_elastic_entry` | 55 | 18.18% | -2.47% | -3.71% | 17.65% | -13.40% |
+
+这组结果说明：当前 AI 条件入场相对下一开盘基准降低了成交数和平均亏损，但整体仍为负收益样本，后续重点应继续改进候选质量、入场有效期、资金确认和 risk-off 降级规则。回测只用于诊断，不构成收益承诺。
 
 ## 主要使用场景
 
@@ -159,7 +198,9 @@ data/agent_traces/                 本地 Trace artifact，默认不提交
 
 ## 相关文档
 
+- [Agent Loop / Workflow Glossary](docs/architecture/agent-loop-workflow-glossary.md)
 - [选股链路说明](docs/architecture/stock-selection-pipeline.md)
+- [完成报告样例](docs/examples/agent-watchlist-report-20260715.md)
 - [选股链路重构实施方案](docs/architecture/选股链路重构-实施方案.md)
 - [候选池路线图](docs/plans/agent-candidate-pool-roadmap.md)
 - [阶段化选股 Prompt 设计](docs/plans/agent-stock-selection-prompts.md)

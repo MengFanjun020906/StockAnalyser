@@ -9,6 +9,7 @@ from typing import Any
 
 from scripts.audit_agent_infra import (
     Finding,
+    _audit_agent_operating_docs,
     _audit_loop_files,
     _audit_planner,
     _audit_tools,
@@ -115,6 +116,20 @@ def test_loop_file_audit_requires_autonomous_goal_budget(tmp_path: Path):
     _audit_loop_files(tmp_path, findings)
 
     assert any(finding.severity == "error" and finding.area == "loop_budget" for finding in findings)
+
+
+def test_agent_operating_docs_audit_flags_missing_markers(tmp_path: Path):
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+    (tmp_path / "docs" / "architecture").mkdir(parents=True)
+    (tmp_path / "docs" / "architecture" / "agent-loop-workflow-glossary.md").write_text(
+        "# Agent Glossary\n\nLoop only.\n",
+        encoding="utf-8",
+    )
+    findings: list[Finding] = []
+
+    _audit_agent_operating_docs(tmp_path, findings)
+
+    assert any(finding.severity == "error" and finding.area == "agent_docs" for finding in findings)
 
 
 def _write_minimal_loop_files(root: Path) -> None:

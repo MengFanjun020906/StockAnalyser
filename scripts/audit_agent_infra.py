@@ -50,11 +50,32 @@ REQUIRED_TODO_MARKERS = (
     "downstream_use=",
     "fallback_on_failure=",
     "next_step=",
+    "## Planning Ledger",
+    "reuse_payload=",
+    "invalidates_on=",
     "## Replan",
     "## Execute Protocol",
 )
 
 REQUIRED_LOOP_FILES = ("LOOP.md", "STATE.md", "loop-budget.md", "loop-constraints.md")
+
+AGENT_OPERATING_DOC = Path("docs/architecture/agent-loop-workflow-glossary.md")
+
+REQUIRED_README_MARKERS = (
+    "AI Operating Model",
+    "Serenity Investment Orchestrator / 静研投资编排官",
+    "agent-loop-workflow-glossary.md",
+    "entry_execution_backtest.jsonl",
+)
+
+REQUIRED_AGENT_OPERATING_DOC_MARKERS = (
+    "Planning Ledger / 计划账本",
+    "Workflow / 工作流",
+    "Loop / 循环",
+    "Serenity Investment Orchestrator / 静研投资编排官",
+    "Structural Reversal Desk / 结构反转席",
+    "Theme Catalyst Desk / 主题催化席",
+)
 
 STALE_STATE_PATTERNS = (
     "Graphiti plan implementation is in final validation/PR handoff",
@@ -84,6 +105,7 @@ def run_audit(root: Optional[Path] = None) -> Dict[str, Any]:
     planner_summary = _audit_planner(registry, registry_names, findings)
     _audit_trace_contracts(registry, findings)
     _audit_loop_files(repo_root, findings)
+    _audit_agent_operating_docs(repo_root, findings)
 
     severity_counts = Counter(finding.severity for finding in findings)
     summary = {
@@ -381,6 +403,46 @@ def _audit_loop_files(root: Path, findings: List[Finding]) -> None:
         _add(findings, "error", "loop", "LOOP.md misses Autonomous Goal Loop Contract")
     if "AGENTS.md" not in loop_text or "hard baseline" not in loop_text:
         _add(findings, "error", "loop", "LOOP.md must keep AGENTS.md as the hard baseline")
+
+
+def _audit_agent_operating_docs(root: Path, findings: List[Finding]) -> None:
+    readme_text = _read_text(root / "README.md")
+    missing_readme_markers = [
+        marker for marker in REQUIRED_README_MARKERS
+        if marker not in readme_text
+    ]
+    if missing_readme_markers:
+        _add(
+            findings,
+            "error",
+            "agent_docs",
+            "README.md misses Agent operating model markers",
+            {"missing": missing_readme_markers},
+        )
+
+    doc_path = root / AGENT_OPERATING_DOC
+    doc_text = _read_text(doc_path)
+    if not doc_text:
+        _add(
+            findings,
+            "error",
+            "agent_docs",
+            "Agent loop/workflow glossary is missing",
+            {"file": str(AGENT_OPERATING_DOC)},
+        )
+        return
+    missing_doc_markers = [
+        marker for marker in REQUIRED_AGENT_OPERATING_DOC_MARKERS
+        if marker not in doc_text
+    ]
+    if missing_doc_markers:
+        _add(
+            findings,
+            "error",
+            "agent_docs",
+            "Agent loop/workflow glossary misses required concepts or names",
+            {"file": str(AGENT_OPERATING_DOC), "missing": missing_doc_markers},
+        )
 
 
 def _read_text(path: Path) -> str:
