@@ -3189,7 +3189,7 @@ def _handle_discover_watchlist_candidates(
     """Build a deterministic candidate list for watchlist_scan."""
     effective_limit = max(1, min(int(limit or 8), 20))
     source_mode = str(candidate_source or "auto").strip().lower()
-    if source_mode not in {"auto", "alphasift", "sequoia", "sector", "event_impact", "news_momentum", "news_sentiment", "fallback"}:
+    if source_mode not in {"auto", "alphasift", "sequoia", "sector", "event_impact", "news_momentum", "news_sentiment", "sentiment_heat", "fallback"}:
         source_mode = "auto"
     discovery_steps: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
@@ -3284,6 +3284,30 @@ def _handle_discover_watchlist_candidates(
             capacity=expert_result.get("capacity") or {},
             quality=expert_result.get("quality") or {},
             hard_exclusion=expert_result.get("hard_exclusion") or {},
+        )
+
+    if source_mode == "sentiment_heat":
+        from src.agent.tools.sentiment_tools import _handle_get_sentiment_heat_candidates
+
+        heat_result = _handle_get_sentiment_heat_candidates(market=market, limit=effective_limit)
+        heat_candidates = heat_result.get("candidates") or []
+        discovery_steps.append({
+            "source": "sentiment_heat",
+            "status": heat_result.get("status", "failed"),
+            "count": len(heat_candidates),
+            "source_chain": heat_result.get("source_chain", []),
+            "data_quality": heat_result.get("data_quality"),
+            **({"error": heat_result.get("error")} if heat_result.get("error") else {}),
+        })
+        candidates = _dedupe_candidates(heat_candidates, effective_limit)
+        return _candidate_discovery_response(
+            status="ok" if candidates else "partial",
+            market=market,
+            candidates=candidates,
+            discovery_steps=discovery_steps,
+            fallback_used=False,
+            candidate_source="sentiment_heat",
+            note="情绪热度候选只代表关注度/短线情绪上升，必须继续核验价格位置、流动性、资金和消息真因。",
         )
 
     alphasift_result: Dict[str, Any] = {}
@@ -3612,10 +3636,10 @@ discover_watchlist_candidates_tool = ToolDefinition(
         ToolParameter(
             name="candidate_source",
             type="string",
-            description="Candidate source: auto, alphasift, sequoia, sector, event_impact, news_momentum, news_sentiment, or fallback. auto tries AlphaSift YAML candidates, Sequoia quantitative candidates, event-impact candidates, company-news momentum candidates, sector constituents, and fallback seeds. news_sentiment is kept as a compatibility alias for event_impact.",
+            description="Candidate source: auto, alphasift, sequoia, sector, event_impact, news_momentum, news_sentiment, sentiment_heat, or fallback. auto tries AlphaSift YAML candidates, Sequoia quantitative candidates, event-impact candidates, company-news momentum candidates, sector constituents, and fallback seeds. news_sentiment is kept as a compatibility alias for event_impact.",
             required=False,
             default="auto",
-            enum=["auto", "alphasift", "sequoia", "sector", "event_impact", "news_momentum", "news_sentiment", "fallback"],
+            enum=["auto", "alphasift", "sequoia", "sector", "event_impact", "news_momentum", "news_sentiment", "sentiment_heat", "fallback"],
         ),
         ToolParameter(
             name="strategy_names",

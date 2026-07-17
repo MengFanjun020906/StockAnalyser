@@ -522,9 +522,10 @@ class TestBuiltinToolDefinitions(unittest.TestCase):
         from src.agent.tools.analysis_tools import ALL_ANALYSIS_TOOLS
         from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
         from src.agent.tools.market_tools import ALL_MARKET_TOOLS
+        from src.agent.tools.sentiment_tools import ALL_SENTIMENT_TOOLS
         from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
 
-        all_tools = ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS
+        all_tools = ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_SENTIMENT_TOOLS + ALL_BACKTEST_TOOLS
         for td in all_tools:
             oai = td.to_openai_tool()
             self.assertEqual(oai["type"], "function")

@@ -6,12 +6,14 @@
 #   bash scripts/daily_run.sh --reset                # 清除今日进度，从头开始
 #   bash scripts/daily_run.sh --skip-fundamental     # 跳过财务快照更新
 #   bash scripts/daily_run.sh --skip-news-signals    # 跳过新闻信号维护
+#   bash scripts/daily_run.sh --skip-seed-quality    # 跳过 Seed Pool 质量评估
 #   bash scripts/daily_run.sh --dry-run              # 只打印，不执行
 #
 # 执行顺序:
 #   1. update_sequoia_candidates.py   (baostock, 更新 stock_daily 个股日线 + 上证指数)
 #   2. update_fundamental_candidates.py (tushare, 更新财务快照, 可跳过)
 #   3. maintain_news_signals.py       (opt-in, 新闻卡片/事件/outcome/Graphiti repair)
+#   4. evaluate_seed_pool_quality.py  (opt-in, Seed Pool T+1 质量评估)
 #
 # 续跑机制:
 #   每天在 .cache/ 下生成一个状态文件 daily_run_YYYYMMDD.state。
@@ -28,6 +30,7 @@ cd "$REPO_ROOT"
 # ---------- 参数解析 ----------
 SKIP_FUNDAMENTAL=false
 SKIP_NEWS_SIGNALS=false
+SKIP_SEED_QUALITY=false
 DRY_RUN=false
 RESET=false
 
@@ -35,6 +38,7 @@ for arg in "$@"; do
     case "$arg" in
         --skip-fundamental) SKIP_FUNDAMENTAL=true ;;
         --skip-news-signals) SKIP_NEWS_SIGNALS=true ;;
+        --skip-seed-quality) SKIP_SEED_QUALITY=true ;;
         --dry-run)          DRY_RUN=true ;;
         --reset)            RESET=true ;;
     esac
@@ -126,6 +130,7 @@ log "状态文件: $STATE_FILE"
 [ "$DRY_RUN" = true ]          && log "模式    : DRY-RUN（只打印，不执行）"
 [ "$SKIP_FUNDAMENTAL" = true ] && log "模式    : 跳过财务快照更新"
 [ "$SKIP_NEWS_SIGNALS" = true ] && log "模式    : 跳过新闻信号维护"
+[ "$SKIP_SEED_QUALITY" = true ] && log "模式    : 跳过 Seed Pool 质量评估"
 
 sep
 log "关键配置检查"
@@ -136,6 +141,7 @@ info "STOCK_LIST           : ${STOCK_LIST:-(未配置，使用默认)}"
 info "CANDIDATE_MODE       : ${AGENT_CANDIDATE_DISCOVERY_MODE:-(未配置)}"
 info "NEWS_SIGNAL_DAILY    : ${NEWS_SIGNAL_DAILY_ENABLED:-false}"
 info "GRAPH_REPAIR_MODE    : ${NEWS_SIGNAL_GRAPH_REPAIR_MODE:-edges}"
+info "SEED_QUALITY_DAILY   : ${SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED:-false}"
 
 SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db}"
 STEP1_TARGET_DATE=$("$PYTHON" - <<'PY' 2>/dev/null
@@ -155,7 +161,7 @@ STEP1_KEY="step1_stock_daily_with_index_${STEP1_TARGET_DATE}"
 # Step 1: 更新 stock_daily 日线
 # ============================================================
 sep
-log ">>> [1/3] 更新 stock_daily 日线缓存 + 上证指数  (baostock)"
+log ">>> [1/4] 更新 stock_daily 日线缓存 + 上证指数  (baostock)"
 
 if step_done "$STEP1_KEY"; then
     ok "已完成（跳过）  —  使用上次结果: $(db_stat "$SEQUOIA_DB")"
@@ -182,7 +188,7 @@ fi
 # Step 2: 更新财务快照
 # ============================================================
 sep
-log ">>> [2/3] 更新财务候选快照  (tushare)"
+log ">>> [2/4] 更新财务候选快照  (tushare)"
 
 if step_done "step2"; then
     ok "已完成（跳过）"
@@ -218,7 +224,7 @@ fi
 # Step 3: 新闻信号卡片、事件与 Graphiti 投影维护
 # ============================================================
 sep
-log ">>> [3/3] 维护新闻信号卡片、事件、outcome 与 Graphiti 投影"
+log ">>> [3/4] 维护新闻信号卡片、事件、outcome 与 Graphiti 投影"
 
 NEWS_TARGET_DATE="${STEP1_TARGET_DATE:0:4}-${STEP1_TARGET_DATE:4:2}-${STEP1_TARGET_DATE:6:2}"
 STEP3_KEY="step3_news_signals_${STEP1_TARGET_DATE}"
@@ -241,6 +247,35 @@ else
     else
         warn "新闻信号维护失败，关系型旧数据仍可用"
         warn "step3 未标记完成，下次续跑会重试"
+    fi
+fi
+
+# ============================================================
+# Step 4: Seed Pool T+1 质量评估
+# ============================================================
+sep
+log ">>> [4/4] 评估 Seed Pool T+1 质量快照"
+
+STEP4_KEY="step4_seed_pool_quality_${STEP1_TARGET_DATE}"
+SEED_QUALITY_DAILY_VALUE=$(printf '%s' "${SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')
+
+if step_done "$STEP4_KEY"; then
+    ok "已完成（跳过）"
+elif [ "$SKIP_SEED_QUALITY" = true ]; then
+    warn "已指定 --skip-seed-quality，跳过"
+    mark_done "$STEP4_KEY"
+elif [ "$SEED_QUALITY_DAILY_VALUE" != "true" ]; then
+    warn "SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED 未启用，跳过（opt-in，不写入完成标记）"
+elif [ "$DRY_RUN" = true ]; then
+    warn "dry-run: 将执行 evaluate_seed_pool_quality.py --days 30 --limit 500"
+else
+    T4=$SECONDS
+    if "$PYTHON" scripts/evaluate_seed_pool_quality.py --days 30 --limit 500; then
+        ok "Seed Pool 质量评估完成  (耗时: $(elapsed $((SECONDS - T4))))"
+        mark_done "$STEP4_KEY"
+    else
+        warn "Seed Pool 质量评估失败；不会覆盖已有快照"
+        warn "step4 未标记完成，下次续跑会重试"
     fi
 fi
 

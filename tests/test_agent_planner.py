@@ -79,9 +79,11 @@ def test_get_tools_for_capability_prefers_detect_market_regime():
         "regime_detection",
         tool_registry=_registry(
             "detect_market_regime",
+            "get_market_sentiment_snapshot",
             "get_market_indices",
             "get_sector_rankings",
             "get_volume_analysis",
+            "scan_global_risk_events",
         ),
     )
 
@@ -202,7 +204,15 @@ def test_build_planning_result_watchlist_scan_starts_with_candidate_discovery():
 
     result = build_planning_result(
         context,
-        tool_registry=_registry("discover_watchlist_candidates", "detect_market_regime", "get_realtime_quote", "analyze_trend"),
+        tool_registry=_registry(
+            "discover_watchlist_candidates",
+            "detect_market_regime",
+            "get_market_sentiment_snapshot",
+            "get_sentiment_heat_candidates",
+            "scan_global_risk_events",
+            "get_realtime_quote",
+            "analyze_trend",
+        ),
     )
 
     assert result.intent == "watchlist_scan"
@@ -210,7 +220,11 @@ def test_build_planning_result_watchlist_scan_starts_with_candidate_discovery():
     assert result.main_dimension == "watchlist_discovery"
     assert result.required_tools[0] == "discover_watchlist_candidates"
     assert "regime_detection" in result.capabilities
+    assert "sentiment_analysis" in result.capabilities
     assert "detect_market_regime" in result.required_tools
+    assert "get_market_sentiment_snapshot" in result.required_tools
+    assert "get_sentiment_heat_candidates" in result.required_tools
+    assert "scan_global_risk_events" in result.required_tools
     payload = result.to_dict()
     assert "候选池" in payload["tool_execution_plan"][0]["expected_result"]
     assert "watchlist_scan" in payload["replan_policy"]["watchlist_note"]

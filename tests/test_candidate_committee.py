@@ -81,6 +81,43 @@ def test_seed_pool_assembly_round_robins_sources_instead_of_starving_late_source
     assert sources.count("daily_screener") < 5
 
 
+def test_strategy_trunk_health_flags_missing_alphasift_and_sequoia():
+    diagnostic = committee_module._strategy_trunk_health_diagnostic(
+        seeds_by_source={
+            "daily_screener": [committee_module.SeedItem(code="600001", name="测试", source="daily_screener")],
+            "alphasift": [],
+            "sequoia": [],
+        },
+        source_quality={
+            "alphasift": {"status": "empty", "available": True},
+            "sequoia": {"status": "failed", "available": False},
+        },
+    )
+
+    assert diagnostic["source"] == "strategy_trunk_health"
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["hard_strategy_trunk_missing"] is True
+    assert diagnostic["strategy_trunk_sources"]["alphasift"]["usable"] is False
+    assert diagnostic["strategy_trunk_sources"]["sequoia"]["usable"] is False
+
+
+def test_strategy_trunk_health_treats_supplemented_strategy_seed_as_usable():
+    diagnostic = committee_module._strategy_trunk_health_diagnostic(
+        seeds_by_source={
+            "alphasift": [committee_module.SeedItem(code="600001", name="测试", source="alphasift")],
+            "sequoia": [],
+        },
+        source_quality={
+            "alphasift": {"status": "empty", "available": True},
+            "sequoia": {"status": "failed", "available": False},
+        },
+    )
+
+    assert diagnostic["status"] == "partial"
+    assert diagnostic["hard_strategy_trunk_missing"] is False
+    assert diagnostic["strategy_trunk_sources"]["alphasift"]["usable"] is True
+
+
 def test_market_regime_key_accepts_market_regime_payload_dict():
     assert _market_regime_key({"regime": "risk_off", "volatility": "high"}) == "risk_off"
     assert _market_regime_key({"market_regime": "TRENDING_UP"}) == "trending_up"

@@ -537,7 +537,7 @@ SerpAPI 推荐参数：
 - 当前验证事实来自搜索摘要关键词匹配，已处理常见否定表达，但还不是完整语义蕴含判断。
 - 当前候选从已验证主题成分股召回，不直接从事件文本抽公司名。
 
-### Phase 1：确定性情绪热度候选
+### Phase 1：确定性情绪热度候选（已实现最小闭环）
 
 文件建议：
 
@@ -547,13 +547,13 @@ SerpAPI 推荐参数：
 - `src/agent/tools/sentiment_tools.py`
 - `tests/test_agent_sentiment_tools.py`
 
-实现：
+实现状态：
 
-- 接 AkShare 人气榜、关键词、板块、涨跌停池。
-- 实现 `get_market_sentiment_snapshot`。
-- 实现 `get_sentiment_heat_candidates`。
-- 接入 `discover_watchlist_candidates(auto)`。
-- 前端不需要大改，复用 `reason_dimensions`。
+- [x] 实现 `get_market_sentiment_snapshot`，汇总指数、涨停池、人气热度和全球风险约束。
+- [x] 实现 `get_sentiment_heat_candidates`，基于 StockAPI 人气榜和涨停池生成 `sentiment_heat` 候选。
+- [x] 接入工具注册、planner、ETL profile 和 `discover_watchlist_candidates(candidate_source="sentiment_heat")`。
+- [x] 前端复用 `reason_dimensions` 中的 `情绪/热点` 展示。
+- [ ] AkShare 关键词/板块源暂未接入；当前最小闭环优先复用已存在 StockAPI 源，避免新增不稳定依赖。
 
 验收：
 
@@ -578,13 +578,13 @@ SerpAPI 推荐参数：
 - 减持、处罚、问询等负面事件不会被当作利好热度，只进入风险提示。
 - 同一新闻多源转载只计一次。
 
-### Phase 3：全球风险扫描
+### Phase 3：全球风险扫描（已实现最小闭环）
 
-实现：
+实现状态：
 
-- 接 GDELT DOC 2.0。
-- 实现 `scan_global_risk_events`。
-- 接入 Regime 和 Risk Gate。
+- [x] 实现 `scan_global_risk_events`，通过 `SearchService.search_general_news()` 识别战争、制裁、油价、航运、出口管制等风险标题。
+- [x] 接入 `get_market_sentiment_snapshot`、`regime_detection` planner 能力和工具上下文压缩。
+- [ ] GDELT DOC 2.0 暂未接入；当前最小闭环优先复用项目统一搜索服务和确定性规则。
 
 验收：
 

@@ -437,6 +437,7 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `realtime_quote` -> `get_realtime_quote`
 - `technical_analysis` -> `get_daily_history`, `analyze_trend`, `calculate_ma`, `get_tushare_stk_factor`, `get_volume_analysis`, `analyze_pattern`, `analyze_price_structure`
 - `news_event` -> `search_comprehensive_intel`, `search_stock_news`, `score_stock_news_sentiment`
+- `sentiment_analysis` -> `get_market_sentiment_snapshot`, `get_sentiment_heat_candidates`, `scan_global_risk_events`, `score_stock_news_sentiment`
 - `capital_flow` -> `get_capital_flow`, `get_board_capital_flow`, `get_market_capital_flow`, `get_tushare_moneyflow_mkt_dc`, `get_northbound_capital_flow`, `get_margin_trading_summary`
 - `get_capital_flow` 字段语义必须保留：先看 `selected_flow_source`、`main_inflow_definition`、`net_inflow_definition`，不能把 DC、THS、legacy moneyflow 数值当同一统计定义混写。
 - `get_board_capital_flow` 是板块资金统一入口：`flow_sources` 保留 DC 行业/概念/地域、THS 行业、THS 概念的不同统计口径，不能把三套来源的排名和金额当同一来源直接相加。
@@ -444,7 +445,7 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `chip_distribution` -> `get_chip_distribution`
 - `fundamental_analysis` -> `get_stock_info`, `get_tushare_daily_basic`, `get_tushare_financial_indicators`, `get_tushare_financial_statements`
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`, `get_board_capital_flow`
-- `regime_detection` -> `detect_market_regime`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`
+- `regime_detection` -> `detect_market_regime`, `get_market_sentiment_snapshot`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`, `scan_global_risk_events`
 - `symbol_regime_probability` -> `get_symbol_regime_probability`
 - `backtest_memory` -> `get_skill_backtest_summary`, `get_strategy_backtest_summary`, `get_stock_backtest_summary`
 
