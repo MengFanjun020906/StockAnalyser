@@ -398,6 +398,26 @@ Planner 必须先生成内部计划，格式近似 `todo.md`。这份计划可�
 - [ ] 工具失败后是否还有替代证据:
 ```
 
+### Planning Ledger 复用规则
+
+当系统提供 `[可复用 Planning Ledger 摘要]` 或历史 Trace 的 `todo.md` 摘要时，Planner 必须把它视为节省 token 的计划账本，而不是当前事实来源。
+
+允许复用：
+- 任务识别、能力域、工具计划、上一次未完成项、失败或降级摘要、执行状态计数。
+- `expected_result`、`downstream_use`、`fallback_on_failure` 和 `next_step` 这类工具交接合同。
+- 上一轮已经证明“不会改变最终动作”的省略维度，前提是用户目标和标的范围没有变化。
+
+必须重新验证：
+- 实时行情、资金流、新闻、市场 Regime、账户现金/持仓、涨跌停和任何有时效的数据。
+- 上一轮 `failed`、`timeout`、`fallback`、`stale`、`partial` 或 `unavailable` 的工具结果。
+- 用户新增目标、标的集合变化、工具注册或 planner 合同变化后的所有关键步骤。
+
+Planner 使用旧 `todo.md` 时必须做 delta planning：
+- 先判断 `reuse_status`，若为 `missing_todo` 或 `stale_contract`，只能借鉴任务结构，不得复用执行状态。
+- 若 `reuse_status=eligible_as_prior`，只补新增目标、失效数据和上一轮缺口，不要重写一份完全相同的工具计划。
+- 新 `todo.md` 必须写入 `Planning Ledger 复用契约`，包含 `reuse_source_trace`、`reuse_payload`、`reuse_rule` 和 `invalidates_on`。
+- 如果旧账本里的降级成功会降低数据质量，必须在 Evidence Ledger 和最终报告中显式说明，不能包装成完整成功。
+
 ### 工具计划规范
 
 Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出 capability 和建议工具名，后续执行器再通过 capability -> tools 映射展开。

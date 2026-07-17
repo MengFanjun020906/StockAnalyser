@@ -24,7 +24,7 @@
 | Context | 用户账户、持仓、目标股票、报告 intent 是否稳定注入，并让 plan/todo 随任务变化 | 代表性 `AgentUserContext` 生成 planner，比较 capability/tool plan 是否不同 | 是否扩展 context schema 支持更完整的交易账户约束 |
 | Memory | 记忆是否门控、样本阈值是否透明、失败是否可观测 | 记录当前门控和中性降级语义；避免把未启用记忆当成证据 | 是否默认开启记忆；记忆读取失败是否阻断分析 |
 | Pipeline | 主流程阶段、可选服务、外部依赖、通知和图谱同步是否隔离失败 | 后续增加 stage ledger：每阶段 status、evidence freshness、fallback quality | 是否把 pipeline 的部分 best-effort 步骤升级为硬门槛 |
-| Planning/Execute | `planner.json`、`todo.md`、`evidence_ledger.json` 是否讲清工具预期输入输出、replan 和下一步 | todo/replan/evidence ledger contract 离线审计 | 是否把 replan 从静态策略升级为运行时显式 artifact |
+| Planning/Execute | `planner.json`、`todo.md`、`evidence_ledger.json` 是否讲清工具预期输入输出、replan、下一步和历史计划复用边界 | todo/replan/evidence ledger/Planning Ledger contract 离线审计 | 是否把 replan 从静态策略升级为运行时显式 artifact |
 | Loop | `LOOP.md`、`STATE.md`、budget、constraints 是否和真实开发模式一致 | 检查 stale state、预算语义、autonomous goal loop 合同 | 是否将 loop 审计纳入 CI |
 
 ## 执行阶段
@@ -43,6 +43,7 @@
 - 审计 planner capability 元数据是否锁步，映射工具是否真实存在。
 - 用 entry / position / watchlist 三类 context 验证 planner/todo 不应一模一样。
 - 审计 `todo.md` 必须包含 expected result、downstream use、fallback、next step、replan 和执行复核。
+- 审计 `todo.md` 必须作为 Planning Ledger / 计划账本写入 `reuse_source_trace`、`reuse_payload`、`reuse_rule` 和 `invalidates_on`，恢复历史 Trace 时只复用计划摘要，不复用过期行情、资金或新闻事实。
 - 审计 `evidence_ledger.json` 必须区分 success/failed/timeout/cached 的局限和影响。
 
 ### Stage 2：记忆与上下文可观测性
@@ -68,6 +69,7 @@
 
 - 有一份可审计的基础设施诊断计划。
 - 有一个离线命令可以检查 tools/context/planner/todo/evidence/loop 的核心契约。
+- `todo.md` 复用闭环已落到 prompt、Trace 摘要、生成的 Planning Ledger 和离线审计，不再依赖模型重新展开整份历史计划。
 - 当前 stale loop state 被清理，budget/constraints 不再和 autonomous goal loop 冲突。
 - 新增测试覆盖审计脚本和 stale state 检测。
 - Autonomous loop 超过 200k 估算 token 时必须更新 `STATE.md` / PR checkpoint。

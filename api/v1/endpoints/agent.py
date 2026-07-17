@@ -403,6 +403,10 @@ def _build_trace_context(
             )
         context["resume_from_session_id"] = resume_session_id
         context["stock_selection_resume_artifact_dir"] = str(resume_artifact_dir)
+        context["planning_ledger_reuse"] = _build_planning_ledger_reuse_summary(
+            resume_artifact_dir,
+            source_trace_id=resume_session_id,
+        )
     stock_code = (request.stock_code or context.get("stock_code") or _infer_stock_code_from_message(request.message) or "").strip()
     if stock_code:
         context["stock_code"] = stock_code
@@ -773,6 +777,7 @@ def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
         "accounts": [],
         "investor": None,
         "metadata": {},
+        "planning_ledger_reuse": context.get("planning_ledger_reuse"),
     }
     if not payload:
         return summary
@@ -929,6 +934,82 @@ def _find_trace_artifact_dir(session_id: str) -> Optional[Path]:
     if not matches:
         return None
     return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _build_planning_ledger_reuse_summary(artifact_dir: Path, *, source_trace_id: str) -> Dict[str, Any]:
+    """Return a compact, prompt-safe summary of a previous trace todo.md."""
+    todo_path = artifact_dir / "todo.md"
+    text = _read_trace_text(todo_path)
+    if not text:
+        return {
+            "schema_version": 1,
+            "source_trace_id": source_trace_id,
+            "artifact_dir": str(artifact_dir),
+            "todo_path": str(todo_path),
+            "reuse_status": "missing_todo",
+            "exists": False,
+            "open_items_count": 0,
+            "completed_items_count": 0,
+            "failed_or_degraded_count": 0,
+            "has_planning_ledger_contract": False,
+            "has_tool_handoff_contract": False,
+            "reusable_sections": [],
+            "reuse_rule": "do not reuse raw evidence; rebuild a fresh plan",
+        }
+
+    lines = [line.strip() for line in text.splitlines()]
+    reusable_sections = [
+        section
+        for section in (
+            "任务识别",
+            "工具计划",
+            "Replan 策略",
+            "执行状态",
+            "未调用计划工具",
+        )
+        if f"## {section}" in text
+    ]
+    failed_or_degraded_count = sum(
+        1
+        for line in lines
+        if any(marker in line.lower() for marker in ("failed", "timeout", "degraded", "fallback", "unavailable"))
+    )
+    has_tool_handoff_contract = all(
+        marker in text
+        for marker in (
+            "expected_result=",
+            "downstream_use=",
+            "fallback_on_failure=",
+            "next_step=",
+        )
+    )
+    has_planning_ledger_contract = "Planning Ledger 复用契约" in text or "reuse_payload=" in text
+    return {
+        "schema_version": 1,
+        "source_trace_id": source_trace_id,
+        "artifact_dir": str(artifact_dir),
+        "todo_path": str(todo_path),
+        "reuse_status": "eligible_as_prior" if has_tool_handoff_contract else "stale_contract",
+        "exists": True,
+        "open_items_count": sum(1 for line in lines if line.startswith("- [ ]")),
+        "completed_items_count": sum(1 for line in lines if line.startswith("- [x]")),
+        "failed_or_degraded_count": failed_or_degraded_count,
+        "has_planning_ledger_contract": has_planning_ledger_contract,
+        "has_tool_handoff_contract": has_tool_handoff_contract,
+        "reusable_sections": reusable_sections,
+        "reuse_rule": (
+            "reuse only task identity, tool plan, open items, failed/degraded summaries, "
+            "and execution status counts; revalidate realtime quote, capital flow, news, "
+            "market regime, and account-sensitive facts before final action"
+        ),
+    }
+
+
+def _read_trace_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
 
 def _normalize_trace_session_id(session_id: Optional[str]) -> str:
@@ -1095,6 +1176,13 @@ def _planner_to_todo_md(
             f"- [x] target_position_pct: {target_position.get('position_pct') or '-'}",
         ])
 
+    ledger_reuse = (
+        (context_summary or {}).get("planning_ledger_reuse")
+        if isinstance(context_summary, dict)
+        else None
+    )
+    _append_planning_ledger_contract_to_todo(lines, ledger_reuse if isinstance(ledger_reuse, dict) else None)
+
     lines.extend(["", "## 初始假设"])
     hypotheses = planner.get("hypotheses") or []
     if hypotheses:
@@ -1184,6 +1272,32 @@ def _planner_to_todo_md(
     _append_execute_status_to_todo(lines, tool_plan, tool_calls or [])
 
     return "\n".join(lines) + "\n"
+
+
+def _append_planning_ledger_contract_to_todo(
+    lines: List[str],
+    ledger_reuse: Optional[Dict[str, Any]],
+) -> None:
+    source_trace = (ledger_reuse or {}).get("source_trace_id") or "-"
+    reuse_status = (ledger_reuse or {}).get("reuse_status") or "new_plan"
+    reusable_sections = ", ".join(str(item) for item in (ledger_reuse or {}).get("reusable_sections") or []) or "-"
+    failed_or_degraded = (ledger_reuse or {}).get("failed_or_degraded_count")
+    open_items = (ledger_reuse or {}).get("open_items_count")
+    lines.extend(
+        [
+            "",
+            "## Planning Ledger 复用契约",
+            "- [x] ledger_name=Planning Ledger / 计划账本",
+            f"- [x] reuse_source_trace={source_trace}",
+            f"- [x] reuse_status={reuse_status}",
+            f"- [x] reusable_sections={reusable_sections}",
+            f"- [x] prior_open_items={open_items if open_items is not None else '-'}",
+            f"- [x] prior_failed_or_degraded={failed_or_degraded if failed_or_degraded is not None else '-'}",
+            "- [x] reuse_payload=task_identification,tool_plan,open_items,failed_or_degraded_steps,execution_status_summary",
+            "- [x] reuse_rule=仅作为 delta planning 提示；实时行情、资金、新闻、市场状态和账户事实必须按新鲜度重验",
+            "- [x] invalidates_on=user_goal_changed,symbol_scope_changed,planner_or_tool_contract_changed,stale_realtime_data,degraded_fallback",
+        ]
+    )
 
 
 def _append_execute_status_to_todo(

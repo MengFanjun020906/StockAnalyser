@@ -820,6 +820,12 @@ class AgentExecutor:
                 )
                 parts.append("\n[系统生成的 AgentUserContext]\n" + agent_user_context.model_dump_json(indent=2))
                 parts.append("\n[系统生成的 Planner 工具执行计划]\n" + json.dumps(planning_result.to_dict(), ensure_ascii=False, indent=2))
+                planning_ledger_reuse = context.get("planning_ledger_reuse")
+                if isinstance(planning_ledger_reuse, dict):
+                    parts.append(
+                        "\n[可复用 Planning Ledger 摘要]\n"
+                        + json.dumps(planning_ledger_reuse, ensure_ascii=False, indent=2, default=str)
+                    )
                 parts.append(
                     "\n请先遵循 Planner 的 capability -> tools 计划调用必要工具；"
                     "如某工具缺失或返回失败，记录原因并使用已有证据降级分析。"
