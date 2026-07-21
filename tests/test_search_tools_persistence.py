@@ -44,51 +44,88 @@ def _response(query: str, *, success: bool = True) -> SearchResponse:
 
 
 class SearchToolsPersistenceTest(unittest.TestCase):
-    def test_get_cls_telegraph_news_normalizes_orz_dailynews_response(self) -> None:
+    def test_get_cls_telegraph_news_normalizes_cls_v1_response(self) -> None:
         response = MagicMock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
-            "status": "200",
-            "msg": "success",
-            "data": [
-                {
-                    "title": "[电报解读] 三星第三季DRAM拟提价20%",
-                    "url": "https://www.cls.cn/telegraph",
-                    "content": "三星第三季DRAM拟提价20%，国产存储厂商关注升温。",
-                    "source": "cls",
-                    "publish_time": "2026-07-04 11:11:41",
-                    "score": 997,
-                    "rank": 4,
-                }
-            ],
+            "errno": 0,
+            "data": {
+                "roll_data": [
+                    {
+                        "id": 12345,
+                        "title": "[电报解读] 三星第三季DRAM拟提价20%",
+                        "content": "三星第三季DRAM拟提价20%，国产存储厂商关注升温。",
+                        "ctime": 1783134701,
+                        "level": "B",
+                        "subjects": [{"subject_name": "存储芯片", "subject_id": 7}],
+                        "stock_list": [{"StockID": "sz300750", "name": "宁德时代", "RiseRange": 1.2}],
+                    }
+                ]
+            },
         }
 
         with patch("src.agent.tools.search_tools.requests.get", return_value=response) as requests_get:
             result = _handle_get_cls_telegraph_news(limit=5, keyword="DRAM", timeout_seconds=1)
 
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["provider"], "orz.dailynews.cls")
-        self.assertEqual(result["query_url"], "https://orz.ai/api/v1/dailynews/?platform=cls")
+        self.assertEqual(result["provider"], "cls.v1.roll")
+        self.assertEqual(result["endpoint"], "https://www.cls.cn/v1/roll/get_roll_list")
         self.assertEqual(result["results_count"], 1)
         item = result["results"][0]
-        self.assertEqual(item["id"], "4")
-        self.assertEqual(item["url"], "https://www.cls.cn/telegraph")
+        self.assertEqual(item["id"], "12345")
+        self.assertEqual(item["url"], "https://www.cls.cn/detail/12345")
         self.assertEqual(item["published_at"], "2026-07-04T11:11:41+08:00")
-        self.assertEqual(item["score"], 997.0)
-        self.assertEqual(item["rank"], 4)
+        self.assertEqual(item["provider"], "cls.v1.roll")
+        self.assertEqual(item["level"], "B")
         self.assertTrue(item["is_important"])
+        self.assertEqual(item["subject_names"], ["存储芯片"])
+        self.assertEqual(item["stocks"][0]["ts_code"], "300750.SZ")
         self.assertIn(get_cls_telegraph_news_tool, ALL_SEARCH_TOOLS)
-        self.assertEqual(requests_get.call_args.kwargs["params"], {"platform": "cls"})
+        params = requests_get.call_args.kwargs["params"]
+        self.assertEqual(params["app"], "CailianpressWeb")
+        self.assertEqual(params["rn"], "20")
+        self.assertIn("sign", params)
+
+    def test_get_cls_telegraph_news_paginates_when_limit_exceeds_first_page(self) -> None:
+        def make_response(items):
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"errno": 0, "data": {"roll_data": items}}
+            return response
+
+        first_page = [
+            {"id": index, "title": f"快讯{index}", "content": "内容", "ctime": 1783159200 - index, "level": "C"}
+            for index in range(1, 21)
+        ]
+        second_page = [
+            {"id": index, "title": f"快讯{index}", "content": "内容", "ctime": 1783159000 - index, "level": "C"}
+            for index in range(21, 41)
+        ]
+
+        with patch(
+            "src.agent.tools.search_tools.requests.get",
+            side_effect=[make_response(first_page), make_response(second_page)],
+        ) as requests_get:
+            result = _handle_get_cls_telegraph_news(limit=25, timeout_seconds=1)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["results_count"], 25)
+        self.assertEqual(requests_get.call_count, 2)
+        self.assertEqual(result["results"][0]["id"], "1")
+        self.assertEqual(result["results"][-1]["id"], "25")
+        self.assertEqual(result["source_chain"][1]["params"]["last_time"], str(first_page[-1]["ctime"]))
 
     def test_get_cls_telegraph_news_filters_important_items(self) -> None:
         response = MagicMock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
-            "status": "200",
-            "data": [
-                {"title": "普通快讯", "content": "普通", "publish_time": "2026-07-04 10:00:00", "rank": 16, "score": 20},
-                {"title": "重要快讯", "content": "重要", "publish_time": "2026-07-04 10:01:00", "rank": 2, "score": 998},
-            ],
+            "errno": 0,
+            "data": {
+                "roll_data": [
+                    {"id": 1, "title": "普通快讯", "content": "普通", "ctime": 1783159200, "level": "C"},
+                    {"id": 2, "title": "重要快讯", "content": "重要", "ctime": 1783159260, "level": "B"},
+                ]
+            },
         }
 
         with patch("src.agent.tools.search_tools.requests.get", return_value=response):
@@ -253,7 +290,8 @@ class SearchToolsPersistenceTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["results"], [])
         self.assertEqual(result["source_chain"][0]["result"], "error")
-        self.assertEqual(result["errors"], ["cls_telegraph timeout"])
+        self.assertEqual(result["source_chain"][1]["result"], "error")
+        self.assertEqual(result["errors"], ["cls_telegraph timeout", "cls_telegraph timeout"])
 
     def test_search_stock_news_persists_successful_response(self) -> None:
         response = _response("贵州茅台 600519 latest news")

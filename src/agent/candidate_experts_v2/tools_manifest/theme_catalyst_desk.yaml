@@ -38,12 +38,12 @@ tools:
       获取财联社当日消息热榜/电报条目，用于捕捉盘中政策、产业、海外映射、
       材料供应和公司线索等即时催化。
     typical_args:
-      limit: 20
+      limit: 50
       important_only: false
       keyword: ""
     returns_summary: >-
-      返回经 orz dailynews 归一化后的财联社条目，包括标题、内容、发布时间、
-      热度分数、排名、source_chain 和降级错误。
+      返回经财联社官网 v1 签名接口归一化后的电报条目，包括标题、内容、发布时间、
+      等级、关联题材/股票、source_chain 和降级错误；orz dailynews 仅作为兜底。
     key_fields:
       - results
       - title
@@ -59,7 +59,7 @@ tools:
       - 付费栏目摘要可能只给线索，不得把“这家公司”直接臆造成具体股票。
     cost: cheap
     failure_modes:
-      - orz dailynews 失败或返回 empty 时只能降级，不能阻断主题催化席。
+      - 财联社官网 v1 接口失败或返回 empty 时可降级到 orz dailynews，仍不能阻断主题催化席。
 
   - tool: get_xueqiu_hot_news
     priority: 7

@@ -281,7 +281,7 @@ daily_stock_analysis/
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | 盘中实时技术面：启用时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘 | `true` | 可选 |
 | `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Agent 层单次 Tushare 工具请求超时；基础数据、筹码、两融、资金流和板块排行快路径共用 | `20.0` | 可选 |
 | `get_tushare_today_news` | Agent 工具：调用 Tushare `news` 获取当日新闻快讯，时间窗口固定为今天 `00:00:00` 到当前时刻；支持 `sina`、`wallstreetcn`、`10jqka`、`eastmoney`、`yuncaijing`、`fenghuang`、`jinrongjie`、`cls`、`yicai` 来源；需 Tushare 单独开通 news 权限 | - | 工具 |
-| `get_cls_telegraph_news` | Agent 工具：通过 `https://orz.ai/api/v1/dailynews/?platform=cls` 获取财联社电报/消息热榜，返回标题、内容、发布时间、热度分数、排名和 `source_chain` | - | 工具 |
+| `get_cls_telegraph_news` | Agent 工具：优先通过 `https://www.cls.cn/v1/roll/get_roll_list` 签名接口获取财联社电报，`orz dailynews platform=cls` 仅作兜底；返回标题、内容、发布时间、等级、关联题材/股票和 `source_chain` | - | 工具 |
 | `get_xueqiu_hot_news` | Agent 工具：通过 `https://orz.ai/api/v1/dailynews/?platform=xueqiu` 获取雪球热榜，用于观察市场讨论热度、热门主题扩散和情绪确认 | - | 工具 |
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；按 Tushare THS、Eastmoney、StockAPI 顺序降级，`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |

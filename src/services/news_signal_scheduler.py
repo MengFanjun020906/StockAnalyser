@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List
 
 from src.services.news_signal_service import NewsSignalService
+from src.services.news_event_sentinel import NewsEventSentinel
 from src.services.graphiti.outbox_worker import GraphitiOutboxWorker
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,35 @@ def build_news_signal_background_tasks(config: Any) -> List[Dict[str, Any]]:
                 "name": "news_signal_cls_incremental",
             }
         )
+    if bool(getattr(config, "news_event_sentinel_enabled", False)):
+        interval_minutes = max(
+            5,
+            min(int(getattr(config, "news_event_sentinel_interval_minutes", 30) or 30), 120),
+        )
+        run_immediately = bool(getattr(config, "news_event_sentinel_run_immediately", False))
+
+        def news_event_sentinel_task() -> None:
+            result = NewsEventSentinel(config=config).run_once()
+            status = str(result.get("status") or "unknown")
+            if status == "failed":
+                raise RuntimeError(str(result.get("errors") or "news event sentinel failed"))
+            logger.info(
+                "[NewsEventSentinel] 完成: status=%s triggered=%s cooldown=%s cards=%s",
+                status,
+                result.get("triggered", 0),
+                result.get("suppressed_by_cooldown", 0),
+                result.get("cards_scanned", 0),
+            )
+
+        tasks.append(
+            {
+                "task": news_event_sentinel_task,
+                "interval_seconds": interval_minutes * 60,
+                "run_immediately": run_immediately,
+                "name": "news_event_sentinel",
+            }
+        )
+
     if bool(getattr(config, "graphiti_enabled", False)) and bool(
         getattr(config, "graphiti_outbox_worker_enabled", True)
     ):

@@ -582,12 +582,12 @@ Graphiti/Neo4j 侧职责：
 | 公告 / 投资者关系记录 | 高证据等级来源 |
 | 财联社电报 | 实时快讯来源，补充日内突发消息 |
 
-财联社电报入口为 `https://www.cls.cn/telegraph`。页面本身可能存在 WAF 和前端渲染限制，实现时优先使用更稳定的聚合接口 `https://orz.ai/api/v1/dailynews/?platform=cls`；若接口不可用，工具应返回结构化降级原因，不能阻断新闻卡片生成。
+财联社电报入口为 `https://www.cls.cn/telegraph`。当前实现优先使用官网 `https://www.cls.cn/v1/roll/get_roll_list` 签名接口抓取并分页，`https://orz.ai/api/v1/dailynews/?platform=cls` 仅作为兜底；若接口不可用，工具应返回结构化降级原因，不能阻断新闻卡片生成。
 
 第一版已经明确复用现有 Agent 新闻工具链路，新增 `get_cls_telegraph_news` 作为财联社电报实时快讯工具：
 
 - 页面入口：`https://www.cls.cn/telegraph`
-- 第一版数据接口：`https://orz.ai/api/v1/dailynews/?platform=cls`
+- 当前数据接口：优先 `https://www.cls.cn/v1/roll/get_roll_list`，fallback `https://orz.ai/api/v1/dailynews/?platform=cls`
 - 返回字段：标题、内容、发布时间、热度分数、排名、来源链接、`source_chain` 和 `errors`
 - 支持轻量过滤：`keyword`、`important_only`、`last_time`
 - 降级原则：接口失败、WAF 或结构变化时返回 `status=error` 和结构化错误，不阻断其它新闻来源生成卡片
@@ -601,7 +601,7 @@ Graphiti/Neo4j 侧职责：
 | 工具 | 来源 | 用途 | 当前验证 |
 | --- | --- | --- | --- |
 | `get_eastmoney_cjzc_daily` | 东方财富财经早餐 | 盘前主题、产业链映射、候选主题来源 | 2026-07-04 smoke 通过，回退到 2026-07-03，返回 5 个主题 |
-| `get_cls_telegraph_news` | orz dailynews `platform=cls` | 财联社消息热榜/电报，捕捉日内催化 | 2026-07-04 smoke 通过，返回 `status=ok` |
+| `get_cls_telegraph_news` | CLS v1 signed roll API + orz dailynews fallback | 财联社消息热榜/电报，捕捉日内催化 | 2026-07-21 smoke 通过，`328GWh` 储能新闻可抓取并入库 |
 | `get_xueqiu_hot_news` | orz dailynews `platform=xueqiu` | 雪球热榜，观察讨论热度和主题扩散 | 2026-07-04 smoke 通过，返回 `status=ok` |
 | `get_macro_finance_news` | orz dailynews `platform=sina_finance,eastmoney` + `SearchService.search_general_news` fallback | 宏观层消息，补齐非农、逆回购、利率、流动性等市场约束 | 2026-07-04 smoke 通过，两个平台均返回 `status=ok`；无搜索 key 时 fallback 降级为 `disabled` |
 
@@ -1075,7 +1075,7 @@ volumes:
 - [x] 复用 `candidate_experts_v2/resources/news_theme_daily/concept_mapping.json` 做产业链与公司映射，补齐 `mapped/ambiguous/industry_only/unmapped` 失败模式。
 - [x] 新增 `/api/v1/news-signals` 列表、详情、重建、反馈、指标、EvidenceCard 适配和 outcome 刷新接口。
 - [x] 新增 Web 独立“消息”页面，支持卡片列表、详情抽屉式详情区、反馈 overlay 和关键指标展示。
-- [x] 财联社工具切换到 `orz.ai dailynews platform=cls`，新增 `get_xueqiu_hot_news` 雪球热榜工具，并接入新闻卡片重建。
+- [x] 财联社工具切换到官网 v1 签名接口优先、`orz.ai dailynews platform=cls` 兜底，新增 `get_xueqiu_hot_news` 雪球热榜工具，并接入新闻卡片重建。
 - [x] 新增 `signal_layer=industry/company/macro` 三层分类，API 和页面支持按层级筛选；宏观层先用非农、逆回购、CPI/PPI/PMI、利率、流动性等关键词规则。
 - [x] 新增 `get_macro_finance_news` 宏观财经工具，默认抓取 `sina_finance`、`eastmoney` 并按宏观关键词过滤；当热榜覆盖不足时追加 `SearchService.search_general_news()` 宏观关键词 fallback，新闻卡片重建和主题催化席白名单已接入。
 - [x] 2026-07-04 真实 smoke：`get_eastmoney_cjzc_daily`、`get_cls_telegraph_news`、`get_xueqiu_hot_news`、`get_macro_finance_news` 均返回可用；临时库 rebuild 生成卡片无错误。

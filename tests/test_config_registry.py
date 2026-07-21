@@ -143,3 +143,40 @@ class TestDiscordInteractionPublicKeyField(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestNewsEventSentinelFieldsRegistered(unittest.TestCase):
+    """News event sentinel fields must be registered for the settings UI."""
+
+    _SENTINEL_KEYS = (
+        "NEWS_EVENT_SENTINEL_ENABLED",
+        "NEWS_EVENT_SENTINEL_INTERVAL_MINUTES",
+        "NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS",
+        "NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE",
+        "NEWS_EVENT_SENTINEL_CARD_MAX_AGE_MINUTES",
+        "NEWS_EVENT_SENTINEL_MIN_SEVERITY",
+        "NEWS_EVENT_SENTINEL_COOLDOWN_MINUTES",
+        "NEWS_EVENT_SENTINEL_TRIGGER_MODE",
+        "NEWS_EVENT_SENTINEL_TRACE_MAX_PER_RUN",
+        "NEWS_EVENT_SENTINEL_TRACE_MAX_PER_DAY",
+        "NEWS_EVENT_SENTINEL_RUN_IMMEDIATELY",
+        "NEWS_EVENT_SENTINEL_FEISHU_ENABLED",
+        "NEWS_EVENT_SENTINEL_HEARTBEAT_ENABLED",
+        "NEWS_EVENT_SENTINEL_HEARTBEAT_INTERVAL_MINUTES",
+    )
+
+    def test_field_definitions_exist(self):
+        for key in self._SENTINEL_KEYS:
+            field = get_field_definition(key)
+            self.assertEqual(field["category"], "data_source", f"{key} category")
+            self.assertNotEqual(field["display_order"], 9000)
+
+    def test_schema_response_includes_news_event_sentinel_fields(self):
+        schema = build_schema_response()
+        data_source_cat = next(
+            (c for c in schema["categories"] if c["category"] == "data_source"),
+            None,
+        )
+        self.assertIsNotNone(data_source_cat, "data_source category missing")
+        field_keys = {f["key"] for f in data_source_cat["fields"]}
+        for key in self._SENTINEL_KEYS:
+            self.assertIn(key, field_keys, f"{key} missing from schema response")

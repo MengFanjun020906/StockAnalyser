@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
 
+- [修复] 财联社电报抓取改为 cls.cn v1 签名接口直连优先、orz dailynews 兜底，并将新闻事件哨兵默认扫描窗口提高到 50 条，避免聚合源超时或首页窗口过窄导致漏抓。
+- [改进] 新闻事件哨兵新增方向性产业线索触发，`news_tone=positive|negative` 且 `signal_score>=50` 的 active 卡片可通过 `SIGNAL:POSITIVE` / `SIGNAL:NEGATIVE` 推送飞书。
+- [新功能] 新闻事件哨兵新增无触发 heartbeat，可按独立间隔发送存活卡片并写入审计，便于确认 schedule worker 正在运行。
+- [修复] 新闻事件哨兵市场触发新增卡片新鲜度闸门，避免日内旧卡在冷却过期后被重复当作最新消息发送。
+- [改进] 新闻事件哨兵新增 A 股与美股宏观触发条件，宏观卡片可通过 `MACRO:A_SHARE` / `MACRO:US` 进入飞书告警和冷却审计。
+- [新功能] 新闻事件哨兵新增飞书 webhook notifier，可将触发信封渲染为 interactive card，并展示触发原因、来源链接和关联传导路径。
+- [新功能] 新增新闻事件哨兵第一版底层闭环，支持 `NewsEventSentinel.run_once()`、run/trigger 审计、active window、severity/cooldown 触发门和 schedule opt-in 注册。
+- [文档] 新增新闻事件哨兵底层设计，明确 openInvest 哨兵模式在 StockAnalyser 中的事件层、调度、触发审计和飞书通知适配原则。
+- [新功能] Agent 新增市场情绪快照、情绪热度候选和全球风险扫描工具，并接入 planner、ETL 压缩、工具注册与显式 `sentiment_heat` 候选来源。
+- [改进] Seed Pool 候选池输出新增 `strategy_trunk_health` 诊断，AlphaSift 与 Sequoia 主干都无可用候选时显式标记硬策略主干缺失。
+- [新功能] Seed Pool 质量闭环新增历史 Trace 回填脚本、T+1 批量评估脚本，并在 `daily_run.sh` 第四步提供 opt-in 自动评估。
 - [改进] planning_execute 恢复历史 Trace 时生成 Planning Ledger 摘要，并在新 `todo.md` 写入复用来源、复用 payload、重验规则和失效条件。
 - [文档] README 新增 AI Operating Model、主/子 Agent 中英双语命名、完成报告样例和本地入场执行回测快照。
 - [文档] README 入场执行回测改为起始日至本地最新基准日的累计 PnL 与指数对比表。

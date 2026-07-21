@@ -22,6 +22,18 @@ GRAPHITI_OUTBOX_BATCH_SIZE=10
 GRAPHITI_OUTBOX_MAX_ATTEMPTS=5
 GRAPHITI_OUTBOX_RETRY_BASE_SECONDS=30
 GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS=120
+NEWS_EVENT_SENTINEL_ENABLED=true
+NEWS_EVENT_SENTINEL_INTERVAL_MINUTES=30
+NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS=08:00-02:30
+NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE=50
+NEWS_EVENT_SENTINEL_CARD_MAX_AGE_MINUTES=30
+NEWS_EVENT_SENTINEL_MIN_SEVERITY=mid
+NEWS_EVENT_SENTINEL_COOLDOWN_MINUTES=120
+NEWS_EVENT_SENTINEL_TRIGGER_MODE=notify_only
+NEWS_EVENT_SENTINEL_FEISHU_ENABLED=true
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_key_here
+# FEISHU_WEBHOOK_SECRET=your_secret_if_enabled
+# FEISHU_WEBHOOK_KEYWORD=StockAnalyser
 ```
 
 随后执行：
@@ -33,7 +45,9 @@ bash scripts/daily_run.sh
 第三步会依次执行当日卡片重建、公司映射修复、同事件归并、缺失事件回填、seed outcome 刷新、Graphiti repair 和 outbox 消费。每个交易日有独立续跑标记。
 事件回填出现部分失败，或明确请求的 Graphiti repair 未成功时，维护命令返回非零退出码，第三步不会写完成标记，后续续跑会重试。
 
-`python main.py --schedule` 还会注册两个独立后台任务：财联社电报按 5-10 分钟增量入库，Graphiti outbox 按秒级间隔分批消费。关系库写入不等待 Graphiti；episode 超时后进入指数退避，删除任务优先于写入任务。
+`python main.py --schedule` 还会注册两个独立后台任务：财联社电报按 5-10 分钟增量入库，Graphiti outbox 按秒级间隔分批消费。财联社电报主源使用 `https://www.cls.cn/v1/roll/get_roll_list` 签名接口，`https://orz.ai/api/v1/dailynews/?platform=cls` 仅作为兜底；高峰期建议保持 `NEWS_SIGNAL_CLS_INCREMENTAL_LIMIT=50` 与 `NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE=50`，避免只扫首页少量快讯导致漏抓。关系库写入不等待 Graphiti；episode 超时后进入指数退避，删除任务优先于写入任务。
+
+启用 `NEWS_EVENT_SENTINEL_ENABLED=true` 后，schedule 模式会额外注册 `news_event_sentinel` 后台任务。第一版底层哨兵使用 Portfolio active positions 与 `STOCK_LIST` 构建关注宇宙，复用现有 CLS 增量入库和 `NewsSignalCard` 读取路径，再按 active window、card freshness、severity、company mapping、macro market、cooldown 生成 `news_event_sentinel_runs` 与 `news_event_sentinel_triggers` 审计。公司级事件要求命中持仓/自选；宏观事件可在命中 A 股或美股宏观白名单时触发，分别以 `MACRO:A_SHARE`、`MACRO:US` 记录；方向性产业线索在 `status=active`、`news_tone=positive|negative`、`signal_score>=50` 时分别以 `SIGNAL:POSITIVE` / `SIGNAL:NEGATIVE` 记录并推送，正向用于入场观察，负向用于避险预警。默认 `NEWS_EVENT_SENTINEL_TRIGGER_MODE=notify_only`，底层生成通知信封和触发记录；`NEWS_EVENT_SENTINEL_FEISHU_ENABLED=true` 且配置 `FEISHU_WEBHOOK_URL` 后，会通过飞书 webhook 发送 interactive card。`NEWS_EVENT_SENTINEL_HEARTBEAT_ENABLED=true` 时，如果一轮扫描没有产生市场触发，会按 `NEWS_EVENT_SENTINEL_HEARTBEAT_INTERVAL_MINUTES` 写入并发送低等级存活卡片，便于确认 10 分钟后台轮询仍在运行。飞书卡片属于外层汇报适配器，只负责监控汇报，不负责拉取、入库或 LLM 抽取。Agent Trace 按钮和持仓 provider 属于后续外层适配器，不参与第一版触发语义。
 
 `NEWS_SIGNAL_GRAPH_REPAIR_MODE`：
 
