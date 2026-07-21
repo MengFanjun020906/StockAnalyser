@@ -69,3 +69,30 @@ def test_build_news_signal_background_tasks_registers_graphiti_outbox_worker() -
         job_timeout_seconds=90,
     )
     worker.run_once.assert_called_once_with(limit=12)
+
+def test_build_news_signal_background_tasks_registers_news_event_sentinel() -> None:
+    config = SimpleNamespace(
+        news_signal_cls_incremental_enabled=False,
+        news_event_sentinel_enabled=True,
+        news_event_sentinel_interval_minutes=3,
+        news_event_sentinel_run_immediately=True,
+        graphiti_enabled=False,
+    )
+    sentinel = MagicMock()
+    sentinel.run_once.return_value = {
+        "status": "ok",
+        "triggered": 1,
+        "suppressed_by_cooldown": 0,
+        "cards_scanned": 2,
+    }
+
+    with patch("src.services.news_signal_scheduler.NewsEventSentinel", return_value=sentinel) as sentinel_cls:
+        tasks = build_news_signal_background_tasks(config)
+        tasks[0]["task"]()
+
+    assert len(tasks) == 1
+    assert tasks[0]["name"] == "news_event_sentinel"
+    assert tasks[0]["interval_seconds"] == 5 * 60
+    assert tasks[0]["run_immediately"] is True
+    sentinel_cls.assert_called_once_with(config=config)
+    sentinel.run_once.assert_called_once_with()

@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 _CN_TZ = timezone(timedelta(hours=8))
 _ORZ_DAILYNEWS_ENDPOINT = "https://orz.ai/api/v1/dailynews/"
-_CLS_TELEGRAPH_ENDPOINT = _ORZ_DAILYNEWS_ENDPOINT
+_CLS_TELEGRAPH_V1_ENDPOINT = "https://www.cls.cn/v1/roll/get_roll_list"
+_CLS_TELEGRAPH_ENDPOINT = _CLS_TELEGRAPH_V1_ENDPOINT
 _CLS_TELEGRAPH_PAGE_URL = "https://www.cls.cn/telegraph"
 _XUEQIU_HOT_PAGE_URL = "https://xueqiu.com/"
 _SINA_FINANCE_PAGE_URL = "https://finance.sina.com.cn/7x24/"
@@ -128,7 +129,10 @@ _ORZ_DAILYNEWS_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     ),
 }
-_CLS_TELEGRAPH_HEADERS = _ORZ_DAILYNEWS_HEADERS
+_CLS_TELEGRAPH_HEADERS = {
+    **_ORZ_DAILYNEWS_HEADERS,
+    "Referer": _CLS_TELEGRAPH_PAGE_URL,
+}
 
 
 def _run_search_task_with_timeout(
@@ -398,9 +402,9 @@ def _normalize_orz_dailynews_item(row: Dict[str, Any], *, platform: str) -> Dict
             "page_url": _ORZ_DAILYNEWS_ENDPOINT,
         },
     )
-    source_label = str(meta["source"])
-    provider = str(meta["provider"])
-    default_url = str(meta["page_url"])
+    source_label = str(row.get("_source_label") or meta["source"])
+    provider = str(row.get("_provider") or meta["provider"])
+    default_url = str(row.get("_page_url") or meta["page_url"])
 
     rank = _safe_int(row.get("rank"), 0)
     score = _safe_float(row.get("score"), 0.0)
@@ -473,8 +477,61 @@ def _fetch_orz_dailynews_payload(platform: str, timeout_seconds: float) -> Dict[
     return body
 
 
+def _make_cls_v1_sign(params: Dict[str, Any]) -> str:
+    sign_str = "&".join(f"{key}={params[key]}" for key in sorted(params.keys()))
+    sha1 = hashlib.sha1(sign_str.encode("utf-8")).hexdigest()
+    return hashlib.md5(sha1.encode("utf-8")).hexdigest()
+
+
+def _fetch_cls_telegraph_v1_payload(
+    *,
+    last_time: int,
+    count: int,
+    category: str = "",
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "app": "CailianpressWeb",
+        "os": "web",
+        "sv": "8.4.6",
+        "refresh_type": "1",
+        "rn": str(max(1, min(int(count or 20), 50))),
+        "last_time": str(max(1, int(last_time or time.time()))),
+        "category": str(category or ""),
+    }
+    params["sign"] = _make_cls_v1_sign(params)
+    response = requests.get(
+        _CLS_TELEGRAPH_V1_ENDPOINT,
+        params=params,
+        headers=_CLS_TELEGRAPH_HEADERS,
+        timeout=max(1.0, float(timeout_seconds or 6.0)),
+    )
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise ValueError("cls v1 roll returned non-object JSON")
+    return body
+
+
 def _fetch_cls_telegraph_payload(params: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
-    return _fetch_orz_dailynews_payload("cls", timeout_seconds=timeout_seconds)
+    last_time = _safe_int((params or {}).get("last_time"), int(time.time()))
+    count = _safe_int((params or {}).get("rn") or (params or {}).get("count"), 20)
+    category = str((params or {}).get("category") or "")
+    return _fetch_cls_telegraph_v1_payload(
+        last_time=last_time,
+        count=count,
+        category=category,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _normalize_cls_v1_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(row)
+    payload.setdefault("url", f"https://www.cls.cn/detail/{payload.get('id')}")
+    payload["_provider"] = "cls.v1.roll"
+    payload["_source_label"] = "财联社电报"
+    payload["_page_url"] = _CLS_TELEGRAPH_PAGE_URL
+    return _normalize_orz_dailynews_item(payload, platform="cls")
 
 
 def _dailynews_payload_error(payload: Dict[str, Any]) -> Optional[str]:
@@ -764,9 +821,128 @@ def _handle_get_cls_telegraph_news(
     last_time: int = 0,
     timeout_seconds: float = 6.0,
 ) -> dict:
-    """Fetch 财联社电报/消息热榜 items through the orz dailynews feed."""
+    """Fetch 财联社电报 from cls.cn first, falling back to orz dailynews."""
 
-    return _handle_get_orz_dailynews(
+    started = time.time()
+    effective_limit = max(1, min(_safe_int(limit, 20), 50))
+    important_flag = _coerce_bool(important_only)
+    effective_timeout = max(1.0, min(float(timeout_seconds or 6.0), 15.0))
+    effective_last_time = _safe_int(last_time, 0)
+    keyword_text = str(keyword or "").strip()
+    provider = "cls.v1.roll"
+    first_cursor = effective_last_time or int(time.time())
+    query_url = _CLS_TELEGRAPH_V1_ENDPOINT
+    source_chain: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    rows: List[Dict[str, Any]] = []
+    seen_row_keys: set[str] = set()
+    cursor = first_cursor
+    base_rounds = max((effective_limit + 19) // 20, 1)
+    rounds = max(base_rounds + 2, 3) if keyword_text or important_flag else base_rounds
+
+    for _ in range(rounds):
+        params = {
+            "app": "CailianpressWeb",
+            "os": "web",
+            "sv": "8.4.6",
+            "refresh_type": "1",
+            "rn": "20",
+            "last_time": str(cursor),
+            "category": "",
+        }
+        signed_params = dict(params)
+        signed_params["sign"] = _make_cls_v1_sign(signed_params)
+        payload, err, fetch_ms = _run_search_task_with_timeout(
+            lambda p=dict(params): _fetch_cls_telegraph_v1_payload(
+                last_time=_safe_int(p.get("last_time"), first_cursor),
+                count=_safe_int(p.get("rn"), 20),
+                category=str(p.get("category") or ""),
+                timeout_seconds=effective_timeout,
+            ),
+            effective_timeout + 1.0,
+            provider,
+        )
+        entry: Dict[str, Any] = {
+            "provider": provider,
+            "endpoint": _CLS_TELEGRAPH_V1_ENDPOINT,
+            "params": signed_params,
+            "page_url": _CLS_TELEGRAPH_PAGE_URL,
+            "result": "pending",
+            "duration_ms": fetch_ms,
+        }
+        source_chain.append(entry)
+        if err or not isinstance(payload, dict):
+            entry["result"] = "error"
+            errors.append(str(err or "invalid cls v1 response"))
+            break
+        payload_error = _dailynews_payload_error(payload)
+        if payload_error:
+            entry["result"] = "error"
+            entry["errno"] = payload.get("errno")
+            errors.append(payload_error)
+            break
+        batch = _extract_cls_roll_data(payload)
+        entry["result"] = "ok" if batch else "empty"
+        entry["count"] = len(batch)
+        entry["errno"] = payload.get("errno")
+        if not batch:
+            break
+        fresh_batch: List[Dict[str, Any]] = []
+        for row in batch:
+            row_key = str(row.get("id") or row.get("news_id") or row.get("ctime") or json.dumps(row, sort_keys=True, default=str))
+            if row_key in seen_row_keys:
+                continue
+            seen_row_keys.add(row_key)
+            fresh_batch.append(row)
+        if not fresh_batch:
+            break
+        rows.extend(fresh_batch)
+        normalized_so_far = [_normalize_cls_v1_row(row) for row in rows]
+        filtered_so_far = _filter_dailynews_items(
+            normalized_so_far,
+            effective_limit=effective_limit,
+            important_only=important_flag,
+            keyword=keyword_text,
+            last_time=effective_last_time,
+        )
+        if len(filtered_so_far) >= effective_limit:
+            break
+        next_cursor = min([_safe_int(row.get("ctime"), 0) for row in batch if _safe_int(row.get("ctime"), 0)] or [0])
+        if next_cursor <= 0 or next_cursor >= cursor:
+            break
+        cursor = next_cursor
+
+    if rows:
+        items = [_normalize_cls_v1_row(row) for row in rows]
+        items = _filter_dailynews_items(
+            items,
+            effective_limit=effective_limit,
+            important_only=important_flag,
+            keyword=keyword_text,
+            last_time=effective_last_time,
+        )
+        return {
+            "status": "ok" if items else "empty",
+            "provider": provider,
+            "query_url": query_url,
+            "endpoint": _CLS_TELEGRAPH_V1_ENDPOINT,
+            "results_count": len(items),
+            "results": items,
+            "important_only": important_flag,
+            "keyword": keyword_text,
+            "last_time": effective_last_time,
+            "min_score": 0.0,
+            "next_last_time": min([item["published_ts"] for item in items if item.get("published_ts")] or [0]),
+            "source_chain": source_chain,
+            "errors": errors,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "notes": [
+                "Primary data source: https://www.cls.cn/v1/roll/get_roll_list",
+                "Fallback data source: https://orz.ai/api/v1/dailynews/?platform=cls",
+            ],
+        }
+
+    fallback = _handle_get_orz_dailynews(
         platform="cls",
         limit=limit,
         important_only=important_only,
@@ -774,6 +950,14 @@ def _handle_get_cls_telegraph_news(
         last_time=last_time,
         timeout_seconds=timeout_seconds,
     )
+    fallback_chain = fallback.get("source_chain") if isinstance(fallback.get("source_chain"), list) else []
+    fallback_errors = fallback.get("errors") if isinstance(fallback.get("errors"), list) else []
+    fallback["source_chain"] = [*source_chain, *fallback_chain]
+    fallback["errors"] = [*errors, *fallback_errors]
+    fallback["elapsed_ms"] = int((time.time() - started) * 1000)
+    if fallback.get("status") == "ok":
+        fallback["provider"] = "cls.v1.roll+orz.dailynews.cls"
+    return fallback
 
 
 def _handle_get_xueqiu_hot_news(
@@ -1638,7 +1822,7 @@ search_openinvest_news_tool = ToolDefinition(
 get_cls_telegraph_news_tool = ToolDefinition(
     name="get_cls_telegraph_news",
     description=(
-        "Fetch 财联社电报/消息热榜 items via https://orz.ai/api/v1/dailynews/?platform=cls. "
+        "Fetch 财联社电报 items from https://www.cls.cn/v1/roll/get_roll_list, with orz dailynews fallback. "
         "Use this for intraday market news, policy/material/company catalysts, and theme-catalyst evidence. "
         "Returns normalized ranked news cards with publish time, score/rank, source_chain, "
         "and structured degradation errors when the upstream feed is unavailable."
@@ -1668,7 +1852,7 @@ get_cls_telegraph_news_tool = ToolDefinition(
         ToolParameter(
             name="last_time",
             type="integer",
-            description="Optional published_ts upper bound. The orz dailynews feed is fetched once, then filtered locally.",
+            description="Optional published_ts upper bound. CLS v1 uses it as last_time for paging and local filtering.",
             required=False,
             default=0,
         ),
