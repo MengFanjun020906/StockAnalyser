@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-A股自选股智能分析系统 - 配置管理模块
+StockAnalyser - 配置管理模块
 ===================================
 
 职责：
@@ -738,9 +738,14 @@ class Config:
     news_signal_cls_incremental_enabled: bool = False
     news_signal_cls_incremental_interval_minutes: int = 10
     news_signal_cls_incremental_limit: int = 50
+    news_signal_portfolio_anysearch_enabled: bool = False
+    news_signal_portfolio_anysearch_interval_minutes: int = 300
+    news_signal_portfolio_anysearch_max_results_per_stock: int = 5
+    news_signal_portfolio_anysearch_max_age_days: int = 3
+    news_signal_portfolio_anysearch_run_immediately: bool = False
     news_event_sentinel_enabled: bool = False
     news_event_sentinel_interval_minutes: int = 30
-    news_event_sentinel_active_windows: str = "08:00-02:30"
+    news_event_sentinel_active_windows: str = "08:00-23:59"
     news_event_sentinel_max_items_per_source: int = 50
     news_event_sentinel_card_max_age_minutes: int = 30
     news_event_sentinel_min_severity: str = "mid"
@@ -845,7 +850,7 @@ class Config:
     
     # 邮件配置（只需邮箱和授权码，SMTP 自动识别）
     email_sender: Optional[str] = None  # 发件人邮箱
-    email_sender_name: str = "daily_stock_analysis股票分析助手"  # 发件人显示名称
+    email_sender_name: str = "StockAnalyser股票分析助手"  # 发件人显示名称
     email_password: Optional[str] = None  # 邮箱密码/授权码
     email_receivers: List[str] = field(default_factory=list)  # 收件人列表（留空则发给自己）
 
@@ -1538,6 +1543,35 @@ class Config:
                 minimum=1,
                 maximum=50,
             ),
+            news_signal_portfolio_anysearch_enabled=parse_env_bool(
+                os.getenv('NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_ENABLED'),
+                default=False,
+            ),
+            news_signal_portfolio_anysearch_interval_minutes=parse_env_int(
+                os.getenv('NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_INTERVAL_MINUTES'),
+                300,
+                field_name='NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_INTERVAL_MINUTES',
+                minimum=60,
+                maximum=1440,
+            ),
+            news_signal_portfolio_anysearch_max_results_per_stock=parse_env_int(
+                os.getenv('NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_MAX_RESULTS_PER_STOCK'),
+                5,
+                field_name='NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_MAX_RESULTS_PER_STOCK',
+                minimum=1,
+                maximum=10,
+            ),
+            news_signal_portfolio_anysearch_max_age_days=parse_env_int(
+                os.getenv('NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_MAX_AGE_DAYS'),
+                3,
+                field_name='NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_MAX_AGE_DAYS',
+                minimum=1,
+                maximum=90,
+            ),
+            news_signal_portfolio_anysearch_run_immediately=parse_env_bool(
+                os.getenv('NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_RUN_IMMEDIATELY'),
+                default=False,
+            ),
             news_event_sentinel_enabled=parse_env_bool(
                 os.getenv('NEWS_EVENT_SENTINEL_ENABLED'),
                 default=False,
@@ -1550,7 +1584,7 @@ class Config:
                 maximum=120,
             ),
             news_event_sentinel_active_windows=(
-                os.getenv('NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS', '08:00-02:30') or '08:00-02:30'
+                os.getenv('NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS', '08:00-23:59') or '08:00-23:59'
             ).strip(),
             news_event_sentinel_max_items_per_source=parse_env_int(
                 os.getenv('NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE'),
@@ -1847,7 +1881,7 @@ class Config:
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
             email_sender=os.getenv('EMAIL_SENDER'),
-            email_sender_name=os.getenv('EMAIL_SENDER_NAME', 'daily_stock_analysis股票分析助手'),
+            email_sender_name=os.getenv('EMAIL_SENDER_NAME', 'StockAnalyser股票分析助手'),
             email_password=os.getenv('EMAIL_PASSWORD'),
             email_receivers=[r.strip() for r in os.getenv('EMAIL_RECEIVERS', '').split(',') if r.strip()],
             stock_email_groups=cls._parse_stock_email_groups(),

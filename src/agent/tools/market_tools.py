@@ -1608,8 +1608,10 @@ def _event_cards_from_response(response: Any) -> List[Dict[str, Any]]:
     for result in getattr(response, "results", []) or []:
         title = str(getattr(result, "title", "") or "").strip()
         snippet = str(getattr(result, "snippet", "") or "").strip()
-        text = f"{title} {snippet}"
-        rule = _event_rule_for_text(text)
+        # The title is the event identity that is later used as event_id and
+        # Graphiti episode name. Snippet-only matches are too easy to pollute
+        # with SEO pages whose body contains copied market terms.
+        rule = _event_rule_for_text(title)
         if not title or rule is None:
             continue
         cards.append({

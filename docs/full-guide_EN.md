@@ -1,13 +1,13 @@
 # Complete Configuration & Deployment Guide
 
-This document contains the complete configuration guide for the AI Stock Analysis System, intended for users who need advanced features or special deployment methods.
+This document contains the complete configuration guide for the StockAnalyser, intended for users who need advanced features or special deployment methods.
 
 > Quick start guide available in [README_EN.md](i18n/README_EN.md). This document covers advanced configuration.
 
 ## Project Structure
 
 ```
-daily_stock_analysis/
+StockAnalyser/
 ├── main.py              # Main entry point
 ├── src/                 # Core business logic
 │   ├── analyzer.py      # AI analyzer
@@ -141,7 +141,7 @@ To get started quickly, you need at minimum:
 ### 4. Manual Test
 
 1. Go to `Actions` tab
-2. Select `Daily Stock Analysis` workflow on the left
+2. Select `StockAnalyser Daily Analysis` workflow on the left
 3. Click `Run workflow` button on the right
 4. Select run mode
 5. Click green `Run workflow` to confirm
@@ -342,15 +342,15 @@ The image uses prebuilt frontend assets under `/app/static` at runtime, so the r
 
 Official image registries:
 
-- GHCR: `ghcr.io/zhulinsen/daily_stock_analysis:<tag>`
-- Docker Hub: `<DOCKERHUB_USERNAME>/daily_stock_analysis:<tag>` (driven by the publisher's `DOCKERHUB_USERNAME` secret; the official release uses `zhulinsen/daily_stock_analysis`)
+- GHCR: `ghcr.io/mengfanjun020906/stockanalyser:<tag>`
+- Docker Hub: `<DOCKERHUB_USERNAME>/stockanalyser:<tag>` (driven by the publisher's `DOCKERHUB_USERNAME` secret; the official release uses `mengfanjun020906/stockanalyser`)
 
 ### Quick Start
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/ZhuLinsen/daily_stock_analysis.git
-cd daily_stock_analysis
+git clone https://github.com/MengFanjun020906/StockAnalyser.git
+cd StockAnalyser
 
 # 2. Configure environment variables
 cp .env.example .env
@@ -374,27 +374,27 @@ If you do not want to keep the source tree on the target machine, you can run th
 
 ```bash
 # Web/API mode
-docker pull zhulinsen/daily_stock_analysis:latest
+docker pull mengfanjun020906/stockanalyser:latest
 docker run -d \
-  --name dsa-server \
+  --name stockanalyser-server \
   --env-file .env \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/reports:/app/reports" \
   -v "$(pwd)/.env:/app/.env" \
-  zhulinsen/daily_stock_analysis:latest \
+  mengfanjun020906/stockanalyser:latest \
   python main.py --serve-only --host 0.0.0.0 --port 8000
 
 # Scheduled-task mode
 docker run -d \
-  --name dsa-analyzer \
+  --name stockanalyser-analyzer \
   --env-file .env \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/reports:/app/reports" \
   -v "$(pwd)/.env:/app/.env" \
-  zhulinsen/daily_stock_analysis:latest
+  mengfanjun020906/stockanalyser:latest
 ```
 
 For pinned deployments or easier rollback, replace `latest` with a concrete version tag such as `v3.13.0`.
@@ -487,7 +487,7 @@ docker-compose -f ./docker/docker-compose.yml up -d server
 ```bash
 docker build -f docker/Dockerfile -t stock-analysis .
 docker run -d \
-  --name dsa-server-local \
+  --name stockanalyser-server-local \
   --env-file .env \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
@@ -1062,4 +1062,4 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 
 ---
 
-For more questions, please [submit an Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+For more questions, please [submit an Issue](https://github.com/MengFanjun020906/StockAnalyser/issues)

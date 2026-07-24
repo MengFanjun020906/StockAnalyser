@@ -242,7 +242,7 @@ Agent Trace 属于外层动作，不属于事件判定本身。建议分阶段�
 ```text
 NEWS_EVENT_SENTINEL_ENABLED=false
 NEWS_EVENT_SENTINEL_INTERVAL_MINUTES=30
-NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS=08:00-02:30
+NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS=08:00-23:59
 NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE=50
 NEWS_EVENT_SENTINEL_MIN_SEVERITY=mid
 NEWS_EVENT_SENTINEL_COOLDOWN_MINUTES=120
@@ -250,12 +250,14 @@ NEWS_EVENT_SENTINEL_TRIGGER_MODE=notify_only
 NEWS_EVENT_SENTINEL_TRACE_MAX_PER_RUN=2
 NEWS_EVENT_SENTINEL_TRACE_MAX_PER_DAY=8
 NEWS_EVENT_SENTINEL_FEISHU_ENABLED=false
+GRAPHITI_OUTBOX_WORKER_ENABLED=true
+GRAPHITI_OUTBOX_INTERVAL_SECONDS=600
 # FEISHU_WEBHOOK_URL=...
 # FEISHU_WEBHOOK_SECRET=...
 # FEISHU_WEBHOOK_KEYWORD=StockAnalyser
 ```
 
-后续如果需要 openInvest 同款 cron，可再增加 `NEWS_EVENT_SENTINEL_CRON`，但 cron parser 不应成为第一阶段的核心依赖。运行窗口应在 `NewsEventSentinel` 内判断，确保手动 `run_once(dry_run=True)` 仍可跳过窗口或显式 override。市场触发还要经过 `NEWS_EVENT_SENTINEL_CARD_MAX_AGE_MINUTES` 新鲜度闸门，防止同一张日内旧卡在冷却过期后被重新当作最新消息发送。
+后续如果需要 openInvest 同款 cron，可再增加 `NEWS_EVENT_SENTINEL_CRON`，但 cron parser 不应成为第一阶段的核心依赖。运行窗口应在 `NewsEventSentinel` 内判断，确保手动 `run_once(dry_run=True)` 仍可跳过窗口或显式 override。市场触发还要经过 `NEWS_EVENT_SENTINEL_CARD_MAX_AGE_MINUTES` 新鲜度闸门，防止同一张日内旧卡在冷却过期后被重新当作最新消息发送。触发通知会按 `NEWS_EVENT_SENTINEL_TRACE_MAX_PER_RUN` 对 Graphiti 做 best-effort 查询，并将 trace 状态写入飞书卡片和 trigger ledger；Graphiti outbox worker 与哨兵 worker 同进程注册，用于按周期把新闻卡与关系边投影到 Neo4j。Graphiti 的 LLM、embedding、reranker 都走项目适配层；没有 OpenAI-compatible embedding key 时降级为本地 hash embedding，确保消息入库与关系投影不会因为外部 embedding 凭证缺失而停摆；使用 Ollama Qwen3 时会自动透传 `think=false`，避免结构化抽取阶段长时间只输出 thinking。
 
 后台任务注册原则：
 

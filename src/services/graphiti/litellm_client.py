@@ -88,6 +88,8 @@ class LiteLLMGraphitiClient(LLMClient):
             "max_tokens": max_tokens,
             "temperature": self.temperature,
         }
+        if "qwen3" in model.lower():
+            request_kwargs["think"] = False
         if response_model is not None:
             schema = response_model.model_json_schema()
             schema_name = getattr(response_model, "__name__", "structured_response")

@@ -82,6 +82,8 @@ POSITIVE_TERMS = (
     "供给收缩",
     "需求旺盛",
     "政策支持",
+    "批量供货",
+    "量产供货",
 )
 NEGATIVE_TERMS = (
     "利空",
@@ -104,6 +106,58 @@ NEGATIVE_TERMS = (
 )
 LONG_TERMS = ("规划", "长期", "产业趋势", "战略", "国产替代", "技术路线", "供给格局")
 MEDIUM_TERMS = ("政策", "订单", "产能", "涨价", "需求", "景气", "验证", "客户")
+TRUE_POSITIVE_TERMS = (
+    "国外大厂",
+    "海外大厂",
+    "国际大厂",
+    "英伟达",
+    "nvidia",
+    "苹果",
+    "apple",
+    "特斯拉",
+    "tesla",
+    "微软",
+    "microsoft",
+    "亚马逊",
+    "amazon",
+    "谷歌",
+    "google",
+    "meta",
+    "台积电",
+    "tsmc",
+    "三星",
+    "samsung",
+    "批量供货",
+    "量产供货",
+    "批量交付",
+    "规模化供货",
+    "增持",
+    "股份回购",
+    "回购股份",
+    "回购公司股份",
+)
+WEAK_POSITIVE_TERMS = (
+    "框架协议",
+    "意向协议",
+    "合作备忘录",
+    "战略合作协议",
+    "战略合作",
+    "不具约束力",
+    "可撤销",
+    "新增概念",
+    "概念股",
+    "概念业务",
+    "开展研究",
+    "相关研究",
+    "研发",
+    "布局",
+    "正布局",
+    "正在布局",
+    "送样",
+    "正送样",
+    "样品",
+    "客户验证",
+)
 MACRO_TERMS = (
     "非农",
     "就业数据",
@@ -627,6 +681,214 @@ class NewsSignalService:
             "outbox_enqueued": outbox_enqueued,
             "cursor": self.repo.latest_raw_episode_cursor("cls_telegraph"),
             "errors": [],
+        }
+
+    def ingest_portfolio_anysearch_news(
+        self,
+        *,
+        search_client: Optional[Any] = None,
+        name_resolver: Optional[Any] = None,
+        max_results_per_stock: int = 5,
+        max_age_days: int = 3,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Search actionable news for real portfolio holdings and persist cards.
+
+        This produces message-surface ``portfolio_anysearch`` cards only. It does
+        not run stock analysis, market review, or report notification flows.
+        """
+
+        current = (now or datetime.now()).replace(tzinfo=None)
+        holdings = _load_active_portfolio_holdings()
+        if not holdings:
+            return {
+                "status": "empty",
+                "source": "portfolio_anysearch",
+                "holding_count": 0,
+                "searched_holdings": 0,
+                "fetched_items": 0,
+                "accepted_items": 0,
+                "filtered_items": 0,
+                "new_raw_episodes": 0,
+                "events_upserted": 0,
+                "cards_upserted": 0,
+                "affected_dates": [],
+                "outbox_enqueued": 0,
+                "errors": [],
+                "cards": [],
+            }
+
+        client = search_client or _default_portfolio_anysearch_client()
+        if client is None:
+            return {
+                "status": "failed",
+                "source": "portfolio_anysearch",
+                "holding_count": len(holdings),
+                "searched_holdings": 0,
+                "fetched_items": 0,
+                "accepted_items": 0,
+                "filtered_items": 0,
+                "new_raw_episodes": 0,
+                "events_upserted": 0,
+                "cards_upserted": 0,
+                "affected_dates": [],
+                "outbox_enqueued": 0,
+                "errors": [{"source": "portfolio_anysearch", "error": "ANYSEARCH_API_KEY not configured"}],
+                "cards": [],
+            }
+
+        max_results = max(1, min(int(max_results_per_stock or 5), 10))
+        max_age = max(1, min(int(max_age_days or 3), 90))
+        resolver = name_resolver or _PortfolioStockNameResolver()
+        payload_results: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        filtered_items = 0
+        fetched_items = 0
+        searched_holdings = 0
+
+        for holding in holdings:
+            symbol = str(holding.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            market = str(holding.get("market") or "cn").strip().lower() or "cn"
+            try:
+                name = str(resolver(symbol, market) or "").strip()
+            except Exception as exc:
+                name = ""
+                errors.append({"symbol": symbol, "source": "name_resolver", "error": str(exc)})
+            if not name:
+                name = symbol
+            query = _portfolio_anysearch_query(symbol=symbol, name=name, market=market)
+            try:
+                response = _run_portfolio_news_search(
+                    client,
+                    query=query,
+                    max_results=max_results,
+                    max_age_days=max_age,
+                )
+            except Exception as exc:
+                errors.append({"symbol": symbol, "query": query, "source": "anysearch", "error": str(exc)})
+                continue
+
+            searched_holdings += 1
+            if not getattr(response, "success", False):
+                errors.append(
+                    {
+                        "symbol": symbol,
+                        "query": query,
+                        "source": "anysearch",
+                        "error": str(getattr(response, "error_message", None) or "search failed"),
+                    }
+                )
+                continue
+
+            results = list(getattr(response, "results", []) or [])[:max_results]
+            fetched_items += len(results)
+            for rank, result in enumerate(results, start=1):
+                gate = _portfolio_anysearch_gate(
+                    result,
+                    symbol=symbol,
+                    name=name,
+                    now=current,
+                    max_age_days=max_age,
+                )
+                if not gate["accepted"]:
+                    filtered_items += 1
+                    continue
+                payload_results.append(
+                    _portfolio_anysearch_dailynews_item(
+                        result,
+                        symbol=symbol,
+                        name=name,
+                        market=market,
+                        holding=holding,
+                        query=query,
+                        rank=rank,
+                        provider=str(getattr(response, "provider", "") or "AnySearch"),
+                        gate=gate,
+                        now=current,
+                    )
+                )
+
+        raw_payloads, card_payloads = self._build_from_dailynews(
+            {
+                "status": "ok",
+                "provider": "AnySearch",
+                "results": payload_results,
+                "source_chain": [{"provider": "AnySearch", "result": "ok", "scope": "portfolio_holdings"}],
+                "errors": errors,
+            },
+            source="portfolio_anysearch",
+            raw_prefix="portfolio_anysearch",
+            default_title="持仓消息面",
+        )
+        existing_ids = self.repo.existing_raw_episode_ids(
+            item.get("episode_id") for item in raw_payloads
+        )
+        new_raw_payloads = [
+            item for item in raw_payloads
+            if str(item.get("episode_id") or "") not in existing_ids
+        ]
+        new_episode_ids = {
+            str(item.get("episode_id") or "")
+            for item in new_raw_payloads
+            if item.get("episode_id")
+        }
+        new_card_payloads = [
+            card for card in card_payloads
+            if new_episode_ids.intersection(
+                str(value or "") for value in card.get("raw_episode_ids") or []
+            )
+        ]
+
+        saved_raw = self.repo.upsert_raw_episodes(new_raw_payloads)
+        saved_events = self.repo.upsert_extracted_events(
+            _collect_extracted_events(new_card_payloads)
+        )
+        saved_cards = self.repo.upsert_cards(new_card_payloads)
+        affected_dates = sorted(
+            {
+                str(card.get("signal_date") or "")
+                for card in saved_cards
+                if card.get("signal_date")
+            }
+        )
+        edge_sync = [
+            self.rebuild_edges(signal_date=signal_date, limit=500)
+            for signal_date in affected_dates
+        ]
+        cluster_sync = [
+            self.reconcile_same_event_clusters(signal_date=signal_date, limit=500)
+            for signal_date in affected_dates
+        ]
+        active_saved_cards = [
+            detail
+            for card in saved_cards
+            if (detail := self.repo.get_card(str(card.get("card_id") or "")))
+            and detail.get("status") == "active"
+        ]
+        outbox_enqueued = self._enqueue_graphiti_jobs(
+            active_saved_cards,
+            signal_dates=affected_dates,
+        )
+        status = "ok" if saved_raw else ("partial" if errors and payload_results else ("empty" if not errors else "failed"))
+        return {
+            "status": status,
+            "source": "portfolio_anysearch",
+            "holding_count": len(holdings),
+            "searched_holdings": searched_holdings,
+            "fetched_items": fetched_items,
+            "accepted_items": len(payload_results),
+            "filtered_items": filtered_items,
+            "new_raw_episodes": len(saved_raw),
+            "events_upserted": len(saved_events),
+            "cards_upserted": len(saved_cards),
+            "affected_dates": affected_dates,
+            "edge_sync": edge_sync,
+            "cluster_sync": cluster_sync,
+            "outbox_enqueued": outbox_enqueued,
+            "errors": errors,
+            "cards": saved_cards,
         }
 
     def _enqueue_graphiti_jobs(
@@ -1633,7 +1895,9 @@ class NewsSignalService:
                 "session": session,
                 "subjects": item.get("subjects") or [],
                 "stocks": item.get("stocks") or [],
-                "source_chain": payload.get("source_chain") or [{"provider": payload.get("provider") or source, "result": payload.get("status") or "ok"}],
+                "source_chain": item.get("source_chain")
+                or payload.get("source_chain")
+                or [{"provider": payload.get("provider") or source, "result": payload.get("status") or "ok"}],
                 "raw_payload": item,
                 "status": "ok",
                 "errors": [],
@@ -1762,8 +2026,15 @@ class NewsSignalService:
         company_candidate_count = len(source_stocks) + len(mapped_stocks)
         explicit_stocks = _stocks_explicitly_mentioned(source_stocks, text)
         explicitly_mapped_stocks = _stocks_explicitly_mentioned(mapped_stocks, text)
-        explicit_company_impacts, explicit_status, explicit_confidence = _company_impacts_from_cls_stocks(explicit_stocks, _infer_tone(text))
-        mapped_company_impacts, mapped_status, mapped_confidence = _company_impacts_from_mapped_stocks(explicitly_mapped_stocks, _infer_tone(text))
+        tone = _tone_from_polarity(item.get("polarity"))
+        if tone == "neutral":
+            tone = _infer_tone(text)
+        positive_quality = _positive_signal_quality(text)
+        tone_override = str(positive_quality.get("tone_override") or "")
+        if tone_override and tone in {"positive", "mixed", "neutral"}:
+            tone = tone_override
+        explicit_company_impacts, explicit_status, explicit_confidence = _company_impacts_from_cls_stocks(explicit_stocks, tone)
+        mapped_company_impacts, mapped_status, mapped_confidence = _company_impacts_from_mapped_stocks(explicitly_mapped_stocks, tone)
         company_impacts = _merge_company_impacts(explicit_company_impacts + mapped_company_impacts)
         company_mapping_gate = _company_mapping_gate(
             candidate_count=company_candidate_count,
@@ -1777,12 +2048,14 @@ class NewsSignalService:
             mapped_confidence,
             has_industry=bool(primary),
         )
-        tone = _infer_tone(text)
         horizon, decay, valid_until = _horizon_for_text(text, published_at)
         raw_quality = _raw_quality_summary(raw)
         evidence_grade = "confirmed" if explicit_company_impacts else ("plausible" if concepts or macro_theme else "speculative")
         if _status_from_quality(raw_quality) == "low_quality":
             evidence_grade = "speculative"
+        evidence_grade_override = str(positive_quality.get("evidence_grade_override") or "")
+        if evidence_grade_override:
+            evidence_grade = evidence_grade_override
         signal_layer = _classify_signal_layer(
             text=text,
             company_impacts=company_impacts,
@@ -1798,6 +2071,7 @@ class NewsSignalService:
             mapping_confidence=mapping_confidence,
         )
         adjusted_score = _score_with_quality(base_score, raw_quality)
+        adjusted_score = _apply_positive_signal_quality_score(adjusted_score, positive_quality)
         if generic_company_teaser:
             adjusted_score = min(adjusted_score, 35.0)
             evidence_grade = "speculative"
@@ -1856,6 +2130,7 @@ class NewsSignalService:
                 "rank": item.get("rank"),
                 "raw_quality": raw_quality,
                 "quality_gate": _quality_gate(raw_quality),
+                "positive_signal_quality": positive_quality,
                 "event_extraction": _event_extraction_summary(extracted_events),
             },
             "source_count": 1,
@@ -1993,6 +2268,374 @@ def _normalize_stock_code(value: Any) -> str:
     if 5 <= len(digits) <= 6:
         return digits.zfill(6)
     return text
+
+
+def _load_active_portfolio_holdings() -> List[Dict[str, Any]]:
+    from sqlalchemy import select
+
+    from src.storage import DatabaseManager, PortfolioAccount, PortfolioPosition
+
+    holdings: Dict[str, Dict[str, Any]] = {}
+    db = DatabaseManager.get_instance()
+    with db.get_session() as session:
+        rows = session.execute(
+            select(
+                PortfolioAccount.name,
+                PortfolioPosition.symbol,
+                PortfolioPosition.market,
+                PortfolioPosition.currency,
+                PortfolioPosition.quantity,
+            )
+            .join(PortfolioAccount, PortfolioPosition.account_id == PortfolioAccount.id)
+            .where(PortfolioAccount.is_active == True)  # noqa: E712
+            .where(PortfolioPosition.quantity > 0)
+            .order_by(PortfolioPosition.symbol.asc(), PortfolioAccount.name.asc())
+        ).all()
+
+    for account_name, symbol, market, currency, quantity in rows:
+        key = str(symbol or "").strip().upper()
+        if not key:
+            continue
+        entry = holdings.setdefault(
+            key,
+            {
+                "symbol": key,
+                "market": str(market or "cn").strip().lower() or "cn",
+                "currency": str(currency or "").strip() or "CNY",
+                "accounts": [],
+                "total_quantity": 0.0,
+            },
+        )
+        account = str(account_name or "").strip()
+        if account and account not in entry["accounts"]:
+            entry["accounts"].append(account)
+        try:
+            entry["total_quantity"] += float(quantity or 0.0)
+        except Exception:
+            pass
+    return list(holdings.values())
+
+
+def _default_portfolio_anysearch_client() -> Optional[Any]:
+    config = get_config()
+    api_key = str(getattr(config, "anysearch_api_key", "") or "").strip()
+    if not api_key:
+        return None
+    from src.search_service import AnySearchProvider
+
+    return AnySearchProvider([api_key])
+
+
+class _PortfolioStockNameResolver:
+    def __init__(self) -> None:
+        self._manager: Optional[Any] = None
+        self._cache: Dict[str, str] = {}
+
+    def __call__(self, symbol: str, market: str = "cn") -> str:
+        del market
+        key = str(symbol or "").strip().upper()
+        if not key:
+            return ""
+        if key in self._cache:
+            return self._cache[key]
+        try:
+            if self._manager is None:
+                from data_provider import DataFetcherManager
+
+                self._manager = DataFetcherManager()
+            name = str(self._manager.get_stock_name(key, allow_realtime=False) or "").strip()
+        except Exception:
+            name = ""
+        self._cache[key] = name
+        return name
+
+
+def _portfolio_anysearch_query(*, symbol: str, name: str, market: str) -> str:
+    code = str(symbol or "").strip().upper()
+    label = f"{str(name or '').strip()} {code}".strip()
+    market_key = str(market or "").strip().lower()
+    if market_key in {"us", "usa", "nasdaq", "nyse"} or re.fullmatch(r"[A-Z.]{1,8}", code):
+        return f"{label} latest news earnings guidance risk"
+    return f"{label} 最新消息 公告 业绩 风险"
+
+
+def _run_portfolio_news_search(
+    client: Any,
+    *,
+    query: str,
+    max_results: int,
+    max_age_days: int,
+) -> Any:
+    if hasattr(client, "search"):
+        return client.search(query, max_results=max_results, days=max_age_days)
+    return client.search_general_news(query, max_results=max_results, days=max_age_days)
+
+
+PORTFOLIO_ANYSEARCH_ACTION_TERMS = (
+    "业绩预增",
+    "业绩预告",
+    "业绩快报",
+    "预计",
+    "净利润",
+    "净亏损",
+    "亏损",
+    "回购",
+    "减持",
+    "增持",
+    "异常波动",
+    "风险提示",
+    "监管",
+    "问询",
+    "处罚",
+    "立案",
+    "调查",
+    "诉讼",
+    "仲裁",
+    "中标",
+    "订单",
+    "合同",
+    "签订",
+    "签署",
+    "框架协议",
+    "战略合作",
+    "送样",
+    "布局",
+    "批量供货",
+    "量产供货",
+    "建厂",
+    "停产",
+    "分拆",
+    "上市事宜",
+    "转股价格调整",
+    "权益分派",
+    "股权激励",
+    "资产重组",
+    "重大事项",
+    "停牌",
+    "复牌",
+    "earnings",
+    "guidance",
+    "buyback",
+    "repurchase",
+    "offering",
+    "investigation",
+    "lawsuit",
+    "risk",
+)
+PORTFOLIO_ANYSEARCH_POSITIVE_TERMS = (
+    "业绩预增",
+    "预增",
+    "业绩快报",
+    "盈利",
+    "同比增长",
+    "扭亏",
+    "回购",
+    "增持",
+    "中标",
+    "订单",
+    "权益分派",
+    "分红",
+    "股权激励",
+    "buyback",
+    "repurchase",
+)
+PORTFOLIO_ANYSEARCH_NEGATIVE_TERMS = (
+    "业绩预减",
+    "预减",
+    "业绩预亏",
+    "预亏",
+    "净亏损",
+    "亏损",
+    "同比下降",
+    "减持",
+    "风险提示",
+    "监管",
+    "问询",
+    "处罚",
+    "立案",
+    "调查",
+    "诉讼",
+    "仲裁",
+    "停牌",
+    "guidance cut",
+    "investigation",
+    "lawsuit",
+    "offering",
+    "risk",
+)
+PORTFOLIO_ANYSEARCH_LIST_PAGE_TERMS = (
+    "最新价格",
+    "行情",
+    "走势图",
+    "公告大全",
+    "公告列表",
+    "公告摘要",
+    "公司公告",
+    "股票公告",
+    "业绩公告",
+    "历史业绩报告",
+    "最新资讯",
+    "个股资讯",
+    "行情中心",
+    "股票股价",
+    "股价",
+    "重大事项提醒与新闻公告",
+)
+PORTFOLIO_ANYSEARCH_LIST_URL_TERMS = (
+    "corp/go.php/",
+    "quote.eastmoney.com",
+    "wap.eastmoney.com/quote",
+    "xueqiu.com/s/",
+    "stock.quote.stockstar.com/finance/performance",
+    "assortment/stock/list/info/summary",
+)
+
+
+def _portfolio_anysearch_gate(
+    result: Any,
+    *,
+    symbol: str,
+    name: str,
+    now: datetime,
+    max_age_days: int,
+) -> Dict[str, Any]:
+    title = str(getattr(result, "title", "") or "").strip()
+    snippet = str(getattr(result, "snippet", "") or "").strip()
+    url = str(getattr(result, "url", "") or "").strip()
+    source = str(getattr(result, "source", "") or "").strip()
+    text = f"{title} {snippet} {source} {url}"
+    lower_url = url.lower()
+    if any(term in lower_url for term in PORTFOLIO_ANYSEARCH_LIST_URL_TERMS):
+        return {"accepted": False, "reason": "list_or_quote_url"}
+    upper_text = text.upper()
+    code = str(symbol or "").strip().upper()
+    stock_name = str(name or "").strip()
+    has_anchor = bool(code and code in upper_text) or bool(stock_name and stock_name != code and stock_name in text)
+    if not has_anchor:
+        return {"accepted": False, "reason": "holding_anchor_missing"}
+
+    has_action = any(term in text or term.lower() in text.lower() for term in PORTFOLIO_ANYSEARCH_ACTION_TERMS)
+    title_has_action = any(term in title or term.lower() in title.lower() for term in PORTFOLIO_ANYSEARCH_ACTION_TERMS)
+    title_is_list_page = any(term in title for term in PORTFOLIO_ANYSEARCH_LIST_PAGE_TERMS)
+    is_list_page = any(term in text for term in PORTFOLIO_ANYSEARCH_LIST_PAGE_TERMS)
+    if title_is_list_page and not title_has_action:
+        return {"accepted": False, "reason": "list_or_quote_page"}
+    if is_list_page and not has_action:
+        return {"accepted": False, "reason": "list_or_quote_page"}
+    if not has_action:
+        return {"accepted": False, "reason": "actionable_terms_missing"}
+
+    published_at = _parse_datetime(getattr(result, "published_date", None))
+    if published_at is None:
+        return {"accepted": False, "reason": "missing_published_date"}
+    age_days = max(0, (now - published_at.replace(tzinfo=None)).days)
+    if age_days > max_age_days:
+        return {"accepted": False, "reason": "too_old", "published_at": published_at.isoformat()}
+    return {
+        "accepted": True,
+        "reason": "actionable_holding_news",
+        "published_at": published_at.isoformat(),
+        "action_terms": [term for term in PORTFOLIO_ANYSEARCH_ACTION_TERMS if term in text or term.lower() in text.lower()][:5],
+    }
+
+
+def _portfolio_anysearch_dailynews_item(
+    result: Any,
+    *,
+    symbol: str,
+    name: str,
+    market: str,
+    holding: Dict[str, Any],
+    query: str,
+    rank: int,
+    provider: str,
+    gate: Dict[str, Any],
+    now: datetime,
+) -> Dict[str, Any]:
+    published_at = _parse_datetime(gate.get("published_at")) or _parse_datetime(getattr(result, "published_date", None)) or now
+    title = str(getattr(result, "title", "") or "").strip()
+    snippet = str(getattr(result, "snippet", "") or "").strip()
+    display_title = _portfolio_anysearch_display_title(
+        title=title,
+        snippet=snippet,
+        symbol=symbol,
+        name=name,
+    )
+    url = str(getattr(result, "url", "") or "").strip()
+    stock = {
+        "code": symbol,
+        "symbol": symbol,
+        "name": name or symbol,
+        "market": market or holding.get("market") or "cn",
+        "role": "portfolio_holding",
+        "accounts": holding.get("accounts") or [],
+        "total_quantity": holding.get("total_quantity") or 0.0,
+    }
+    return {
+        "id": _stable_id("portfolio_anysearch", symbol, url, title),
+        "title": display_title,
+        "brief": display_title,
+        "content": snippet,
+        "snippet": snippet,
+        "url": url,
+        "published_at": published_at.isoformat(),
+        "published_ts": int(published_at.timestamp()),
+        "score": max(1.0, 1000.0 - float(rank)),
+        "rank": rank,
+        "is_important": True,
+        "subjects": [],
+        "subject_names": ["持仓消息面", "AnySearch"],
+        "stocks": [stock],
+        "polarity": _portfolio_anysearch_polarity(f"{display_title} {snippet}"),
+        "provider": provider or "AnySearch",
+        "source_query": query,
+        "raw_gate": gate,
+        "source_chain": [
+            {
+                "provider": provider or "AnySearch",
+                "result": "ok",
+                "scope": "portfolio_holdings",
+                "source": str(getattr(result, "source", "") or ""),
+                "url": url,
+                "published_at": published_at.isoformat(),
+                "rank": rank,
+                "query": query,
+            }
+        ],
+    }
+
+
+def _portfolio_anysearch_polarity(text: str) -> str:
+    value = str(text or "")
+    lowered = value.lower()
+    positive = any(term in value or term.lower() in lowered for term in PORTFOLIO_ANYSEARCH_POSITIVE_TERMS)
+    negative = any(term in value or term.lower() in lowered for term in PORTFOLIO_ANYSEARCH_NEGATIVE_TERMS)
+    if positive and negative:
+        return "mixed"
+    if positive:
+        return "positive"
+    if negative:
+        return "negative"
+    return "neutral"
+
+
+def _portfolio_anysearch_display_title(
+    *,
+    title: str,
+    snippet: str,
+    symbol: str,
+    name: str,
+) -> str:
+    cleaned_title = re.sub(r"\s+", " ", str(title or "")).strip()
+    cleaned_snippet = re.sub(r"\s+", " ", str(snippet or "")).strip()
+    label = str(name or symbol or "持仓").strip()
+    if cleaned_title.startswith("证券代码") and "关于" in cleaned_snippet:
+        start = cleaned_snippet.find("关于")
+        end = cleaned_snippet.find("公告", start)
+        if end > start:
+            subject = cleaned_snippet[start : end + len("公告")]
+            return _compact_text(f"{label}: {subject}", 180)
+    return cleaned_title or _compact_text(cleaned_snippet, 180) or f"{label} 持仓消息面"
 
 
 def _signal_date_and_session(value: datetime) -> Tuple[date, str]:
@@ -2341,6 +2984,180 @@ def _market_impact_from_tone(tone: str) -> str:
     if tone in {"positive", "negative", "mixed"}:
         return tone
     return "unknown"
+
+
+def _positive_signal_quality(text: str) -> Dict[str, Any]:
+    value = str(text or "")
+    lowered = value.lower()
+
+    def has_any(terms: Iterable[str]) -> bool:
+        return any(str(term).lower() in lowered for term in terms if str(term or "").strip())
+
+    matched_rules: List[str] = []
+    score_adjustment = 0.0
+    tone_override = ""
+    evidence_grade_override = ""
+
+    unlock_terms = ("解禁", "限售股上市", "解除限售", "大股东解禁", "控股股东解禁")
+    earnings_terms = ("业绩预增", "预增", "业绩预告", "净利润同比增长", "预计净利润", "预计202")
+    if has_any(unlock_terms) and has_any(earnings_terms):
+        matched_rules.append("大股东解禁前突发业绩预增")
+        return {
+            "category": "risk_disguised_positive",
+            "label": "利空式利好",
+            "strength": "weak",
+            "matched_rules": matched_rules,
+            "tone_override": "negative",
+            "evidence_grade_override": "speculative",
+            "score_cap": 45.0,
+            "score_adjustment": -18.0,
+        }
+
+    foreign_terms = (
+        "国外",
+        "海外",
+        "国际",
+        "境外",
+        "美国",
+        "欧洲",
+        "日本",
+        "韩国",
+        "英伟达",
+        "nvidia",
+        "苹果",
+        "apple",
+        "特斯拉",
+        "tesla",
+        "微软",
+        "microsoft",
+        "亚马逊",
+        "amazon",
+        "谷歌",
+        "google",
+        "meta",
+        "台积电",
+        "tsmc",
+        "三星",
+        "samsung",
+    )
+    contract_terms = ("签订", "签署", "合同", "订单", "供货协议", "采购协议", "长单")
+    if has_any(foreign_terms) and has_any(contract_terms):
+        matched_rules.append("已与国外大厂签合同")
+    if re.search(r"(落实|拟|计划|投资|建设).{0,24}(?:\d+(?:\.\d+)?\s*)?(?:亿美金|亿美元|美元).{0,24}(建厂|工厂|基地|产能)", value, re.IGNORECASE):
+        matched_rules.append("落实大额美元建厂")
+    if has_any(("海外停产", "国外停产", "境外停产", "海外工厂停产", "海外减产", "海外停工")):
+        matched_rules.append("海外停产")
+    if "增持" in value and "减持" not in value:
+        matched_rules.append("增持")
+    if _is_company_share_buyback_true_positive(value):
+        matched_rules.append("公司股份回购")
+    if has_any(("批量供货", "量产供货", "批量交付", "规模化供货", "批量出货", "稳定供货")):
+        matched_rules.append("批量供货")
+    if matched_rules:
+        return {
+            "category": "true_positive",
+            "label": "真利好",
+            "strength": "strong",
+            "matched_rules": matched_rules[:4],
+            "tone_override": "positive",
+            "evidence_grade_override": "",
+            "score_cap": None,
+            "score_adjustment": 8.0,
+        }
+
+    if has_any(("框架协议", "意向协议", "合作备忘录", "战略合作协议")):
+        matched_rules.append("随时可撤的框架/意向协议")
+    if has_any(("正布局", "正在布局", "布局", "正送样", "送样", "样品", "客户验证")):
+        matched_rules.append("布局/送样/客户验证")
+    if "新增概念" in value or ("新增" in value and "概念" in value) or has_any(("概念股", "概念业务")):
+        matched_rules.append("新增概念")
+    if re.search(r"(开展|推进|启动).{0,12}(研究|研发|试验|实验)", value):
+        matched_rules.append("新增研究/研发")
+    domestic_terms = ("国内", "境内", "本土")
+    if has_any(contract_terms) and not has_any(foreign_terms) and (has_any(domestic_terms) or "合同" in value):
+        matched_rules.append("国内主体合同")
+    if matched_rules:
+        score_adjustment = -12.0
+        tone_override = "positive"
+        evidence_grade_override = "speculative"
+        return {
+            "category": "one_day_positive",
+            "label": "一日游式利好",
+            "strength": "weak",
+            "matched_rules": _unique_strings(matched_rules)[:4],
+            "tone_override": tone_override,
+            "evidence_grade_override": evidence_grade_override,
+            "score_cap": 49.0,
+            "score_adjustment": score_adjustment,
+        }
+
+    return {
+        "category": "unclassified",
+        "label": "未识别",
+        "strength": "unknown",
+        "matched_rules": [],
+        "tone_override": "",
+        "evidence_grade_override": "",
+        "score_cap": None,
+        "score_adjustment": 0.0,
+    }
+
+
+def _is_company_share_buyback_true_positive(text: str) -> bool:
+    value = str(text or "")
+    if not value:
+        return False
+    lowered = value.lower()
+    macro_repo_terms = (
+        "逆回购",
+        "正回购",
+        "央行",
+        "人民银行",
+        "公开市场",
+        "回购操作",
+        "回购利率",
+    )
+    if any(term.lower() in lowered for term in macro_repo_terms):
+        return False
+    buyback_terms = (
+        "股份回购",
+        "回购股份",
+        "回购公司股份",
+        "回购部分股份",
+        "回购a股股份",
+        "回购A股股份",
+        "以集中竞价方式回购",
+    )
+    if not any(term.lower() in lowered for term in buyback_terms):
+        return False
+    company_context_terms = (
+        "董事长",
+        "控股股东",
+        "实际控制人",
+        "公司",
+        "公告",
+        ".sh",
+        ".sz",
+        ".bj",
+    )
+    shareholder_return_terms = (
+        "用于注销",
+        "全部用于注销",
+        "减少注册资本",
+        "注销并减少注册资本",
+        "提议回购",
+    )
+    return any(term.lower() in lowered for term in company_context_terms) or any(
+        term.lower() in lowered for term in shareholder_return_terms
+    )
+
+
+def _apply_positive_signal_quality_score(score: float, quality: Dict[str, Any]) -> float:
+    adjusted = float(score or 0.0) + float(quality.get("score_adjustment") or 0.0)
+    cap = quality.get("score_cap")
+    if cap is not None:
+        adjusted = min(adjusted, float(cap))
+    return round(max(0.0, min(100.0, adjusted)), 2)
 
 
 def _macro_theme_for_text(text: str) -> str:

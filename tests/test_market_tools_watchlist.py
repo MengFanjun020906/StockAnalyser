@@ -100,6 +100,29 @@ def _write_alphasift_strategy_dir(path):
     )
 
 
+def test_event_cards_require_event_rule_in_title_not_only_snippet():
+    polluted = SimpleNamespace(
+        title="WBG闫盼盼单手解罩3分21视频 单手解内衣为了出名-百度|安全直达官网",
+        snippet="欧盟议员批准拖延已久的美欧贸易协定，涉及关税、订单、出口和供应链。",
+        source="云企通建站公司",
+        url="https://www.yqtweb.com/contact.asp?/auto/61585120260704-EViSRdT.shtml",
+        published_date="2026-07-04",
+    )
+    valid = SimpleNamespace(
+        title="欧盟议员批准美欧贸易协定 关税取消承诺引发市场关注",
+        snippet="该事件涉及关税、订单、出口和供应链。",
+        source="Reuters",
+        url="https://example.test/trade-policy",
+        published_date="2026-07-04",
+    )
+
+    cards = market_tools._event_cards_from_response(SimpleNamespace(results=[polluted, valid]))
+
+    assert len(cards) == 1
+    assert cards[0]["title"] == valid.title
+    assert cards[0]["event_type"] == "trade_policy"
+
+
 def _write_profiled_alphasift_strategy_dir(path):
     path.mkdir(parents=True, exist_ok=True)
     (path / "profiled_heat.yaml").write_text(

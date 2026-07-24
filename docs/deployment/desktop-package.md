@@ -68,10 +68,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build-all.ps1
   - 推送语义化 tag（如 `v3.2.12`）后自动触发
   - 在 Actions 页面手动触发并指定 `release_tag`
 - 产物：
-  - Windows 安装包：Release 附件会整理为 `daily-stock-analysis-windows-installer-<tag>.exe`，本地 `apps/dsa-desktop/dist/` 中仍是 `*Setup*.exe`
-  - Windows 免安装包：`daily-stock-analysis-windows-noinstall-<tag>.zip`
-  - macOS Intel：`daily-stock-analysis-macos-x64-<tag>.dmg`
-  - macOS Apple Silicon：`daily-stock-analysis-macos-arm64-<tag>.dmg`
+  - Windows 安装包：Release 附件会整理为 `stockanalyser-windows-installer-<tag>.exe`，本地 `apps/dsa-desktop/dist/` 中仍是 `*Setup*.exe`
+  - Windows 免安装包：`stockanalyser-windows-noinstall-<tag>.zip`
+  - macOS Intel：`stockanalyser-macos-x64-<tag>.dmg`
+  - macOS Apple Silicon：`stockanalyser-macos-arm64-<tag>.dmg`
 
 建议发布流程：
 
@@ -122,7 +122,7 @@ Windows 安装包模式下，安装器仅支持当前用户安装且已禁用管
 
 ```
 win-unpacked/
-  Daily Stock Analysis.exe    <- 双击启动
+  StockAnalyser.exe    <- 双击启动
   .env                        <- 用户配置文件（首次启动自动生成）
   data/
     stock_analysis.db         <- 数据库
@@ -205,4 +205,4 @@ Windows 分发现在有两种方式：
 
 1. 解压文件夹
 2. 编辑 `.env` 配置 API Key 和股票列表
-3. 双击 `Daily Stock Analysis.exe` 启动
+3. 双击 `StockAnalyser.exe` 启动

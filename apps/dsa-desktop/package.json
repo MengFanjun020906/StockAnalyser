@@ -1,5 +1,5 @@
 {
-  "name": "daily-stock-analysis-desktop",
+  "name": "stock-analyser-desktop",
   "version": "3.14.2",
   "private": true,
   "main": "main.js",
@@ -13,8 +13,8 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.daily-stock-analysis.desktop",
-    "productName": "Daily Stock Analysis",
+    "appId": "com.stockanalyser.desktop",
+    "productName": "StockAnalyser",
     "directories": {
       "output": "dist"
     },

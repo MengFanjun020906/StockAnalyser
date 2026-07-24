@@ -1,6 +1,6 @@
 # 迁移到一台全新 Windows 电脑
 
-本文档面向「目标机器是一台空白 Windows，没有 Python、Node、uv、WSL」的场景，把 daily_stock_analysis 部署到新机器。
+本文档面向「目标机器是一台空白 Windows，没有 Python、Node、uv、WSL」的场景，把 StockAnalyser 部署到新机器。
 
 约束：
 - 包含 `.env` 配置文件迁移
@@ -12,7 +12,7 @@
 在旧机器上准备一个压缩包，至少包含：
 
 ```
-daily_stock_analysis/
+StockAnalyser/
   ├── .env                    # 当前可用的密钥/配置
   ├── requirements.txt
   ├── apps/dsa-web/
@@ -31,9 +31,9 @@ daily_stock_analysis/
 
 ```powershell
 cd <项目父目录>
-Compress-Archive -Path daily_stock_analysis -DestinationPath dsa.zip `
+Compress-Archive -Path StockAnalyser -DestinationPath stockanalyser.zip `
     -Force -CompressionLevel Optimal
-# 拷贝 dsa.zip 到 U 盘 / 网盘 / SCP 到新机器
+# 拷贝 stockanalyser.zip 到 U 盘 / 网盘 / SCP 到新机器
 ```
 
 或在 WSL/Linux 旧机器：
@@ -43,7 +43,7 @@ tar --exclude='.venv' --exclude='node_modules' \
     --exclude='data' --exclude='logs' --exclude='.cache' \
     --exclude='__pycache__' --exclude='.pytest_cache' \
     --exclude='Sequoia-X/data/*.db' \
-    -czf dsa.tar.gz daily_stock_analysis/
+    -czf stockanalyser.tar.gz StockAnalyser/
 ```
 
 ## 1. 新机器 — 安装 WSL2 + Ubuntu
@@ -55,10 +55,10 @@ tar --exclude='.venv' --exclude='node_modules' \
    ```powershell
    Set-ExecutionPolicy -Scope Process Bypass -Force
    ```
-3. 解压项目到任意位置，例如 `C:\Users\<you>\Downloads\daily_stock_analysis`。
+3. 解压项目到任意位置，例如 `C:\Users\<you>\Downloads\StockAnalyser`。
 4. 运行：
    ```powershell
-   cd C:\Users\<you>\Downloads\daily_stock_analysis
+   cd C:\Users\<you>\Downloads\StockAnalyser
    .\scripts\install-windows.ps1
    ```
    该脚本会：
@@ -84,10 +84,10 @@ tar --exclude='.venv' --exclude='node_modules' \
 mkdir -p ~/code
 cd ~/code
 # 假设你把 zip 放在 Windows 的 Downloads
-cp -r /mnt/c/Users/<你的Windows用户名>/Downloads/daily_stock_analysis .
+cp -r /mnt/c/Users/<你的Windows用户名>/Downloads/StockAnalyser .
 # 或解压
-# unzip /mnt/c/Users/<你>/Downloads/dsa.zip -d .
-cd daily_stock_analysis
+# unzip /mnt/c/Users/<你>/Downloads/stockanalyser.zip -d .
+cd StockAnalyser
 ls -la .env requirements.txt scripts/bootstrap-wsl.sh
 ```
 
@@ -96,7 +96,7 @@ ls -la .env requirements.txt scripts/bootstrap-wsl.sh
 ## 3. 一键安装 WSL 内依赖
 
 ```bash
-cd ~/code/daily_stock_analysis
+cd ~/code/StockAnalyser
 bash scripts/bootstrap-wsl.sh
 ```
 
@@ -168,7 +168,7 @@ GRAPHITI_ENABLED=false
 **Shell 1 — 后端：**
 
 ```bash
-cd ~/code/daily_stock_analysis
+cd ~/code/StockAnalyser
 source .venv/bin/activate
 bash scripts/start-backend.sh
 # 默认 http://0.0.0.0:8000，可通过 BACKEND_PORT 覆盖
@@ -177,7 +177,7 @@ bash scripts/start-backend.sh
 **Shell 2 — 前端：**
 
 ```bash
-cd ~/code/daily_stock_analysis
+cd ~/code/StockAnalyser
 bash scripts/start-web.sh
 # 默认 http://0.0.0.0:5173
 ```

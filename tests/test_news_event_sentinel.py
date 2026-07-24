@@ -7,13 +7,22 @@ import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from src.config import Config
 from src.repositories.news_event_sentinel_repo import NewsEventSentinelRepository
-from src.services.news_event_sentinel import ConfigWatchedUniverseProvider, NewsEventSentinel, NewsSignalCardProvider, WatchedSymbol, WatchedUniverse
+from src.services.news_event_sentinel import (
+    ConfigWatchedUniverseProvider,
+    FeishuSentinelNotifier,
+    GraphitiSentinelTraceProvider,
+    NewsEventSentinel,
+    NewsSignalCardProvider,
+    WatchedSymbol,
+    WatchedUniverse,
+    _build_envelope,
+)
 from src.storage import DatabaseManager, PortfolioAccount, PortfolioPosition
 
 
@@ -56,6 +65,31 @@ class _FakeNotifier:
     def send(self, envelope):
         self.envelopes.append(envelope)
         return {"status": "sent", "channel": "fake"}
+
+
+class _FakeTraceProvider:
+    def __init__(self, trace):
+        self.payload = trace
+        self.calls = []
+
+    def trace(self, card, decision):
+        self.calls.append((card, decision))
+        return dict(self.payload)
+
+
+class _FakeGraphitiSearch:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def search_sync(self, query, *, market=None, limit=10, timeout_seconds=None):
+        self.calls.append({
+            "query": query,
+            "market": market,
+            "limit": limit,
+            "timeout_seconds": timeout_seconds,
+        })
+        return dict(self.result)
 
 
 class _FailingCardProvider:
@@ -108,6 +142,26 @@ def _holding_risk_card(now: datetime):
     }
 
 
+def _holding_harm_card(now: datetime):
+    card = _holding_risk_card(now)
+    card["card_id"] = "card:portfolio-anysearch:600519:loss"
+    card["summary_short"] = "贵州茅台公告称预计阶段性净利润同比下降，经营压力上升。"
+    card["news_tone"] = "negative"
+    card["company_impacts"] = [
+        {"symbol": "600519", "name": "贵州茅台", "direction": "harm", "impact": "earnings_pressure"}
+    ]
+    card["extracted_events"] = [
+        {
+            "event_id": "evt:600519:loss-warning",
+            "event_type": "业绩验证",
+            "direction": "harm",
+            "evidence_sentence": "贵州茅台预计阶段性净利润同比下降。",
+            "confidence": 0.88,
+        }
+    ]
+    return card
+
+
 def _positive_industry_card(now: datetime, *, score: float = 59.5):
     return {
         "card_id": "card:cls:positive-industry",
@@ -143,6 +197,23 @@ def _positive_industry_card(now: datetime, *, score: float = 59.5):
             }
         ],
     }
+
+
+def _turnover_signal_card(now: datetime, *, card_id: str, summary: str):
+    card = _positive_industry_card(now)
+    card["card_id"] = card_id
+    card["summary_short"] = summary
+    card["primary_industries"] = ["盘面直播"]
+    card["secondary_industries"] = []
+    card["source_chain"] = [{"title": summary, "url": f"https://example.test/{card_id}", "source": "cls"}]
+    card["transmission_paths"] = [
+        {
+            "path": "市场成交额变化 -> 风险偏好 -> 盘面交易活跃度",
+            "mechanism": "market_turnover",
+            "target": "A股",
+        }
+    ]
+    return card
 
 
 def _negative_industry_card(now: datetime, *, score: float = 62.0):
@@ -298,6 +369,292 @@ class NewsEventSentinelTestCase(unittest.TestCase):
         self.assertEqual(triggers[0]["canonical_symbol"], "600519")
         self.assertEqual(triggers[0]["notification_status"], "sent")
 
+    def test_graphiti_trace_is_attached_to_trigger_and_feishu_markdown(self) -> None:
+        now = datetime(2026, 7, 20, 10, 15, 0)
+        card = _holding_risk_card(now)
+        notifier = _FakeNotifier()
+        trace_provider = _FakeTraceProvider(
+            {
+                "status": "linked",
+                "trace_id": "trace:test:600519",
+                "source": "graphiti",
+                "edge_count": 2,
+                "episode_count": 2,
+                "node_count": 2,
+                "edges": [
+                    {"name": "MENTIONS", "fact": "贵州茅台 -> 收入指引下调 -> 盈利预期下修"},
+                    {"name": "MENTIONS"},
+                ],
+                "episodes": [
+                    {"name": "trace:trace-b88763a2f848433dae8d20eca7f2f4dd", "source_description": "agent_trace"},
+                    {"summary_short": "渠道库存压力上升"},
+                ],
+                "nodes": [
+                    {"id": "stock:600519", "labels": ["Entity", "Stock"], "name": "贵州茅台"},
+                    {"name": "国轩高科", "labels": ["Entity", "MarketEvent"], "summary": "储能订单增长带动电池链关注"},
+                ],
+            }
+        )
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=_FakeCardProvider([card]),
+            notifier=notifier,
+            trace_provider=trace_provider,
+        )
+
+        result = sentinel.run_once(now=now)
+        envelope = notifier.envelopes[0]
+        markdown = FeishuSentinelNotifier(self.config)._build_markdown(envelope)
+
+        self.assertEqual(result["triggers"][0]["trace_status"], "linked")
+        self.assertEqual(result["triggers"][0]["notification_payload"]["trace_id"], "trace:test:600519")
+        self.assertEqual(envelope.trace_id, "trace:test:600519")
+        self.assertEqual(trace_provider.calls[0][0]["card_id"], card["card_id"])
+        self.assertIn("Graphiti 事件跟踪", markdown)
+        self.assertIn("状态：已关联 Graphiti", markdown)
+        self.assertIn("关联线索", markdown)
+        self.assertIn("贵州茅台 -> 收入指引下调", markdown)
+        self.assertIn("渠道库存压力上升", markdown)
+        self.assertIn("国轩高科（事件）", markdown)
+        self.assertNotIn("trace:trace-b88763a2f848433dae8d20eca7f2f4dd", markdown)
+        self.assertNotIn("MENTIONS", markdown)
+        self.assertNotIn("['Entity'", markdown)
+
+    def test_graphiti_trace_filters_weak_hits_for_turnover_signal_card(self) -> None:
+        now = datetime(2026, 7, 20, 10, 15, 0)
+        card = _turnover_signal_card(
+            now,
+            card_id="card:cls:514782be2569bf49cf0757f4",
+            summary="【沪深两市成交额突破2万亿 较上一日此时缩量超3100亿】财联社7月22日电，沪深两市成交额连续第72个交易日突破2万亿，较上一日此时缩量超3100亿。",
+        )
+        graphiti = _FakeGraphitiSearch(
+            {
+                "success": True,
+                "source": "graphiti",
+                "edges": [
+                    {"name": "MENTIONS", "fact": "中华网新闻频道提到出口额同比增长199.5%至448.2亿美元"},
+                    {"name": "MENTIONS", "fact": "航油价格大幅上涨推高成本，导致交通运输行业成本增加"},
+                ],
+                "episodes": [
+                    {"summary_short": "澎湃新闻报道三大航上半年预亏至少73亿元"},
+                    {
+                        "name": "trace:trace-b88763a2f848433dae8d20eca7f2f4dd",
+                        "source_description": "agent_trace",
+                        "content": "沪深两市成交额突破2万亿，但这是旧分析 trace，不应进哨兵卡片。",
+                    },
+                ],
+                "nodes": [
+                    {"name": "算力", "labels": ["Entity", "ImpactVariable"], "summary": "政策利好算力"},
+                    {"name": "交通运输行业", "labels": ["Sector"], "summary": "航油价格推高成本"},
+                ],
+            }
+        )
+        trace_provider = GraphitiSentinelTraceProvider(self.config, graphiti=graphiti)
+        notifier = _FakeNotifier()
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=_FakeCardProvider([card]),
+            notifier=notifier,
+            trace_provider=trace_provider,
+        )
+
+        result = sentinel.run_once(now=now)
+        envelope = notifier.envelopes[0]
+        markdown = FeishuSentinelNotifier(self.config)._build_markdown(envelope)
+
+        self.assertEqual(result["triggers"][0]["trace_status"], "empty")
+        self.assertEqual(envelope.graph_trace["fallback_reason"], "filtered_weak_relevance")
+        self.assertEqual(envelope.graph_trace["filtered_out_count"], 6)
+        self.assertIn("状态：Graphiti 未找到强关联", markdown)
+        self.assertIn("已过滤 6 条弱相关命中", markdown)
+        self.assertNotIn("出口额同比增长", markdown)
+        self.assertNotIn("航油价格", markdown)
+        self.assertNotIn("trace-b88763a2f848433dae8d20eca7f2f4dd", markdown)
+        self.assertNotIn("算力", markdown)
+        self.assertNotIn("交通运输行业", markdown)
+
+    def test_graphiti_trace_filters_polluted_event_watch_episode_for_tax_news(self) -> None:
+        now = datetime(2026, 7, 22, 15, 10, 0)
+        card = _positive_industry_card(now)
+        card.update(
+            {
+                "card_id": "card:cls:5319db1db574090f8347a10f",
+                "summary_short": "【财政部：上半年证券交易印花税1549亿元 同比增长97.3%】财联社7月22日电，财政部发布2026年上半年财政收支情况，上半年，印花税2752亿元，同比增长40.9%。其中，证券交易印花税1549亿元，同比增长97.3%。",
+                "primary_industries": ["实时快讯"],
+                "secondary_industries": [],
+                "explicit_entities": [],
+                "transmission_paths": [
+                    {
+                        "mechanism": "业绩预告验证景气兑现，重点观察实时快讯链条中收入、利润和订单弹性更高的产业链标的。",
+                        "target": "实时快讯",
+                    }
+                ],
+            }
+        )
+        graphiti = _FakeGraphitiSearch(
+            {
+                "success": True,
+                "source": "graphiti",
+                "edges": [
+                    {"name": "MENTIONS", "fact": "中华网新闻频道提到韩国6月半导体出口额同比增长199.5%至448.2亿美元"},
+                    {"name": "MENTIONS", "fact": "中华网新闻频道提到出口额同比增长199.5%至448.2亿美元"},
+                    {"name": "MENTIONS", "fact": "澎湃新闻-The Paper报道了航油价格大幅上涨推高成本，导致三大航上半年预亏至少73亿元"},
+                ],
+                "episodes": [
+                    {
+                        "name": "market_event:WBG_3_21___-:2026-07-04",
+                        "source_description": "event_impact_candidate_discovery",
+                        "content": '{"title":"WBG闫盼盼单手解罩3分21视频 单手解内衣为了出名-百度|安全直达官网","snippet":"欧盟议员批准拖延已久的美欧贸易协定。"}',
+                    }
+                ],
+                "nodes": [
+                    {"name": "出口", "labels": ["Entity", "ThemeWatch"], "summary": "中华网新闻频道提到出口额同比增长199.5%至448.2亿美元"},
+                    {"name": "中华网新闻频道", "labels": ["Entity", "MarketEvent"], "summary": "半导体出口额同比增长"},
+                ],
+            }
+        )
+        trace = GraphitiSentinelTraceProvider(self.config, graphiti=graphiti).trace(
+            card,
+            {
+                "symbols": ["SIGNAL:POSITIVE"],
+                "event_type": "industry_positive_signal",
+                "direction": "positive",
+                "severity": "mid",
+            },
+        )
+        envelope = _build_envelope(
+            card,
+            {
+                "symbol": "SIGNAL:POSITIVE",
+                "symbols": ["SIGNAL:POSITIVE"],
+                "event_type": "industry_positive_signal",
+                "direction": "positive",
+                "severity": "mid",
+                "event_id": "",
+                "why_triggered": ["正向线索"],
+            },
+            graph_trace=trace,
+        )
+        markdown = FeishuSentinelNotifier(self.config)._build_markdown(envelope)
+
+        self.assertEqual(trace["status"], "empty")
+        self.assertEqual(trace["fallback_reason"], "filtered_weak_relevance")
+        self.assertIn("Graphiti 未找到强关联", markdown)
+        self.assertNotIn("闫盼盼", markdown)
+        self.assertNotIn("安全直达官网", markdown)
+        self.assertNotIn("出口额同比增长199.5%", markdown)
+        self.assertNotIn("航油价格", markdown)
+
+    def test_graphiti_trace_for_company_signal_requires_company_anchor(self) -> None:
+        now = datetime(2026, 7, 22, 15, 37, 42)
+        card = _positive_industry_card(now)
+        card.update(
+            {
+                "card_id": "card:cls:6c94560fef24060b620d5d9c",
+                "summary_short": "【奥浦迈：预计2026年半年度净利润同比增长229%】财联社7月22日电，奥浦迈(688293.SH)公告称，预计2026年半年度归属于母公司所有者的净利润为1.24亿元左右，同比增长229%。",
+                "signal_layer": "company",
+                "primary_industries": ["A股公告速递", "科创板最新动态"],
+                "secondary_industries": [],
+                "explicit_entities": ["A股公告速递", "科创板最新动态", "奥浦迈"],
+                "company_impacts": [
+                    {
+                        "symbol": "688293",
+                        "name": "奥浦迈",
+                        "direction": "benefit",
+                        "confidence": 0.9,
+                    }
+                ],
+                "transmission_paths": [
+                    {
+                        "source": "A股公告速递",
+                        "mechanism": "业绩预告验证景气兑现，重点观察A股公告速递链条中收入、利润和订单弹性更高的奥浦迈。",
+                        "target": "奥浦迈",
+                        "affected_symbols": ["688293"],
+                        "evidence_snippets": ["奥浦迈：预计2026年半年度净利润同比增长229%"],
+                    }
+                ],
+            }
+        )
+        graphiti = _FakeGraphitiSearch(
+            {
+                "success": True,
+                "source": "graphiti",
+                "edges": [
+                    {"name": "MENTIONS", "fact": "A股公告速递提到韩国6月半导体出口额同比增长199.5%至448.2亿美元"},
+                    {"name": "MENTIONS", "fact": "科创板最新动态提到航油价格大幅上涨推高三大航成本"},
+                    {"name": "MENTIONS", "fact": "奥浦迈完成澎立生物收购后合并报表范围变化，预计净利润同比增长229%"},
+                ],
+                "episodes": [
+                    {"summary_short": "国金证券研报提到跨境电商二季度业绩超预期"},
+                    {"summary_short": "奥浦迈半年度业绩预告显示利润同比高增长"},
+                ],
+                "nodes": [
+                    {"name": "中国石化", "labels": ["Entity", "Stock"], "attributes": {"code": "600111"}},
+                    {"name": "奥浦迈", "labels": ["Entity", "Stock"], "attributes": {"code": "688293"}},
+                ],
+            }
+        )
+
+        trace = GraphitiSentinelTraceProvider(self.config, graphiti=graphiti).trace(
+            card,
+            {
+                "symbols": ["SIGNAL:POSITIVE"],
+                "event_type": "earnings_validation",
+                "direction": "positive",
+                "severity": "high",
+            },
+        )
+        envelope = _build_envelope(
+            card,
+            {
+                "symbol": "SIGNAL:POSITIVE",
+                "symbols": ["SIGNAL:POSITIVE"],
+                "event_type": "earnings_validation",
+                "direction": "positive",
+                "severity": "high",
+                "event_id": "",
+                "why_triggered": ["正向线索"],
+            },
+            graph_trace=trace,
+        )
+        markdown = FeishuSentinelNotifier(self.config)._build_markdown(envelope)
+
+        self.assertEqual(trace["status"], "linked")
+        self.assertEqual(trace["edge_count"], 1)
+        self.assertEqual(trace["episode_count"], 1)
+        self.assertEqual(trace["node_count"], 1)
+        self.assertEqual(trace["filtered_out_count"], 4)
+        self.assertIn("奥浦迈完成澎立生物收购", markdown)
+        self.assertIn("奥浦迈半年度业绩预告", markdown)
+        self.assertIn("奥浦迈(688293)", markdown)
+        self.assertNotIn("韩国6月半导体出口额", markdown)
+        self.assertNotIn("航油价格", markdown)
+        self.assertNotIn("跨境电商", markdown)
+        self.assertNotIn("中国石化", markdown)
+
+    def test_holding_event_accepts_benefit_harm_direction_aliases(self) -> None:
+        now = datetime(2026, 7, 20, 10, 15, 0)
+        card = _holding_harm_card(now)
+        notifier = _FakeNotifier()
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=_FakeCardProvider([card]),
+            notifier=notifier,
+        )
+
+        result = sentinel.run_once(now=now)
+
+        self.assertEqual(result["triggered"], 1)
+        self.assertEqual(result["triggers"][0]["direction"], "negative")
+        self.assertEqual(result["triggers"][0]["canonical_symbol"], "600519")
+        self.assertEqual(notifier.envelopes[0].direction, "negative")
+
     def test_a_share_macro_event_triggers_without_company_match(self) -> None:
         now = datetime(2026, 7, 20, 10, 15, 0)
         card = _macro_card(
@@ -371,6 +728,12 @@ class NewsEventSentinelTestCase(unittest.TestCase):
     def test_positive_industry_signal_triggers_without_company_match(self) -> None:
         now = datetime(2026, 7, 20, 10, 15, 0)
         card = _positive_industry_card(now)
+        card["diagnostics"] = {
+            "positive_signal_quality": {
+                "category": "true_positive",
+                "label": "真利好",
+            }
+        }
         notifier = _FakeNotifier()
         sentinel = NewsEventSentinel(
             config=self.config,
@@ -387,7 +750,39 @@ class NewsEventSentinelTestCase(unittest.TestCase):
         self.assertEqual(notifier.envelopes[0].symbols, ["SIGNAL:POSITIVE"])
         self.assertIn("正向线索", notifier.envelopes[0].why_triggered)
         self.assertIn("主题=国产算力", notifier.envelopes[0].why_triggered)
+        self.assertIn("利好质量=真利好", notifier.envelopes[0].why_triggered)
         self.assertEqual(notifier.envelopes[0].severity, "mid")
+
+    def test_turnover_milestone_signal_uses_normalized_cooldown(self) -> None:
+        now = datetime(2026, 7, 20, 10, 15, 0)
+        first = _turnover_signal_card(
+            now,
+            card_id="card:cls:turnover-1t",
+            summary="【沪深两市成交额突破1万亿 较上一日此时放量超800亿】财联社7月20日电，据财联社盯盘数据显示，沪深两市成交额突破1万亿。",
+        )
+        second = _turnover_signal_card(
+            now,
+            card_id="card:cls:turnover-1_5t",
+            summary="【沪深两市成交额突破1.5万亿 较上一日此时缩量超50亿】财联社7月20日电，据财联社盯盘数据显示，沪深两市成交额突破1.5万亿。",
+        )
+        provider = _FakeCardProvider([first])
+        notifier = _FakeNotifier()
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=provider,
+            notifier=notifier,
+        )
+
+        first_result = sentinel.run_once(now=now)
+        provider.cards = [second]
+        second_result = sentinel.run_once(now=now + timedelta(minutes=30))
+
+        self.assertEqual(first_result["triggered"], 1)
+        self.assertEqual(second_result["triggered"], 0)
+        self.assertEqual(second_result["suppressed_by_cooldown"], 1)
+        self.assertEqual(len(notifier.envelopes), 1)
 
     def test_negative_industry_signal_triggers_without_company_match(self) -> None:
         now = datetime(2026, 7, 20, 10, 15, 0)
@@ -633,6 +1028,25 @@ class NewsEventSentinelTestCase(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0]["status"], "skipped_inactive_window")
 
+    def test_default_active_window_stops_after_midnight(self) -> None:
+        now = datetime(2026, 7, 21, 0, 1, 0)
+        provider = _FakeCardProvider([_holding_risk_card(now)])
+        notifier = _FakeNotifier()
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=provider,
+            notifier=notifier,
+        )
+
+        result = sentinel.run_once(now=now)
+
+        self.assertEqual(self.config.news_event_sentinel_active_windows, "08:00-23:59")
+        self.assertEqual(result["status"], "skipped_inactive_window")
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(len(notifier.envelopes), 0)
+
     def test_default_card_provider_reuses_ingestion_before_monitoring_cards(self) -> None:
         now = datetime(2026, 7, 20, 10, 15, 0)
         service = MagicMock()
@@ -683,6 +1097,157 @@ class NewsEventSentinelTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["fetched_count"], 50)
         self.assertEqual(result["card_count"], 1)
+
+    def test_default_card_provider_includes_recent_portfolio_anysearch_cards_by_publish_time(self) -> None:
+        now = datetime.now().replace(microsecond=0)
+        published_at = now - timedelta(days=2)
+        from src.services.news_signal_service import NewsSignalService
+
+        service = NewsSignalService()
+        card = _holding_risk_card(published_at)
+        card["card_id"] = "card:portfolio-anysearch:600519"
+        card["signal_date"] = published_at.date()
+        card["valid_from"] = published_at
+        card["diagnostics"] = {"source": "portfolio_anysearch"}
+        service.repo.upsert_cards([card])
+        provider = NewsSignalCardProvider(config=self.config)
+
+        with patch.object(
+            service,
+            "ingest_cls_incremental",
+            return_value={"status": "empty", "fetched_items": 0, "new_raw_episodes": 0, "errors": []},
+        ), patch.object(
+            service,
+            "list_cards",
+            return_value={"items": []},
+        ), patch("src.services.news_signal_service.NewsSignalService", return_value=service):
+            result = provider.fetch_cards(
+                universe=_FakeUniverseProvider().load(now=now),
+                now=now,
+                limit=20,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["diagnostics"]["portfolio_anysearch_cards"], 1)
+        self.assertEqual(result["cards"][0]["card_id"], "card:portfolio-anysearch:600519")
+
+    def test_default_card_provider_excludes_old_portfolio_anysearch_even_when_updated_recently(self) -> None:
+        now = datetime.now().replace(microsecond=0)
+        published_at = now - timedelta(days=7)
+        from src.services.news_signal_service import NewsSignalService
+
+        service = NewsSignalService()
+        card = _holding_risk_card(published_at)
+        card["card_id"] = "card:portfolio-anysearch:600519"
+        card["signal_date"] = published_at.date()
+        card["valid_from"] = published_at
+        card["updated_at"] = now
+        card["diagnostics"] = {"source": "portfolio_anysearch"}
+        service.repo.upsert_cards([card])
+        provider = NewsSignalCardProvider(config=self.config)
+
+        with patch.object(
+            service,
+            "ingest_cls_incremental",
+            return_value={"status": "empty", "fetched_items": 0, "new_raw_episodes": 0, "errors": []},
+        ), patch.object(
+            service,
+            "list_cards",
+            return_value={"items": []},
+        ), patch("src.services.news_signal_service.NewsSignalService", return_value=service):
+            result = provider.fetch_cards(
+                universe=_FakeUniverseProvider().load(now=now),
+                now=now,
+                limit=20,
+            )
+
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["diagnostics"]["portfolio_anysearch_cards"], 0)
+        self.assertEqual(result["cards"], [])
+
+    def test_default_card_provider_does_not_drop_portfolio_anysearch_when_base_limit_is_full(self) -> None:
+        now = datetime.now().replace(microsecond=0)
+        published_at = now - timedelta(days=2)
+        from src.services.news_signal_service import NewsSignalService
+
+        service = NewsSignalService()
+        for symbol in ("600519", "300750"):
+            card = _holding_risk_card(published_at)
+            card["card_id"] = f"card:portfolio-anysearch:{symbol}"
+            card["signal_date"] = published_at.date()
+            card["valid_from"] = published_at
+            card["diagnostics"] = {"source": "portfolio_anysearch"}
+            card["company_impacts"][0]["symbol"] = symbol
+            service.repo.upsert_cards([card])
+        base_cards = [{"card_id": f"card:cls:{index}", "summary_short": "CLS"} for index in range(20)]
+        provider = NewsSignalCardProvider(config=self.config)
+
+        with patch.object(
+            service,
+            "ingest_cls_incremental",
+            return_value={"status": "empty", "fetched_items": 0, "new_raw_episodes": 0, "errors": []},
+        ), patch.object(
+            service,
+            "list_cards",
+            return_value={"items": base_cards},
+        ), patch("src.services.news_signal_service.NewsSignalService", return_value=service):
+            result = provider.fetch_cards(
+                universe=_FakeUniverseProvider().load(now=now),
+                now=now,
+                limit=20,
+            )
+
+        ids = [card["card_id"] for card in result["cards"]]
+        self.assertEqual(result["card_count"], 20)
+        self.assertIn("card:portfolio-anysearch:600519", ids[:2])
+        self.assertIn("card:portfolio-anysearch:300750", ids[:2])
+
+    def test_portfolio_anysearch_freshness_suppresses_old_publish_time_even_when_updated_today(self) -> None:
+        now = datetime(2026, 7, 20, 10, 15, 0)
+        card = _holding_risk_card(now - timedelta(days=7))
+        card["card_id"] = "card:portfolio-anysearch:600519"
+        card["valid_from"] = (now - timedelta(days=7)).isoformat()
+        card["updated_at"] = now.isoformat()
+        card["diagnostics"] = {"source": "portfolio_anysearch"}
+        self.config.news_event_sentinel_card_max_age_minutes = 30
+        notifier = _FakeNotifier()
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=_FakeCardProvider([card]),
+            notifier=notifier,
+        )
+
+        result = sentinel.run_once(now=now)
+
+        self.assertEqual(result["triggered"], 0)
+        self.assertEqual(result["cards_scanned"], 1)
+        self.assertEqual(result["run"]["diagnostics"]["stale_card_suppressed"], 1)
+        self.assertEqual(notifier.envelopes, [])
+
+    def test_portfolio_anysearch_freshness_allows_publish_time_inside_three_days(self) -> None:
+        now = datetime(2026, 7, 20, 10, 15, 0)
+        card = _holding_risk_card(now - timedelta(days=2))
+        card["card_id"] = "card:portfolio-anysearch:600519"
+        card["valid_from"] = (now - timedelta(days=2)).isoformat()
+        card["updated_at"] = now.isoformat()
+        card["diagnostics"] = {"source": "portfolio_anysearch"}
+        self.config.news_event_sentinel_card_max_age_minutes = 30
+        self.config.news_signal_portfolio_anysearch_max_age_days = 3
+        notifier = _FakeNotifier()
+        sentinel = NewsEventSentinel(
+            config=self.config,
+            repository=self.repo,
+            universe_provider=_FakeUniverseProvider(),
+            card_provider=_FakeCardProvider([card]),
+            notifier=notifier,
+        )
+
+        result = sentinel.run_once(now=now)
+
+        self.assertEqual(result["triggered"], 1)
+        self.assertEqual(notifier.envelopes[0].card_id, "card:portfolio-anysearch:600519")
 
     def test_source_failure_marks_run_failed(self) -> None:
         now = datetime(2026, 7, 20, 10, 15, 0)

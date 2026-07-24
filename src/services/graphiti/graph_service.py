@@ -308,6 +308,7 @@ class GraphitiService:
             from graphiti_core.graphiti import Graphiti
             from .litellm_client import LiteLLMGraphitiClient
             from .litellm_embedder import LiteLLMGraphitiEmbedder
+            from .reranker import DeterministicGraphitiReranker
 
             self._graphiti_cls = Graphiti
             self._client = Graphiti(
@@ -316,6 +317,7 @@ class GraphitiService:
                 password=self.config.graphiti_neo4j_password,
                 llm_client=LiteLLMGraphitiClient(),
                 embedder=LiteLLMGraphitiEmbedder(),
+                cross_encoder=DeterministicGraphitiReranker(),
             )
             logger.info(
                 "Graphiti initialized (uri=%s, group_strategy=%s)",
@@ -404,7 +406,7 @@ class GraphitiService:
     def _resolve_group_id(self, market: str | None = None, user_id: str | None = None) -> str:
         strategy = self.config.graphiti_group_strategy
         if strategy == "single":
-            return "daily_stock_analysis"
+            return "StockAnalyser"
         if strategy == "user":
             return f"user_{_safe_group_token(user_id, 'default')}"
         return f"market_{_safe_group_token((market or 'cn').lower(), 'cn')}"
@@ -655,10 +657,18 @@ class GraphitiService:
         if not self.is_available():
             return {"status": "skipped", "reason": "graphiti_unavailable"}
 
-        return self._run_sync(
-            self.ingest_news_signal_card(**kwargs),
-            timeout_seconds=timeout_seconds,
-        )
+        try:
+            return self._run_sync(
+                self.ingest_news_signal_card(**kwargs),
+                timeout_seconds=timeout_seconds,
+            )
+        except TimeoutError:
+            card = kwargs.get("card") or {}
+            return {
+                "status": "failed",
+                "error": "graphiti_news_signal_ingest_timeout",
+                "card_id": str(card.get("card_id") or ""),
+            }
 
     def remove_news_signal_card_sync(self, **kwargs: Any) -> dict[str, Any]:
         if not self.is_available():

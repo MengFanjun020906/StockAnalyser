@@ -42,6 +42,39 @@ def test_cls_incremental_interval_is_clamped_to_five_to_ten_minutes() -> None:
     assert slow[0]["interval_seconds"] == 10 * 60
 
 
+def test_build_news_signal_background_tasks_registers_portfolio_anysearch_news() -> None:
+    config = SimpleNamespace(
+        news_signal_cls_incremental_enabled=False,
+        news_signal_portfolio_anysearch_enabled=True,
+        news_signal_portfolio_anysearch_interval_minutes=300,
+        news_signal_portfolio_anysearch_max_results_per_stock=5,
+        news_signal_portfolio_anysearch_max_age_days=21,
+        news_signal_portfolio_anysearch_run_immediately=True,
+        news_event_sentinel_enabled=False,
+        graphiti_enabled=False,
+    )
+    service = MagicMock()
+    service.ingest_portfolio_anysearch_news.return_value = {
+        "status": "ok",
+        "holding_count": 2,
+        "accepted_items": 2,
+        "new_raw_episodes": 2,
+    }
+
+    with patch("src.services.news_signal_scheduler.NewsSignalService", return_value=service):
+        tasks = build_news_signal_background_tasks(config)
+        tasks[0]["task"]()
+
+    assert len(tasks) == 1
+    assert tasks[0]["name"] == "news_signal_portfolio_anysearch"
+    assert tasks[0]["interval_seconds"] == 300 * 60
+    assert tasks[0]["run_immediately"] is True
+    service.ingest_portfolio_anysearch_news.assert_called_once_with(
+        max_results_per_stock=5,
+        max_age_days=21,
+    )
+
+
 def test_build_news_signal_background_tasks_registers_graphiti_outbox_worker() -> None:
     config = SimpleNamespace(
         news_signal_cls_incremental_enabled=False,

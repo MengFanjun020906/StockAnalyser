@@ -18,7 +18,9 @@ from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RR
 
 from src.services.graphiti.graph_service import GraphitiService
 from src.services.graphiti.litellm_client import LiteLLMGraphitiClient
+from src.services.graphiti.litellm_embedder import LiteLLMGraphitiEmbedder
 from src.services.graphiti.ontology import DEFAULT_ENTITY_TYPES, validate_entity_types
+from src.services.graphiti.reranker import DeterministicGraphitiReranker
 
 
 class GraphitiServiceTestCase(unittest.TestCase):
@@ -76,9 +78,54 @@ class GraphitiServiceTestCase(unittest.TestCase):
             ))
 
         self.assertEqual(result, {"extracted_entities": []})
+        self.assertIs(seen["think"], False)
         self.assertEqual(seen["response_format"]["type"], "json_schema")
         self.assertIn("extracted_entities", seen["response_format"]["json_schema"]["schema"]["properties"])
         self.assertIn("Do not return the schema itself", seen["messages"][-1]["content"])
+
+    def test_embedder_falls_back_to_local_hash_without_external_key(self):
+        with patch("src.services.graphiti.litellm_embedder.get_config") as mock_get_config, \
+                patch.dict("os.environ", {}, clear=True):
+            cfg = mock_get_config.return_value
+            cfg.graphiti_embedding_model = ""
+            cfg.graphiti_embedding_base_url = None
+            cfg.graphiti_embedding_api_key = None
+
+            embedder = LiteLLMGraphitiEmbedder()
+            first = asyncio.run(embedder.create("储能 出货 增长"))
+            second = asyncio.run(embedder.create("储能 出货 增长"))
+
+        self.assertEqual(embedder.model, "local/hash-embedding")
+        self.assertEqual(len(first), embedder.config.embedding_dim)
+        self.assertEqual(first, second)
+        self.assertGreater(sum(abs(item) for item in first), 0)
+
+    def test_enabled_service_uses_deterministic_reranker_without_openai_key(self):
+        with patch("src.services.graphiti.graph_service.get_config") as mock_get_config, \
+                patch("src.services.graphiti.graph_service._can_open_tcp", return_value=(True, "")), \
+                patch.dict("os.environ", {"OPENAI_API_KEY": ""}, clear=False), \
+                patch("graphiti_core.graphiti.Graphiti") as mock_graphiti:
+            cfg = mock_get_config.return_value
+            cfg.graphiti_enabled = True
+            cfg.graphiti_neo4j_uri = "bolt://localhost:7687"
+            cfg.graphiti_neo4j_user = "neo4j"
+            cfg.graphiti_neo4j_password = "password"
+            cfg.graphiti_group_strategy = "market"
+            cfg.graphiti_llm_model = "deepseek/deepseek-v4-flash"
+            cfg.litellm_model = "deepseek/deepseek-v4-flash"
+            cfg.litellm_fallback_models = []
+            cfg.llm_temperature = 0.0
+            cfg.graphiti_embedding_model = "openai/text-embedding-3-small"
+            cfg.graphiti_embedding_base_url = None
+            cfg.graphiti_embedding_api_key = None
+
+            service = GraphitiService()
+
+        self.assertTrue(service.is_available())
+        self.assertIsInstance(
+            mock_graphiti.call_args.kwargs["cross_encoder"],
+            DeterministicGraphitiReranker,
+        )
 
     def test_ingest_analysis_serializes_episode_body(self):
         with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
@@ -100,7 +147,7 @@ class GraphitiServiceTestCase(unittest.TestCase):
         ))
 
         kwargs = service._client.add_episode.await_args.kwargs
-        self.assertEqual(kwargs["group_id"], "daily_stock_analysis")
+        self.assertEqual(kwargs["group_id"], "StockAnalyser")
         self.assertIsInstance(kwargs["episode_body"], str)
         self.assertIn("600519", kwargs["episode_body"])
 
@@ -306,6 +353,27 @@ class GraphitiServiceTestCase(unittest.TestCase):
             )
 
         self.assertEqual(run_sync.call_args.kwargs["timeout_seconds"], 42)
+
+    def test_news_signal_sync_ingest_timeout_returns_structured_failure(self):
+        with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:
+            cfg = mock_get_config.return_value
+            cfg.graphiti_enabled = False
+            cfg.graphiti_group_strategy = "market"
+            service = GraphitiService()
+
+        service.enabled = True
+        service._client = MagicMock()
+
+        with patch.object(service, "_run_sync", side_effect=TimeoutError):
+            result = service.ingest_news_signal_card_sync(
+                card={"card_id": "card:timeout"},
+                market="cn",
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "graphiti_news_signal_ingest_timeout")
+        self.assertEqual(result["card_id"], "card:timeout")
 
     def test_search_initializes_indices_before_query(self):
         with patch("src.services.graphiti.graph_service.get_config") as mock_get_config:

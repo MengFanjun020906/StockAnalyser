@@ -20,6 +20,8 @@ Connectors -> Agents -> Core committee -> Memory / DB -> Jobs / Web
 
 本仓库已经有账户感知、四席位选股、Meta-Agent、点位计算、组合配置、反方审查、Judge、Risk Gate、Agent Trace 和 Portfolio Service。直接搬整套 `openInvest` 会制造双数据源和双编排链路。建议采用“按组件吸收”的方式，把高价值机制接入现有链路。
 
+最新同步记录：2026-07-20 已将本地 `openInvest/` 快进到 `origin/main` 快照 `717974a`。相较上一轮总结，新增价值主要来自 `0.31.5` 至 `0.31.7` 的硬化修复：交易状态 CAS 防重复入账、缺价/0 价治理、benchmark 缓存终点新鲜度、回测 win rate 防前视、Web/API token 保护、Docker 排除本地账本、backup skill 安装形态兜底。
+
 ## 2. 迁移原则
 
 - 不迁移整仓，不新增与现有 `src/agent/`、`src/services/`、`src/repositories/` 平行的投资系统。
@@ -35,10 +37,14 @@ Connectors -> Agents -> Core committee -> Memory / DB -> Jobs / Web
 | --- | --- | --- | --- | --- |
 | P0 | CIO / Judge sanity check | `openInvest/core/committee.py` | `src/agent/risk_gate.py` 或新增 `src/agent/judge_sanity.py` | 提取确定性后处理规则，接在 Judge 输出之后、Risk Gate 之前 |
 | P0 | LLM telemetry | `openInvest/core/llm_telemetry.py` | `src/agent/llm_adapter.py`、Agent Trace artifact | 统一记录 role / asset / stage / tokens / latency / cost / tool calls |
+| P0 | 交易状态 CAS / 防重复入账 | `openInvest/db/trades_db.py`、`openInvest/connectors/web_api/routers/trades.py` | 未来订单状态流、执行记录、交易导入幂等层 | 状态跃迁必须声明原状态，只有真实 `planned -> executed` 赢得账本副作用 |
+| P0 | 缺价与 0 价治理 | `openInvest/utils/fx.py`、`openInvest/services/skill_views.py` | `src/services/portfolio_service.py`、未来 `portfolio_performance_service.py`、回测服务 | `None/NaN/<=0` 分层视为缺价或 fallback，不把哨兵值当有效估值 |
+| P1 | 事件新闻哨兵 cron | `openInvest/jobs/event_watch.py`、`openInvest/jobs/event_watch.yml`、`openInvest/scheduler/runner.py` | `src/services/news_signal_scheduler.py`、`src/services/news_signal_service.py`、Agent Trace 触发入口 | 从持仓/自选股生成 watched set，定时多源抓新闻，事件化后只对命中标的和高严重度事件触发分析 |
 | P1 | Regime forward probability / reentry reference | `openInvest/core/regime_probability.py` | `src/agent/regime.py`、`src/core/backtest_engine.py`、点位计算层 | 基于历史行情计算 regime 下 forward return 分布和买回点参考 |
 | P1 | Dreaming verdict review | `openInvest/docs/wiki/03-dreaming.md`、`openInvest/jobs/verdict_review.py` | `data/agent_traces/`、`src/services/`、可选 `src/agent/memory.py` | 从历史 Trace 生成 verdict 后验复盘和稳定 insight |
 | P1 | 信息隔离委员会协议 | `openInvest/core/committee.py`、`openInvest/docs/wiki/02-agents.md` | `src/agent/debate.py`、选股 Meta / Judge 阶段 | 强化 Round 1 角色隔离、Round 2 交叉质询和收敛检测 |
 | P1 | 收益率展示 / PnL Dashboard | `openInvest/jobs/pnl_snapshot.py`、`openInvest/core/benchmarks.py`、`openInvest/connectors/web_api.py`、`openInvest/scripts/sync_gui_dist.py` | `src/services/portfolio_service.py`、`api/v1/endpoints/portfolio.py` 或新增 `performance.py`、`apps/dsa-web/` | 接入收益率时间序列、基准对比和展示页；不直接挂独立 `invest-gui` dist |
+| P1 | 自托管安全与备份边界 | `openInvest/connectors/web_api/__main__.py`、`.dockerignore`、`plugin/skills/invest-backup/` | Docker / Desktop / 部署文档 / 本地数据备份脚本 | 远端暴露默认要求 token，构建默认排除账本和画像，备份工具兼容非源码安装 |
 | P2 | 策略级 reward / paper trading 评估 | `openInvest/core/paper_trade_simulator.py`、`openInvest/core/backtest_reward.py` | `src/core/backtest_engine.py`、`src/services/backtest_service.py` | 借鉴 reward 口径，不直接替换现有回测引擎 |
 | P2 | Web/SSE 任务状态 | `openInvest/connectors/web_api.py` | `api/v1/endpoints/agent.py`、Agent Trace 页面 | 仅借鉴阶段状态推送，不迁移 API 层 |
 
@@ -435,6 +441,29 @@ POST /api/v1/performance/snapshot
 - 后端单测：无持仓、单账户、多账户、多币种、行情缺失、基准缺失、负收益和现金占比高的场景。
 - 前端测试：空状态、加载失败、收益为负、基准缺失、长标签不溢出。
 - 构建验证：涉及 `apps/dsa-web/` 时执行 `npm run lint` 和 `npm run build`。
+
+### 4.8 最新增量：状态机、安全边界与评估口径硬化
+
+**价值**
+
+`openInvest` 最新一轮修复的共同点是把“真实资金系统不能犯的错”从经验和文档下沉到代码边界。它对本仓库的参考价值高于普通功能增量，尤其适合 Portfolio、Performance、Backtest 和部署链路。
+
+**本轮新增可借鉴点**
+
+- 交易状态副作用必须用精确原状态 CAS：`planned -> executed` 才能触发组合账本同步，`cancelled -> executed` 不能再次入账。
+- 缺价治理要显式区分 `missing`、`stale`、`fallback` 和有效价格；`0.0` 这类哨兵值不能进入总资产、收益率、what-if 或风险指标。
+- benchmark 缓存新鲜度要对齐评估窗口终点，而不是窗口起点；否则组合收益每天更新，基准可能冻结数周。
+- 回测指标必须防前视：卖出收益只能匹配该卖出之前最近的买入，2Y 窗口必须明确交易日长度，不能拿更长历史冒充两年。
+- 自托管 Web/API 只要绑定非 loopback，就必须要求 token；Docker build 默认排除 `db/`、`user_profile.json` 这类本地资产数据。
+- ignored state 需要可执行的备份/恢复工具，且工具要兼容源码 checkout 与插件/PyPI 安装形态。
+- provider、insight slug、UTC timestamp 等审计字段不能写死或混用本地时区，否则 Trace 与历史洞察会变成“看似存在但不可对账”。
+
+**本仓库落点**
+
+- `src/services/portfolio_service.py` 已有写锁和缺价元信息，后续若加入订单执行状态，应补“原状态 CAS + 副作用唯一执行”的测试。
+- 未来 `portfolio_performance_service` 必须复用缺价元信息，不允许把 `0.0` 当作有效实时价或收盘价。
+- `entry_execution_backtest`、`agent_verdict_review` 和策略评估应补“只看过去交易”的回归测试，避免后续成交、后续入场或未来窗口污染当前样本。
+- Docker、桌面端和公开报告导出要把资产金额、持仓、成本、用户画像和密钥纳入默认排除/脱敏范围。
 
 ## 5. 暂不建议迁移的部分
 

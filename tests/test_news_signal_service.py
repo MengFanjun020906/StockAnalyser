@@ -14,8 +14,15 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy import func, select
 
 from src.config import Config
+from src.search_service import SearchResponse, SearchResult
 from src.services.news_signal_service import NewsEventLLMExtractor, NewsSignalService
-from src.storage import DatabaseManager, NewsSignalEdge, RawNewsEpisode
+from src.storage import (
+    DatabaseManager,
+    NewsSignalEdge,
+    PortfolioAccount,
+    PortfolioPosition,
+    RawNewsEpisode,
+)
 
 
 class NewsSignalServiceTestCase(unittest.TestCase):
@@ -300,6 +307,240 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         self.assertEqual(second["source"], "cls_telegraph")
         self.assertGreaterEqual(second["outbox_enqueued"], 2)
         self.assertIsNotNone(second["cursor"]["published_at"])
+
+    def test_portfolio_anysearch_ingest_keeps_actionable_holding_news_idempotently(self) -> None:
+        with DatabaseManager.get_instance().get_session() as session:
+            active = PortfolioAccount(name="A股主账户", market="cn", is_active=True)
+            inactive = PortfolioAccount(name="停用账户", market="cn", is_active=False)
+            session.add_all([active, inactive])
+            session.flush()
+            session.add_all(
+                [
+                    PortfolioPosition(
+                        account_id=active.id,
+                        symbol="600487",
+                        market="cn",
+                        currency="CNY",
+                        quantity=300,
+                    ),
+                    PortfolioPosition(
+                        account_id=active.id,
+                        symbol="600667",
+                        market="cn",
+                        currency="CNY",
+                        quantity=100,
+                    ),
+                    PortfolioPosition(
+                        account_id=inactive.id,
+                        symbol="002050",
+                        market="cn",
+                        currency="CNY",
+                        quantity=100,
+                    ),
+                ]
+            )
+            session.commit()
+
+        search = _FakePortfolioAnySearch()
+        names = {"600487": "亨通光电", "600667": "太极实业"}
+
+        first = self.service.ingest_portfolio_anysearch_news(
+            search_client=search,
+            name_resolver=lambda symbol, market: names.get(symbol, ""),
+            max_results_per_stock=5,
+            max_age_days=14,
+            now=datetime(2026, 7, 21, 12, 0, 0),
+        )
+        second = self.service.ingest_portfolio_anysearch_news(
+            search_client=search,
+            name_resolver=lambda symbol, market: names.get(symbol, ""),
+            max_results_per_stock=5,
+            max_age_days=14,
+            now=datetime(2026, 7, 21, 12, 5, 0),
+        )
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(first["holding_count"], 2)
+        self.assertEqual(first["searched_holdings"], 2)
+        self.assertEqual(first["fetched_items"], 4)
+        self.assertEqual(first["accepted_items"], 2)
+        self.assertEqual(first["filtered_items"], 2)
+        self.assertEqual(first["new_raw_episodes"], 2)
+        self.assertEqual(first["cards_upserted"], 2)
+        self.assertEqual(second["new_raw_episodes"], 0)
+        self.assertEqual(second["cards_upserted"], 0)
+        self.assertEqual(
+            search.queries[:2],
+            [
+                "亨通光电 600487 最新消息 公告 业绩 风险",
+                "太极实业 600667 最新消息 公告 业绩 风险",
+            ],
+        )
+
+        cards = self.service.list_cards(limit=10)
+        self.assertEqual(cards["total"], 2)
+        titles = {card["summary_short"] for card in cards["items"]}
+        self.assertTrue(any("业绩预增" in title for title in titles))
+        self.assertTrue(any("减持" in title for title in titles))
+        self.assertFalse(any("最新价格" in title for title in titles))
+
+        detail = self.service.get_card(first["cards"][0]["card_id"])
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["diagnostics"]["source"], "portfolio_anysearch")
+        self.assertEqual(detail["mapping_status"], "mapped")
+        self.assertEqual(detail["company_impacts"][0]["symbol"], "600487")
+        self.assertEqual(detail["source_chain"][0]["provider"], "AnySearch")
+        self.assertEqual(detail["source_chain"][0]["published_at"], "2026-07-14T00:00:00")
+        self.assertEqual(detail["source_chain"][0]["url"], "https://example.test/600487-performance.pdf")
+
+        by_title = {card["summary_short"]: card for card in cards["items"]}
+        performance_card = next(card for title, card in by_title.items() if "业绩预增" in title)
+        reduction_card = next(card for title, card in by_title.items() if "减持" in title)
+        self.assertEqual(performance_card["news_tone"], "positive")
+        self.assertEqual(performance_card["company_impacts"][0]["direction"], "benefit")
+        self.assertEqual(reduction_card["news_tone"], "negative")
+        self.assertEqual(reduction_card["company_impacts"][0]["direction"], "harm")
+
+    def test_portfolio_anysearch_ingest_filters_old_and_missing_publish_dates(self) -> None:
+        with DatabaseManager.get_instance().get_session() as session:
+            account = PortfolioAccount(name="A股主账户", market="cn", is_active=True)
+            session.add(account)
+            session.flush()
+            session.add(
+                PortfolioPosition(
+                    account_id=account.id,
+                    symbol="600367",
+                    market="cn",
+                    currency="CNY",
+                    quantity=100,
+                )
+            )
+            session.commit()
+
+        class _StalePortfolioAnySearch:
+            def search(self, query: str, max_results: int = 5, days: int = 3):
+                del max_results, days
+                return SearchResponse(
+                    query=query,
+                    provider="AnySearch",
+                    success=True,
+                    results=[
+                        SearchResult(
+                            title="红星发展(600367) - 股票交易异常波动暨风险提示公告",
+                            snippet="公司股票短期内存在市场情绪过热、非理性炒作风险。",
+                            url="https://example.test/600367-risk-old",
+                            source="example.test",
+                            published_date="2026-07-06",
+                        ),
+                        SearchResult(
+                            title="红星发展(600367) - 业绩预告公告",
+                            snippet="红星发展公告称预计净利润同比变动。",
+                            url="https://example.test/600367-missing-date",
+                            source="example.test",
+                            published_date=None,
+                        ),
+                    ],
+                )
+
+        result = self.service.ingest_portfolio_anysearch_news(
+            search_client=_StalePortfolioAnySearch(),
+            name_resolver=lambda symbol, market: "红星发展",
+            max_results_per_stock=5,
+            max_age_days=3,
+            now=datetime(2026, 7, 22, 16, 30, 0),
+        )
+
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["fetched_items"], 2)
+        self.assertEqual(result["accepted_items"], 0)
+        self.assertEqual(result["filtered_items"], 2)
+        self.assertEqual(result["new_raw_episodes"], 0)
+        self.assertEqual(result["cards_upserted"], 0)
+        self.assertEqual(self.service.list_cards(limit=10)["items"], [])
+
+    def test_positive_signal_quality_marks_unlock_earnings_as_risk_disguised_positive(self) -> None:
+        payload = _dailynews_payload(
+            title="测试股份：限售股解禁前披露半年度业绩预增公告",
+            content="测试股份(600001)控股股东限售股即将解禁，公司预计2026年半年度净利润同比增长220%。",
+            published_at="2026-07-22T10:00:00+08:00",
+        )
+        payload["results"][0]["stocks"] = [{"code": "600001", "name": "测试股份"}]
+
+        _raw, cards = self.service._build_from_cls(payload)
+        card = cards[0]
+        quality = card["diagnostics"]["positive_signal_quality"]
+
+        self.assertEqual(quality["category"], "risk_disguised_positive")
+        self.assertEqual(quality["label"], "利空式利好")
+        self.assertEqual(card["news_tone"], "negative")
+        self.assertEqual(card["company_impacts"][0]["direction"], "harm")
+        self.assertEqual(card["evidence_grade"], "speculative")
+        self.assertLessEqual(card["signal_score"], 45.0)
+
+    def test_positive_signal_quality_marks_framework_or_domestic_contract_as_one_day_positive(self) -> None:
+        payload = _dailynews_payload(
+            title="测试股份：与国内客户签署战略合作框架协议",
+            content="测试股份(600002)与国内客户签署战略合作框架协议，双方正布局新材料应用并推进送样验证。",
+            published_at="2026-07-22T10:05:00+08:00",
+        )
+        payload["results"][0]["stocks"] = [{"code": "600002", "name": "测试股份"}]
+
+        _raw, cards = self.service._build_from_cls(payload)
+        card = cards[0]
+        quality = card["diagnostics"]["positive_signal_quality"]
+
+        self.assertEqual(quality["category"], "one_day_positive")
+        self.assertEqual(quality["label"], "一日游式利好")
+        self.assertIn("随时可撤的框架/意向协议", quality["matched_rules"])
+        self.assertEqual(card["news_tone"], "positive")
+        self.assertEqual(card["company_impacts"][0]["direction"], "benefit")
+        self.assertEqual(card["evidence_grade"], "speculative")
+        self.assertLessEqual(card["signal_score"], 49.0)
+
+    def test_positive_signal_quality_marks_foreign_contract_and_batch_supply_as_true_positive(self) -> None:
+        payload = _dailynews_payload(
+            title="测试股份：已与海外大厂英伟达签订批量供货合同",
+            content="测试股份(600003)公告，已与海外大厂英伟达签订长期供货合同，相关产品进入批量供货阶段。",
+            published_at="2026-07-22T10:10:00+08:00",
+        )
+        payload["results"][0]["stocks"] = [{"code": "600003", "name": "测试股份"}]
+
+        _raw, cards = self.service._build_from_cls(payload)
+        card = cards[0]
+        quality = card["diagnostics"]["positive_signal_quality"]
+
+        self.assertEqual(quality["category"], "true_positive")
+        self.assertEqual(quality["label"], "真利好")
+        self.assertIn("已与国外大厂签合同", quality["matched_rules"])
+        self.assertIn("批量供货", quality["matched_rules"])
+        self.assertEqual(card["news_tone"], "positive")
+        self.assertEqual(card["company_impacts"][0]["direction"], "benefit")
+        self.assertEqual(card["evidence_grade"], "confirmed")
+        self.assertGreaterEqual(card["signal_score"], 85.0)
+
+    def test_positive_signal_quality_marks_company_share_buyback_as_true_positive(self) -> None:
+        payload = _dailynews_payload(
+            title="佰维存储：董事长提议回购2亿元-2.5亿元股份 全部用于注销并减少注册资本",
+            content=(
+                "佰维存储(688525.SH)公告称，公司控股股东、实际控制人、董事长提议公司"
+                "以集中竞价方式回购股份，回购资金总额为2亿元至2.5亿元，"
+                "回购股份将全部用于注销并减少注册资本。"
+            ),
+            published_at="2026-07-22T19:23:07+08:00",
+        )
+        payload["results"][0]["stocks"] = [{"code": "688525", "name": "佰维存储"}]
+
+        _raw, cards = self.service._build_from_cls(payload)
+        card = cards[0]
+        quality = card["diagnostics"]["positive_signal_quality"]
+
+        self.assertEqual(quality["category"], "true_positive")
+        self.assertEqual(quality["label"], "真利好")
+        self.assertIn("公司股份回购", quality["matched_rules"])
+        self.assertEqual(card["news_tone"], "positive")
+        self.assertEqual(card["market_impact"], "positive")
+        self.assertEqual(card["company_impacts"][0]["direction"], "benefit")
+        self.assertGreaterEqual(card["signal_score"], 85.0)
 
     def test_dailynews_normalizes_raw_content_and_marks_low_quality_without_deleting(self) -> None:
         raw, cards = self.service._build_from_cls(
@@ -632,6 +873,7 @@ class NewsSignalServiceTestCase(unittest.TestCase):
         self.assertEqual(card["primary_industries"], ["国内流动性"])
         self.assertEqual(card["company_impacts"], [])
         self.assertEqual(card["diagnostics"]["source"], "macro_finance")
+        self.assertNotEqual(card["diagnostics"]["positive_signal_quality"]["category"], "true_positive")
 
     def test_people_bank_penalty_is_not_classified_as_macro_liquidity(self) -> None:
         raw, cards = self.service._build_from_macro_finance(
@@ -1041,6 +1283,60 @@ def _dailynews_payload(
         "source_chain": [{"provider": provider, "result": "ok"}],
         "errors": [],
     }
+
+
+class _FakePortfolioAnySearch:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def search(self, query: str, max_results: int = 5, days: int = 7):
+        del max_results, days
+        self.queries.append(query)
+        if "600487" in query:
+            return SearchResponse(
+                query=query,
+                provider="AnySearch",
+                success=True,
+                results=[
+                    SearchResult(
+                        title="江苏亨通光电股份有限公司2026年半年度业绩预增公告",
+                        snippet="证券代码：600487 证券简称：亨通光电，预计2026年上半年归母净利润同比增长。",
+                        url="https://example.test/600487-performance.pdf",
+                        source="example.test",
+                        published_date="2026-07-14",
+                    ),
+                    SearchResult(
+                        title="亨通光电(600487)_最新价格_行情_走势图",
+                        snippet="行情中心页面，展示最新价、成交额和盘口。",
+                        url="https://example.test/600487-quote",
+                        source="example.test",
+                        published_date="2026-07-21",
+                    ),
+                ],
+            )
+        if "600667" in query:
+            return SearchResponse(
+                query=query,
+                provider="AnySearch",
+                success=True,
+                results=[
+                    SearchResult(
+                        title="A股异动丨太极实业跌超6%，董事王毅勃拟减持5.03万股",
+                        snippet="太极实业600667公告称，董事拟减持公司股份，短期风险偏好承压。",
+                        url="https://example.test/600667-reduce",
+                        source="example.test",
+                        published_date="2026-07-14",
+                    ),
+                    SearchResult(
+                        title="太极实业(600667)公司公告",
+                        snippet="新浪财经公司公告列表页。",
+                        url="https://example.test/600667-notice-list",
+                        source="example.test",
+                        published_date=None,
+                    ),
+                ],
+            )
+        return SearchResponse(query=query, provider="AnySearch", success=True, results=[])
 
 
 def _edge_card(card_id: str, summary: str, industry: str, symbol: str, name: str) -> dict:

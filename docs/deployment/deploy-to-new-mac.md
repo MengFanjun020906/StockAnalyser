@@ -1,6 +1,6 @@
 # 迁移到一台全新 Mac 电脑
 
-本文档面向「目标机器是一台空白 Mac，没有 Homebrew、Python、Node、uv」的场景，把 daily_stock_analysis 部署到新机器。
+本文档面向「目标机器是一台空白 Mac，没有 Homebrew、Python、Node、uv」的场景，把 StockAnalyser 部署到新机器。
 
 约束（与 [迁移到一台全新 Windows 电脑](./deploy-to-new-windows.md) 一致）：
 - 包含 `.env` 配置文件迁移
@@ -16,7 +16,7 @@
 在旧机器上准备一个压缩包，至少包含：
 
 ```
-daily_stock_analysis/
+StockAnalyser/
   ├── .env                    # 当前可用的密钥/配置
   ├── requirements.txt
   ├── apps/dsa-web/
@@ -35,23 +35,23 @@ daily_stock_analysis/
 
 ```bash
 cd <项目父目录>
-tar --exclude='daily_stock_analysis/.venv' \
-    --exclude='daily_stock_analysis/apps/dsa-web/node_modules' \
-    --exclude='daily_stock_analysis/apps/dsa-desktop/node_modules' \
-    --exclude='daily_stock_analysis/data' \
-    --exclude='daily_stock_analysis/logs' \
-    --exclude='daily_stock_analysis/.cache' \
-    --exclude='daily_stock_analysis/Sequoia-X/data/*.db' \
+tar --exclude='StockAnalyser/.venv' \
+    --exclude='StockAnalyser/apps/dsa-web/node_modules' \
+    --exclude='StockAnalyser/apps/dsa-desktop/node_modules' \
+    --exclude='StockAnalyser/data' \
+    --exclude='StockAnalyser/logs' \
+    --exclude='StockAnalyser/.cache' \
+    --exclude='StockAnalyser/Sequoia-X/data/*.db' \
     --exclude='*/__pycache__' --exclude='*/.pytest_cache' \
-    -czf dsa.tar.gz daily_stock_analysis
-# 拷贝 dsa.tar.gz 到 U 盘 / 网盘 / scp 到新机器
+    -czf stockanalyser.tar.gz StockAnalyser
+# 拷贝 stockanalyser.tar.gz 到 U 盘 / 网盘 / scp 到新机器
 ```
 
 旧机器在 Windows PowerShell：
 
 ```powershell
 cd <项目父目录>
-Compress-Archive -Path daily_stock_analysis -DestinationPath dsa.zip `
+Compress-Archive -Path StockAnalyser -DestinationPath stockanalyser.zip `
     -Force -CompressionLevel Optimal
 ```
 
@@ -59,28 +59,28 @@ Compress-Archive -Path daily_stock_analysis -DestinationPath dsa.zip `
 
 1. 系统设置 → 通用 → 软件更新，把 macOS 升到最新次版本，避免 Xcode CLT 装不上。
 2. 打开「终端」（`Cmd + Space`，输入 `Terminal` 回车）。
-3. 把上一步的 `dsa.tar.gz` 放到比如 `~/Projects/` 下：
+3. 把上一步的 `stockanalyser.tar.gz` 放到比如 `~/Projects/` 下：
 
    ```bash
    mkdir -p ~/Projects && cd ~/Projects
-   # 假设 dsa.tar.gz 在下载目录
-   tar -xzf ~/Downloads/dsa.tar.gz
-   cd daily_stock_analysis
+   # 假设 stockanalyser.tar.gz 在下载目录
+   tar -xzf ~/Downloads/stockanalyser.tar.gz
+   cd StockAnalyser
    ```
 
    或者直接 `git clone`：
 
    ```bash
    mkdir -p ~/Projects && cd ~/Projects
-   git clone https://github.com/ZhuLinsen/daily_stock_analysis.git
-   cd daily_stock_analysis
+   git clone https://github.com/MengFanjun020906/StockAnalyser.git
+   cd StockAnalyser
    # 别忘了手动把旧机器的 .env 拷过来
    ```
 
 ## 2. 一键安装依赖
 
 ```bash
-cd ~/Projects/daily_stock_analysis
+cd ~/Projects/StockAnalyser
 bash scripts/install-mac.sh
 ```
 
@@ -119,7 +119,7 @@ SEQUOIA_DB_URL=https://example.com/sequoia_v2.db bash scripts/install-mac.sh
 **终端 A — 后端**：
 
 ```bash
-cd ~/Projects/daily_stock_analysis
+cd ~/Projects/StockAnalyser
 source .venv/bin/activate
 bash scripts/start-backend.sh
 # 监听 http://0.0.0.0:8000，日志写到 logs/dev/backend.log
@@ -128,7 +128,7 @@ bash scripts/start-backend.sh
 **终端 B — 前端**：
 
 ```bash
-cd ~/Projects/daily_stock_analysis
+cd ~/Projects/StockAnalyser
 bash scripts/start-web.sh
 # 监听 http://0.0.0.0:5173
 ```

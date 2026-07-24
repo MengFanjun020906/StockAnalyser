@@ -47,6 +47,47 @@ def build_news_signal_background_tasks(config: Any) -> List[Dict[str, Any]]:
                 "name": "news_signal_cls_incremental",
             }
         )
+    if bool(getattr(config, "news_signal_portfolio_anysearch_enabled", False)):
+        interval_minutes = max(
+            60,
+            min(int(getattr(config, "news_signal_portfolio_anysearch_interval_minutes", 300) or 300), 1440),
+        )
+        max_results_per_stock = max(
+            1,
+            min(int(getattr(config, "news_signal_portfolio_anysearch_max_results_per_stock", 5) or 5), 10),
+        )
+        max_age_days = max(
+            1,
+            min(int(getattr(config, "news_signal_portfolio_anysearch_max_age_days", 3) or 3), 90),
+        )
+        run_immediately = bool(
+            getattr(config, "news_signal_portfolio_anysearch_run_immediately", False)
+        )
+
+        def portfolio_anysearch_task() -> None:
+            result = NewsSignalService().ingest_portfolio_anysearch_news(
+                max_results_per_stock=max_results_per_stock,
+                max_age_days=max_age_days,
+            )
+            status = str(result.get("status") or "unknown")
+            if status == "failed":
+                raise RuntimeError(str(result.get("errors") or "portfolio AnySearch ingest failed"))
+            logger.info(
+                "[NewsSignal] 持仓 AnySearch 消息面完成: status=%s holdings=%s accepted=%s new=%s",
+                status,
+                result.get("holding_count", 0),
+                result.get("accepted_items", 0),
+                result.get("new_raw_episodes", 0),
+            )
+
+        tasks.append(
+            {
+                "task": portfolio_anysearch_task,
+                "interval_seconds": interval_minutes * 60,
+                "run_immediately": run_immediately,
+                "name": "news_signal_portfolio_anysearch",
+            }
+        )
     if bool(getattr(config, "news_event_sentinel_enabled", False)):
         interval_minutes = max(
             5,
