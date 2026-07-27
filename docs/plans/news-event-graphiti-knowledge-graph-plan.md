@@ -412,16 +412,18 @@ event_key = normalize(event_type + core_subject + impact_variable + date_bucket)
 
 ## 13. Todo
 
-- [ ] P1 新增 SQLite 事件缓存和追踪状态表。
-- [ ] P1 将 `news_momentum/event_impact` 搜索结果写入事件缓存。
-- [ ] P2 扩展 Graphiti ontology：`NewsArticle`、`ValidationFact`。
-- [ ] P2 实现 `ingest_news_events` 服务与重试机制。
-- [ ] P3 实现事件成熟度更新和验证任务。
-- [ ] P4 新增 `search_event_graph`、`get_event_watchlist`、`promote_event_candidates` 工具。
-- [ ] P4 改造 `discover_watchlist_candidates`：图谱优先，搜索 fallback。
-- [ ] P5 Agent Trace 展示事件链路和成熟度。
-- [ ] P5 新增 `/event-graph` 事件图谱页面。
-- [ ] 测试：同事件去重、未验证事件不出个股、confirmed 事件生成候选。
+> 状态勘误（2026-07-17）：本旧方案已被 `docs/plans/graphiti-integration-plan.md` 中的 NewsSignalCard / 显式边 / Graphiti outbox 方案替代。下面条目不再作为活跃待办；对应能力以新闻信号卡片、`search_knowledge_graph`、Web“消息”页和 Seed Pool 证据链为准。
+
+- [x] P1 新增 SQLite 事件缓存和追踪状态表：由新闻信号卡片关系型真源表和 Graphiti outbox 替代。
+- [x] P1 将 `news_momentum/event_impact` 搜索结果写入事件缓存：由 NewsSignalCard 入库、事件抽取和边重建链路替代。
+- [x] P2 扩展 Graphiti ontology：`NewsArticle`、`ValidationFact`：由新闻信号卡片 episode、显式边和 Graphiti 投影替代。
+- [x] P2 实现 `ingest_news_events` 服务与重试机制：由 `scripts/maintain_news_signals.py`、Graphiti outbox、重试/死信机制替代。
+- [x] P3 实现事件成熟度更新和验证任务：由卡片 gate、反馈、outcome 刷新和边质量指标替代。
+- [x] P4 新增 `search_event_graph`、`get_event_watchlist`、`promote_event_candidates` 工具：由 `search_knowledge_graph`、新闻信号卡片查询、Seed Pool 证据增强替代。
+- [x] P4 改造 `discover_watchlist_candidates`：图谱优先，搜索 fallback：现实现为候选 seed 先召回，Graphiti/新闻信号作为证据增强，不作为硬依赖。
+- [x] P5 Agent Trace 展示事件链路和成熟度：由 Trace artifact、新闻信号卡片详情和 Seed Pool 质量页跳转替代。
+- [x] P5 新增 `/event-graph` 事件图谱页面：由 Web“消息”详情局部图和 Graphiti/Neo4j 投影替代。
+- [x] 测试：同事件去重、未验证事件不出个股、confirmed 事件生成候选：由新闻信号服务、边重建和候选池消息/图谱证据测试覆盖。
 
 ## 14. 补充：事件抽取执行方案
 

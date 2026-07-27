@@ -5,12 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-> For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
+> For user-friendly release highlights, see the [GitHub Releases](https://github.com/MengFanjun020906/StockAnalyser/releases) page.
 
-## [Unreleased](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.2...HEAD)
+## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [修复] `start_all.sh` 启动 Neo4j 前会复用或启动已有 `stock-graphiti-neo4j` 容器，避免同名容器残留导致 Docker Compose 创建失败。
+- [修复] 持仓 AnySearch 消息面与新闻事件哨兵统一收窄到最近 3 天来源发布时间，避免旧公告因今日重新入库被当作新告警发送。
+- [改进] 新闻消息面新增利好质量判断，区分真利好、一日游式利好和利空式利好，并在哨兵触发原因中展示该标签。
+- [改进] 新闻消息面将公司股份回购纳入真利好识别，支持非持仓公司通过全市场正向信号进入飞书哨兵告警。
+- [新功能] 新增真实持仓 AnySearch 消息面入库任务，按 active portfolio positions 去重搜索，每只默认 5 条，并以 `portfolio_anysearch` 新闻信号卡片保存可行动公告/快讯。
+- [修复] 新闻事件哨兵优先保留持仓 AnySearch 卡片并增强公告正负向识别，避免持仓消息面被 CLS 扫描上限挤掉或因 `benefit/harm` 方向别名漏发。
+- [修复] 新闻事件哨兵方向性信号冷却新增成交额里程碑归一化，避免“沪深两市成交额突破 1 万亿/1.5 万亿”等滚动盘面快讯重复触发飞书卡片。
+- [新功能] 新闻事件哨兵飞书卡片接入 Graphiti 事件跟踪，触发审计记录 trace 状态，并启用消息 worker 周期性消费 Graphiti outbox 同步新闻卡与关系边。
+- [修复] Graphiti 初始化显式使用项目内确定性 reranker，避免缺少 OPENAI_API_KEY 时默认 OpenAI reranker 导致哨兵 trace 链路降级。
+- [改进] Graphiti embedding 未配置外部 key 时降级为本地 hash embedding，保证新闻信号 outbox 周期同步不会因 embedding 凭证缺失停摆。
+- [改进] Graphiti 使用本地 Ollama Qwen3 模型时自动透传 think=false，避免 episode 抽取阶段长时间只输出 thinking 而不返回 JSON。
+- [改进] 新闻哨兵 Graphiti 事件跟踪卡片改为可读摘要，隐藏 trace hash、裸关系类型和调试标签，优先展示事实线索、相关事件和主题。
+- [改进] 新闻哨兵 Graphiti 事件跟踪增加当前卡片相关性过滤，弱相关图谱命中不再展示为有效线索，盘面成交额类快讯会显示“未找到强关联”。
+- [修复] 新闻哨兵 Graphiti 事件跟踪对公司公告启用公司/代码严格锚点，避免只命中栏目名或泛化上下文的旧事件污染飞书卡片。
+- [修复] 事件 watch 入 Graphiti 前要求搜索结果标题本身匹配事件规则，并收紧哨兵 Graphiti trace 数字/泛词锚点，避免 SEO 污染页通过“年份/同比/金额单位”误关联到财经快讯。
+- [改进] 新闻事件哨兵默认活跃窗口改为 `08:00-23:59`，午夜后停止监控推送，避免凌晨无效打扰。
+- [改进] 新增 `scripts/run_news_signal_worker.py` 消息面专用常驻入口，只注册新闻后台任务，避免飞书消息面 webhook 收到个股分析报告或大盘复盘报告。
+- [修复] 财联社电报抓取改为 cls.cn v1 签名接口直连优先、orz dailynews 兜底，并将新闻事件哨兵默认扫描窗口提高到 50 条，避免聚合源超时或首页窗口过窄导致漏抓。
+- [改进] 新闻事件哨兵新增方向性产业线索触发，`news_tone=positive|negative` 且 `signal_score>=50` 的 active 卡片可通过 `SIGNAL:POSITIVE` / `SIGNAL:NEGATIVE` 推送飞书。
+- [新功能] 新闻事件哨兵新增无触发 heartbeat，可按独立间隔发送存活卡片并写入审计，便于确认 schedule worker 正在运行。
+- [修复] 新闻事件哨兵市场触发新增卡片新鲜度闸门，避免日内旧卡在冷却过期后被重复当作最新消息发送。
+- [改进] 新闻事件哨兵新增 A 股与美股宏观触发条件，宏观卡片可通过 `MACRO:A_SHARE` / `MACRO:US` 进入飞书告警和冷却审计。
+- [新功能] 新闻事件哨兵新增飞书 webhook notifier，可将触发信封渲染为 interactive card，并展示触发原因、来源链接和关联传导路径。
+- [新功能] 新增新闻事件哨兵第一版底层闭环，支持 `NewsEventSentinel.run_once()`、run/trigger 审计、active window、severity/cooldown 触发门和 schedule opt-in 注册。
+- [文档] 新增新闻事件哨兵底层设计，明确 openInvest 哨兵模式在 StockAnalyser 中的事件层、调度、触发审计和飞书通知适配原则。
+- [chore] 将用户可见项目名、API/Web/桌面端品牌和当前仓库链接统一为 `StockAnalyser`。
+- [新功能] Agent 新增市场情绪快照、情绪热度候选和全球风险扫描工具，并接入 planner、ETL 压缩、工具注册与显式 `sentiment_heat` 候选来源。
+- [修复] `/portfolio` 当天快照优先使用实时行情，避免“刷新数据”继续被昨日或过期 `stock_daily` 收盘价覆盖。
+- [文档] 将本地 `openInvest/` 快进到最新 `origin/main`，并更新集成评估与原理索引，补充交易状态 CAS、缺价治理、自托管安全、benchmark 新鲜度和回测防前视等增量优点。
+- [改进] Seed Pool 候选池输出新增 `strategy_trunk_health` 诊断，AlphaSift 与 Sequoia 主干都无可用候选时显式标记硬策略主干缺失。
+- [新功能] Seed Pool 质量闭环新增历史 Trace 回填脚本、T+1 批量评估脚本，并在 `daily_run.sh` 第四步提供 opt-in 自动评估。
 - [改进] planning_execute 恢复历史 Trace 时生成 Planning Ledger 摘要，并在新 `todo.md` 写入复用来源、复用 payload、重验规则和失效条件。
 - [文档] README 新增 AI Operating Model、主/子 Agent 中英双语命名、完成报告样例和本地入场执行回测快照。
+- [文档] README 入场执行回测改为起始日至本地最新基准日的累计 PnL 与指数对比表。
+- [文档] README 移除入场执行回测曲线，保留 `strict_ai_entry` 区间 PnL 与指数对比表。
 - [文档] 新增 Agent loop/workflow 概念词汇表，明确 `todo.md` 作为 Planning Ledger / 计划账本的复用边界。
 - [测试] 扩展 Agent 基础设施审计，校验 README、概念词汇表和 `todo.md` 复用契约。
 - [chore] 接入 loop-engineering Codex daily-triage 脚手架，新增 LOOP/STATE/loop-budget/loop-constraints 与 Codex loop skill/verifier 运行资产。
@@ -58,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新闻信号卡片保存后默认 best-effort 写入 Graphiti episode，并新增 `/api/v1/news-signals/graph-sync` 从关系型真源补同步 pending/failed 卡片。
 - [改进] 新闻信号卡片新增 `get_macro_finance_news` 宏观财经源，默认从 orz dailynews 的 `sina_finance`、`eastmoney` 平台过滤非农、逆回购、利率、流动性等宏观消息，并用 `SearchService.search_general_news()` 做关键词 fallback，接入重建 API、Web 重建按钮和主题催化席白名单。
 - [改进] 新闻信号卡片新增 `signal_layer=industry/company/macro` 三层分类和筛选，重建链路默认纳入雪球热榜，并补充三类消息工具真实 smoke 验证记录。
-- [改进] `get_cls_telegraph_news` 改用 `https://orz.ai/api/v1/dailynews/?platform=cls`，并新增 `get_xueqiu_hot_news` 雪球热榜工具，主题催化席白名单同步开放两个消息面工具。
+- [改进] 新增 `get_xueqiu_hot_news` 雪球热榜工具，主题催化席白名单同步开放财联社电报与雪球两个消息面工具。
 - [修复] daily run 在周末或休市日会检查最新已完成交易日的数据缺口，缺失时继续补跑对应股票，避免周六无法补齐周五行情。
 - [新功能] 新增新闻信号卡片第一版，包含关系型真源表、重建 API、EvidenceCard 适配、反馈 overlay、指标接口和 Web“消息”页面。
 - [改进] Web“消息”页反馈按钮会按已有反馈保持高亮并展示次数，避免重复点击后无法确认状态。
@@ -74,7 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 交易日历模块在 `exchange-calendars` 依赖版本错配导致导入异常时改为 fail-open，避免 `main.py` / daily run 入口被交易日检查依赖拖垮。
 - [修复] CI checkout 补齐 `graphiti` 子模块映射，并在 backend-gate / docker-build 拉取子模块，避免 `-e ./graphiti` 依赖安装在 GitHub Actions 中失败。
 - [文档] 更新 openInvest 原理接入索引，补充新版 openInvest 的信息隔离委员会、事件层、path profile、运行时治理、回测防前视和 PnL/benchmark 自审计等可借鉴原则。
-- [修复] `scripts/ci_gate.sh` 默认优先使用仓库 `.venv` Python，并在 flake8 critical check / offline pytest 排除本地外部 clone 与 gitlink 目录，避免系统 Python 或 `openInvest`、`graphiti`、`Sequoia-X`、`alphasift` 干扰 DSA 后端门禁。
+- [修复] `scripts/ci_gate.sh` 默认优先使用仓库 `.venv` Python，并在 flake8 critical check / offline pytest 排除本地外部 clone 与 gitlink 目录，避免系统 Python 或 `openInvest`、`graphiti`、`Sequoia-X`、`alphasift` 干扰 StockAnalyser 后端门禁。
 - [修复] 系统配置 API schema 同步 `graphiti` 分类与 `float` 数据类型，并修正未显式指定 `ENV_FILE` 时 schedule immediate 配置被默认 `.env` 抢占的问题。
 - [改进] Agent planning_execute 的 `planner.json` / `todo.md` 补齐主辅维度、初始假设、工具预期结果、下游使用方式、失败降级、停止条件和 replan 策略，避免 Trace 计划产物只展示重复工具清单。
 - [改进] 四席位主题催化席收窄为 AI/科技产业链候选，并要求新闻证据摘要化为产品品类出口、国产替代政策、业务映射和资金验证，避免原文堆砌和非科技行业消息面拖慢链路。
@@ -441,7 +474,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] planning Agent prompt 新增数据引用与 confidence 内部使用约束，禁止最终输出暴露置信度字段或编造缺失数据。
 - [测试] 新增 Agent 用户上下文 schema 与 planning prompt 拼接回归测试，锁定第一阶段契约不被后续改动破坏。
 
-## [3.14.2](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.1...v3.14.2) - 2026-04-30
+## [3.14.2](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.1...v3.14.2) - 2026-04-30
 
 ### 发布亮点
 
@@ -478,18 +511,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 新增 `tests/test_bot_market_command.py`，覆盖 `MARKET_REVIEW_REGION=both` + open markets `{"cn","us"}` / `{"cn","hk"}` 的 `override_region` 透传断言，并覆盖全市场休市跳过与关闭交易日检查路径；新增 `tests/test_yfinance_hk_indices.py` 覆盖港股指数符号映射与部分/全部失败降级路径。
 - 补齐 `task_queue` 轻量导入 stub 的股票代码规范化函数，恢复 `tests/test_task_queue_config_sync.py` 收集与运行。
 
-## [3.14.1](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.14.0...v3.14.1) - 2026-04-26
+## [3.14.1](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.0...v3.14.1) - 2026-04-26
 
 - [测试] 修正大盘复盘 prompt 测试对“明日交易计划”标题的断言，并同步桌面端版本号，恢复发布 gate。
 
-## [3.14.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.13.0...v3.14.0) - 2026-04-26
+## [3.14.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.13.0...v3.14.0) - 2026-04-26
 
 ### 发布亮点
 
 - 📊 **大盘复盘升级为盘后工作台式结构** — A 股复盘固定输出盘面温度、指数明细、板块 Top 表、新闻催化、明日交易计划和风险提示，减少纯文字复盘的重复与空泛。
 - 🖥️ **桌面端新增 GitHub Release 更新提醒** — Windows/macOS 桌面端启动后自动检测新版本，也可从设置页手动检查并跳转下载页。
 - 🤖 **Pipeline Agent 数据加载大幅降噪** — K 线工具改为 DB-first 并预热 240 天历史数据，避免同一只股票重复 HTTP 请求。
-- 🐳 **Docker 发布链路整理** — 发布工作流收敛为正式发布与手动补发两条路径，官方 Docker Hub 镜像名统一为 `zhulinsen/daily_stock_analysis`。
+- 🐳 **Docker 发布链路整理** — 发布工作流收敛为正式发布与手动补发两条路径，官方 Docker Hub 镜像名统一为 `mengfanjun020906/stockanalyser`。
 - 🔧 **LLM 渠道与 DeepSeek V4 配置补强** — GitHub Actions 定时分析补齐多渠道变量透传，DeepSeek 官方渠道预设与示例同步到 V4。
 - 🧩 **桌面端静态资源一致性校验** — 打包链路和运行时都能更早发现静态资源错配，降低 Release 包白屏排查成本。
 
@@ -501,7 +534,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### 改进
 
 - 📊 **A 股大盘复盘报告改为结构化盘后工作台版式** — 固定输出盘面温度、指数明细、板块 Top 表、新闻催化和明日交易计划。
-- 🐳 **Docker 发布工作流收敛** — 更清晰地区分正式发布与手动补发链路，并统一官方 Docker Hub 镜像名为 `zhulinsen/daily_stock_analysis`。
+- 🐳 **Docker 发布工作流收敛** — 更清晰地区分正式发布与手动补发链路，并统一官方 Docker Hub 镜像名为 `mengfanjun020906/stockanalyser`。
 - 🤖 **Agent 日线工具优先复用本地缓存** — 同时持久化新获取的日线与新闻情报，减少重复数据源调用。
 
 ### 修复
@@ -530,7 +563,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🧪 **稳定市场复盘相关测试的 LiteLLM stub 行为** — 避免本机安装的 LiteLLM 在测试收集顺序变化时影响市场复盘单元测试。
 - 🧪 **pytest 默认跳过前端依赖目录** — 本地存在 `apps/dsa-web/node_modules` 时不再被后端测试递归扫描，避免发布前 gate 被无关目录拖慢。
 
-## [3.13.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.12.0...v3.13.0) - 2026-04-21
+## [3.13.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.12.0...v3.13.0) - 2026-04-21
 
 ### 发布亮点
 
@@ -596,7 +629,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🌉 **README 补充长桥数据源使用说明** — 中/英/繁 README 明确长桥"首选 / 兜底 / 未配置不调用"边界；`docs/` 内相对路径链接修复；`LONGBRIDGE_PRINT_QUOTE_PACKAGES` 配置与代码及 `.env.example` 对齐。
 - 🐋 **Docker 安装场景版本说明** — 补充最小化文档，明确 Docker 安装场景下应以 Git tag / 镜像 tag 判断版本（fixes #1091）。
 
-## [3.12.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.11.0...v3.12.0) - 2026-04-01
+## [3.12.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.11.0...v3.12.0) - 2026-04-01
 
 ### 发布亮点
 
@@ -638,7 +671,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🧪 **补充设置页版本信息回归测试** — 新增 Web 设置页版本信息渲染断言，并覆盖占位版本 `0.0.0` 自动回退为构建标识的逻辑。
 - 🧪 **UI 治理与关键路径回归补强** — 补充 `SidebarNav`、`ChatPage`、`BacktestPage` 等组件测试，并新增 UI governance 守卫，持续防止交互元素重新引入原生 `title` 属性或旧 `input-terminal` 样式回流。同步更新 smoke / markdown drawer 相关验证，覆盖主题升级后的关键主链路。
 
-## [3.11.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.10.1...v3.11.0) - 2026-03-27
+## [3.11.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.10.1...v3.11.0) - 2026-03-27
 
 ### 发布亮点
 
@@ -681,7 +714,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 🧾 **README 捐赠入口更新为小红书二维码** — README 及中英文说明中的赞助入口更新为小红书二维码素材，保持展示口径一致。
 
-## [3.10.1](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.10.0...v3.10.1) - 2026-03-24
+## [3.10.1](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.10.0...v3.10.1) - 2026-03-24
 
 ### 新功能
 
@@ -705,7 +738,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 🧪 **问股 / 回测 / 智能导入回归覆盖补齐** — 同步更新 E2E 冒烟期望，补充 `DashboardStateBlock`、Chat 页、智能导入文件选择与相关交互回归断言，确保近期 UI 调整后的关键路径仍可稳定通过。
 
-## [3.10.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.9.0...v3.10.0) - 2026-03-24
+## [3.10.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.9.0...v3.10.0) - 2026-03-24
 
 ### 发布亮点
 
@@ -753,7 +786,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🌍 **补齐定时模式与关联板块的双语说明** — `docs/full-guide.md` / `docs/full-guide_EN.md` 现在明确说明 scheduled mode 会在每次执行前重新读取 `STOCK_LIST`，并同步补充个股关联板块展示能力说明，减少配置预期偏差。
 - 🧭 **调整 Agent 术语兼容文案** — README、双语文档、设置页与问股界面继续以“策略”作为用户入口主称呼，同时补充 `skill` 作为内部统一命名，降低迁移期理解成本。
 
-## [3.9.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.8.0...v3.9.0) - 2026-03-20
+## [3.9.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.8.0...v3.9.0) - 2026-03-20
 
 ### 发布亮点
 
@@ -795,7 +828,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 完善 Ollama 配置说明：`docs/full-guide.md` / `docs/full-guide_EN.md` 环境变量表与 Note 补充 `OLLAMA_API_BASE`，避免英文用户误以为 Ollama 不能作为独立配置入口；合并重复的 `OLLAMA_API_BASE` 条目为单一条目
 - 明确文档同步治理边界：补充 `README.md`、专题文档、双语文档与交付说明之间的默认同步规则，减少后续文档漂移
 
-## [3.8.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.7.0...v3.8.0) - 2026-03-17
+## [3.8.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.7.0...v3.8.0) - 2026-03-17
 
 ### 发布亮点
 
@@ -849,7 +882,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🌍 **补齐英文文档索引与协作文档** — 新增英文文档索引、贡献指南、Bot 命令文档，并补充中英双语 issue / PR 模板，方便中英文协作与外部贡献者理解项目入口。
 - 🏷️ **本地化 README 补充 Trendshift badge** — 在多语言 README 中同步补上新版能力入口标识，减少中英文说明面不一致。
 
-## [3.7.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.6.0...v3.7.0) - 2026-03-15
+## [3.7.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.6.0...v3.7.0) - 2026-03-15
 
 ### 新功能
 
@@ -886,7 +919,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 新增 Agent `get_portfolio_snapshot` 工具调用测试。
 - 新增分析 API 异步契约回归测试。
 
-## [3.6.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.5.0...v3.6.0) - 2026-03-14
+## [3.6.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.5.0...v3.6.0) - 2026-03-14
 
 ### Added
 
@@ -894,7 +927,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 📊 **UI Components Refactoring** — integrated `clsx` and `tailwind-merge` for robust class composition across Web UI
 - 🗑️ **History batch deletion** — Web UI now supports multi-selection and batch deletion of analysis history; added `POST /api/v1/history/batch-delete` endpoint and `ConfirmDialog` component.
 - 🔐 **Auth settings API** — new `POST /api/v1/auth/settings` endpoint to enable or disable Web authentication at runtime and set the initial admin password when needed
-- openclaw Skill 集成指南 — 新增 [docs/integrations/openclaw-skill-integration.md](integrations/openclaw-skill-integration.md)，说明如何通过 openclaw Skill 调用 DSA API
+- openclaw Skill 集成指南 — 新增 [docs/integrations/openclaw-skill-integration.md](integrations/openclaw-skill-integration.md)，说明如何通过 openclaw Skill 调用 StockAnalyser API
 - ⚙️ **LLM channel protocol/test UX** — `.env` and Web settings now share the same channel shape (`LLM_CHANNELS` + `LLM_<NAME>_PROTOCOL/BASE_URL/API_KEY/MODELS/ENABLED`); settings page adds per-channel connection testing, primary/fallback/vision model selection, and protocol-aware model prefixing
 - 🤖 **Agent architecture Phase 0+1** — shared protocols (`AgentContext`, `AgentOpinion`, `StageResult`), extracted `run_agent_loop()` runner, `AGENT_ARCH` switch (`single`/`multi`), config registry entries
 - 🔍 **Bot NL routing** — two-layer natural-language routing: cheap regex pre-filter (stock codes + finance keywords) → lightweight LLM intent parsing; controlled by `AGENT_NL_ROUTING=true`; supports multi-stock and strategy extraction
@@ -967,7 +1000,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - ⚠️ **Multi-worker auth toggles** — runtime auth updates are process-local; multi-worker deployments must restart/roll workers to keep auth state consistent
 
-## [3.5.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.4.10...v3.5.0) - 2026-03-12
+## [3.5.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.4.10...v3.5.0) - 2026-03-12
 
 ### Added
 
@@ -1015,7 +1048,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 📖 `modules/image-extract-prompt.md` with full prompt documentation
 - 📖 AkShare fallback cache TTL documentation
 
-## [3.4.10](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.4.9...v3.4.10) - 2026-03-07
+## [3.4.10](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.4.9...v3.4.10) - 2026-03-07
 
 ### Fixed
 
@@ -1039,7 +1072,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **WeChat-only image routing optimization** (#455) — 仅配置企业微信图片时，不再对完整报告做冗余转图，避免误导性失败日志
 - **Stock name prefetch lightweight mode** (#455) — 名称预取阶段跳过 realtime quote 查询，减少额外网络开销
 
-## [3.4.9](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.4.8...v3.4.9) - 2026-03-06
+## [3.4.9](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.4.8...v3.4.9) - 2026-03-06
 
 ### Added
 
@@ -1070,7 +1103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 📝 Clarified GitHub Actions non-trading-day manual run controls (`TRADING_DAY_CHECK_ENABLED` + `force_run`) for Issue #461 / PR #466
 
-## [3.4.8](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.4.7...v3.4.8) - 2026-03-02
+## [3.4.8](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.4.7...v3.4.8) - 2026-03-02
 
 ### Fixed
 
@@ -1085,7 +1118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 📝 Clarify non-trading-day manual run controls for GitHub Actions (`TRADING_DAY_CHECK_ENABLED` + `force_run`) (#474)
 
-## [3.4.7](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.4.0...v3.4.7) - 2026-02-28
+## [3.4.7](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.4.0...v3.4.7) - 2026-02-28
 
 ### Added
 
@@ -1105,7 +1138,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 📝 Clarify potential ambiguities in code (#343)
 - 📝 ENABLE_EASTMONEY_PATCH guidance for Issue #453 (#456)
 
-## [3.4.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.3.22...v3.4.0) - 2026-02-27
+## [3.4.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.3.22...v3.4.0) - 2026-02-27
 
 ### Added
 
@@ -1130,7 +1163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🐛 History list scroll reset (#431)
 - 🐛 Settings save button false positive (fixes #417, #430)
 
-## [3.3.22](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.3.12...v3.3.22) - 2026-02-26
+## [3.3.22](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.3.12...v3.3.22) - 2026-02-26
 
 ### Added
 
@@ -1147,7 +1180,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🐛 Agent framework category missing (#406)
 - 🐛 Date inconsistency & query id (fixes #322, #363)
 
-## [3.3.12](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.2.11...v3.3.12) - 2026-02-24
+## [3.3.12](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.2.11...v3.3.12) - 2026-02-24
 
 ### Added
 
@@ -1171,7 +1204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Market review strategy consistency — unified cn/us template
 - Agent test assertions updated (`6 -> 11`)
 
-## [3.2.11](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v3.2.10...v3.2.11) - 2026-02-23
+## [3.2.11](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.2.10...v3.2.11) - 2026-02-23
 
 ### 修复（#patch）
 
@@ -1493,7 +1526,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Bot 分析命令（`bot/commands/analyze.py`）改为使用 `src.services.task_service`
   - Docker 环境变量 `WEBUI_HOST`/`WEBUI_PORT` 更名为 `API_HOST`/`API_PORT`（旧名仍兼容）
 
-## [2.3.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.2.5...v2.3.0) - 2026-02-01
+## [2.3.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.2.5...v2.3.0) - 2026-02-01
 
 ### 新增
 
@@ -1506,7 +1539,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 🐛 修复 AMD 等美股代码被误识别为 A 股的问题 (Issue #153)
 
-## [2.2.5](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.2.4...v2.2.5) - 2026-02-01
+## [2.2.5](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.2.4...v2.2.5) - 2026-02-01
 
 ### 新增
 
@@ -1515,7 +1548,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 支持 HMAC SHA256 签名验证，确保通信安全
   - 通过 `ASTRBOT_URL` 和 `ASTRBOT_TOKEN` 配置
 
-## [2.2.4](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.2.3...v2.2.4) - 2026-02-01
+## [2.2.4](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.2.3...v2.2.4) - 2026-02-01
 
 ### 新增
 
@@ -1523,26 +1556,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 支持通过环境变量（如 `YFINANCE_PRIORITY=0`）动态调整数据源优先级
   - 无需修改代码即可优先使用特定数据源（如 Yahoo Finance）
 
-## [2.2.3](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.2.2...v2.2.3) - 2026-01-31
+## [2.2.3](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.2.2...v2.2.3) - 2026-01-31
 
 ### 修复
 
 - 📦 更新 requirements.txt，增加 `lxml_html_clean` 依赖以解决兼容性问题
 
-## [2.2.2](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.2.1...v2.2.2) - 2026-01-31
+## [2.2.2](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.2.1...v2.2.2) - 2026-01-31
 
 ### 修复
 
 - 🐛 修复代理配置区分大小写问题 (fixes #211)
 
-## [2.2.1](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.2.0...v2.2.1) - 2026-01-31
+## [2.2.1](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.2.0...v2.2.1) - 2026-01-31
 
 ### 修复
 
 - 🐛 **YFinance 兼容性修复** (PR #210, fixes #209)
   - 修复新版 yfinance 返回 MultiIndex 列名导致的数据解析错误
 
-## [2.2.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.14...v2.2.0) - 2026-01-31
+## [2.2.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.14...v2.2.0) - 2026-01-31
 
 ### 新增
 
@@ -1554,13 +1587,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - 🐛 修复 analyzer 运行后无法通过改 .env 文件的 stock_list 内容调整跟踪的股票
 
-## [2.1.14](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.13...v2.1.14) - 2026-01-31
+## [2.1.14](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.13...v2.1.14) - 2026-01-31
 
 ### 文档
 
 - 📝 更新 README 和优化 auto-tag 规则
 
-## [2.1.13](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.12...v2.1.13) - 2026-01-31
+## [2.1.13](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.12...v2.1.13) - 2026-01-31
 
 ### 修复
 
@@ -1568,14 +1601,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 修复 Tushare 数据源优先级设置问题
   - 修复 Tushare 实时行情获取功能
 
-## [2.1.12](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.11...v2.1.12) - 2026-01-30
+## [2.1.12](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.11...v2.1.12) - 2026-01-30
 
 ### 修复
 
 - 🌐 修复代理配置在某些情况下的区分大小写问题
 - 🌐 修复本地环境禁用代理的逻辑
 
-## [2.1.11](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.10...v2.1.11) - 2026-01-30
+## [2.1.11](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.10...v2.1.11) - 2026-01-30
 
 ### 优化
 
@@ -1583,13 +1616,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 优化飞书 Stream 模式的消息类型处理
   - 修改 Stream 消息模式默认为关闭，防止配置错误运行时报错
 
-## [2.1.10](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.9...v2.1.10) - 2026-01-30
+## [2.1.10](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.9...v2.1.10) - 2026-01-30
 
 ### 合并
 
 - 📦 合并 PR #154 贡献
 
-## [2.1.9](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.8...v2.1.9) - 2026-01-30
+## [2.1.9](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.8...v2.1.9) - 2026-01-30
 
 ### 新增
 
@@ -1597,19 +1630,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 新增微信推送的纯文本消息类型支持
   - 添加 `WECHAT_MSG_TYPE` 配置项
 
-## [2.1.8](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.7...v2.1.8) - 2026-01-30
+## [2.1.8](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.7...v2.1.8) - 2026-01-30
 
 ### 修复
 
 - 🐛 修正日志中 API 提供商显示错误 (PR #197)
 
-## [2.1.7](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.6...v2.1.7) - 2026-01-30
+## [2.1.7](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.6...v2.1.7) - 2026-01-30
 
 ### 修复
 
 - 🌐 禁用本地环境的代理设置，避免网络连接问题
 
-## [2.1.6](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.5...v2.1.6) - 2026-01-29
+## [2.1.6](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.5...v2.1.6) - 2026-01-29
 
 ### 新增
 
@@ -1633,19 +1666,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 更新搜索查询模板以提高相关性
 - 增强 `format_intel_report()` 输出结构
 
-## [2.1.5](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.4...v2.1.5) - 2026-01-29
+## [2.1.5](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.4...v2.1.5) - 2026-01-29
 
 ### 新增
 
 - 📡 新增 Pytdx 数据源和多源股票名称解析功能
 
-## [2.1.4](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.3...v2.1.4) - 2026-01-29
+## [2.1.4](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.3...v2.1.4) - 2026-01-29
 
 ### 文档
 
 - 📝 更新赞助商信息
 
-## [2.1.3](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.2...v2.1.3) - 2026-01-28
+## [2.1.3](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.2...v2.1.3) - 2026-01-28
 
 ### 文档
 
@@ -1658,14 +1691,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 输入框逻辑改成所有字母都转换成大写
   - 支持 `.` 的输入（如 `BRK.B`）
 
-## [2.1.2](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.1...v2.1.2) - 2026-01-27
+## [2.1.2](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.1...v2.1.2) - 2026-01-27
 
 ### 修复
 
 - 🐛 修复个股分析推送失败和报告路径问题 (fixes #166)
 - 🐛 修改 CR 错误，确保微信消息最大字节配置生效
 
-## [2.1.1](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.1.0...v2.1.1) - 2026-01-26
+## [2.1.1](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.1.0...v2.1.1) - 2026-01-26
 
 ### 新增
 
@@ -1677,7 +1710,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 🐳 修复 docker-compose 路径和文档命令
 - 🐳 Dockerfile 补充 copy src 文件夹 (fixes #145)
 
-## [2.1.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v2.0.0...v2.1.0) - 2026-01-25
+## [2.1.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v2.0.0...v2.1.0) - 2026-01-25
 
 ### 新增
 
@@ -1729,7 +1762,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 👷 **CI/CD 修复**
   - 修复 GitHub Actions 中路径引用的错误
 
-## [2.0.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.6.0...v2.0.0) - 2026-01-24
+## [2.0.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.6.0...v2.0.0) - 2026-01-24
 
 ### 新增
 
@@ -1758,7 +1791,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - ⚙️ 配置 TUSHARE_TOKEN 时自动提升 Tushare 数据源优先级
 - ⚙️ 实现 4 个用户反馈 issue (#112, #128, #38, #119)
 
-## [1.6.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.5.0...v1.6.0) - 2026-01-19
+## [1.6.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.5.0...v1.6.0) - 2026-01-19
 
 ### 新增
 
@@ -1767,32 +1800,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 核心 API：支持 `/analysis` (触发分析), `/tasks` (查询进度), `/health` (健康检查)
   - 交互界面：支持页面直接输入代码并触发分析，实时展示进度
   - 运行模式：新增 `--webui-only` 模式，仅启动 Web 服务
-  - 解决了 [#70](https://github.com/ZhuLinsen/daily_stock_analysis/issues/70) 的核心需求（提供触发分析的接口）
-- ⚙️ GitHub Actions 配置灵活性增强（[#79](https://github.com/ZhuLinsen/daily_stock_analysis/issues/79)）
+  - 解决了 [#70](https://github.com/MengFanjun020906/StockAnalyser/issues/70) 的核心需求（提供触发分析的接口）
+- ⚙️ GitHub Actions 配置灵活性增强（[#79](https://github.com/MengFanjun020906/StockAnalyser/issues/79)）
   - 支持从 Repository Variables 读取非敏感配置（如 STOCK_LIST, GEMINI_MODEL）
   - 保持对 Secrets 的向下兼容
 
 ### 修复
 
-- 🐛 修复企业微信/飞书报告截断问题（[#73](https://github.com/ZhuLinsen/daily_stock_analysis/issues/73)）
+- 🐛 修复企业微信/飞书报告截断问题（[#73](https://github.com/MengFanjun020906/StockAnalyser/issues/73)）
   - 移除 notification.py 中不必要的长度硬截断逻辑
   - 依赖底层自动分片机制处理长消息
-- 🐛 修复 GitHub Workflow 环境变量缺失（[#80](https://github.com/ZhuLinsen/daily_stock_analysis/issues/80)）
+- 🐛 修复 GitHub Workflow 环境变量缺失（[#80](https://github.com/MengFanjun020906/StockAnalyser/issues/80)）
   - 修复 `CUSTOM_WEBHOOK_BEARER_TOKEN` 未正确传递到 Runner 的问题
 
-## [1.5.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.4.0...v1.5.0) - 2026-01-17
+## [1.5.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.4.0...v1.5.0) - 2026-01-17
 
 ### 新增
 
-- 📲 单股推送模式（[#55](https://github.com/ZhuLinsen/daily_stock_analysis/issues/55)）
+- 📲 单股推送模式（[#55](https://github.com/MengFanjun020906/StockAnalyser/issues/55)）
   - 每分析完一只股票立即推送，不用等全部分析完
   - 命令行参数：`--single-notify`
   - 环境变量：`SINGLE_STOCK_NOTIFY=true`
-- 🔐 自定义 Webhook Bearer Token 认证（[#51](https://github.com/ZhuLinsen/daily_stock_analysis/issues/51)）
+- 🔐 自定义 Webhook Bearer Token 认证（[#51](https://github.com/MengFanjun020906/StockAnalyser/issues/51)）
   - 支持需要 Token 认证的 Webhook 端点
   - 环境变量：`CUSTOM_WEBHOOK_BEARER_TOKEN`
 
-## [1.4.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.3.0...v1.4.0) - 2026-01-17
+## [1.4.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.3.0...v1.4.0) - 2026-01-17
 
 ### 新增
 
@@ -1823,7 +1856,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 📝 README 精简优化
   - 高级配置移至 `docs/full-guide.md`
 
-## [1.3.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.2.0...v1.3.0) - 2026-01-12
+## [1.3.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.2.0...v1.3.0) - 2026-01-12
 
 ### 新增
 
@@ -1840,7 +1873,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 智能按股票分析块分割，每批添加分页标记（如 1/3, 2/3）
   - 批次间隔 1 秒，避免触发频率限制
 
-## [1.2.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.1.0...v1.2.0) - 2026-01-11
+## [1.2.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.1.0...v1.2.0) - 2026-01-11
 
 ### 新增
 
@@ -1855,7 +1888,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - 统一使用 `NOTIFICATION_URL` 配置，兼容旧的 `WECHAT_WEBHOOK_URL`
 - 邮件支持 Markdown 转 HTML 渲染
 
-## [1.1.0](https://github.com/ZhuLinsen/daily_stock_analysis/compare/v1.0.0...v1.1.0) - 2026-01-11
+## [1.1.0](https://github.com/MengFanjun020906/StockAnalyser/compare/v1.0.0...v1.1.0) - 2026-01-11
 
 ### 新增
 
@@ -1864,7 +1897,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Gemini 和 OpenAI 格式二选一
   - 自动降级重试机制
 
-## [1.0.0](https://github.com/ZhuLinsen/daily_stock_analysis/releases/tag/v1.0.0) - 2026-01-10
+## [1.0.0](https://github.com/MengFanjun020906/StockAnalyser/releases/tag/v1.0.0) - 2026-01-10
 
 ### 新增
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-Daily Stock Analysis - FastAPI 后端服务入口
+StockAnalyser - FastAPI 后端服务入口
 ===================================
 
 职责：

@@ -1,5 +1,5 @@
 # =====================================================================
-# install-windows.ps1 — One-shot Windows host bootstrap for DSA
+# install-windows.ps1 — One-shot Windows host bootstrap for StockAnalyser
 #
 # What this does (Windows side, before WSL):
 #   1. Enable WSL2 + Virtual Machine Platform features
@@ -84,9 +84,9 @@ Write-Host "3. Copy the project folder into WSL, e.g. from PowerShell:" -Foregro
 Write-Host "     wsl -d $Distro" -ForegroundColor Gray
 Write-Host "     # then inside WSL:" -ForegroundColor Gray
 Write-Host "     mkdir -p ~/code && cd ~/code" -ForegroundColor Gray
-Write-Host "     cp -r /mnt/c/path/to/daily_stock_analysis ./" -ForegroundColor Gray
+Write-Host "     cp -r /mnt/c/path/to/StockAnalyser ./" -ForegroundColor Gray
 Write-Host "4. Inside WSL, run the bootstrap:" -ForegroundColor White
-Write-Host "     cd ~/code/daily_stock_analysis" -ForegroundColor Gray
+Write-Host "     cd ~/code/StockAnalyser" -ForegroundColor Gray
 Write-Host "     bash scripts/bootstrap-wsl.sh" -ForegroundColor Gray
 Write-Host "5. Follow docs/deployment/deploy-to-new-windows.md for .env and DB notes." -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Green

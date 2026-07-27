@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List
 
 from src.services.news_signal_service import NewsSignalService
+from src.services.news_event_sentinel import NewsEventSentinel
 from src.services.graphiti.outbox_worker import GraphitiOutboxWorker
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,76 @@ def build_news_signal_background_tasks(config: Any) -> List[Dict[str, Any]]:
                 "name": "news_signal_cls_incremental",
             }
         )
+    if bool(getattr(config, "news_signal_portfolio_anysearch_enabled", False)):
+        interval_minutes = max(
+            60,
+            min(int(getattr(config, "news_signal_portfolio_anysearch_interval_minutes", 300) or 300), 1440),
+        )
+        max_results_per_stock = max(
+            1,
+            min(int(getattr(config, "news_signal_portfolio_anysearch_max_results_per_stock", 5) or 5), 10),
+        )
+        max_age_days = max(
+            1,
+            min(int(getattr(config, "news_signal_portfolio_anysearch_max_age_days", 3) or 3), 90),
+        )
+        run_immediately = bool(
+            getattr(config, "news_signal_portfolio_anysearch_run_immediately", False)
+        )
+
+        def portfolio_anysearch_task() -> None:
+            result = NewsSignalService().ingest_portfolio_anysearch_news(
+                max_results_per_stock=max_results_per_stock,
+                max_age_days=max_age_days,
+            )
+            status = str(result.get("status") or "unknown")
+            if status == "failed":
+                raise RuntimeError(str(result.get("errors") or "portfolio AnySearch ingest failed"))
+            logger.info(
+                "[NewsSignal] 持仓 AnySearch 消息面完成: status=%s holdings=%s accepted=%s new=%s",
+                status,
+                result.get("holding_count", 0),
+                result.get("accepted_items", 0),
+                result.get("new_raw_episodes", 0),
+            )
+
+        tasks.append(
+            {
+                "task": portfolio_anysearch_task,
+                "interval_seconds": interval_minutes * 60,
+                "run_immediately": run_immediately,
+                "name": "news_signal_portfolio_anysearch",
+            }
+        )
+    if bool(getattr(config, "news_event_sentinel_enabled", False)):
+        interval_minutes = max(
+            5,
+            min(int(getattr(config, "news_event_sentinel_interval_minutes", 30) or 30), 120),
+        )
+        run_immediately = bool(getattr(config, "news_event_sentinel_run_immediately", False))
+
+        def news_event_sentinel_task() -> None:
+            result = NewsEventSentinel(config=config).run_once()
+            status = str(result.get("status") or "unknown")
+            if status == "failed":
+                raise RuntimeError(str(result.get("errors") or "news event sentinel failed"))
+            logger.info(
+                "[NewsEventSentinel] 完成: status=%s triggered=%s cooldown=%s cards=%s",
+                status,
+                result.get("triggered", 0),
+                result.get("suppressed_by_cooldown", 0),
+                result.get("cards_scanned", 0),
+            )
+
+        tasks.append(
+            {
+                "task": news_event_sentinel_task,
+                "interval_seconds": interval_minutes * 60,
+                "run_immediately": run_immediately,
+                "name": "news_event_sentinel",
+            }
+        )
+
     if bool(getattr(config, "graphiti_enabled", False)) and bool(
         getattr(config, "graphiti_outbox_worker_enabled", True)
     ):

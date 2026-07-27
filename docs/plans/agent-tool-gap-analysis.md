@@ -4,6 +4,8 @@
 
 > 情绪面工具的具体实施闭环已单独展开到 [Agent 情绪面工具实施调研与闭环方案](./agent-sentiment-tool-implementation-plan.md)，包括推荐 API、工具契约、评分规则、SQLite 存储、候选池接入、Regime / Risk Gate 联动和验收标准。
 
+> 状态勘误（2026-07-17）：`get_market_sentiment_snapshot`、`get_sentiment_heat_candidates`、`scan_global_risk_events` 已进入 ToolRegistry，并接入 planner、ETL profile 和显式 `sentiment_heat` 候选来源。本文中“缺少市场情绪/全球风险工具”的表述保留为历史分析背景；剩余未闭环项主要是 `get_cross_asset_risk_signals` 这类跨资产风险联动工具。
+
 ## 1. 当前工具版图
 
 当前 Agent 工具大致覆盖 7 类能力，共 25 个工具：
@@ -921,4 +923,4 @@ if len(failed_tools) >= 2:
 - 用户要求选股，但市场环境已经不适合主动开仓。
 - 用户持仓暴露在出口链、能源、军工、黄金、半导体管制等事件敏感方向。
 
-下一步最值得做的是先实现 `get_market_sentiment_snapshot`，再补 `scan_geopolitical_risk_news` 和 `get_cross_asset_risk_signals`。这三类工具会把 Agent 从“个股分析器”提升为“能判断市场是否适合交易的账户级助手”。
+2026-07-17 起，最小闭环已先落地 `get_market_sentiment_snapshot`、`get_sentiment_heat_candidates` 和 `scan_global_risk_events`。下一步最值得补的是 `get_cross_asset_risk_signals`，用于把黄金、原油、汇率、利率和海外指数联动纳入账户级 risk-off 判断。

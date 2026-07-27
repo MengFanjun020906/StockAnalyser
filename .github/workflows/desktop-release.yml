@@ -72,8 +72,8 @@ jobs:
             throw 'No win-unpacked directory found under apps/dsa-desktop/dist.'
           }
           New-Item -ItemType Directory -Path 'dist/release-assets' -Force | Out-Null
-          $exeTarget = "dist/release-assets/daily-stock-analysis-windows-installer-$env:RELEASE_TAG.exe"
-          $zipTarget = "dist/release-assets/daily-stock-analysis-windows-noinstall-$env:RELEASE_TAG.zip"
+          $exeTarget = "dist/release-assets/stockanalyser-windows-installer-$env:RELEASE_TAG.exe"
+          $zipTarget = "dist/release-assets/stockanalyser-windows-noinstall-$env:RELEASE_TAG.zip"
           Copy-Item -Path $installerExe.FullName -Destination $exeTarget -Force
           Compress-Archive -Path $winUnpacked -DestinationPath $zipTarget -CompressionLevel Optimal -Force
 
@@ -153,7 +153,7 @@ jobs:
           fi
           test -n "$dmg_file"
           mkdir -p dist/release-assets
-          cp "$dmg_file" "dist/release-assets/daily-stock-analysis-macos-${{ matrix.arch }}-${RELEASE_TAG}.dmg"
+          cp "$dmg_file" "dist/release-assets/stockanalyser-macos-${{ matrix.arch }}-${RELEASE_TAG}.dmg"
 
       - uses: actions/upload-artifact@v6
         with:
@@ -180,7 +180,7 @@ jobs:
           BODY=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" docs/CHANGELOG.md)
           if [[ -z "$BODY" ]]; then
             echo "Warning: no CHANGELOG entry found for ${VERSION}"
-            BODY="See [CHANGELOG](https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/CHANGELOG.md) for details."
+            BODY="See [CHANGELOG](https://github.com/MengFanjun020906/StockAnalyser/blob/main/docs/CHANGELOG.md) for details."
           fi
           # Write changelog content + install instructions to file
           echo "$BODY" > /tmp/release_body.md

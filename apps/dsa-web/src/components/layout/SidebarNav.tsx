@@ -48,7 +48,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
           <BarChart3 className="h-5 w-5" />
         </div>
         {!collapsed ? (
-          <p className="min-w-0 truncate text-sm font-semibold text-foreground">DSA</p>
+          <p className="min-w-0 truncate text-sm font-semibold text-foreground">StockAnalyser</p>
         ) : null}
       </div>
 

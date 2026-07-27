@@ -1,13 +1,13 @@
 # Complete Configuration & Deployment Guide
 
-This document contains the complete configuration guide for the AI Stock Analysis System, intended for users who need advanced features or special deployment methods.
+This document contains the complete configuration guide for the StockAnalyser, intended for users who need advanced features or special deployment methods.
 
 > Quick start guide available in [README_EN.md](i18n/README_EN.md). This document covers advanced configuration.
 
 ## Project Structure
 
 ```
-daily_stock_analysis/
+StockAnalyser/
 ├── main.py              # Main entry point
 ├── src/                 # Core business logic
 │   ├── analyzer.py      # AI analyzer
@@ -141,7 +141,7 @@ To get started quickly, you need at minimum:
 ### 4. Manual Test
 
 1. Go to `Actions` tab
-2. Select `Daily Stock Analysis` workflow on the left
+2. Select `StockAnalyser Daily Analysis` workflow on the left
 3. Click `Run workflow` button on the right
 4. Select run mode
 5. Click green `Run workflow` to confirm
@@ -250,7 +250,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Timeout budget for explicit Agent `get_chip_distribution` calls; the default now reserves more time for recent-trade-date Tushare `cyq_chips` queries on the private gateway. | `12.0` | Optional |
 | `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Per-request timeout for Agent Tushare tools, shared by basic data, chip, margin, capital-flow fallback, and sector-ranking fast paths. | `20.0` | Optional |
 | `get_tushare_today_news` | Agent tool: calls Tushare `news` for current-day flash news only, from today's `00:00:00` through now. Supported `src` values are `sina`, `wallstreetcn`, `10jqka`, `eastmoney`, `yuncaijing`, `fenghuang`, `jinrongjie`, `cls`, and `yicai`; this Tushare API requires separate news permission. | - | Tool |
-| `get_cls_telegraph_news` | Agent tool: fetches CLS telegraph / news hot-list items via `https://orz.ai/api/v1/dailynews/?platform=cls`, returning title, content, publish time, heat score, rank, and `source_chain`. | - | Tool |
+| `get_cls_telegraph_news` | Agent tool: fetches CLS telegraph items from the signed `https://www.cls.cn/v1/roll/get_roll_list` endpoint first, with `orz dailynews platform=cls` only as fallback; returns title, content, publish time, level, linked themes/stocks, and `source_chain`. | - | Tool |
 | `get_xueqiu_hot_news` | Agent tool: fetches Xueqiu hot-list items via `https://orz.ai/api/v1/dailynews/?platform=xueqiu` for market discussion heat, theme diffusion, and sentiment confirmation. | - | Tool |
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | Per-component budget for `detect_market_regime`; affects index history, market indices, northbound flow, margin, and market capital-flow auxiliary inputs. | `25.0` | Optional |
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | Sector-ranking probing budget. Sources degrade in Tushare THS, Eastmoney, then StockAPI order; `detect_market_regime` uses the result for sector context and breadth. | `10.0` | Optional |
@@ -285,6 +285,7 @@ Final Agent dashboards run a fact guard before being returned. Exact capital-flo
 > - In thesis-desk candidate discovery, `momentum_desk` is now the trend/pattern-continuation desk and primarily consumes Sequoia, AlphaSift, limit-up, and capital-flow-anomaly recalls. The `early_turn_desk` code key is kept for compatibility, but its business role is a supplemental reversal-structure desk: a low `range_pct_120` must be paired with explicit turn evidence, and low position alone no longer qualifies. Defensive regimes (`risk_off`/`panic`/`trending_down`) skip zero-quota momentum runs to avoid wasting LLM budget.
 > - Update the Sequoia candidate DB with `python scripts/update_sequoia_candidates.py --trading-days 260`; it pulls recent A-share daily bars from baostock and also maintains `000001.SH` (Shanghai Composite) and `000300.SH` (CSI 300). The first index supports Seed Pool Alpha evaluation, while the second supplies market-regime and forward-probability history when the primary cache is short. Interrupted runs are resumable by default. Use `--no-incremental --no-resume` only for a full refresh from the first symbol.
 > - The Seed Pool quality page keeps one latest pool per `seed_date`. If the candidate pool is generated multiple times on the same day, the newer pool replaces the older one, and T+1 evaluation plus dashboard summaries use only the latest pool. Snapshot attribution first uses each seed's own `freshness`/`as_of`/`trade_date`; when those fields are missing, pools generated before 09:00 Beijing time are attributed to the previous natural day, for example, a pool generated before 09:00 on June 10 belongs to June 9.
+> - Historical Seed Pool snapshots can be previewed with `python scripts/backfill_seed_pool_quality_from_traces.py --trace-root data/agent_traces --dry-run` and backfilled by removing `--dry-run`. Due T+1 evaluations can be run manually with `python scripts/evaluate_seed_pool_quality.py --days 30 --limit 500`. `scripts/daily_run.sh` step 4 remains opt-in; set `SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED=true` to evaluate automatically, with missing OHLC reported as structured skipped results for later retry.
 > - Agent model context uses compact tool fact cards. High-risk metrics that are easy to misread, such as capital-flow and chip-distribution fields, receive short `field_semantics` guardrails from `src/agent/metric_semantics.py`; self-explanatory fields do not receive repeated explanations to protect context budget.
 > - When Tushare reports an expired, invalid, or unauthorized token, the current process temporarily quarantines that credential. Later tools skip Tushare and continue through fallback sources instead of repeating the same doomed request. Install a valid `TUSHARE_TOKEN` and restart the process to resume probing.
 > - `get_capital_flow` and `get_chip_distribution` retain successful results for up to five days; `get_sector_rankings` retains them for 36 hours. If live sources fail, a cache hit returns `status=stale`, `cache_age_seconds`, and `live_diagnostics`. Without a cache, the tool returns `status=unavailable` plus `provider_errors`. `unavailable` is a completed probe but is invalid as evidence; stale results keep their original data date and trigger refresh guidance.
@@ -341,15 +342,15 @@ The image uses prebuilt frontend assets under `/app/static` at runtime, so the r
 
 Official image registries:
 
-- GHCR: `ghcr.io/zhulinsen/daily_stock_analysis:<tag>`
-- Docker Hub: `<DOCKERHUB_USERNAME>/daily_stock_analysis:<tag>` (driven by the publisher's `DOCKERHUB_USERNAME` secret; the official release uses `zhulinsen/daily_stock_analysis`)
+- GHCR: `ghcr.io/mengfanjun020906/stockanalyser:<tag>`
+- Docker Hub: `<DOCKERHUB_USERNAME>/stockanalyser:<tag>` (driven by the publisher's `DOCKERHUB_USERNAME` secret; the official release uses `mengfanjun020906/stockanalyser`)
 
 ### Quick Start
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/ZhuLinsen/daily_stock_analysis.git
-cd daily_stock_analysis
+git clone https://github.com/MengFanjun020906/StockAnalyser.git
+cd StockAnalyser
 
 # 2. Configure environment variables
 cp .env.example .env
@@ -373,27 +374,27 @@ If you do not want to keep the source tree on the target machine, you can run th
 
 ```bash
 # Web/API mode
-docker pull zhulinsen/daily_stock_analysis:latest
+docker pull mengfanjun020906/stockanalyser:latest
 docker run -d \
-  --name dsa-server \
+  --name stockanalyser-server \
   --env-file .env \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/reports:/app/reports" \
   -v "$(pwd)/.env:/app/.env" \
-  zhulinsen/daily_stock_analysis:latest \
+  mengfanjun020906/stockanalyser:latest \
   python main.py --serve-only --host 0.0.0.0 --port 8000
 
 # Scheduled-task mode
 docker run -d \
-  --name dsa-analyzer \
+  --name stockanalyser-analyzer \
   --env-file .env \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/reports:/app/reports" \
   -v "$(pwd)/.env:/app/.env" \
-  zhulinsen/daily_stock_analysis:latest
+  mengfanjun020906/stockanalyser:latest
 ```
 
 For pinned deployments or easier rollback, replace `latest` with a concrete version tag such as `v3.13.0`.
@@ -486,7 +487,7 @@ docker-compose -f ./docker/docker-compose.yml up -d server
 ```bash
 docker build -f docker/Dockerfile -t stock-analysis .
 docker run -d \
-  --name dsa-server-local \
+  --name stockanalyser-server-local \
   --env-file .env \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
@@ -1061,4 +1062,4 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 
 ---
 
-For more questions, please [submit an Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+For more questions, please [submit an Issue](https://github.com/MengFanjun020906/StockAnalyser/issues)

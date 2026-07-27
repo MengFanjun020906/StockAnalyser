@@ -1,17 +1,17 @@
 <div align="center">
 
-# 股票智能分析系統
+# StockAnalyser
 
-[![GitHub stars](https://img.shields.io/github/stars/ZhuLinsen/daily_stock_analysis?style=social)](https://github.com/ZhuLinsen/daily_stock_analysis/stargazers)
-[![CI](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/MengFanjun020906/StockAnalyser?style=social)](https://github.com/MengFanjun020906/StockAnalyser/stargazers)
+[![CI](https://github.com/MengFanjun020906/StockAnalyser/actions/workflows/ci.yml/badge.svg)](https://github.com/MengFanjun020906/StockAnalyser/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/zhulinsen/daily_stock_analysis)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/mengfanjun020906/stockanalyser)
 
 <p>
-  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="ZhuLinsen%2Fdaily_stock_analysis | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-  <a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="MengFanjun020906%2FStockAnalyser | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+  <a href="https://hellogithub.com/repository/MengFanjun020906/StockAnalyser" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 </p>
 
 **基於 AI 大模型的 A股/港股/美股自選股智能分析系統**
@@ -27,7 +27,7 @@
 ## 💖 贊助商 (Sponsors)
 
 <div align="center">
-  <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
+  <a href="https://serpapi.com/baidu-search-api?utm_source=github_stockanalyser" target="_blank">
     <img src="../../sources/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
   </a>
 </div>
@@ -138,7 +138,7 @@
 
 ```bash
 # 克隆項目
-git clone https://github.com/ZhuLinsen/daily_stock_analysis.git && cd daily_stock_analysis
+git clone https://github.com/MengFanjun020906/StockAnalyser.git && cd StockAnalyser
 
 # 安裝依賴
 pip install -r requirements.txt
@@ -229,7 +229,7 @@ python main.py --webui-only
 
 ## 相關項目 (Related Projects)
 
-DSA 聚焦日常分析報告；以下兩個同系列項目分別覆蓋選股、策略驗證與策略進化，適合按需延伸使用。它們目前獨立維護，後續會優先探索與 DSA 的候選股導入、回測驗證和報告聯動。
+StockAnalyser 聚焦日常分析報告；以下兩個同系列項目分別覆蓋選股、策略驗證與策略進化，適合按需延伸使用。它們目前獨立維護，後續會優先探索與 StockAnalyser 的候選股導入、回測驗證和報告聯動。
 
 - [AlphaSift](https://github.com/ZhuLinsen/alphasift)：多因子選股與全市場掃描，用於從股票池中整理候選標的。
 - [AlphaEvo](https://github.com/ZhuLinsen/alphaevo)：策略回測與自我進化，用於驗證策略規則，並透過迭代探索策略參數與組合。
@@ -238,7 +238,7 @@ DSA 聚焦日常分析報告；以下兩個同系列項目分別覆蓋選股、�
 
 查看已支援的功能和未來規劃：[更新日誌](../CHANGELOG.md)
 
-> 有建議？歡迎 [提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+> 有建議？歡迎 [提交 Issue](https://github.com/MengFanjun020906/StockAnalyser/issues)
 
 > UI 正在持續調整與升級，部分頁面在過渡階段可能仍存在樣式、交互或兼容性問題。歡迎通過 Issue 或 Pull Request 一起完善。
 
@@ -275,18 +275,18 @@ npm run build
 
 ## 📬 聯繫與合作
 
-- GitHub Issues：[提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+- GitHub Issues：[提交 Issue](https://github.com/MengFanjun020906/StockAnalyser/issues)
 - 合作郵箱：zhuls345@gmail.com
 
 ## ⭐ Star History
 
 **如果覺得有用，請給個 ⭐ Star 支持一下！**
 
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
+<a href="https://star-history.com/#MengFanjun020906/StockAnalyser&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=MengFanjun020906/StockAnalyser&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=MengFanjun020906/StockAnalyser&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=MengFanjun020906/StockAnalyser&type=Date" />
  </picture>
 </a>
 

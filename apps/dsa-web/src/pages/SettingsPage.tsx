@@ -135,7 +135,7 @@ function formatDesktopEnvFilename() {
   const pad = (value: number) => value.toString().padStart(2, '0');
   const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
   const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
-  return `dsa-desktop-env_${date}_${time}.env`;
+  return `stockanalyser-desktop-env_${date}_${time}.env`;
 }
 
 const SettingsPage: React.FC = () => {
@@ -158,7 +158,7 @@ const SettingsPage: React.FC = () => {
 
   // Set page title
   useEffect(() => {
-    document.title = '系统设置 - DSA';
+    document.title = '系统设置 - StockAnalyser';
   }, []);
 
   const {

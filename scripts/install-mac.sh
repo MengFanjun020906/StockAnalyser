@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# install-mac.sh — One-shot dependency install for DSA on macOS
+# install-mac.sh — One-shot dependency install for StockAnalyser on macOS
 #
 # Target: macOS (Intel default; Apple Silicon also auto-detected).
 # Assumes: project source already copied to local disk; you ran this from
@@ -19,7 +19,7 @@
 #   7. (Optional) download Sequoia candidate DB if SEQUOIA_DB_URL set.
 #
 # Usage:
-#   cd ~/Projects/daily_stock_analysis
+#   cd ~/Projects/StockAnalyser
 #   bash scripts/install-mac.sh
 #
 # Env overrides:
@@ -102,7 +102,7 @@ BREW_LINE="eval \"\$(\"$(command -v brew)\" shellenv)\""
 if [[ -f "$SHELL_RC" ]] && grep -Fq "$BREW_LINE" "$SHELL_RC"; then
     :
 else
-    printf '\n# Added by daily_stock_analysis/scripts/install-mac.sh\n%s\n' \
+    printf '\n# Added by StockAnalyser/scripts/install-mac.sh\n%s\n' \
         "$BREW_LINE" >> "$SHELL_RC"
     log "Appended brew shellenv to $SHELL_RC"
 fi

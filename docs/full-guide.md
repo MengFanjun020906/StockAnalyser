@@ -1,13 +1,13 @@
 # 📖 完整配置与部署指南
 
-本文档包含 A股智能分析系统的完整配置说明，适合需要高级功能或特殊部署方式的用户。
+本文档包含 StockAnalyser 的完整配置说明，适合需要高级功能或特殊部署方式的用户。
 
 > 💡 快速上手请参考 [README.md](../README.md)，本文档为进阶配置。
 
 ## 📁 项目结构
 
 ```
-daily_stock_analysis/
+StockAnalyser/
 ├── main.py              # 主程序入口
 ├── src/                 # 核心业务逻辑
 │   ├── analyzer.py      # AI 分析器
@@ -85,7 +85,7 @@ daily_stock_analysis/
 | `EMAIL_SENDER` | 发件人邮箱（如 `xxx@qq.com`） | 可选 |
 | `EMAIL_PASSWORD` | 邮箱授权码（非登录密码） | 可选 |
 | `EMAIL_RECEIVERS` | 收件人邮箱（多个用逗号分隔，留空则发给自己） | 可选 |
-| `EMAIL_SENDER_NAME` | 发件人显示名称（默认：daily_stock_analysis股票分析助手） | 可选 |
+| `EMAIL_SENDER_NAME` | 发件人显示名称（默认：StockAnalyser股票分析助手） | 可选 |
 | `PUSHPLUS_TOKEN` | PushPlus Token（[获取地址](https://www.pushplus.plus)，国内推送服务） | 可选 |
 | `SERVERCHAN3_SENDKEY` | Server酱³ Sendkey（[获取地址](https://sc3.ft07.com/)，手机APP推送服务） | 可选 |
 | `CUSTOM_WEBHOOK_URLS` | 自定义 Webhook（支持钉钉等，多个用逗号分隔） | 可选 |
@@ -281,7 +281,7 @@ daily_stock_analysis/
 | `ENABLE_REALTIME_TECHNICAL_INDICATORS` | 盘中实时技术面：启用时用实时价计算 MA5/MA10/MA20 与多头排列（Issue #234）；关闭则用昨日收盘 | `true` | 可选 |
 | `AGENT_TUSHARE_TOOL_TIMEOUT_SECONDS` | Agent 层单次 Tushare 工具请求超时；基础数据、筹码、两融、资金流和板块排行快路径共用 | `20.0` | 可选 |
 | `get_tushare_today_news` | Agent 工具：调用 Tushare `news` 获取当日新闻快讯，时间窗口固定为今天 `00:00:00` 到当前时刻；支持 `sina`、`wallstreetcn`、`10jqka`、`eastmoney`、`yuncaijing`、`fenghuang`、`jinrongjie`、`cls`、`yicai` 来源；需 Tushare 单独开通 news 权限 | - | 工具 |
-| `get_cls_telegraph_news` | Agent 工具：通过 `https://orz.ai/api/v1/dailynews/?platform=cls` 获取财联社电报/消息热榜，返回标题、内容、发布时间、热度分数、排名和 `source_chain` | - | 工具 |
+| `get_cls_telegraph_news` | Agent 工具：优先通过 `https://www.cls.cn/v1/roll/get_roll_list` 签名接口获取财联社电报，`orz dailynews platform=cls` 仅作兜底；返回标题、内容、发布时间、等级、关联题材/股票和 `source_chain` | - | 工具 |
 | `get_xueqiu_hot_news` | Agent 工具：通过 `https://orz.ai/api/v1/dailynews/?platform=xueqiu` 获取雪球热榜，用于观察市场讨论热度、热门主题扩散和情绪确认 | - | 工具 |
 | `AGENT_REGIME_COMPONENT_TIMEOUT_SECONDS` | `detect_market_regime` 单个组件预算；影响指数历史、指数概览、北向、两融、市场资金等市场环境辅助输入 | `25.0` | 可选 |
 | `AGENT_SECTOR_RANKINGS_TIMEOUT_SECONDS` | 板块排行数据源探测预算；按 Tushare THS、Eastmoney、StockAPI 顺序降级，`detect_market_regime` 会用它补充板块环境与市场宽度上下文 | `10.0` | 可选 |
@@ -323,6 +323,7 @@ daily_stock_analysis/
 > - 四席位候选发现中，`momentum_desk` 的业务语义是“趋势/形态延续席”，优先消费 Sequoia、AlphaSift、涨停池和资金异常召回；`early_turn_desk` 代码名保留，但业务上降级为“结构反转席”，必须同时满足 `range_pct_120` 低位和明确转强证据，低位本身不再天然加分。防守 regime（`risk_off`/`panic`/`trending_down`）会跳过零配额动量席，避免无效席位消耗 LLM 预算。
 > - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并额外维护 `000001.SH` 上证指数和 `000300.SH` 沪深 300。前者供 Seed Pool 质量页计算 Alpha，后者供市场状态与前向概率在主缓存不足时补历史。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
 > - Seed Pool 质量页按 `seed_date` 只保留最新一个池子；同一天多次生成候选池时，新池会替换旧池，T+1 评估和页面总览只针对最新池。候选池会优先使用 seed 自身的 `freshness`/`as_of`/`trade_date` 归属日期；缺少这些字段时，北京时间 09:00 前生成的候选池归属到前一自然日，例如 6 月 10 日 09:00 前生成的池子计入 6 月 9 日。
+> - 历史 Seed Pool 快照可用 `python scripts/backfill_seed_pool_quality_from_traces.py --trace-root data/agent_traces --dry-run` 预览，再去掉 `--dry-run` 回填；到期 T+1 评估可用 `python scripts/evaluate_seed_pool_quality.py --days 30 --limit 500` 手动运行。`scripts/daily_run.sh` 第四步默认 opt-in，设置 `SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED=true` 后会自动评估，缺行情时保留结构化 skipped 并在下次续跑重试。
 > - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
 > - Agent 模型上下文使用压缩后的工具事实卡。资金流、筹码分布等容易被误读的高风险指标，会从 `src/agent/metric_semantics.py` 注入短 `field_semantics` 防误读说明；自解释字段不会重复解释，避免浪费上下文预算。
 > - Tushare 返回 Token 过期、无效或鉴权失败后，当前进程会短期隔离该凭据，后续工具直接跳过 Tushare 并继续其他来源，避免同一 Trace 重复消耗超时预算。更新有效 `TUSHARE_TOKEN` 并重启进程后恢复探测。
@@ -383,15 +384,15 @@ Dockerfile 使用多阶段构建，前端会在构建镜像时自动打包并内
 
 当前官方镜像发布地址：
 
-- GHCR：`ghcr.io/zhulinsen/daily_stock_analysis:<tag>`
-- Docker Hub：`<DOCKERHUB_USERNAME>/daily_stock_analysis:<tag>`（由发布者的 `DOCKERHUB_USERNAME` secret 决定，官方发布为 `zhulinsen/daily_stock_analysis`）
+- GHCR：`ghcr.io/mengfanjun020906/stockanalyser:<tag>`
+- Docker Hub：`<DOCKERHUB_USERNAME>/stockanalyser:<tag>`（由发布者的 `DOCKERHUB_USERNAME` secret 决定，官方发布为 `mengfanjun020906/stockanalyser`）
 
 ### 快速启动
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/ZhuLinsen/daily_stock_analysis.git
-cd daily_stock_analysis
+git clone https://github.com/MengFanjun020906/StockAnalyser.git
+cd StockAnalyser
 
 # 2. 配置环境变量
 cp .env.example .env
@@ -415,27 +416,27 @@ docker-compose -f ./docker/docker-compose.yml logs -f server
 
 ```bash
 # Web/API 模式
-docker pull zhulinsen/daily_stock_analysis:latest
+docker pull mengfanjun020906/stockanalyser:latest
 docker run -d \
-  --name dsa-server \
+  --name stockanalyser-server \
   --env-file .env \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/reports:/app/reports" \
   -v "$(pwd)/.env:/app/.env" \
-  zhulinsen/daily_stock_analysis:latest \
+  mengfanjun020906/stockanalyser:latest \
   python main.py --serve-only --host 0.0.0.0 --port 8000
 
 # 定时任务模式
 docker run -d \
-  --name dsa-analyzer \
+  --name stockanalyser-analyzer \
   --env-file .env \
   -v "$(pwd)/data:/app/data" \
   -v "$(pwd)/logs:/app/logs" \
   -v "$(pwd)/reports:/app/reports" \
   -v "$(pwd)/.env:/app/.env" \
-  zhulinsen/daily_stock_analysis:latest
+  mengfanjun020906/stockanalyser:latest
 ```
 
 如需固定版本或便于回滚，请将 `latest` 替换为具体版本 tag，例如 `v3.13.0`。
@@ -527,7 +528,7 @@ docker-compose -f ./docker/docker-compose.yml up -d server
 ```bash
 docker build -f docker/Dockerfile -t stock-analysis .
 docker run -d \
-  --name dsa-server-local \
+  --name stockanalyser-server-local \
   --env-file .env \
   -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
@@ -1194,7 +1195,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 
 ---
 
-更多问题请 [提交 Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+更多问题请 [提交 Issue](https://github.com/MengFanjun020906/StockAnalyser/issues)
 
 ## Agent 工具数据缓存与持久化
 
@@ -1238,7 +1239,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 导入流程会先把 CSV 解析成标准化记录，再逐条提交到持仓账本；遇到忙碌行会计入 `failed_count`，不会因为单行冲突让整批请求整体失败。
 - 交易去重优先使用账户内唯一的 `trade_uid`，缺失时回退到基于日期、代码、方向、数量、价格、费用、税费、币种的确定性哈希。
 - 卖出会先校验可用数量，超卖返回 `409 portfolio_oversell`；并发写入冲突时可能返回 `409 portfolio_busy`。
-- 持仓快照的 `positions[]` 会返回 `price_source`、`price_date`、`price_stale`、`price_available` 等价格元信息；当天快照优先使用历史收盘价，仅在收盘价缺失时尝试实时价 fallback，历史 `as_of` 快照不会拉取实时价，也不会再把成本价静默当作现价；缺价持仓会标记 `price_available=false` 并从市值与未实现盈亏汇总中排除。
+- 持仓快照的 `positions[]` 会返回 `price_source`、`price_date`、`price_stale`、`price_available` 等价格元信息；当天快照优先尝试实时价，实时价缺失时再回退本地历史收盘价，历史 `as_of` 快照不会拉取实时价，也不会再把成本价静默当作现价；缺价持仓会标记 `price_available=false` 并从市值与未实现盈亏汇总中排除。
 - 汇率刷新会先尝试在线源；若在线获取失败，则回退到最近一次缓存并标记 `is_stale=true`，避免快照和风险页整体不可用。
 - 当 `PORTFOLIO_FX_UPDATE_ENABLED=false` 时，手动刷新接口会明确返回“在线刷新已禁用”，页面不会误导为“当前没有可刷新的汇率对”。
 - 风险摘要包含集中度、回撤、止损接近度等信息；`sector_concentration` 会优先尝试按板块归类，失败时降级到 `UNCLASSIFIED`，不会阻断风险结果返回。

@@ -13,11 +13,12 @@ untouched.
 ``run_thesis_desk_committee`` (P4 thesis-desk pipeline: recall → desks →
 aggregate → allocate_slots) and preserves the legacy payload shape.
 
-Seed pool construction (four sources, deterministic, runs before any LLM call):
+Seed pool construction (ordered/capped deterministic sources, runs before any LLM call):
 1. User-provided target_symbols → source="user_watchlist"
-2. Daily limit-up list (get_tushare_limit_list_d) → source="limit_up_pool"
-3. Hot-rank list (get_tushare_hot_rank) → source="hot_rank"
-4. AlphaSift + Sequoia quant candidates → source="alphasift" / "sequoia"
+2. Daily screener / local post-close candidates → source="daily_screener"
+3. AlphaSift + Sequoia quant candidates → source="alphasift" / "sequoia"
+4. Market heat / theme / capital anomaly candidates → source-specific buckets
+5. Optional Graphiti / news-signal-card evidence attaches to seeds without replacing source provenance.
 
 If the committee expert layer fails or returns no picks, the facade fails the
 candidate-discovery stage and attaches diagnostics. The seed pool is input
@@ -747,6 +748,48 @@ def _source_quality(status: str, *, freshness: str = "unknown", error: str = "")
     if error:
         quality["error"] = error
     return quality
+
+
+def _strategy_trunk_health_diagnostic(
+    seeds_by_source: Dict[str, List[SeedItem]],
+    source_quality: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_payload: Dict[str, Dict[str, Any]] = {}
+    usable_count = 0
+    total_count = 0
+    for source in ("alphasift", "sequoia"):
+        count = len(seeds_by_source.get(source) or [])
+        status = str((source_quality.get(source) or {}).get("status") or "missing").lower()
+        usable = count > 0 and status not in {"failed", "missing", "timeout", "error", "unavailable"}
+        source_payload[source] = {
+            "status": status,
+            "count": count,
+            "usable": usable,
+        }
+        total_count += count
+        if usable:
+            usable_count += 1
+
+    if usable_count == 2:
+        status = "ok"
+        error = ""
+    elif usable_count == 1:
+        status = "partial"
+        error = "Only one strategy trunk source produced candidates."
+    else:
+        status = "failed"
+        error = "AlphaSift and Sequoia produced no usable strategy candidates."
+
+    return _source_diagnostic(
+        "strategy_trunk_health",
+        status,
+        count=total_count,
+        error=error,
+        detail={
+            "hard_strategy_trunk_missing": usable_count == 0,
+            "strategy_trunk_sources": source_payload,
+        },
+    )
 
 
 def _seed_from_candidate(
@@ -2508,6 +2551,15 @@ def _build_seed_pool_result(
 
     for source, bucket in list(seeds_by_source.items()):
         seeds_by_source[source] = _dedupe_by_code(bucket)
+
+    trunk_diagnostic = _strategy_trunk_health_diagnostic(seeds_by_source, source_quality)
+    diagnostics.append(trunk_diagnostic)
+    _log_seed_source_diagnostic(trunk_diagnostic)
+    source_quality["strategy_trunk_health"] = _source_quality(
+        str(trunk_diagnostic.get("status") or "unknown"),
+        freshness="latest_local",
+        error=str(trunk_diagnostic.get("error") or ""),
+    )
 
     result_pool = _assemble_seed_pool(
         seeds_by_source,

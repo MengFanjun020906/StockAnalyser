@@ -16,12 +16,29 @@ NEWS_SIGNAL_INCLUDE_SEMANTIC_EDGES=false
 NEWS_SIGNAL_CLS_INCREMENTAL_ENABLED=true
 NEWS_SIGNAL_CLS_INCREMENTAL_INTERVAL_MINUTES=10
 NEWS_SIGNAL_CLS_INCREMENTAL_LIMIT=50
+NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_ENABLED=true
+NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_INTERVAL_MINUTES=300
+NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_MAX_RESULTS_PER_STOCK=5
+NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_MAX_AGE_DAYS=3
+NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_RUN_IMMEDIATELY=false
 GRAPHITI_OUTBOX_WORKER_ENABLED=true
 GRAPHITI_OUTBOX_INTERVAL_SECONDS=60
 GRAPHITI_OUTBOX_BATCH_SIZE=10
 GRAPHITI_OUTBOX_MAX_ATTEMPTS=5
 GRAPHITI_OUTBOX_RETRY_BASE_SECONDS=30
 GRAPHITI_OUTBOX_JOB_TIMEOUT_SECONDS=120
+NEWS_EVENT_SENTINEL_ENABLED=true
+NEWS_EVENT_SENTINEL_INTERVAL_MINUTES=30
+NEWS_EVENT_SENTINEL_ACTIVE_WINDOWS=08:00-23:59
+NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE=50
+NEWS_EVENT_SENTINEL_CARD_MAX_AGE_MINUTES=30
+NEWS_EVENT_SENTINEL_MIN_SEVERITY=mid
+NEWS_EVENT_SENTINEL_COOLDOWN_MINUTES=120
+NEWS_EVENT_SENTINEL_TRIGGER_MODE=notify_only
+NEWS_EVENT_SENTINEL_FEISHU_ENABLED=true
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_key_here
+# FEISHU_WEBHOOK_SECRET=your_secret_if_enabled
+# FEISHU_WEBHOOK_KEYWORD=StockAnalyser
 ```
 
 随后执行：
@@ -33,7 +50,13 @@ bash scripts/daily_run.sh
 第三步会依次执行当日卡片重建、公司映射修复、同事件归并、缺失事件回填、seed outcome 刷新、Graphiti repair 和 outbox 消费。每个交易日有独立续跑标记。
 事件回填出现部分失败，或明确请求的 Graphiti repair 未成功时，维护命令返回非零退出码，第三步不会写完成标记，后续续跑会重试。
 
-`python main.py --schedule` 还会注册两个独立后台任务：财联社电报按 5-10 分钟增量入库，Graphiti outbox 按秒级间隔分批消费。关系库写入不等待 Graphiti；episode 超时后进入指数退避，删除任务优先于写入任务。
+`python main.py --schedule` 会注册每日个股分析/大盘复盘任务，因此不适合只接飞书消息面 webhook 的常驻哨兵。只需要消息面时，使用 `python scripts/run_news_signal_worker.py`；该入口只注册新闻后台任务，不会调用个股分析、市场复盘或报告通知链路。
+
+消息 worker 可注册三个独立后台任务：财联社电报按 5-10 分钟增量入库，真实持仓 AnySearch 消息面按 `NEWS_SIGNAL_PORTFOLIO_ANYSEARCH_INTERVAL_MINUTES` 周期入库，Graphiti outbox 按 `GRAPHITI_OUTBOX_INTERVAL_SECONDS` 分批消费。生产哨兵可将 `GRAPHITI_OUTBOX_INTERVAL_SECONDS=600` 与 10 分钟哨兵周期对齐。财联社电报主源使用 `https://www.cls.cn/v1/roll/get_roll_list` 签名接口，`https://orz.ai/api/v1/dailynews/?platform=cls` 仅作为兜底；高峰期建议保持 `NEWS_SIGNAL_CLS_INCREMENTAL_LIMIT=50` 与 `NEWS_EVENT_SENTINEL_MAX_ITEMS_PER_SOURCE=50`，避免只扫首页少量快讯导致漏抓。关系库写入不等待 Graphiti；episode 超时后进入指数退避，删除任务优先于写入任务。Graphiti embedding 未显式配置且运行环境没有 OpenAI-compatible key 时，worker 使用本地 hash embedding 保底同步，后续配置外部 embedding 后可提升语义检索质量。
+
+真实持仓 AnySearch 消息面只读取 active portfolio positions 中 `quantity > 0` 的股票，跨账户按 symbol 去重，每只股票默认请求 5 条搜索结果。入库来源为 `portfolio_anysearch`，只保留公告、业绩、回购、减持、异常波动、风险、重大事项等可行动消息；行情页、公告列表页和泛资讯列表页会被过滤。该任务只产出新闻信号卡片，不生成个股报告或大盘报告。
+
+启用 `NEWS_EVENT_SENTINEL_ENABLED=true` 后，schedule 模式会额外注册 `news_event_sentinel` 后台任务。第一版底层哨兵使用 Portfolio active positions 与 `STOCK_LIST` 构建关注宇宙，复用现有 CLS 增量入库和 `NewsSignalCard` 读取路径，再按 active window、card freshness、severity、company mapping、macro market、cooldown 生成 `news_event_sentinel_runs` 与 `news_event_sentinel_triggers` 审计。公司级事件要求命中持仓/自选；宏观事件可在命中 A 股或美股宏观白名单时触发，分别以 `MACRO:A_SHARE`、`MACRO:US` 记录；方向性产业线索在 `status=active`、`news_tone=positive|negative`、`signal_score>=50` 时分别以 `SIGNAL:POSITIVE` / `SIGNAL:NEGATIVE` 记录并推送，正向用于入场观察，负向用于避险预警。默认 `NEWS_EVENT_SENTINEL_TRIGGER_MODE=notify_only`，底层生成通知信封和触发记录；`NEWS_EVENT_SENTINEL_FEISHU_ENABLED=true` 且配置 `FEISHU_WEBHOOK_URL` 后，会通过飞书 webhook 发送 interactive card。触发卡会 best-effort 查询 Graphiti，并在卡片和 `news_event_sentinel_triggers.trace_status` 中记录 `linked`、`degraded`、`empty`、`failed` 或 `skipped`；Graphiti 不可用时会展示关系库 fallback 状态，不再静默隐藏。`NEWS_EVENT_SENTINEL_HEARTBEAT_ENABLED=true` 时，如果一轮扫描没有产生市场触发，会按 `NEWS_EVENT_SENTINEL_HEARTBEAT_INTERVAL_MINUTES` 写入并发送低等级存活卡片，便于确认 10 分钟后台轮询仍在运行。飞书卡片属于外层汇报适配器，只负责监控汇报，不负责拉取、入库或 LLM 抽取。
 
 `NEWS_SIGNAL_GRAPH_REPAIR_MODE`：
 

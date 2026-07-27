@@ -1,5 +1,5 @@
 # ===================================
-# A股自选股智能分析系统 - Docker Compose
+# StockAnalyser - Docker Compose
 # ===================================
 # 
 # 使用方式:
@@ -8,7 +8,7 @@
 #   同时启动: docker-compose -f ./docker/docker-compose.yml up -d analyzer server
 #   Graphiti/Neo4j: docker-compose -f ./docker/docker-compose.yml --profile graphiti up -d neo4j
 
-name: daily-stock-analysis
+name: stockanalyser
 version: '3.8'
 
 x-common: &common

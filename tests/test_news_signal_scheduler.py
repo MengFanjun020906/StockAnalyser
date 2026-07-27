@@ -42,6 +42,39 @@ def test_cls_incremental_interval_is_clamped_to_five_to_ten_minutes() -> None:
     assert slow[0]["interval_seconds"] == 10 * 60
 
 
+def test_build_news_signal_background_tasks_registers_portfolio_anysearch_news() -> None:
+    config = SimpleNamespace(
+        news_signal_cls_incremental_enabled=False,
+        news_signal_portfolio_anysearch_enabled=True,
+        news_signal_portfolio_anysearch_interval_minutes=300,
+        news_signal_portfolio_anysearch_max_results_per_stock=5,
+        news_signal_portfolio_anysearch_max_age_days=21,
+        news_signal_portfolio_anysearch_run_immediately=True,
+        news_event_sentinel_enabled=False,
+        graphiti_enabled=False,
+    )
+    service = MagicMock()
+    service.ingest_portfolio_anysearch_news.return_value = {
+        "status": "ok",
+        "holding_count": 2,
+        "accepted_items": 2,
+        "new_raw_episodes": 2,
+    }
+
+    with patch("src.services.news_signal_scheduler.NewsSignalService", return_value=service):
+        tasks = build_news_signal_background_tasks(config)
+        tasks[0]["task"]()
+
+    assert len(tasks) == 1
+    assert tasks[0]["name"] == "news_signal_portfolio_anysearch"
+    assert tasks[0]["interval_seconds"] == 300 * 60
+    assert tasks[0]["run_immediately"] is True
+    service.ingest_portfolio_anysearch_news.assert_called_once_with(
+        max_results_per_stock=5,
+        max_age_days=21,
+    )
+
+
 def test_build_news_signal_background_tasks_registers_graphiti_outbox_worker() -> None:
     config = SimpleNamespace(
         news_signal_cls_incremental_enabled=False,
@@ -69,3 +102,30 @@ def test_build_news_signal_background_tasks_registers_graphiti_outbox_worker() -
         job_timeout_seconds=90,
     )
     worker.run_once.assert_called_once_with(limit=12)
+
+def test_build_news_signal_background_tasks_registers_news_event_sentinel() -> None:
+    config = SimpleNamespace(
+        news_signal_cls_incremental_enabled=False,
+        news_event_sentinel_enabled=True,
+        news_event_sentinel_interval_minutes=3,
+        news_event_sentinel_run_immediately=True,
+        graphiti_enabled=False,
+    )
+    sentinel = MagicMock()
+    sentinel.run_once.return_value = {
+        "status": "ok",
+        "triggered": 1,
+        "suppressed_by_cooldown": 0,
+        "cards_scanned": 2,
+    }
+
+    with patch("src.services.news_signal_scheduler.NewsEventSentinel", return_value=sentinel) as sentinel_cls:
+        tasks = build_news_signal_background_tasks(config)
+        tasks[0]["task"]()
+
+    assert len(tasks) == 1
+    assert tasks[0]["name"] == "news_event_sentinel"
+    assert tasks[0]["interval_seconds"] == 5 * 60
+    assert tasks[0]["run_immediately"] is True
+    sentinel_cls.assert_called_once_with(config=config)
+    sentinel.run_once.assert_called_once_with()

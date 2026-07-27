@@ -1,17 +1,17 @@
 <div align="center">
 
-# AI Stock Analysis System
+# StockAnalyser
 
-[![GitHub stars](https://img.shields.io/github/stars/ZhuLinsen/daily_stock_analysis?style=social)](https://github.com/ZhuLinsen/daily_stock_analysis/stargazers)
-[![CI](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhuLinsen/daily_stock_analysis/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/MengFanjun020906/StockAnalyser?style=social)](https://github.com/MengFanjun020906/StockAnalyser/stargazers)
+[![CI](https://github.com/MengFanjun020906/StockAnalyser/actions/workflows/ci.yml/badge.svg)](https://github.com/MengFanjun020906/StockAnalyser/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Ready-2088FF?logo=github-actions&logoColor=white)](https://github.com/features/actions)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/zhulinsen/daily_stock_analysis)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/mengfanjun020906/stockanalyser)
 
 <p>
-  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="ZhuLinsen%2Fdaily_stock_analysis | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-  <a href="https://hellogithub.com/repository/ZhuLinsen/daily_stock_analysis" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+  <a href="https://trendshift.io/repositories/18527" target="_blank"><img src="https://trendshift.io/api/badge/repositories/18527" alt="MengFanjun020906%2FStockAnalyser | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+  <a href="https://hellogithub.com/repository/MengFanjun020906/StockAnalyser" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=6daa16e405ce46ed97b4a57706aeb29f&claim_uid=pfiJMqhR9uvDGlT&theme=neutral" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 </p>
 
 **AI-powered stock analysis system for A-shares / Hong Kong / US stocks**
@@ -27,7 +27,7 @@ English | [简体中文](../../README.md) | [繁體中文](README_CHT.md)
 ## 💖 Sponsors
 
 <div align="center">
-  <a href="https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis" target="_blank">
+  <a href="https://serpapi.com/baidu-search-api?utm_source=github_stockanalyser" target="_blank">
     <img src="../../sources/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" height="160">
   </a>
 </div>
@@ -128,7 +128,7 @@ Open the `Actions` tab and click `I understand my workflows, go ahead and enable
 
 #### 4. Manual Test
 
-`Actions` -> `Daily Stock Analysis` -> `Run workflow` -> `Run workflow`.
+`Actions` -> `StockAnalyser Daily Analysis` -> `Run workflow` -> `Run workflow`.
 
 #### Done
 
@@ -138,7 +138,7 @@ By default, the workflow runs every weekday at 18:00 Beijing time and skips non-
 
 ```bash
 # Clone the project
-git clone https://github.com/ZhuLinsen/daily_stock_analysis.git && cd daily_stock_analysis
+git clone https://github.com/MengFanjun020906/StockAnalyser.git && cd StockAnalyser
 
 # Install dependencies
 pip install -r requirements.txt
@@ -229,14 +229,14 @@ After configuring any available AI API key, the Web `/chat` page can use strateg
 
 ## Related Projects
 
-DSA focuses on daily analysis reports. These sibling projects cover stock screening, strategy validation, and strategy evolution for users who want to extend the workflow. They are maintained independently today, with candidate import, backtest validation, and report handoff planned as future integration directions.
+StockAnalyser focuses on daily analysis reports. These sibling projects cover stock screening, strategy validation, and strategy evolution for users who want to extend the workflow. They are maintained independently today, with candidate import, backtest validation, and report handoff planned as future integration directions.
 
 - [AlphaSift](https://github.com/ZhuLinsen/alphasift): multi-factor stock screening and full-market scanning for building candidate watchlists.
 - [AlphaEvo](https://github.com/ZhuLinsen/alphaevo): strategy backtesting and self-evolution experiments for validating rules and iteratively exploring strategy parameters and combinations.
 
 ## 🗺️ Roadmap
 
-See supported features and release notes in the [Changelog](../CHANGELOG.md). Suggestions are welcome through [GitHub Issues](https://github.com/ZhuLinsen/daily_stock_analysis/issues).
+See supported features and release notes in the [Changelog](../CHANGELOG.md). Suggestions are welcome through [GitHub Issues](https://github.com/MengFanjun020906/StockAnalyser/issues).
 
 > UI pages are still being polished. Please report style, interaction, or compatibility issues through Issues or Pull Requests.
 
@@ -275,19 +275,19 @@ If you use or build on this project, attribution with a link back to this reposi
 
 ## 📞 Contact
 
-- GitHub Issues: [Report bugs or request features](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
-- Discussions: [Join discussions](https://github.com/ZhuLinsen/daily_stock_analysis/discussions)
+- GitHub Issues: [Report bugs or request features](https://github.com/MengFanjun020906/StockAnalyser/issues)
+- Discussions: [Join discussions](https://github.com/MengFanjun020906/StockAnalyser/discussions)
 - Email: zhuls345@gmail.com
 
 ## ⭐ Star History
 
 **Star this repo if you find it useful.**
 
-<a href="https://star-history.com/#ZhuLinsen/daily_stock_analysis&Date">
+<a href="https://star-history.com/#MengFanjun020906/StockAnalyser&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ZhuLinsen/daily_stock_analysis&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=MengFanjun020906/StockAnalyser&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=MengFanjun020906/StockAnalyser&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=MengFanjun020906/StockAnalyser&type=Date" />
  </picture>
 </a>
 

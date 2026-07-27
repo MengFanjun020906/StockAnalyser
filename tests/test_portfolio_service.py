@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -136,7 +136,36 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(pos["price_provider"], "unit-test")
         self.assertTrue(pos["price_available"])
 
-    def test_current_snapshot_uses_close_before_realtime_fallback(self) -> None:
+    def test_current_snapshot_prefers_realtime_over_stale_cached_close(self) -> None:
+        today = date.today()
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=today,
+            side="buy",
+            quantity=10,
+            price=100,
+            market="cn",
+            currency="CNY",
+        )
+        self._save_close("600519", today - timedelta(days=1), 118.0)
+
+        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value=(125.0, "unit-test")):
+            snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
+
+        pos = snapshot["accounts"][0]["positions"][0]
+        self.assertAlmostEqual(pos["last_price"], 125.0, places=6)
+        self.assertAlmostEqual(pos["market_value_base"], 1250.0, places=6)
+        self.assertAlmostEqual(pos["unrealized_pnl_base"], 250.0, places=6)
+        self.assertEqual(pos["price_source"], "realtime_quote")
+        self.assertEqual(pos["price_provider"], "unit-test")
+        self.assertEqual(pos["price_date"], today.isoformat())
+        self.assertFalse(pos["price_stale"])
+        self.assertTrue(pos["price_available"])
+
+    def test_current_snapshot_falls_back_to_close_when_realtime_missing(self) -> None:
         today = date.today()
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
         aid = account["id"]
@@ -152,11 +181,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
         )
         self._save_close("600519", today, 118.0)
 
-        with patch.object(
-            PortfolioService,
-            "_fetch_realtime_position_price",
-            side_effect=AssertionError("close price should be used before realtime fallback"),
-        ):
+        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value=(None, None)):
             snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
 
         pos = snapshot["accounts"][0]["positions"][0]
@@ -164,6 +189,8 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertAlmostEqual(pos["market_value_base"], 1180.0, places=6)
         self.assertAlmostEqual(pos["unrealized_pnl_base"], 180.0, places=6)
         self.assertEqual(pos["price_source"], "history_close")
+        self.assertEqual(pos["price_date"], today.isoformat())
+        self.assertFalse(pos["price_stale"])
         self.assertTrue(pos["price_available"])
 
     def test_historical_snapshot_marks_missing_price_without_cost_fallback(self) -> None:

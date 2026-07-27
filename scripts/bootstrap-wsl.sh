@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# bootstrap-wsl.sh — One-shot dependency install for DSA inside WSL2
+# bootstrap-wsl.sh — One-shot dependency install for StockAnalyser inside WSL2
 #
 # Target: Ubuntu (WSL2). Tested on Ubuntu 22.04 / 24.04.
 # Assumes: project source already copied into WSL filesystem.
@@ -18,7 +18,7 @@
 #   9. (Optional) download Sequoia candidate DB if URL provided
 #
 # Usage:
-#   cd ~/code/daily_stock_analysis
+#   cd ~/code/StockAnalyser
 #   bash scripts/bootstrap-wsl.sh
 #
 # Env overrides:

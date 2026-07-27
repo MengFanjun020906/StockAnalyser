@@ -292,7 +292,7 @@ const CandidatePoolPage: React.FC = () => {
   const [error, setError] = useState<ParsedApiError | null>(null);
 
   useEffect(() => {
-    document.title = '候选池 - DSA';
+    document.title = '候选池 - StockAnalyser';
   }, []);
 
   const loadLatest = useCallback(async () => {

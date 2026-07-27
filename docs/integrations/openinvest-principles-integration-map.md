@@ -4,7 +4,9 @@
 
 结论先说：接入点主要在后端 Agent 选股链路、工具层、Trace 审计和离线复盘里。它不是把 `openInvest` 整仓搬进来，而是把可复用的机制拆成小模块接到本项目已有链路中。
 
-本次同步基于本地 `openInvest` 当前 `origin/main` 快照 `9886db4`。这版最值得学习的不是某个单点工具，而是几条策略性原则：角色信息隔离必须落在数据投喂契约上，新闻要先变成结构化事件再触发委员会，卖出/等待必须带路径概率和买回参考，运行时风险偏好要可治理地调整，系统自己要持续公开胜率、持有率、PnL 和 benchmark 差距。
+本次重新同步基于本地 `openInvest` 当前 `origin/main` 快照 `717974a`（2026-07-20 本地快进；openInvest `0.31.7`，invest skill `0.20.1`，invest-backup skill `0.2.1`）。这版最值得学习的不是某个单点工具，而是几条策略性原则：角色信息隔离必须落在数据投喂契约上，新闻要先变成结构化事件再触发委员会，卖出/等待必须带路径概率和买回参考，运行时风险偏好要可治理地调整，系统自己要持续公开胜率、持有率、PnL 和 benchmark 差距。
+
+相较上一版总结，这次新增的强信号集中在“真实资金系统的工程硬边界”：交易状态跃迁必须精确到 `planned -> executed` 这类原状态 CAS，避免二次入账；估值和 what-if 不能把 `0.0` 缺价当成有效价格；benchmark 缓存新鲜度必须对齐窗口终点；回测胜率只能匹配卖出之前的买入，不能被后续买入污染；非 loopback Web/API 必须有 token，Docker build 必须排除本地账本和用户画像。
 
 ## 1. 总览
 
@@ -113,13 +115,30 @@ from services.news_sources.rss_feed import load_default_feeds
 - 按 URL 和 event store 去重。
 - 只有命中 watched symbols / macro tags 且 severity 超过阈值时，才触发 committee 和邮件通知。
 
+它的“哨兵模式”不是普通脚本轮询，而是 `scheduler/runner.py` 加载 `jobs/event_watch.yml` 后注册的 cron job。默认配置为北京时间 `*/30 0-2,8-23 * * *`，即 08:00 到次日 02:30 每 30 分钟扫描一次新闻；`event.watch_schedule` 可覆盖默认 cron，调度器每 10 分钟重新读取配置。相邻的 `jobs/price_sentinel.yml` 是另一条价格异动哨兵，默认每 5 分钟检查 10 分钟涨跌与日 ATR 的关系，和新闻事件哨兵职责不同。
+
+`event_watch.py` 的完整闭环是：
+
+```text
+持仓/目标资产 -> watched symbols
+  -> DDGS / SearXNG / RSS / yfinance / 中文 7x24 快讯
+  -> URL 去重
+  -> LLM normalize 为结构化 event
+  -> severity + stance + affected_symbols 过滤
+  -> 通知 + committee rerun
+```
+
+这和本项目当前能力的边界不同。本项目已有 `NEWS_SIGNAL_CLS_INCREMENTAL_ENABLED`，可在 `python main.py --schedule` 模式下注册 `news_signal_cls_incremental` 后台任务，按 5-10 分钟间隔增量抓取财联社快讯并写入新闻信号卡片；`scripts/daily_run.sh` 也能 opt-in 执行新闻卡片、事件、outcome 和 Graphiti 投影维护。但这两者还不是 openInvest 式“按持仓/关注标的持续扫多源新闻，命中后主动触发分析”的事件哨兵。
+
 这对本项目新闻面链路的启发是：AI/科技产业链股票需要消息面，但模型不应该直接吞原文列表。更好的输入形态应该是短事件卡：
 
 ```text
 事件类型 -> 影响品类 -> 受益/受损环节 -> 涉及股票 -> 证据来源 -> 时效 -> 置信度 -> 需要下游验证的问题
 ```
 
-当前主题催化席已经把新闻补证收窄到 AI/科技产业链，并要求摘要化输出产品品类出口、国产替代政策、业务映射和资金验证；下一步可以把这些摘要卡持久化为 `event_store`，让后续 Trace 不必重复搜索同一批原文。
+当前主题催化席已经把新闻补证收窄到 AI/科技产业链，并要求摘要化输出产品品类出口、国产替代政策、业务映射和资金验证；新闻信号卡片也已经有关系型真源和 Graphiti 投影。下一步更接近 openInvest 的做法，是新增一个轻量 `news_event_watch` 后台任务：读取 `STOCK_LIST` 和 Portfolio 持仓，复用现有 `get_cls_telegraph_news`、`search_openinvest_news`、雪球/宏观源和 `NewsSignalService` 入库能力，只在事件命中持仓或关注候选且严重度达标时，才触发 Agent Trace 或选股/持仓复盘。
+
+底层落地原则详见 [新闻事件哨兵底层设计](../architecture/news-event-sentinel-design.md)：飞书消息卡片只作为通知适配器，不能反向决定 watched set、severity、cooldown 或 Agent Trace 触发语义。
 
 ## 5. 多席位委员会
 
@@ -273,7 +292,7 @@ llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path))
 
 ## 10. openInvest 当前版本最值得学习的策略性优点
 
-这次更新后，openInvest 的优势可以概括成九条，按本项目可借鉴价值排序如下。
+这次更新后，openInvest 的优势可以概括成十二条，按本项目可借鉴价值排序如下。
 
 | 优点 | openInvest 做法 | 对本项目的学习价值 |
 | --- | --- | --- |
@@ -286,6 +305,9 @@ llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path))
 | PnL 与 benchmark 自揭短 | README 公开系统胜率、HOLD 比例，并用多组 benchmark 比较；PnL SVG 隐私化，只展示百分比 | 本项目有入场回测，但还缺长期组合级 benchmark 和“系统自我披露” |
 | Reward 看组合质量而不只看命中率 | `backtest_reward.py` 同时考虑年化收益、回撤、相对余额宝 alpha、Sharpe bonus | 后验复盘不应只看 hit/miss，还要把回撤、机会成本和资金效率纳入奖励 |
 | Markdown-as-database 可审计 | 组合、委员会报告、记忆和复盘用 frontmatter + body，配合文件锁、原子写和 Git 审计 | 本项目 Trace 已经较强，长期记忆和策略复盘可以补更适合人工审阅的记录层 |
+| 交易账本副作用受状态机约束 | `claim_status_transition(..., from_status="planned")` 只允许 planned 首次变 executed 的调用同步组合账本 | 本项目持仓账本已有写锁，但后续若加入订单状态流转，应把“状态跃迁”和“记账副作用”绑定成一次原子声明 |
+| 缺价与哨兵值不污染估值 | `price <= 0` 统一视为缺价，what-if 缺 symbol 显式报错，避免返回自信但错误的组合估值 | 本项目 Portfolio / Performance / Backtest 都应把缺价、0 价和 fallback 价分层标注，不能让 0 值静默进入总资产 |
+| 自托管安全边界落进代码 | 非 loopback Web API 无 `INVEST_API_TOKEN` 直接拒绝启动，Docker ignore 排除 `db/` 和 `user_profile.json`，backup skill 支持 PyPI/uvx 安装形态 | 本项目部署、桌面端、公开图和备份链路也应把“不要泄露账户和密钥”做成默认失败条件，而不是只写在文档里 |
 
 一句话总结：openInvest 把“投资委员会”做成了治理系统，而不是一个多角色 prompt。本项目已经吸收了工具、Trace、概率和 sanity 的一部分，但还需要继续学习它的输入隔离、事件存储、运行时治理和自审计。
 
@@ -296,9 +318,12 @@ llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path))
 | P0 | 四席位 / Judge 输入隔离契约 | 这是 openInvest 最核心的质量来源，能减少模型互相污染和“看完答案再解释” | `src/agent/candidate_experts_v2/`、`src/agent/stock_selection.py` |
 | P0 | 新闻事件卡持久化 | 消息面驱动不能让模型吞原文；事件卡能节省时间并支持复用 | `src/agent/tools/search_tools.py`、`data/agent_events/`、主题催化席 |
 | P0 | TRIM / wait 的 reentry 强校验 | 避免只会喊风险但不给买回路径，和 openInvest 的 path profile 思路一致 | `src/agent/judge_sanity.py`、`pricing_agent.json` |
+| P0 | 交易状态 CAS 与副作用隔离 | 防止同一交易从取消状态再次执行造成重复入账，属于真实资金账本红线 | `PortfolioService` 未来订单状态流、交易导入幂等、执行回测成交状态 |
+| P0 | 缺价/0价治理 | 避免 0.0 哨兵值把市值、收益率、what-if 和风险指标污染成“正常为 0” | `src/services/portfolio_service.py`、未来 performance service、backtest service |
 | P1 | 统一运行时治理覆盖层 | 风险偏好、concentration lens、新闻席位开关、DCA/分批规则不应散落在 env 和 prompt 中 | API 设置页、`.env.example`、Agent 配置 schema |
 | P1 | lookahead guard | 历史 Trace、策略回测、LLM prompt 评估都需要显式防未来信息泄漏 | 回测脚本、verdict review、entry execution backtest |
 | P1 | portfolio-level PnL benchmark | 现在更多是单 Trace / 入场层评估，缺长期组合级自揭短 | Web“入场”页、后验复盘页、新 benchmark service |
+| P1 | 自托管安全默认失败 | 远端 Web/API、Docker build、备份恢复都应优先保护本地资产和凭据 | 部署脚本、Docker、桌面端打包、数据备份文档 |
 | P2 | strategy reward | 把胜率、收益、回撤、机会成本合成可比较分数，用于评估 prompt / 策略迭代 | `src/services/agent_verdict_review_service.py`、离线 insight |
 | P2 | Markdown/atomic audit memory | 给长期策略洞察和人工复盘更稳定的可读存储格式 | `data/agent_reviews/insights/`、未来 memory 层 |
 

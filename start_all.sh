@@ -10,6 +10,7 @@ BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 START_NEO4J="${START_NEO4J:-true}"
+NEO4J_CONTAINER_NAME="${NEO4J_CONTAINER_NAME:-stock-graphiti-neo4j}"
 
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
@@ -106,6 +107,29 @@ ensure_docker_daemon_running() {
   fi
 }
 
+reuse_existing_neo4j_container() {
+  local container_id
+  container_id="$(docker ps -aq -f "name=^/${NEO4J_CONTAINER_NAME}$" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$container_id" ]]; then
+    return 1
+  fi
+
+  local running
+  running="$(docker inspect -f '{{.State.Running}}' "$container_id" 2>/dev/null || true)"
+  if [[ "$running" == "true" ]]; then
+    printf 'Neo4j container %s already exists and is running. Reusing it.\n' "$NEO4J_CONTAINER_NAME"
+    return 0
+  fi
+
+  printf 'Neo4j container %s already exists but is not running. Starting it ...\n' "$NEO4J_CONTAINER_NAME"
+  if docker start "$container_id" >/dev/null; then
+    return 0
+  fi
+
+  printf 'Failed to start existing Neo4j container %s. Remove or rename it, then retry.\n' "$NEO4J_CONTAINER_NAME" >&2
+  return 1
+}
+
 ensure_tracked_process_running() {
   local name="$1"
   local pid_file="$2"
@@ -144,6 +168,9 @@ start_neo4j() {
   find_docker_compose
   ensure_docker_daemon_running
   printf 'Starting Neo4j for Graphiti on bolt://127.0.0.1:7687 ...\n'
+  if reuse_existing_neo4j_container; then
+    return 0
+  fi
   (
     cd "$ROOT_DIR"
     "${DOCKER_COMPOSE_CMD[@]}" --profile graphiti -f "$DOCKER_COMPOSE_FILE" up -d neo4j

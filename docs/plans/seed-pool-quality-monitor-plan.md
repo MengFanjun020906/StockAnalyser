@@ -410,10 +410,10 @@ POST /api/v1/seed-pool-quality/evaluate?seed_date=2026-06-05
 
 ### P6：运营和排障
 
-- [ ] 增加手动回填脚本，用于从历史 trace 导入 seed pool 快照。
-- [ ] 增加评估任务日志和失败重试。
-- [ ] 在 Trace 页面提供跳转到质量监控页的反向链接。
-- [ ] 后续接入每日自动评估任务。
+- [x] 增加手动回填脚本，用于从历史 trace 导入 seed pool 快照：`scripts/backfill_seed_pool_quality_from_traces.py`。
+- [x] 增加评估任务日志和失败重试：`scripts/evaluate_seed_pool_quality.py` 输出结构化 ok/skipped/error，`daily_run.sh` 未成功不写完成标记，下次续跑重试。
+- [x] 在 Trace 页面提供跳转到质量监控页的反向链接：`AgentTracePage` 会按 `seed_date` 跳转 `/seed-pool-quality`。
+- [x] 后续接入每日自动评估任务：`scripts/daily_run.sh` 第四步通过 `SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED=true` opt-in 执行。
 
 ## 10. 第一版验收标准
 

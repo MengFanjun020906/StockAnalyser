@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-A股自选股智能分析系统 - 存储层
+StockAnalyser - 存储层
 ===================================
 
 职责：
@@ -405,6 +405,64 @@ class GraphitiOutbox(Base):
     __table_args__ = (
         Index('ix_graphiti_outbox_ready', 'status', 'available_at'),
         Index('ix_graphiti_outbox_aggregate', 'event_type', 'aggregate_id'),
+    )
+
+
+class NewsEventSentinelRun(Base):
+    """Run ledger for the news event sentinel."""
+
+    __tablename__ = 'news_event_sentinel_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    started_at = Column(DateTime, nullable=False, index=True)
+    finished_at = Column(DateTime, index=True)
+    status = Column(String(32), default='running', index=True)
+    watched_symbol_count = Column(Integer, default=0)
+    source_query_count = Column(Integer, default=0)
+    fetched_count = Column(Integer, default=0)
+    unseen_count = Column(Integer, default=0)
+    raw_episode_count = Column(Integer, default=0)
+    card_count = Column(Integer, default=0)
+    trigger_count = Column(Integer, default=0)
+    suppressed_by_cooldown = Column(Integer, default=0)
+    errors_json = Column(Text)
+    diagnostics_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_news_event_sentinel_run_status_started', 'status', 'started_at'),
+    )
+
+
+class NewsEventSentinelTrigger(Base):
+    """Trigger ledger for dedupe, cooldown and notification audit."""
+
+    __tablename__ = 'news_event_sentinel_triggers'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trigger_id = Column(String(96), nullable=False, unique=True, index=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    card_id = Column(String(96), nullable=False, index=True)
+    event_id = Column(String(128), index=True)
+    canonical_symbol = Column(String(32), nullable=False, index=True)
+    event_type = Column(String(64), default='unknown', index=True)
+    direction = Column(String(32), default='neutral', index=True)
+    severity = Column(String(24), default='low', index=True)
+    cooldown_key = Column(String(128), nullable=False, index=True)
+    triggered_at = Column(DateTime, nullable=False, index=True)
+    notification_status = Column(String(32), default='pending', index=True)
+    trace_status = Column(String(32), default='skipped', index=True)
+    notification_payload_json = Column(Text)
+    diagnostics_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_news_event_sentinel_cooldown', 'cooldown_key', 'triggered_at'),
+        Index('ix_news_event_sentinel_symbol_time', 'canonical_symbol', 'triggered_at'),
+        Index('ix_news_event_sentinel_run_symbol', 'run_id', 'canonical_symbol'),
     )
 
 
@@ -1231,7 +1289,77 @@ class DatabaseManager:
         self._migrate_news_signal_edge_quality()
         self._migrate_news_signal_card_layer()
         self._migrate_graphiti_outbox()
+        self._migrate_news_event_sentinel()
         self._migrate_seed_pool_snapshot_unique_key()
+
+    def _migrate_news_event_sentinel(self) -> None:
+        with self._engine.begin() as conn:
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS news_event_sentinel_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id VARCHAR(64) NOT NULL UNIQUE,
+                    started_at DATETIME NOT NULL,
+                    finished_at DATETIME,
+                    status VARCHAR(32) DEFAULT 'running',
+                    watched_symbol_count INTEGER DEFAULT 0,
+                    source_query_count INTEGER DEFAULT 0,
+                    fetched_count INTEGER DEFAULT 0,
+                    unseen_count INTEGER DEFAULT 0,
+                    raw_episode_count INTEGER DEFAULT 0,
+                    card_count INTEGER DEFAULT 0,
+                    trigger_count INTEGER DEFAULT 0,
+                    suppressed_by_cooldown INTEGER DEFAULT 0,
+                    errors_json TEXT,
+                    diagnostics_json TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_runs_run_id ON news_event_sentinel_runs (run_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_runs_started_at ON news_event_sentinel_runs (started_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_runs_status ON news_event_sentinel_runs (status)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_run_status_started ON news_event_sentinel_runs (status, started_at)")
+
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS news_event_sentinel_triggers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trigger_id VARCHAR(96) NOT NULL UNIQUE,
+                    run_id VARCHAR(64) NOT NULL,
+                    card_id VARCHAR(96) NOT NULL,
+                    event_id VARCHAR(128),
+                    canonical_symbol VARCHAR(32) NOT NULL,
+                    event_type VARCHAR(64) DEFAULT 'unknown',
+                    direction VARCHAR(32) DEFAULT 'neutral',
+                    severity VARCHAR(24) DEFAULT 'low',
+                    cooldown_key VARCHAR(128) NOT NULL,
+                    triggered_at DATETIME NOT NULL,
+                    notification_status VARCHAR(32) DEFAULT 'pending',
+                    trace_status VARCHAR(32) DEFAULT 'skipped',
+                    notification_payload_json TEXT,
+                    diagnostics_json TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_trigger_id ON news_event_sentinel_triggers (trigger_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_run_id ON news_event_sentinel_triggers (run_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_card_id ON news_event_sentinel_triggers (card_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_event_id ON news_event_sentinel_triggers (event_id)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_canonical_symbol ON news_event_sentinel_triggers (canonical_symbol)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_event_type ON news_event_sentinel_triggers (event_type)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_direction ON news_event_sentinel_triggers (direction)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_severity ON news_event_sentinel_triggers (severity)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_cooldown_key ON news_event_sentinel_triggers (cooldown_key)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_triggered_at ON news_event_sentinel_triggers (triggered_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_notification_status ON news_event_sentinel_triggers (notification_status)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_triggers_trace_status ON news_event_sentinel_triggers (trace_status)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_cooldown ON news_event_sentinel_triggers (cooldown_key, triggered_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_symbol_time ON news_event_sentinel_triggers (canonical_symbol, triggered_at)")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_news_event_sentinel_run_symbol ON news_event_sentinel_triggers (run_id, canonical_symbol)")
 
     def _migrate_graphiti_outbox(self) -> None:
         with self._engine.begin() as conn:
