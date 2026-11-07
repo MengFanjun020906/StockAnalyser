@@ -180,7 +180,7 @@ def _load_sequoia_history_df(stock_code: str, start: date, end: date) -> Optiona
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():

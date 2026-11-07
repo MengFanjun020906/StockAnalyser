@@ -183,7 +183,7 @@ def _db_path() -> Optional[Path]:
     raw = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     p = Path(raw).expanduser()
     return p if p.exists() else None

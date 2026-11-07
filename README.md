@@ -90,7 +90,7 @@ StockAnalyser 把 AI 链路拆成可审计的 `workflow`、`pipeline` 和 `loop`
 - 本地原始 Trace：`data/agent_traces/20260715-161824-trace-93c77fcb2ea64fec8c124304bf4c8719/final.md`
 - 回测数据集：`data/agent_reviews/entry_execution_backtest.jsonl`
 
-下表不展示最新单笔结果，而是汇总严格入场 `strict_ai_entry` 从首次决策日开始的区间表现，并和同期指数做对比。当前本地回测样本覆盖 48 个 Trace、94 条最终计划，决策日期为 2026-05-15 至 2026-07-14，最新样本退出时间为 2026-07-14 15:00:00；指数基准来自本地 `Sequoia-X/data/sequoia_v2.db`，截至最新可用交易日 2026-07-16。
+下表不展示最新单笔结果，而是汇总严格入场 `strict_ai_entry` 从首次决策日开始的区间表现，并和同期指数做对比。当前本地回测样本覆盖 48 个 Trace、94 条最终计划，决策日期为 2026-05-15 至 2026-07-14，最新样本退出时间为 2026-07-14 15:00:00；指数基准来自本地 `vendor/Sequoia-X/data/sequoia_v2.db`，截至最新可用交易日 2026-07-16。
 
 | 对象 | 类型 | 统计窗口 | 样本/成交 | 触发率 | 胜率 | 累计 PnL | Alpha vs 上证 | 平均/中位单笔 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -155,9 +155,9 @@ OPENAI_MODEL=
 选股候选增强可选配置：
 
 ```env
-SEQUOIA_CANDIDATE_DB_PATH=Sequoia-X/data/sequoia_v2.db
-ALPHASIFT_STRATEGY_DIR=alphasift/alphasift/strategies
-ALPHASIFT_CANDIDATE_DB_PATH=Sequoia-X/data/sequoia_v2.db
+SEQUOIA_CANDIDATE_DB_PATH=vendor/Sequoia-X/data/sequoia_v2.db
+ALPHASIFT_STRATEGY_DIR=vendor/alphasift/alphasift/strategies
+ALPHASIFT_CANDIDATE_DB_PATH=vendor/Sequoia-X/data/sequoia_v2.db
 AGENT_SEED_POOL_TOTAL_LIMIT=32
 ```
 
@@ -193,6 +193,7 @@ api/                               FastAPI API
 apps/dsa-web/                      Web 前端和 Agent Trace 页面
 docs/                              架构、选股链路、配置、排障和实施文档
 tests/                             后端与前端回归测试
+vendor/                            第三方项目：Kronos / Sequoia-X / alphasift / graphiti / openInvest
 data/agent_traces/                 本地 Trace artifact，默认不提交
 ```
 

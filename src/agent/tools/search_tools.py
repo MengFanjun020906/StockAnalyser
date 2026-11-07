@@ -1130,7 +1130,7 @@ def _handle_get_macro_finance_news(
 
 
 def _openinvest_path() -> Optional[Path]:
-    root = Path(__file__).resolve().parents[3] / "openInvest"
+    root = Path(__file__).resolve().parents[3] / "vendor" / "openInvest"
     return root if root.exists() else None
 
 

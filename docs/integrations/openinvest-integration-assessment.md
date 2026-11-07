@@ -1,10 +1,10 @@
 # openInvest 可接入组件评估
 
-> 目标：评估本仓库可从 `openInvest/` 借鉴或迁移的组件，明确接入位置、实施优先级、验证方式和不建议迁移的边界。
+> 目标：评估本仓库可从 `vendor/openInvest/` 借鉴或迁移的组件，明确接入位置、实施优先级、验证方式和不建议迁移的边界。
 
 ## 1. 背景与结论
 
-`openInvest/` 是一个自部署 AI 投资委员会工具，核心链路是：
+`vendor/openInvest/` 是一个自部署 AI 投资委员会工具，核心链路是：
 
 ```text
 Connectors -> Agents -> Core committee -> Memory / DB -> Jobs / Web
@@ -20,7 +20,7 @@ Connectors -> Agents -> Core committee -> Memory / DB -> Jobs / Web
 
 本仓库已经有账户感知、四席位选股、Meta-Agent、点位计算、组合配置、反方审查、Judge、Risk Gate、Agent Trace 和 Portfolio Service。直接搬整套 `openInvest` 会制造双数据源和双编排链路。建议采用“按组件吸收”的方式，把高价值机制接入现有链路。
 
-最新同步记录：2026-07-20 已将本地 `openInvest/` 快进到 `origin/main` 快照 `717974a`。相较上一轮总结，新增价值主要来自 `0.31.5` 至 `0.31.7` 的硬化修复：交易状态 CAS 防重复入账、缺价/0 价治理、benchmark 缓存终点新鲜度、回测 win rate 防前视、Web/API token 保护、Docker 排除本地账本、backup skill 安装形态兜底。
+最新同步记录：2026-07-20 已将本地 `vendor/openInvest/` 快进到 `origin/main` 快照 `717974a`。相较上一轮总结，新增价值主要来自 `0.31.5` 至 `0.31.7` 的硬化修复：交易状态 CAS 防重复入账、缺价/0 价治理、benchmark 缓存终点新鲜度、回测 win rate 防前视、Web/API token 保护、Docker 排除本地账本、backup skill 安装形态兜底。
 
 ## 2. 迁移原则
 
@@ -35,18 +35,18 @@ Connectors -> Agents -> Core committee -> Memory / DB -> Jobs / Web
 
 | 优先级 | 候选组件 | openInvest 来源 | 本仓库建议落点 | 接入方式 |
 | --- | --- | --- | --- | --- |
-| P0 | CIO / Judge sanity check | `openInvest/core/committee.py` | `src/agent/risk_gate.py` 或新增 `src/agent/judge_sanity.py` | 提取确定性后处理规则，接在 Judge 输出之后、Risk Gate 之前 |
-| P0 | LLM telemetry | `openInvest/core/llm_telemetry.py` | `src/agent/llm_adapter.py`、Agent Trace artifact | 统一记录 role / asset / stage / tokens / latency / cost / tool calls |
-| P0 | 交易状态 CAS / 防重复入账 | `openInvest/db/trades_db.py`、`openInvest/connectors/web_api/routers/trades.py` | 未来订单状态流、执行记录、交易导入幂等层 | 状态跃迁必须声明原状态，只有真实 `planned -> executed` 赢得账本副作用 |
-| P0 | 缺价与 0 价治理 | `openInvest/utils/fx.py`、`openInvest/services/skill_views.py` | `src/services/portfolio_service.py`、未来 `portfolio_performance_service.py`、回测服务 | `None/NaN/<=0` 分层视为缺价或 fallback，不把哨兵值当有效估值 |
-| P1 | 事件新闻哨兵 cron | `openInvest/jobs/event_watch.py`、`openInvest/jobs/event_watch.yml`、`openInvest/scheduler/runner.py` | `src/services/news_signal_scheduler.py`、`src/services/news_signal_service.py`、Agent Trace 触发入口 | 从持仓/自选股生成 watched set，定时多源抓新闻，事件化后只对命中标的和高严重度事件触发分析 |
-| P1 | Regime forward probability / reentry reference | `openInvest/core/regime_probability.py` | `src/agent/regime.py`、`src/core/backtest_engine.py`、点位计算层 | 基于历史行情计算 regime 下 forward return 分布和买回点参考 |
-| P1 | Dreaming verdict review | `openInvest/docs/wiki/03-dreaming.md`、`openInvest/jobs/verdict_review.py` | `data/agent_traces/`、`src/services/`、可选 `src/agent/memory.py` | 从历史 Trace 生成 verdict 后验复盘和稳定 insight |
-| P1 | 信息隔离委员会协议 | `openInvest/core/committee.py`、`openInvest/docs/wiki/02-agents.md` | `src/agent/debate.py`、选股 Meta / Judge 阶段 | 强化 Round 1 角色隔离、Round 2 交叉质询和收敛检测 |
-| P1 | 收益率展示 / PnL Dashboard | `openInvest/jobs/pnl_snapshot.py`、`openInvest/core/benchmarks.py`、`openInvest/connectors/web_api.py`、`openInvest/scripts/sync_gui_dist.py` | `src/services/portfolio_service.py`、`api/v1/endpoints/portfolio.py` 或新增 `performance.py`、`apps/dsa-web/` | 接入收益率时间序列、基准对比和展示页；不直接挂独立 `invest-gui` dist |
-| P1 | 自托管安全与备份边界 | `openInvest/connectors/web_api/__main__.py`、`.dockerignore`、`plugin/skills/invest-backup/` | Docker / Desktop / 部署文档 / 本地数据备份脚本 | 远端暴露默认要求 token，构建默认排除账本和画像，备份工具兼容非源码安装 |
-| P2 | 策略级 reward / paper trading 评估 | `openInvest/core/paper_trade_simulator.py`、`openInvest/core/backtest_reward.py` | `src/core/backtest_engine.py`、`src/services/backtest_service.py` | 借鉴 reward 口径，不直接替换现有回测引擎 |
-| P2 | Web/SSE 任务状态 | `openInvest/connectors/web_api.py` | `api/v1/endpoints/agent.py`、Agent Trace 页面 | 仅借鉴阶段状态推送，不迁移 API 层 |
+| P0 | CIO / Judge sanity check | `vendor/openInvest/core/committee.py` | `src/agent/risk_gate.py` 或新增 `src/agent/judge_sanity.py` | 提取确定性后处理规则，接在 Judge 输出之后、Risk Gate 之前 |
+| P0 | LLM telemetry | `vendor/openInvest/core/llm_telemetry.py` | `src/agent/llm_adapter.py`、Agent Trace artifact | 统一记录 role / asset / stage / tokens / latency / cost / tool calls |
+| P0 | 交易状态 CAS / 防重复入账 | `vendor/openInvest/db/trades_db.py`、`vendor/openInvest/connectors/web_api/routers/trades.py` | 未来订单状态流、执行记录、交易导入幂等层 | 状态跃迁必须声明原状态，只有真实 `planned -> executed` 赢得账本副作用 |
+| P0 | 缺价与 0 价治理 | `vendor/openInvest/utils/fx.py`、`vendor/openInvest/services/skill_views.py` | `src/services/portfolio_service.py`、未来 `portfolio_performance_service.py`、回测服务 | `None/NaN/<=0` 分层视为缺价或 fallback，不把哨兵值当有效估值 |
+| P1 | 事件新闻哨兵 cron | `vendor/openInvest/jobs/event_watch.py`、`vendor/openInvest/jobs/event_watch.yml`、`vendor/openInvest/scheduler/runner.py` | `src/services/news_signal_scheduler.py`、`src/services/news_signal_service.py`、Agent Trace 触发入口 | 从持仓/自选股生成 watched set，定时多源抓新闻，事件化后只对命中标的和高严重度事件触发分析 |
+| P1 | Regime forward probability / reentry reference | `vendor/openInvest/core/regime_probability.py` | `src/agent/regime.py`、`src/core/backtest_engine.py`、点位计算层 | 基于历史行情计算 regime 下 forward return 分布和买回点参考 |
+| P1 | Dreaming verdict review | `vendor/openInvest/docs/wiki/03-dreaming.md`、`vendor/openInvest/jobs/verdict_review.py` | `data/agent_traces/`、`src/services/`、可选 `src/agent/memory.py` | 从历史 Trace 生成 verdict 后验复盘和稳定 insight |
+| P1 | 信息隔离委员会协议 | `vendor/openInvest/core/committee.py`、`vendor/openInvest/docs/wiki/02-agents.md` | `src/agent/debate.py`、选股 Meta / Judge 阶段 | 强化 Round 1 角色隔离、Round 2 交叉质询和收敛检测 |
+| P1 | 收益率展示 / PnL Dashboard | `vendor/openInvest/jobs/pnl_snapshot.py`、`vendor/openInvest/core/benchmarks.py`、`vendor/openInvest/connectors/web_api.py`、`vendor/openInvest/scripts/sync_gui_dist.py` | `src/services/portfolio_service.py`、`api/v1/endpoints/portfolio.py` 或新增 `performance.py`、`apps/dsa-web/` | 接入收益率时间序列、基准对比和展示页；不直接挂独立 `invest-gui` dist |
+| P1 | 自托管安全与备份边界 | `vendor/openInvest/connectors/web_api/__main__.py`、`.dockerignore`、`plugin/skills/invest-backup/` | Docker / Desktop / 部署文档 / 本地数据备份脚本 | 远端暴露默认要求 token，构建默认排除账本和画像，备份工具兼容非源码安装 |
+| P2 | 策略级 reward / paper trading 评估 | `vendor/openInvest/core/paper_trade_simulator.py`、`vendor/openInvest/core/backtest_reward.py` | `src/core/backtest_engine.py`、`src/services/backtest_service.py` | 借鉴 reward 口径，不直接替换现有回测引擎 |
+| P2 | Web/SSE 任务状态 | `vendor/openInvest/connectors/web_api.py` | `api/v1/endpoints/agent.py`、Agent Trace 页面 | 仅借鉴阶段状态推送，不迁移 API 层 |
 
 ## 4. 可接入组件详情
 
@@ -362,19 +362,19 @@ openInvest 的重要经验是：不要只看单次预测对不对，要看“长
 
 openInvest 有一套部署后可看的收益率展示能力：后台定时生成 PnL 快照、累计收益率折线、基准对比横向柱状图和“跑赢/跑输基准事件”。这类页面适合作为本仓库 Web 工作台的展示面板，让用户直观看到组合表现、系统建议的后验效果和与基准的差距。
 
-需要注意：openInvest 的前端源码不在 `openInvest/` 本仓库内。`openInvest/scripts/sync_gui_dist.py` 会从独立仓库 `longsizhuo/invest-gui` 的 release 下载 `invest-gui-dist.tar.gz` 到 `static/`，再由 `connectors/web_api.py` 挂载为 SPA。因此本仓库不建议直接接入该静态 dist；更稳的方式是在 `apps/dsa-web/` 里按本仓库设计系统重做同类页面，复用其数据设计。
+需要注意：openInvest 的前端源码不在 `vendor/openInvest/` 本仓库内。`vendor/openInvest/scripts/sync_gui_dist.py` 会从独立仓库 `longsizhuo/invest-gui` 的 release 下载 `invest-gui-dist.tar.gz` 到 `static/`，再由 `connectors/web_api.py` 挂载为 SPA。因此本仓库不建议直接接入该静态 dist；更稳的方式是在 `apps/dsa-web/` 里按本仓库设计系统重做同类页面，复用其数据设计。
 
 **openInvest 可借鉴的数据链路**
 
-- `openInvest/jobs/pnl_snapshot.py`
+- `vendor/openInvest/jobs/pnl_snapshot.py`
   - 定时读取持仓、现金和行情。
   - 写入 `memory/.state/pnl_history.jsonl`。
   - 生成 `docs/pnl_chart.svg`。
   - 生成 outperform events，用于展示“跑赢/跑输某基准”的事件。
-- `openInvest/core/benchmarks.py`
+- `vendor/openInvest/core/benchmarks.py`
   - 管理指数、理财、公募基金、AI 投顾等基准序列。
   - 缓存基准数据，网络失败时跳过单条基准，不影响主图。
-- `openInvest/connectors/web_api.py`
+- `vendor/openInvest/connectors/web_api.py`
   - `GET /api/pnl_chart.svg`
   - `GET /api/pnl_history`
   - `GET /api/outperform_events`

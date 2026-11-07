@@ -28,3 +28,11 @@ test_*.py
 # 忽略文档
 *.md
 !README.md
+
+# 第三方仓库只保留镜像内需要的 graphiti（Dockerfile 显式 COPY）
+vendor/Kronos/
+vendor/Sequoia-X/
+vendor/alphasift/
+vendor/openInvest/
+# graphiti 的 pyproject.toml 声明 readme = "README.md"，构建 editable 包时需要
+!vendor/graphiti/README.md

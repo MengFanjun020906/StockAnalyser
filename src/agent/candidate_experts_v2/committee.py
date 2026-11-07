@@ -2631,7 +2631,7 @@ def _build_daily_screener_seeds(*, trade_date: str, limit: int) -> Tuple[List[Se
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -2873,7 +2873,7 @@ def _build_local_price_volume_seeds(*, limit: int) -> Tuple[List[SeedItem], Dict
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -3452,7 +3452,7 @@ def _build_low_base_structure_seeds(*, limit: int) -> List[SeedItem]:
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():

@@ -1005,7 +1005,7 @@ volumes:
 
 | 文件 | 原因 |
 |------|------|
-| `graphiti/` 目录下所有文件 | 作为外部依赖引用，不修改源码 |
+| `vendor/graphiti/` 目录下所有文件 | 作为外部依赖引用，不修改源码 |
 | `src/agent/memory.py` | 现有 AgentMemory 保持不变，图谱是增量能力 |
 | `src/storage.py` | SQLite 存储层不变，图谱是独立存储 |
 

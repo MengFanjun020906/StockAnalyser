@@ -42,7 +42,7 @@ if str(ROOT) not in sys.path:
 
 from src.core.trading_calendar import get_effective_trading_date
 
-DEFAULT_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
+DEFAULT_DB_PATH = "vendor/Sequoia-X/data/sequoia_v2.db"
 DEFAULT_TRADING_DAYS = 260
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 420
 DEFAULT_INCREMENTAL_THRESHOLD = 30

@@ -11,6 +11,7 @@
   - Web 前端改动在 `apps/dsa-web/`
   - 桌面端改动在 `apps/dsa-desktop/`
   - 部署与流水线改动在 `scripts/`、`.github/workflows/`、`docker/`
+  - 第三方项目统一放在 `vendor/`，只读引用；业务代码、适配层和测试不得写入 `vendor/`
 - 未经明确确认，不执行 `git commit`、`git tag`、`git push`；若 maintainer 明确开启 autonomous loop 并授权当前目标，则该目标范围内可自主执行 commit、dev 分支 push、PR/MR、issue 与 release 操作，但必须保留验证证据，并在无法处理的问题、工具失败、fallback 数据质量下降或权限阻塞时立即停下升级给 maintainer。
 - autonomous loop 目标执行时，优先级为：目标文档 > `LOOP.md` 当前 loop 合同 > 本文件通用规则；但不泄露密钥、不隐瞒错误、不伪造测试结果、不直接破坏数据、fallback 质量未知即升级等硬安全底线永远不可覆盖。
 - commit message 使用英文，不添加 `Co-Authored-By`。
@@ -63,6 +64,10 @@ python scripts/check_ai_assets.py
   - `.github/scripts/`：GitHub 自动化脚本
   - `tests/`：pytest 测试
   - `docs/`：文档与说明
+- 第三方与运行目录：
+  - `vendor/`：第三方项目（Kronos / Sequoia-X / alphasift / graphiti / openInvest），只读引用
+  - `data/`、`logs/`、`reports/`：本地运行产物，默认不提交
+  - 目录职责与命名约定见 `docs/architecture/repository-layout.md`
 
 ## 4. 常用命令
 

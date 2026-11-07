@@ -1,10 +1,10 @@
 # Kronos K线形态检测集成设计
 
-> 目标：将本地 `Kronos/` 预训练预测模型接入 StockAnalyser，形成可落地、可回测、可解释的 A 股日线 K线形态展示与候选池证据链。本文以当前仓库实现为 Phase 1 基线；未实现能力会明确标注 Phase，避免设计和代码继续漂移。
+> 目标：将本地 `vendor/Kronos/` 预训练预测模型接入 StockAnalyser，形成可落地、可回测、可解释的 A 股日线 K线形态展示与候选池证据链。本文以当前仓库实现为 Phase 1 基线；未实现能力会明确标注 Phase，避免设计和代码继续漂移。
 
 ## 1. 背景与结论
 
-本地 `Kronos/` 仓库是原版 Kronos foundation model，核心能力是对 OHLCV K线序列做自回归预测：
+本地 `vendor/Kronos/` 仓库是原版 Kronos foundation model，核心能力是对 OHLCV K线序列做自回归预测：
 
 - `model/KronosTokenizer`：把连续 OHLCV 序列量化为层次化 token。
 - `model/Kronos`：decoder-only Transformer。
@@ -25,7 +25,7 @@
 
 ## 2. 设计原则
 
-- 不把外部 `Kronos/` 代码直接混入主业务路径；新增适配层隔离模型路径、设备、依赖和失败降级。
+- 不把外部 `vendor/Kronos/` 代码直接混入主业务路径；新增适配层隔离模型路径、设备、依赖和失败降级。
 - Kronos 输出只作为“技术形态证据”，不直接越过 Risk Gate/Judge 给买卖指令。
 - 数据口径、复权口径、模型参数、版本和采样配置必须进入 run 记录或参数指纹，保证回测可复现。
 - `pattern_type` 全项目只保留一套 canonical enum；来源差异使用 `origin` / `detector` / `evidence` 区分。
@@ -589,7 +589,7 @@ v1 gate 固定协议：
 
 ```env
 KRONOS_ENABLED=false
-KRONOS_REPO_PATH=Kronos
+KRONOS_REPO_PATH=vendor/Kronos
 KRONOS_TOKENIZER_PATH=NeoQuasar/Kronos-Tokenizer-base
 KRONOS_MODEL_PATH=NeoQuasar/Kronos-small
 KRONOS_DEVICE=auto

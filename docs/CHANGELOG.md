@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [chore] 顶层目录整理：Kronos / Sequoia-X / alphasift / graphiti / openInvest 统一迁入 `vendor/`，品牌素材 `sources/` 迁入 `docs/assets/`，`review.md` 归档到 `docs/reviews/`；同步更新默认路径、Dockerfile、CI 排除项、安装脚本、`.env.example` 和相关文档。
+- [改进] 保留 `data/`、`logs/`、`reports/` 运行目录边界，旧日志与旧报告按时间归档，清理本地缓存和临时文件；docs 中带空格的文件名统一为 kebab-case。
+- [文档] 新增仓库布局与命名规范，说明顶层目录职责、第三方仓库只读边界、运行产物归档方式和文件命名约定。
 - [修复] Agent Trace 修改历史问题后不再携带冲突的旧股票代码；API 在取数前拦截单股目标冲突，并只读隔离已保存的错标的价格、评分、风控、裁决和 Jev 对照，禁止续跑复用污染证据。
 - [新功能] 接入 TypeSafe Jev 日线影子评估，覆盖 A 股、港股、美股的 1/3/5 交易日方向、已有买点方案复核与持仓风险；新增评估页面、不可覆盖的记录及后续收盘价观察，保留现有价格和风控权限。
 - [改进] 将 Jev 影子复核融入 Agent Trace：复用本轮冻结日线与证据，原报告先返回，后台追加流程节点、1/3/5 日判断与原动作分歧对照，支持轻量历史恢复和只读后续观察，并修复手机端长路径及工具标题溢出。

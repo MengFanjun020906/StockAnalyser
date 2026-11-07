@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 复制依赖文件和本地可编辑依赖
 COPY requirements.txt .
-COPY graphiti/ ./graphiti/
+COPY vendor/graphiti/ ./vendor/graphiti/
 
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt

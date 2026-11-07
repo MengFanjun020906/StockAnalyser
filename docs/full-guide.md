@@ -50,7 +50,7 @@ StockAnalyser/
 进入你 Fork 的仓库 → `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
 
 <div align="center">
-  <img src="../sources/secret_config.png" alt="GitHub Secrets 配置示意图" width="600">
+  <img src="assets/secret_config.png" alt="GitHub Secrets 配置示意图" width="600">
 </div>
 
 #### AI 模型配置（二选一）
@@ -292,8 +292,8 @@ StockAnalyser/
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
-| `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia 风格量化候选池 SQLite 路径；`watchlist_scan` 候选发现会读取 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` 并运行形态策略；Agent 历史 K 线工具在主库缺日线时也会读取该本地表 | `Sequoia-X/data/sequoia_v2.db` | 可选 |
-| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML 候选策略目录；`discover_watchlist_candidates` 的 `auto` 模式会优先读取启用的 YAML 策略做 L1 硬筛和因子召回 | `alphasift/alphasift/strategies` | 可选 |
+| `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia 风格量化候选池 SQLite 路径；`watchlist_scan` 候选发现会读取 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` 并运行形态策略；Agent 历史 K 线工具在主库缺日线时也会读取该本地表 | `vendor/Sequoia-X/data/sequoia_v2.db` | 可选 |
+| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML 候选策略目录；`discover_watchlist_candidates` 的 `auto` 模式会优先读取启用的 YAML 策略做 L1 硬筛和因子召回 | `vendor/alphasift/alphasift/strategies` | 可选 |
 | `ALPHASIFT_CANDIDATE_DB_PATH` | AlphaSift 候选池 SQLite 路径；未配置时复用 `SEQUOIA_CANDIDATE_DB_PATH`，表结构同 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` | `SEQUOIA_CANDIDATE_DB_PATH` | 可选 |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `8.0` | 可选 |
@@ -1205,7 +1205,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 当 Agent 请求的天数多于本地缓存记录数时，工具会返回实际可用记录，并通过 `partial_cache=true`、`requested_days`、`actual_records` 标明这是部分缓存命中。
 - 缓存缺失或过期时，工具仍会按原逻辑从数据源获取日线数据；获取成功后会 best-effort 写回 `stock_daily`，保存失败不会阻断 Agent 回复。
 - `search_stock_news` 按 7、14、30 天逐级扩展检索：结果必须在标题、摘要或链接中直接出现公司名或证券代码，行情、F10、公告目录等静态入口不算新闻；有可核验发布日期的相关新闻即返回，只有无日期候选时返回 `date_unverified/partial`，不会伪装成“0 条新闻”；各窗口原始数、无关过滤数、静态入口过滤数、过期过滤数与错误写入 `window_attempts`。已核验和日期待核验候选都会 best-effort 写入 `news_intel`，后者保持 `published_date=null`，不能作为近期消息强证据。`search_comprehensive_intel` 继续按自身维度口径持久化。
-- `search_openinvest_news` 接入 `openInvest/services/news_sources` 的多源新闻适配，默认走 `yfinance.Ticker.news` 做 ticker 关联新闻补充；RSS / DDGS 为可选源，其中 DDGS 需要额外安装 `ddgs` 等依赖，缺依赖或单源失败会在 `source_chain` 中说明，不阻断工具返回。
+- `search_openinvest_news` 接入 `vendor/openInvest/services/news_sources` 的多源新闻适配，默认走 `yfinance.Ticker.news` 做 ticker 关联新闻补充；RSS / DDGS 为可选源，其中 DDGS 需要额外安装 `ddgs` 等依赖，缺依赖或单源失败会在 `source_chain` 中说明，不阻断工具返回。
 - `get_realtime_quote` 不复用 `stock_daily` 作为实时行情缓存，也不会把盘中实时行情写入日线表；如需实时行情缓存，应单独设计实时行情存储。
 
 ## 持仓管理说明

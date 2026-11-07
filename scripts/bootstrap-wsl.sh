@@ -24,7 +24,7 @@
 # Env overrides:
 #   SKIP_NPM=1                 -> skip npm ci
 #   SKIP_DESKTOP=1             -> skip apps/dsa-desktop (default skip)
-#   SEQUOIA_DB_URL=<url>       -> if set, curl -o Sequoia-X/data/sequoia_v2.db
+#   SEQUOIA_DB_URL=<url>       -> if set, curl -o vendor/Sequoia-X/data/sequoia_v2.db
 # =====================================================================
 set -euo pipefail
 
@@ -132,7 +132,7 @@ source .venv/bin/activate
 
 # Strip graphiti-related lines from requirements before install
 REQ_TMP="$(mktemp)"
-grep -viE '^(graphiti|neo4j)' requirements.txt > "$REQ_TMP"
+grep -viE 'graphiti|neo4j' requirements.txt > "$REQ_TMP"
 
 if command -v uv >/dev/null 2>&1; then
     uv pip install --python "$(command -v python)" -r "$REQ_TMP"
@@ -163,7 +163,7 @@ fi
 # 7. Local data dirs
 # ---------------------------------------------------------------------
 log "Step 7/9: data/ logs/ dirs"
-mkdir -p data logs Sequoia-X/data .cache/candidate_experts_v2
+mkdir -p data logs vendor/Sequoia-X/data .cache/candidate_experts_v2
 
 # ---------------------------------------------------------------------
 # 8. .env
@@ -186,7 +186,7 @@ fi
 # ---------------------------------------------------------------------
 log "Step 9/9: Sequoia DB (optional)"
 if [[ -n "$SEQUOIA_DB_URL" ]]; then
-    DEST="Sequoia-X/data/sequoia_v2.db"
+    DEST="vendor/Sequoia-X/data/sequoia_v2.db"
     if [[ -f "$DEST" ]]; then
         log "$DEST already exists, skipping download"
     else

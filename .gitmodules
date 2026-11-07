@@ -1,9 +1,9 @@
 [submodule "alphasift"]
-	path = alphasift
+	path = vendor/alphasift
 	url = https://github.com/ZhuLinsen/alphasift.git
 [submodule "Sequoia-X"]
-	path = Sequoia-X
+	path = vendor/Sequoia-X
 	url = https://github.com/sngyai/Sequoia-X.git
 [submodule "graphiti"]
-	path = graphiti
+	path = vendor/graphiti
 	url = https://github.com/getzep/graphiti.git

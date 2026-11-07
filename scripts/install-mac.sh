@@ -14,7 +14,7 @@
 #   3. Create .venv with Python 3.11; install requirements.txt with
 #      graphiti / neo4j lines stripped; force GRAPHITI_ENABLED=false.
 #   4. npm ci in apps/dsa-web.
-#   5. Initialize data/ logs/ Sequoia-X/data/ .cache/candidate_experts_v2/.
+#   5. Initialize data/ logs/ vendor/Sequoia-X/data/ .cache/candidate_experts_v2/.
 #   6. Copy .env.example -> .env if missing.
 #   7. (Optional) download Sequoia candidate DB if SEQUOIA_DB_URL set.
 #
@@ -25,7 +25,7 @@
 # Env overrides:
 #   SKIP_NPM=1                 -> skip npm ci
 #   SKIP_DESKTOP=1             -> skip apps/dsa-desktop (default skip)
-#   SEQUOIA_DB_URL=<url>       -> curl -o Sequoia-X/data/sequoia_v2.db
+#   SEQUOIA_DB_URL=<url>       -> curl -o vendor/Sequoia-X/data/sequoia_v2.db
 # =====================================================================
 set -euo pipefail
 
@@ -149,7 +149,7 @@ fi
 source .venv/bin/activate
 
 REQ_TMP="$(mktemp)"
-grep -viE '^(graphiti|neo4j)' requirements.txt > "$REQ_TMP"
+grep -viE 'graphiti|neo4j' requirements.txt > "$REQ_TMP"
 
 if command -v uv >/dev/null 2>&1; then
     uv pip install --python "$(command -v python)" -r "$REQ_TMP"
@@ -180,7 +180,7 @@ fi
 # 6. Local data dirs
 # ---------------------------------------------------------------------
 log "Step 6/9: data/ logs/ dirs"
-mkdir -p data logs Sequoia-X/data .cache/candidate_experts_v2
+mkdir -p data logs vendor/Sequoia-X/data .cache/candidate_experts_v2
 
 # ---------------------------------------------------------------------
 # 7. .env
@@ -203,7 +203,7 @@ fi
 # ---------------------------------------------------------------------
 log "Step 8/9: Sequoia DB (optional)"
 if [[ -n "$SEQUOIA_DB_URL" ]]; then
-    DEST="Sequoia-X/data/sequoia_v2.db"
+    DEST="vendor/Sequoia-X/data/sequoia_v2.db"
     if [[ -f "$DEST" ]]; then
         log "$DEST already exists, skipping download"
     else

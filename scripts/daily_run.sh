@@ -135,7 +135,7 @@ log "状态文件: $STATE_FILE"
 sep
 log "关键配置检查"
 info "TUSHARE_TOKEN        : $(masked "${TUSHARE_TOKEN:-}")"
-info "SEQUOIA_DB           : ${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db (默认)}"
+info "SEQUOIA_DB           : ${SEQUOIA_CANDIDATE_DB_PATH:-vendor/Sequoia-X/data/sequoia_v2.db (默认)}"
 info "FUNDAMENTAL_DB       : ${AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH:-(未配置)}"
 info "STOCK_LIST           : ${STOCK_LIST:-(未配置，使用默认)}"
 info "CANDIDATE_MODE       : ${AGENT_CANDIDATE_DISCOVERY_MODE:-(未配置)}"
@@ -143,7 +143,7 @@ info "NEWS_SIGNAL_DAILY    : ${NEWS_SIGNAL_DAILY_ENABLED:-false}"
 info "GRAPH_REPAIR_MODE    : ${NEWS_SIGNAL_GRAPH_REPAIR_MODE:-edges}"
 info "SEED_QUALITY_DAILY   : ${SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED:-false}"
 
-SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db}"
+SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-vendor/Sequoia-X/data/sequoia_v2.db}"
 STEP1_TARGET_DATE=$("$PYTHON" - <<'PY' 2>/dev/null
 from scripts.update_sequoia_candidates import resolve_cn_resume_target_date
 

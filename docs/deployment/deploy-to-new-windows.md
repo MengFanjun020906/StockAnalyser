@@ -4,7 +4,7 @@
 
 约束：
 - 包含 `.env` 配置文件迁移
-- **不**迁移本地数据库（`data/stock_analysis.db`、`Sequoia-X/data/sequoia_v2.db` 等）
+- **不**迁移本地数据库（`data/stock_analysis.db`、`vendor/Sequoia-X/data/sequoia_v2.db` 等）
 - **不**部署 graphiti / Neo4j（强制禁用）
 
 ## 0. 前置条件（旧机器侧）
@@ -24,7 +24,7 @@ StockAnalyser/
 排除项（**不要**带过去）：
 
 - `.venv/`、`apps/dsa-web/node_modules/`、`apps/dsa-desktop/node_modules/`
-- `data/`、`logs/`、`.cache/`、`Sequoia-X/data/*.db`
+- `data/`、`logs/`、`.cache/`、`vendor/Sequoia-X/data/*.db`
 - `__pycache__/`、`*.pyc`、`.pytest_cache/`
 
 打包示例（旧机器 PowerShell）：
@@ -42,7 +42,7 @@ Compress-Archive -Path StockAnalyser -DestinationPath stockanalyser.zip `
 tar --exclude='.venv' --exclude='node_modules' \
     --exclude='data' --exclude='logs' --exclude='.cache' \
     --exclude='__pycache__' --exclude='.pytest_cache' \
-    --exclude='Sequoia-X/data/*.db' \
+    --exclude='vendor/Sequoia-X/data/*.db' \
     -czf stockanalyser.tar.gz StockAnalyser/
 ```
 
@@ -110,7 +110,7 @@ bash scripts/bootstrap-wsl.sh
 | 4 | 安装 Node.js 22（NodeSource，对齐 `.nvmrc`） |
 | 5 | 创建 `.venv` + 安装 `requirements.txt`（**先 grep 掉 graphiti / neo4j 行**） |
 | 6 | `apps/dsa-web` 执行 `npm ci`（可用 `SKIP_NPM=1` 跳过） |
-| 7 | 创建空目录 `data/ logs/ Sequoia-X/data/ .cache/candidate_experts_v2/` |
+| 7 | 创建空目录 `data/ logs/ vendor/Sequoia-X/data/ .cache/candidate_experts_v2/` |
 | 8 | 若 `.env` 不存在则从 `.env.example` 复制；强制写入 `GRAPHITI_ENABLED=false` |
 | 9 | 可选下载 Sequoia 候选 DB（见下一节） |
 
@@ -145,7 +145,7 @@ GRAPHITI_ENABLED=false
 
 - **主分析历史**：`data/stock_analysis.db` 不存在，运行时会自动建库；历史报告从空开始。
 - **持仓账本、回测、Agent Trace artifact**：同样从空开始。
-- **Sequoia 候选池**：`Sequoia-X/data/sequoia_v2.db` 默认不存在。两条路径：
+- **Sequoia 候选池**：`vendor/Sequoia-X/data/sequoia_v2.db` 默认不存在。两条路径：
   1. 通过 `SEQUOIA_DB_URL` 自动下载（见 §3）。
   2. 本地生成：
      ```bash

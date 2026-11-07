@@ -112,7 +112,7 @@ class KronosInferenceService:
         return self._predictor
 
     def _resolve_repo_path(self) -> Path:
-        configured = Path(str(self.config.kronos_repo_path or "Kronos")).expanduser()
+        configured = Path(str(self.config.kronos_repo_path or "vendor/Kronos")).expanduser()
         if configured.is_absolute():
             return configured
         return Path(__file__).resolve().parents[2] / configured

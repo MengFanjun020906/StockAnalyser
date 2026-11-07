@@ -968,7 +968,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "Kronos",
+        "default_value": "vendor/Kronos",
         "options": [],
         "validation": {},
         "display_order": 20,

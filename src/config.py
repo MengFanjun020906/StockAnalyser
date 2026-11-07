@@ -787,7 +787,7 @@ class Config:
 
     # === Kronos K线形态配置 ===
     kronos_enabled: bool = False
-    kronos_repo_path: str = "Kronos"
+    kronos_repo_path: str = "vendor/Kronos"
     kronos_tokenizer_path: str = "NeoQuasar/Kronos-Tokenizer-base"
     kronos_model_path: str = "NeoQuasar/Kronos-small"
     kronos_device: str = "auto"
@@ -1739,7 +1739,7 @@ class Config:
                 field_name='JEV_TIMEOUT_SECONDS', minimum=1.0, maximum=60.0,
             ),
             kronos_enabled=parse_env_bool(os.getenv('KRONOS_ENABLED'), False),
-            kronos_repo_path=os.getenv('KRONOS_REPO_PATH', 'Kronos').strip() or 'Kronos',
+            kronos_repo_path=os.getenv('KRONOS_REPO_PATH', 'vendor/Kronos').strip() or 'vendor/Kronos',
             kronos_tokenizer_path=(
                 os.getenv('KRONOS_TOKENIZER_PATH', 'NeoQuasar/Kronos-Tokenizer-base').strip()
                 or 'NeoQuasar/Kronos-Tokenizer-base'
