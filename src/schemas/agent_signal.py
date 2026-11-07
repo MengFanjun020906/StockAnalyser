@@ -116,18 +116,41 @@ class L3Decision(BaseModel):
     review_triggers: List[str] = Field(default_factory=list)
     evidence_refs: List[EvidenceRef] = Field(default_factory=list)
 
+
+class EntryZone(BaseModel):
+    """One continuous evidence-backed price interval in an entry plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field("entry", min_length=1, max_length=64)
+    low: float = Field(..., gt=0)
+    high: float = Field(..., gt=0)
+    rationale: Optional[str] = Field(None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "EntryZone":
+        if self.low > self.high:
+            raise ValueError("entry zone low cannot be greater than high")
+        return self
+
+
 class TradePlan(BaseModel):
     """Executable plan candidate after an L3 decision and before order routing."""
 
     model_config = ConfigDict(extra="allow")
 
     symbol: str = Field(..., min_length=1, max_length=32)
+    # ``action`` is the action to review when the price condition is met.
+    # ``current_action`` keeps a strict "wait now" conclusion without losing
+    # the evidence-backed conditional plan.
     action: TradeAction
+    current_action: Optional[TradeAction] = None
     order_type: OrderType = "manual"
     target_position_pct: Optional[float] = Field(None, ge=0, le=100)
     entry_price: Optional[float] = Field(None, ge=0)
     entry_zone_low: Optional[float] = Field(None, ge=0)
     entry_zone_high: Optional[float] = Field(None, ge=0)
+    entry_zones: List[EntryZone] = Field(default_factory=list, max_length=4)
     stop_loss_price: Optional[float] = Field(None, ge=0)
     stop_loss_pct: Optional[float] = Field(None, ge=0, le=100)
     take_profit_price: Optional[float] = Field(None, ge=0)
@@ -140,6 +163,10 @@ class TradePlan(BaseModel):
     @model_validator(mode="after")
     def validate_entry_zone(self) -> "TradePlan":
         """Keep price-zone shape valid while risk_gate decides action safety."""
+        if self.entry_zones:
+            primary = self.entry_zones[0]
+            self.entry_zone_low = primary.low
+            self.entry_zone_high = primary.high
         if (
             self.entry_zone_low is not None
             and self.entry_zone_high is not None
@@ -197,6 +224,7 @@ class ReasoningTraceRef(BaseModel):
 
 __all__ = [
     "DataQuality",
+    "EntryZone",
     "EvidenceRef",
     "EXIT_ACTIONS",
     "L1Signal",

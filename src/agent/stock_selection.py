@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -24,6 +24,7 @@ from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
 from src.agent.llm_telemetry import llm_telemetry_scope
 from src.agent.multi_expert import AgentState, ExpertOrchestrator
 from src.agent.runner import try_parse_json
+from src.agent.scoring import CompositeSnapshotBuilder, score_symbol_composite
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.agent.stock_selection_prompts import (
@@ -41,6 +42,7 @@ from src.agent.stock_selection_graph import StockSelectionGraphEvidence
 from src.agent.tools.registry import ToolRegistry
 from src.config import Config
 from src.schemas.agent_context import AgentUserContext
+from src.services.history_loader import get_frozen_target_date
 
 logger = logging.getLogger(__name__)
 
@@ -568,6 +570,30 @@ def run_stock_selection_pipeline(
             positions=_positions_summary(agent_user_context),
         )
 
+        deterministic_scoring_stage = _resume_stage_payload(resume_state, "deterministic_scoring")
+        if deterministic_scoring_stage:
+            reused_stages.append("deterministic_scoring")
+            _emit_resumed_stage(
+                progress_callback,
+                "deterministic_scoring",
+                ctx,
+                deterministic_scoring_stage,
+                reused_stages,
+            )
+        else:
+            deterministic_scoring_stage = _build_deterministic_scoring_stage(
+                target_codes=_deep_dive_target_codes(ctx.stage_full("single_stock_deep_dive")),
+                agent_user_context=agent_user_context,
+                market_regime=ctx.market_regime,
+            )
+            ctx.set_stage("deterministic_scoring", deterministic_scoring_stage)
+            _emit_stage_done(
+                progress_callback,
+                "selection_deterministic_scoring_done",
+                ctx,
+                "deterministic_scoring",
+            )
+
         meta_payload = _resume_stage_payload(resume_state, "meta_orchestrator")
         if meta_payload:
             reused_stages.append("meta_orchestrator")
@@ -830,6 +856,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         item for item in recommendations
         if not item.get("has_deep_dive") and _execution_mode(item) not in {"immediate_open", "conditional_open"} and _is_observable_item(item)
     ]
+    deterministic_scoring = report.get("deterministic_scoring", {})
 
     lines = [
         "# 选股分析报告：下周可关注候选",
@@ -887,6 +914,8 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
                 )
             )
         lines.append("")
+
+    lines.extend(_render_deterministic_scoring_section(deterministic_scoring))
 
     lines.extend([
         "",
@@ -2524,7 +2553,11 @@ def _collect_deep_dive_evidence(
         ("analyze_trend", {"stock_code": code}),
         ("analyze_price_structure", {"stock_code": code}),
         ("get_capital_flow", {"stock_code": code}),
-        ("get_stock_info", {"stock_code": code}),
+        ("get_stock_business_context", {"stock_code": code}),
+        ("get_tushare_daily_basic", {"stock_code": code}),
+        ("get_tushare_financial_indicators", {"stock_code": code}),
+        ("get_tushare_financial_statements", {"stock_code": code}),
+        ("get_tushare_forecast", {"stock_code": code}),
         ("get_chip_distribution", {"stock_code": code}),
     )
     for tool_name, args in base_tools:
@@ -2874,8 +2907,8 @@ def _candidate_evidence_packet(
 
 def _candidate_base_schema(candidate: Dict[str, Any], code: str, stock_name: str, evidence: Dict[str, Any]) -> Dict[str, Any]:
     quote = evidence.get("get_realtime_quote") if isinstance(evidence, dict) else {}
-    info = evidence.get("get_stock_info") if isinstance(evidence, dict) else {}
-    boards = info.get("belong_boards") if isinstance(info, dict) else []
+    business = evidence.get("get_stock_business_context") if isinstance(evidence, dict) else {}
+    boards = business.get("boards") if isinstance(business, dict) else []
     return {
         "status": "ok",
         "code": code,
@@ -2940,20 +2973,42 @@ def _candidate_news_schema(evidence: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _candidate_fundamental_schema(evidence: Dict[str, Any]) -> Dict[str, Any]:
-    info = evidence.get("get_stock_info") if isinstance(evidence, dict) else {}
-    if not isinstance(info, dict) or _is_failed_tool_result(info):
-        return {"status": "missing", "summary": "基本面数据缺失"}
-    keys = ("roe", "revenue_growth", "profit_growth", "pe_ttm", "pb", "debt_ratio")
-    metrics = {
-        key: value
-        for key in keys
-        for value in [_sanitize_non_finite_numbers(info.get(key))]
-        if value is not None
+    tools = (
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_financial_statements",
+        "get_tushare_forecast",
+    )
+    payloads = {
+        tool: evidence.get(tool)
+        for tool in tools
+        if isinstance(evidence.get(tool), dict)
+        and not _is_failed_tool_result(evidence.get(tool))
     }
+    if not payloads:
+        return {"status": "missing", "summary": "基本面数据缺失"}
+    metrics: Dict[str, Any] = {}
+    for payload in payloads.values():
+        rows = payload.get("items") if isinstance(payload.get("items"), list) else []
+        sources = [payload, *(item for item in rows[:1] if isinstance(item, dict))]
+        for source in sources:
+            for key in (
+                "pe_ttm", "pb", "roe", "roe_dt", "or_yoy", "netprofit_yoy",
+                "debt_to_assets", "net_profit_min", "net_profit_max", "type",
+                "end_date", "ann_date",
+            ):
+                value = _sanitize_non_finite_numbers(source.get(key))
+                if value is not None and key not in metrics:
+                    metrics[key] = value
     return {
-        "status": "ok" if metrics else "partial",
-        "summary": "基本面指标已获取" if metrics else "仅获取到公司基础信息",
+        "status": "ok" if len(payloads) >= 2 and metrics else "partial",
+        "summary": (
+            f"已取得{len(payloads)}类结构化基本面来源"
+            if metrics
+            else "已调用基本面工具，但有效指标有限"
+        ),
         "metrics": metrics,
+        "sources": list(payloads),
     }
 
 
@@ -5128,6 +5183,7 @@ def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
         "balanced_candidate_evidence": ctx.stages.get("balanced_candidate_evidence", SelectionStage()).to_dict(include_full=True),
         "candidate_screening": ctx.stages.get("candidate_screening", SelectionStage()).to_dict(include_full=True),
         "single_stock_deep_dive": ctx.stages.get("single_stock_deep_dive", SelectionStage()).to_dict(include_full=True),
+        "deterministic_scoring": ctx.stages.get("deterministic_scoring", SelectionStage()).to_dict(include_full=True),
         "symbol_regime_probability": ctx.stages.get("symbol_regime_probability", SelectionStage()).to_dict(include_full=True),
         "meta_orchestrator": ctx.stages.get("meta_orchestrator", SelectionStage()).to_dict(include_full=True),
         "pricing_agent": ctx.stages.get("pricing_agent", SelectionStage()).to_dict(include_full=True),
@@ -5153,6 +5209,130 @@ def _combine_deep_dive_outputs(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "full": {"results": outputs},
         "full_ref": "deep_dive_results.json",
     }
+
+
+def _deep_dive_target_codes(deep_dive_full: Dict[str, Any]) -> List[str]:
+    results = deep_dive_full.get("results") if isinstance(deep_dive_full, dict) else []
+    codes: List[str] = []
+    for item in results if isinstance(results, list) else []:
+        if not isinstance(item, dict):
+            continue
+        summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+        full = item.get("full") if isinstance(item.get("full"), dict) else {}
+        stock = full.get("stock") if isinstance(full.get("stock"), dict) else {}
+        code = _normalize_stock_identity_code(summary.get("code") or stock.get("code"))
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _build_deterministic_scoring_stage(
+    *,
+    target_codes: Sequence[str],
+    agent_user_context: AgentUserContext,
+    market_regime: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    as_of = get_frozen_target_date() or date.today()
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    snapshot_builder = CompositeSnapshotBuilder(fallback_to_network=False)
+    for code in target_codes:
+        try:
+            payload = score_symbol_composite(
+                code,
+                as_of=as_of,
+                quote_basis="latest_trading_day",
+                holding=agent_user_context.has_position_for(code),
+                snapshot_builder=snapshot_builder,
+                market_regime=market_regime,
+            )
+            results.append({"code": code, **payload})
+        except Exception as exc:
+            logger.warning("Deterministic shadow scoring failed for %s: %s", code, exc)
+            errors.append({"code": code, "error": str(exc)})
+
+    evaluable_count = sum(
+        1
+        for item in results
+        if isinstance(item.get("composite_verdict"), dict)
+        and item["composite_verdict"].get("score") is not None
+    )
+    chan_scored_count = sum(
+        1
+        for item in results
+        if isinstance(item.get("composite_verdict"), dict)
+        and isinstance(item["composite_verdict"].get("components"), dict)
+        and isinstance(item["composite_verdict"]["components"].get("chan"), dict)
+        and item["composite_verdict"]["components"]["chan"].get("score") is not None
+    )
+    result_statuses = {str(item.get("status") or "") for item in results}
+    status = (
+        "ok"
+        if results and not errors and result_statuses == {"ok"}
+        else "partial"
+        if results
+        else "insufficient_data"
+    )
+    return {
+        "stage": "deterministic_scoring",
+        "status": status,
+        "summary": {
+            "target_count": len(target_codes),
+            "completed_count": len(results),
+            "evaluable_count": evaluable_count,
+            "chan_scored_count": chan_scored_count,
+            "shadow_mode": True,
+            "scale_max": 20,
+            "main_limitations": [
+                "策略 4 已按 strategy4.v1 计算；完整综合分仍受周线完整性、历史长度和缠论证据覆盖率影响。",
+                "信号级回测需要上市日期、ST/板块涨停元数据；当前选股阶段未猜测这些字段。",
+            ],
+            "error_count": len(errors),
+        },
+        "full": {"results": results, "errors": errors},
+        "full_ref": "deterministic_scoring.json",
+    }
+
+
+def _render_deterministic_scoring_section(stage: Any) -> List[str]:
+    if not isinstance(stage, dict):
+        return []
+    full = stage.get("full") if isinstance(stage.get("full"), dict) else {}
+    results = full.get("results") if isinstance(full.get("results"), list) else []
+    if not results:
+        return []
+    lines = [
+        "",
+        "## 确定性数学评分（影子模式）",
+        "",
+        "该评分只用于回放和校准，不参与本轮排序、买卖判断或仓位计算；数据不足、周线未收盘或缠论证据不足时保持不可评估。",
+        "",
+        "| 股票 | S4 分 | 缠论分 | 综合分 | 判决状态 | 仓位上限 | 逃顶预警 |",
+        "| --- | ---: | ---: | ---: | --- | ---: | --- |",
+    ]
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        verdict = item.get("composite_verdict") if isinstance(item.get("composite_verdict"), dict) else {}
+        components = verdict.get("components") if isinstance(verdict.get("components"), dict) else {}
+        s4 = components.get("s4") if isinstance(components.get("s4"), dict) else {}
+        chan = components.get("chan") if isinstance(components.get("chan"), dict) else {}
+        warning = verdict.get("exit_warning") if isinstance(verdict.get("exit_warning"), dict) else {}
+        score = verdict.get("score")
+        cap = verdict.get("target_position_cap_pct")
+        lines.append(
+            "| {code} | {s4_score} / 10 | {chan_score} / 10 | {score_text} | {status} | {cap_text} | level {warning_level} |".format(
+                code=_markdown_cell(item.get("code") or "-"),
+                s4_score=_markdown_cell(s4.get("score") if s4.get("score") is not None else "-"),
+                chan_score=_markdown_cell(chan.get("score") if chan.get("score") is not None else "-"),
+                score_text=_markdown_cell(f"{score} / 20" if score is not None else "不可评估"),
+                status=_markdown_cell(verdict.get("verdict_status") or "-"),
+                cap_text=_markdown_cell(f"{cap:.1f}%" if isinstance(cap, (int, float)) else "-"),
+                warning_level=_markdown_cell(warning.get("level") if warning.get("level") is not None else 0),
+            )
+        )
+    lines.append("")
+    return lines
 
 
 def _attach_symbol_regime_to_deep_payload(payload: Dict[str, Any], symbol_regime: Any) -> None:
@@ -5569,6 +5749,38 @@ def _tool_failures_from_evidence(evidence: Dict[str, Any]) -> List[Dict[str, Any
     return failures
 
 
+def _selection_fundamental_dimension_summary(
+    evidence: Dict[str, Any],
+    failures: set[str],
+) -> Dict[str, Any]:
+    tools = (
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_financial_statements",
+        "get_tushare_forecast",
+        "search_stock_fundamentals",
+    )
+    available = [tool for tool in tools if evidence.get(tool)]
+    failed = [tool for tool in tools if tool in failures]
+    if available:
+        verdict = "neutral"
+    elif failed:
+        verdict = "tool_failed"
+    else:
+        verdict = "missing"
+    return {
+        "verdict": verdict,
+        "summary": _truncate(
+            json.dumps(
+                {tool: evidence.get(tool) for tool in available},
+                ensure_ascii=False,
+                default=str,
+            ),
+            500,
+        ),
+    }
+
+
 def _dimension_summary_from_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     failures = set(_missing_from_evidence(evidence))
     regime = evidence.get("detect_market_regime") if isinstance(evidence, dict) else {}
@@ -5584,10 +5796,7 @@ def _dimension_summary_from_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]
             ),
             "summary": _truncate(json.dumps(evidence.get("analyze_price_structure") or {}, ensure_ascii=False, default=str), 500),
         },
-        "fundamental": {
-            "verdict": "tool_failed" if "get_stock_info" in failures else ("neutral" if evidence.get("get_stock_info") else "missing"),
-            "summary": _truncate(json.dumps(evidence.get("get_stock_info") or {}, ensure_ascii=False, default=str), 500),
-        },
+        "fundamental": _selection_fundamental_dimension_summary(evidence, failures),
         "news_event": {
             "verdict": "tool_failed" if "search_comprehensive_intel" in failures else ("neutral" if evidence.get("search_comprehensive_intel") else "missing"),
             "summary": _truncate(json.dumps(evidence.get("search_comprehensive_intel") or {}, ensure_ascii=False, default=str), 500),
@@ -7082,6 +7291,7 @@ def _resume_stage_event_type(stage_name: str) -> str:
         "balanced_candidate_evidence": "selection_balanced_candidate_evidence_done",
         "candidate_screening": "selection_candidate_screening_done",
         "single_stock_deep_dive": "selection_deep_dive_done",
+        "deterministic_scoring": "selection_deterministic_scoring_done",
         "meta_orchestrator": "selection_meta_orchestrator_done",
         "pricing_agent": "selection_pricing_agent_done",
         "portfolio_allocation": "selection_allocation_done",
@@ -7120,6 +7330,7 @@ def _load_stock_selection_resume_state(resume_artifact_dir: Optional[str]) -> Di
         "balanced_candidate_evidence",
         "candidate_screening",
         "single_stock_deep_dive",
+        "deterministic_scoring",
         "meta_orchestrator",
         "pricing_agent",
         "portfolio_allocation",

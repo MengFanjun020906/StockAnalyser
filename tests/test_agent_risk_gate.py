@@ -149,3 +149,84 @@ def test_passes_clean_open_plan():
     assert result.status == "passed"
     assert result.allowed_action == "open"
     assert result.passed is True
+
+
+def test_composite_verdict_is_audited_without_clamping_shadow_plan():
+    result = _gate(
+        TradePlan(
+            symbol="688469",
+            action="open",
+            target_position_pct=15,
+            stop_loss_pct=7,
+        ),
+        quote=QuoteState(symbol="688469"),
+        data_quality="sufficient",
+        l3_confidence=0.9,
+        composite_verdict={
+            "verdict_status": "not_evaluable",
+            "score": None,
+            "scale_max": 20,
+            "shadow_mode": True,
+            "target_position_cap_pct": None,
+        },
+    )
+
+    check = next(check for check in result.checks if check.rule_id == "composite_verdict_ceiling")
+    assert check.passed is True
+    assert check.severity == "info"
+    assert check.details["clamp_applied"] is False
+    assert result.allowed_action == "open"
+    assert result.status == "passed"
+
+
+def test_active_composite_ceiling_blocks_when_pre_gate_clamp_was_missed():
+    result = _gate(
+        TradePlan(
+            symbol="688469",
+            action="open",
+            target_position_pct=15,
+            stop_loss_pct=7,
+        ),
+        quote=QuoteState(symbol="688469"),
+        data_quality="sufficient",
+        l3_confidence=0.9,
+        composite_verdict={
+            "verdict_status": "evaluable",
+            "score": 12,
+            "scale_max": 20,
+            "shadow_mode": False,
+            "target_position_cap_pct": 10,
+        },
+    )
+
+    check = next(check for check in result.checks if check.rule_id == "composite_verdict_ceiling")
+    assert check.passed is False
+    assert check.severity == "blocking"
+    assert result.status == "blocked"
+    assert result.allowed_action == "manual_review"
+
+
+def test_composite_ratio_cap_is_normalized_to_percent_for_risk_gate():
+    result = _gate(
+        TradePlan(
+            symbol="688469",
+            action="open",
+            target_position_pct=21,
+            stop_loss_pct=7,
+        ),
+        quote=QuoteState(symbol="688469"),
+        data_quality="sufficient",
+        l3_confidence=0.9,
+        composite_verdict={
+            "verdict_status": "evaluable",
+            "score": 18,
+            "scale_max": 20,
+            "shadow_mode": False,
+            "target_position_cap_pct": 0.2,
+        },
+    )
+
+    check = next(check for check in result.checks if check.rule_id == "composite_verdict_ceiling")
+    assert check.passed is False
+    assert check.details["target_position_cap_pct"] == 20.0
+    assert check.details["target_position_cap_unit"] == "ratio"

@@ -7,6 +7,28 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+ConfigCategoryName = Literal[
+    "base",
+    "data_source",
+    "ai_model",
+    "notification",
+    "system",
+    "agent",
+    "kronos",
+    "graphiti",
+    "backtest",
+    "uncategorized",
+]
+
+SetupCategoryName = Literal[
+    "base",
+    "ai_model",
+    "agent",
+    "kronos",
+    "notification",
+    "system",
+]
+
 
 class SystemConfigOption(BaseModel):
     """Select option metadata for frontend rendering."""
@@ -21,7 +43,7 @@ class SystemConfigFieldSchema(BaseModel):
     key: str = Field(..., description="Configuration key name")
     title: Optional[str] = Field(None, description="Display title")
     description: Optional[str] = Field(None, description="Field description")
-    category: Literal["base", "data_source", "ai_model", "notification", "system", "agent", "graphiti", "backtest", "uncategorized"]
+    category: ConfigCategoryName
     data_type: Literal["string", "integer", "float", "number", "boolean", "array", "json", "time"]
     ui_control: Literal["text", "password", "number", "select", "textarea", "switch", "time"]
     is_sensitive: bool
@@ -76,7 +98,7 @@ class SetupStatusCheck(BaseModel):
 
     key: str
     title: str
-    category: Literal["base", "ai_model", "agent", "notification", "system"]
+    category: SetupCategoryName
     required: bool
     status: Literal["configured", "inherited", "optional", "needs_action"]
     message: str

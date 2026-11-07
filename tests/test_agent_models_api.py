@@ -6,12 +6,25 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from api.v1.endpoints import agent
 from src.config import Config
 from src.services.agent_model_service import list_agent_model_deployments
+
+
+def _fixed_no_plan_result():
+    from src.agent.pricing.runtime import _system_result
+
+    return _system_result(
+        symbol="600519",
+        as_of=date(2026, 8, 11),
+        reason="SYSTEM_NOT_READY",
+        execution_status="system_unready",
+        trace_ref="trace-test",
+    )
 
 
 def _build_config(**overrides):
@@ -241,6 +254,33 @@ class AgentModelsEndpointTestCase(unittest.TestCase):
 
 
 class AgentSkillsEndpointTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        def composite_payload(context):
+            symbol = str(context.get("stock_code") or "")
+            if not symbol:
+                return None
+            return {
+                "schema_version": "stock-composite-shadow.v1",
+                "status": "insufficient_data",
+                "snapshot": {"symbol": symbol, "as_of": "2026-08-09"},
+                "composite_verdict": {
+                    "symbol": symbol,
+                    "as_of": "2026-08-09",
+                    "verdict_status": "not_evaluable",
+                    "score": None,
+                    "scale_max": 20,
+                    "shadow_mode": True,
+                    "target_position_cap_pct": None,
+                },
+            }
+
+        prefetch_patch = patch(
+            "api.v1.endpoints.agent._prefetch_trace_composite_verdict",
+            side_effect=composite_payload,
+        )
+        prefetch_patch.start()
+        self.addCleanup(prefetch_patch.stop)
+
     def test_skills_endpoint_returns_skill_metadata_shape(self) -> None:
         config = _build_config()
         skill_manager = SimpleNamespace(
@@ -403,6 +443,12 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             ), patch(
                 "api.v1.endpoints.agent.asyncio.get_running_loop",
                 side_effect=lambda: _ImmediateLoop(real_get_running_loop()),
+            ), patch(
+                "src.agent.pricing.runtime.generate_trade_plan",
+                return_value=_fixed_no_plan_result(),
+            ), patch(
+                "src.agent.pricing.runtime.enrich_trade_plan_result",
+                side_effect=lambda value, **_kwargs: value,
             ):
                 payload = asyncio.run(agent.run_agent_trace(request)).model_dump()
 
@@ -410,7 +456,8 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             mock_db.delete_conversation_session.assert_called_once_with(payload["session_id"])
             self.assertTrue(payload["session_id"].startswith("trace-"))
             self.assertTrue(payload["success"])
-            self.assertEqual(payload["content"], "trace ok")
+            self.assertTrue(payload["content"].startswith("trace ok"))
+            self.assertIn("## 确定性价格计划", payload["content"])
             self.assertEqual(payload["tool_calls"][0]["tool"], "get_realtime_quote")
             self.assertEqual(payload["events"][0]["display_name"], "获取实时行情")
             self.assertEqual(payload["planner"]["intent"], "entry_analysis")
@@ -427,10 +474,13 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "tool_calls.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "evidence_ledger.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "debate.json")))
+            self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "composite_verdict.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "risk_gate.json")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "final.md")))
             self.assertTrue(os.path.exists(os.path.join(payload["artifact_dir"], "todo.md")))
             self.assertEqual(payload["debate"]["judge_decision"]["final_action"], "hold")
+            self.assertEqual(payload["composite_verdict"]["schema_version"], "stock-composite-shadow.v1")
+            self.assertTrue(payload["composite_verdict"]["composite_verdict"]["shadow_mode"])
             self.assertEqual(payload["risk_gate"]["trade_plan"]["action"], "hold")
             self.assertEqual(payload["risk_gate"]["risk_gate"]["status"], "passed")
             self.assertEqual(payload["runtime_config"]["agent_orchestration_mode"], "expert_graph")
@@ -438,7 +488,9 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                 lines = [json.loads(line) for line in fh if line.strip()]
             self.assertEqual(lines[0]["type"], "tool_start")
             with open(os.path.join(payload["artifact_dir"], "final.md"), encoding="utf-8") as fh:
-                self.assertEqual(fh.read(), "trace ok")
+                final_report = fh.read()
+            self.assertTrue(final_report.startswith("trace ok"))
+            self.assertIn("## 确定性价格计划", final_report)
             with open(os.path.join(payload["artifact_dir"], "evidence_ledger.json"), encoding="utf-8") as fh:
                 evidence_ledger = json.load(fh)
             self.assertEqual(evidence_ledger["entry_count"], 1)
@@ -450,8 +502,14 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             self.assertEqual(debate["judge_decision"]["final_action"], "hold")
             with open(os.path.join(payload["artifact_dir"], "risk_gate.json"), encoding="utf-8") as fh:
                 risk_gate = json.load(fh)
-            self.assertEqual(risk_gate["source"], "debate_judge")
+            self.assertEqual(risk_gate["source"], "deterministic_price_plan")
             self.assertEqual(risk_gate["risk_gate"]["allowed_action"], "hold")
+            composite_check = next(
+                item
+                for item in risk_gate["risk_gate"]["checks"]
+                if item["rule_id"] == "composite_verdict_ceiling"
+            )
+            self.assertFalse(composite_check["details"]["clamp_applied"])
             with open(os.path.join(payload["artifact_dir"], "todo.md"), encoding="utf-8") as fh:
                 todo_md = fh.read()
             self.assertIn("## 初始假设", todo_md)
@@ -583,6 +641,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
                 total_tokens=42,
                 provider="deepseek",
                 model="deepseek/deepseek-v4-pro",
+                report_quality={"status": "repaired", "initial_issues": ["report_too_short"]},
                 debate={"enabled": True, "success": True, "judge_decision": {"final_action": "hold"}},
                 tool_calls_log=[
                     {
@@ -612,6 +671,12 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
             ), patch(
                 "src.storage.get_db",
                 return_value=MagicMock(),
+            ), patch(
+                "src.agent.pricing.runtime.generate_trade_plan",
+                return_value=_fixed_no_plan_result(),
+            ), patch(
+                "src.agent.pricing.runtime.enrich_trade_plan_result",
+                side_effect=lambda value, **_kwargs: value,
             ):
                 response = await agent.stream_agent_trace(request)
                 chunks = []
@@ -630,7 +695,9 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertIn("planner_ready", event_types)
         self.assertIn("tool_done", event_types)
         self.assertEqual(events[-1]["type"], "done")
-        self.assertEqual(events[-1]["content"], "stream ok")
+        self.assertTrue(events[-1]["content"].startswith("stream ok"))
+        self.assertIn("## 确定性价格计划", events[-1]["content"])
+        self.assertEqual(events[-1]["report_quality"]["status"], "repaired")
         self.assertEqual(events[-1]["debate"]["judge_decision"]["final_action"], "hold")
         self.assertEqual(events[-1]["risk_gate"]["risk_gate"]["status"], "passed")
         self.assertEqual(events[-1]["runtime_config"]["agent_orchestration_mode"], "expert_graph")
@@ -1106,6 +1173,52 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertEqual(planner["primary_symbol"], "002156")
         self.assertEqual(planner["intent"], "entry_analysis")
 
+    @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "", "XIAOMI_MIMO_KEY": "", "XIAOMI_MIMO_API_KEY": ""}, clear=False)
+    @patch("src.services.name_to_code_resolver.resolve_name_to_code", return_value="600487")
+    @patch("src.services.portfolio_service.PortfolioService")
+    def test_trace_context_resolves_chinese_stock_name_before_composite_prefetch(
+        self,
+        mock_service_cls,
+        mock_resolver,
+    ) -> None:
+        mock_service_cls.return_value.get_portfolio_snapshot.return_value = {
+            "as_of": "2026-08-11",
+            "currency": "CNY",
+            "cost_method": "fifo",
+            "accounts": [
+                {
+                    "account_id": 3,
+                    "account_name": "5w账户",
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 50000,
+                    "total_market_value": 20000,
+                    "total_equity": 70000,
+                    "positions": [
+                        {"symbol": "002050", "stock_name": "三花智控", "quantity": 100},
+                        {"symbol": "600487", "stock_name": "亨通光电", "quantity": 300},
+                    ],
+                }
+            ],
+        }
+
+        context = agent._build_trace_context(
+            request=agent.AgentTraceRunRequest(
+                message="分析一下亨通光电",
+                inject_portfolio_context=True,
+            ),
+            config=SimpleNamespace(report_language="zh"),
+        )
+
+        report = context["agent_user_context"].report
+        self.assertEqual(context["stock_code"], "600487")
+        self.assertEqual(report.primary_symbol, "600487")
+        self.assertEqual(report.target_symbols[0], "600487")
+        self.assertEqual(context["_trace_target_resolution"]["status"], "resolved")
+        self.assertEqual(context["_trace_target_resolution"]["source"], "local_name_index")
+        self.assertEqual(agent._trace_composite_symbol(context), "600487")
+        mock_resolver.assert_called_once_with("分析一下亨通光电", allow_network=False)
+
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
     @patch("litellm.completion")
     def test_trace_context_forces_watchlist_scan_when_portfolio_context_is_injected(self, mock_completion) -> None:
@@ -1223,6 +1336,7 @@ class AgentSkillsEndpointTestCase(unittest.TestCase):
         self.assertFalse(context["agent_user_context"].report.include_watchlist_ranking)
         self.assertEqual(context["_trace_intent_resolution"]["source"], "default")
         self.assertFalse(context["_trace_intent_resolution"]["explicit_watchlist_request"])
+        self.assertEqual(context["_trace_target_resolution"]["status"], "not_applicable")
 
     @patch.dict(os.environ, {"XIAOMI_MIMO_URL": "https://mimo.example/v1", "XIAOMI_MIMO_KEY": "sk-test"}, clear=False)
     @patch("litellm.completion")

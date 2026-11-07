@@ -58,20 +58,25 @@ def test_get_tools_for_capability_includes_tushare_fundamental_fallbacks():
     plan = get_tools_for_capability(
         "fundamental_analysis",
         tool_registry=_registry(
-            "get_stock_info",
+            "get_stock_business_context",
             "get_tushare_daily_basic",
             "get_tushare_financial_indicators",
             "get_tushare_financial_statements",
+            "get_tushare_forecast",
+            "search_stock_fundamentals",
         ),
     )
 
     assert plan.tools == [
-        "get_stock_info",
+        "get_stock_business_context",
         "get_tushare_daily_basic",
         "get_tushare_financial_indicators",
         "get_tushare_financial_statements",
+        "get_tushare_forecast",
+        "search_stock_fundamentals",
     ]
     assert plan.missing_tools == []
+    assert "get_stock_info" not in plan.tools
 
 
 def test_get_tools_for_capability_prefers_detect_market_regime():

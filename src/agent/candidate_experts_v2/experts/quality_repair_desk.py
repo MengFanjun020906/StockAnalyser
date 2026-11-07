@@ -16,7 +16,6 @@ from src.agent.candidate_experts_v2.tools_manifest import load_manifest, validat
 
 
 QUALITY_REPAIR_DESK_TOOLS: tuple[str, ...] = (
-    "get_stock_info",
     "get_stock_business_context",
     "get_tushare_daily_basic",
     "get_tushare_financial_indicators",

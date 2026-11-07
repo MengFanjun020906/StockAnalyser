@@ -34,13 +34,19 @@ class DecisionAgent(BaseAgent):
 
     def system_prompt(self, ctx: AgentContext) -> str:
         report_language = normalize_report_language(ctx.meta.get("report_language", "zh"))
+        signal_plan_section = ""
+        if ctx.meta.get("signal_lifecycle_entry_intent") or ctx.meta.get("signal_lifecycle_plan_candidate"):
+            from src.agent.tools.signal_tools import signal_trade_plan_instructions
+
+            signal_plan_section = f"\n\n{signal_trade_plan_instructions()}"
         if self._is_chat_mode(ctx):
             prompt = """\
 You are a **Decision Synthesis Agent** replying directly to the user's latest
 stock-analysis question.
 
-You will receive structured opinions from the technical, intelligence, risk,
-and skill stages. Synthesize them into a concise, natural-language answer.
+You will receive structured opinions from the technical, intelligence,
+capital-flow, fundamental, risk, and skill stages. Synthesize them into a
+concise, natural-language answer.
 
 Requirements:
 - Answer the user's actual question directly
@@ -50,8 +56,8 @@ Requirements:
 - Do NOT output JSON or code fences unless the user explicitly asks for them
 """
             if report_language == "en":
-                return prompt + "\nAlways answer in English.\n"
-            return prompt + "\n默认使用中文回答。\n"
+                return prompt + "\nAlways answer in English.\n" + signal_plan_section
+            return prompt + "\n默认使用中文回答。\n" + signal_plan_section
 
         skills = ""
         if self.skill_instructions:
@@ -62,9 +68,10 @@ You are a **Decision Synthesis Agent** that produces the final investment \
 Decision Dashboard.
 
 You will receive:
-1. Structured opinions from a Technical Agent and an Intel Agent
+1. Structured opinions from Technical, Intelligence, Capital Flow, and
+   Fundamental Agents
 2. Any risk flags raised by a Risk Agent
-        3. Skill evaluation results (if applicable)
+3. Skill evaluation results (if applicable)
 
 Your task: synthesise all inputs into a single, actionable Decision Dashboard.
 {skills}
@@ -77,10 +84,13 @@ Your task: synthesise all inputs into a single, actionable Decision Dashboard.
    the overall signal must be downgraded accordingly.
 
 ## Signal Weighting Guidelines
-- Technical opinion weight: ~40%
-- Intel / sentiment weight: ~30%
-- Risk flags weight: ~30% (negative override: any high-severity risk caps signal at "hold")
-- If a skill opinion is present, blend it at 20% weight (reducing others proportionally)
+- Treat technical, intelligence, capital-flow, and fundamental opinions as
+  four peer dimensions. Start from equal weight and reduce the weight of a
+  dimension whose quality is partial/stale/unavailable.
+- Risk flags are a negative override: any high-severity risk caps signal at
+  "hold".
+- If a skill opinion is present, blend it at 20% weight (reducing the four
+  dimensions proportionally).
 
 ## Scoring
 - 80-100: buy (all conditions met, high conviction)
@@ -120,14 +130,14 @@ new decision_type values.
 - Keep every JSON key unchanged.
 - `decision_type` must remain `buy|hold|sell`.
 - Write all human-readable JSON values in English.
-"""
+""" + signal_plan_section
         return prompt + """
 
 ## 输出语言
 - 所有 JSON 键名保持不变。
 - `decision_type` 必须保持为 `buy|hold|sell`。
 - 所有面向用户的人类可读文本值必须使用中文。
-"""
+""" + signal_plan_section
 
     def build_user_message(self, ctx: AgentContext) -> str:
         if self._is_chat_mode(ctx):

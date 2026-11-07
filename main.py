@@ -920,8 +920,10 @@ def main() -> int:
 
             background_tasks = []
             from src.services.news_signal_scheduler import build_news_signal_background_tasks
+            from src.services.position_watch_scheduler import build_position_watch_background_tasks
 
             background_tasks.extend(build_news_signal_background_tasks(config))
+            background_tasks.extend(build_position_watch_background_tasks(config))
             if getattr(config, 'agent_event_monitor_enabled', False):
                 from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
 

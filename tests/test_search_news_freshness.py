@@ -22,7 +22,7 @@ from src.search_service import SearchResponse, SearchResult, SearchService
 def _result(title: str, published_date: str | None) -> SearchResult:
     return SearchResult(
         title=title,
-        snippet="snippet",
+        snippet="600519 related news",
         url=f"https://example.com/{title}",
         source="example.com",
         published_date=published_date,
@@ -62,24 +62,24 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         return service, mock_search
 
     def test_effective_window_uses_profile_and_news_max_age(self) -> None:
-        """window = min(profile_days, NEWS_MAX_AGE_DAYS)."""
+        """Single-stock news starts with the product-level seven-day window."""
         service, mock_search = self._create_service_with_mock_provider(
             news_max_age_days=3,
             news_strategy_profile="medium",  # 7
         )
         service.search_stock_news("600519", "贵州茅台", max_results=5)
         kwargs = mock_search.call_args[1]
-        self.assertEqual(kwargs["days"], 3)
+        self.assertEqual(kwargs["days"], 7)
 
     def test_invalid_profile_falls_back_to_short(self) -> None:
-        """Invalid profile should fallback to short (3 days)."""
+        """Invalid generic profile does not shrink single-stock news below seven days."""
         service, mock_search = self._create_service_with_mock_provider(
             news_max_age_days=30,
             news_strategy_profile="invalid_profile",
         )
         service.search_stock_news("600519", "贵州茅台", max_results=5)
         kwargs = mock_search.call_args[1]
-        self.assertEqual(kwargs["days"], 3)
+        self.assertEqual(kwargs["days"], 7)
 
     def test_search_stock_news_strict_filters(self) -> None:
         """Drop old/unknown/future+2, keep future+1 and within-window dates."""
@@ -284,7 +284,7 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
         fresh_iso = fresh_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         for stock_code, stock_name, expected_lang, expected_country, title, description in (
-            ("600519", "贵州茅台", "zh-hans", "CN", "中文资讯", "中文摘要"),
+            ("600519", "贵州茅台", "zh-hans", "CN", "贵州茅台中文资讯", "贵州茅台中文摘要"),
             ("AAPL", "Apple", "en", "US", "Apple earnings beat", "English summary"),
         ):
             with self.subTest(stock_code=stock_code):

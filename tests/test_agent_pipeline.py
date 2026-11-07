@@ -914,6 +914,51 @@ class TestAgentConstructionChain(unittest.TestCase):
             {"thinking": {"type": "enabled"}, "reasoning_effort": "max"},
         )
 
+    @patch("src.agent.llm_adapter.Router")
+    def test_llm_adapter_can_disable_thinking_for_structured_deepseek_output(self, _mock_router):
+        """Bounded JSON stages must preserve output tokens for visible content."""
+        mock_cfg = SimpleNamespace(
+            agent_litellm_model="",
+            litellm_model="deepseek/deepseek-v4-pro",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+            llm_temperature=0.2,
+            gemini_api_keys=[],
+            anthropic_api_keys=[],
+            openai_api_keys=[],
+            deepseek_api_keys=[],
+            openai_base_url=None,
+        )
+        from src.agent.llm_adapter import LLMToolAdapter
+
+        adapter = LLMToolAdapter(config=mock_cfg)
+        adapter._router = None
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"ok":true}', tool_calls=[]),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+        )
+
+        with patch("src.agent.llm_adapter.litellm.completion", return_value=response) as mock_completion:
+            result = adapter._call_litellm_model(
+                [{"role": "user", "content": "json"}],
+                [],
+                "deepseek/deepseek-v4-pro",
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                disable_thinking=True,
+            )
+
+        self.assertEqual(result.content, '{"ok":true}')
+        self.assertEqual(
+            mock_completion.call_args.kwargs["extra_body"],
+            {"thinking": {"type": "disabled"}},
+        )
+
     def test_full_construction_chain(self):
         """Test ToolRegistry + SkillManager + LLMToolAdapter + AgentExecutor wiring."""
         from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter

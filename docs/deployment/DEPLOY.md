@@ -205,6 +205,7 @@ journalctl -u stock-analyzer -f
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `SCHEDULE_ENABLED` | `false` | 是否启用定时任务 |
+| `POSITION_WATCH_ENABLED` | `true` | 在独立定时进程中启用持仓信号监控；A/H 18:00、美股收盘后运行 |
 | `SCHEDULE_TIME` | `18:00` | 每日执行时间 |
 | `MARKET_REVIEW_ENABLED` | `true` | 是否启用大盘复盘 |
 | `ANYSEARCH_API_KEY` | - | 统一新闻与网页搜索（可选） |

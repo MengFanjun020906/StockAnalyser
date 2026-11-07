@@ -33,7 +33,14 @@ except ModuleNotFoundError:
     json_repair_stub.repair_json.side_effect = lambda content, **_kwargs: content
     sys.modules["json_repair"] = json_repair_stub
 
-from src.agent.executor import AgentExecutor, AgentResult, _build_context_tool_argument_guard
+from src.agent.executor import (
+    AgentExecutor,
+    AgentResult,
+    _build_context_tool_argument_guard,
+    _compact_report_repair_evidence,
+    _normalize_planning_execute_final_content,
+    _planning_report_quality_issues,
+)
 from src.agent.llm_adapter import LLMResponse, ToolCall
 from src.agent.runner import (
     _is_failed_tool_result,
@@ -45,7 +52,264 @@ from src.agent.runner import (
 )
 from src.agent.metric_semantics import registered_metric_semantics
 from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter
+from src.agent.tools.signal_tools import submit_trade_plan_tool
 from src.schemas.agent_context import AgentUserContext, PositionContext, ReportContext
+
+
+def _late_dimension_tool_calls():
+    calls = [
+        {
+            "step": index,
+            "tool": "analyze_trend",
+            "arguments": {"stock_code": "600667", "window": index},
+            "success": True,
+            "result_preview": '{"status":"ok","trend":"bullish"}',
+        }
+        for index in range(1, 18)
+    ]
+    calls.extend([
+        {
+            "step": 18,
+            "tool": "search_comprehensive_intel",
+            "arguments": {"stock_code": "600667"},
+            "success": True,
+            "result_preview": '{"status":"ok","intel":{"items":[{"title":"公司公告"}]}}',
+        },
+        {
+            "step": 19,
+            "tool": "search_stock_news",
+            "arguments": {"stock_code": "600667"},
+            "success": True,
+            "result_preview": '{"success":true,"results":[{"title":"行业新闻"}]}',
+        },
+        {
+            "step": 20,
+            "tool": "get_stock_info",
+            "arguments": {"stock_code": "600667"},
+            "success": True,
+            "result_preview": '{"status":"partial","name":"太极实业"}',
+        },
+        {
+            "step": 21,
+            "tool": "get_tushare_financial_indicators",
+            "arguments": {"stock_code": "600667"},
+            "success": True,
+            "result_preview": '{"status":"ok","items":[{"roe":8.4,"debt_to_assets":52.1}]}',
+        },
+        {
+            "step": 22,
+            "tool": "get_tushare_daily_basic",
+            "arguments": {"stock_code": "600667"},
+            "success": True,
+            "result_preview": '{"status":"ok","items":[{"pe_ttm":96.54,"pb":5.15}]}',
+        },
+    ])
+    return calls
+
+
+def test_report_repair_balances_late_news_and_fundamental_evidence():
+    evidence = _compact_report_repair_evidence(_late_dimension_tool_calls())
+    selected_tools = {item["tool"] for item in evidence}
+
+    assert "search_comprehensive_intel" in selected_tools
+    assert "search_stock_news" in selected_tools
+    assert "get_stock_info" in selected_tools
+    assert "get_tushare_financial_indicators" in selected_tools
+    assert "get_tushare_daily_basic" in selected_tools
+
+
+def test_report_quality_rejects_missing_claim_when_dimension_evidence_exists():
+    report = (
+        "## 最终结论\n\n等待回踩。\n\n"
+        "## 多维证据\n\n基本面健全度：0/10（完全缺失，无法评分）\n\n"
+        "消息面明确性：0/10（无有效信息）\n\n"
+        "## 交易计划\n\n等待入场，设置止损和止盈。\n\n"
+        "## 策略 4 / 缠论确定性评分\n\n影子评分不改变动作。\n\n"
+        "## 风险与缺失\n\n失效条件为跌破关键支撑，风险证据需要持续复核。"
+    )
+
+    issues = _planning_report_quality_issues(
+        report,
+        report_language="zh",
+        tool_calls=_late_dimension_tool_calls(),
+    )
+
+    assert "report_contradicts_fundamental_evidence" in issues
+    assert "report_contradicts_news_evidence" in issues
+
+
+def test_news_transport_success_without_dated_events_is_partial_not_missing():
+    from src.agent.dimension_evidence import build_dimension_evidence_summary
+
+    summary = build_dimension_evidence_summary([
+        {
+            "tool": "search_stock_news",
+            "success": True,
+            "result_preview": '{"success":true,"results":[{"title":"行业新闻"}]}',
+        },
+    ])
+
+    assert summary["intel"]["quality"] == "partial"
+    assert summary["intel"]["partial_tools"] == ["search_stock_news"]
+    assert summary["intel"]["quality"] != "unavailable"
+
+
+def test_earnings_forecast_is_partial_fundamental_evidence_not_missing():
+    from src.agent.dimension_evidence import build_dimension_evidence_summary
+
+    summary = build_dimension_evidence_summary([
+        {
+            "tool": "get_stock_info",
+            "success": True,
+            "result_preview": '{"status":"partial","fundamental_context":{"status":"failed"}}',
+        },
+        {
+            "tool": "get_tushare_forecast",
+            "success": True,
+            "result_preview": (
+                '{"status":"ok","items":[{"ann_date":"20260715",'
+                '"end_date":"20260630","type":"首亏",'
+                '"net_profit_min":-30000,"net_profit_max":-22000}]}'
+            ),
+        },
+    ])
+
+    assert summary["fundamental"]["quality"] == "partial"
+    assert summary["fundamental"]["available_tools"] == ["get_tushare_forecast"]
+    assert "fundamental_evidence_unavailable" not in summary["fundamental"]["missing_evidence"]
+
+
+def test_planning_report_hides_leading_internal_json_when_markdown_exists():
+    content = """基于证据，以下是决策结果。
+
+```json
+{"intent":"entry_analysis","action":"reject","summary":"当前不宜追高"}
+```
+
+---
+
+## 最终结论
+
+当前不宜追高。
+
+## 多维证据
+
+基本面存在亏损风险。
+"""
+
+    normalized = _normalize_planning_execute_final_content(content)
+
+    assert normalized.startswith("## 最终结论")
+    assert "```json" not in normalized
+    assert '"intent"' not in normalized
+    assert "当前不宜追高" in normalized
+
+
+def test_planning_report_renders_pure_internal_json_as_readable_markdown():
+    content = """```json
+{
+  "action": "wait",
+  "summary": "等待基本面和价格共同确认",
+  "evidence": {"fundamental": ["最新财报显示利润承压"]},
+  "plan": {"entry": "暂不入场"},
+  "risks": ["业绩仍未改善"]
+}
+```"""
+
+    normalized = _normalize_planning_execute_final_content(content)
+
+    assert normalized.startswith("## 最终结论")
+    assert "等待基本面和价格共同确认" in normalized
+    assert "### 基本面" in normalized
+    assert "最新财报显示利润承压" in normalized
+    assert "```json" not in normalized
+
+
+def test_planning_report_renders_mapping_evidence_without_double_bullets():
+    content = """```json
+{"action":"wait","summary":"等待确认","evidence":{"fundamental":{"status":"partial","reason":"财报数据不完整"}}}
+```"""
+
+    normalized = _normalize_planning_execute_final_content(content)
+
+    assert "- - " not in normalized
+    assert "- 状态：partial" in normalized
+
+
+def test_planning_report_renders_embedded_dashboard_json_after_intro():
+    content = """已完成数据采集与交叉验证。
+
+## 决策仪表盘 JSON
+
+```json
+{
+  "action": "reject",
+  "summary": "当前不宜追高",
+  "evidence": {"technical": ["RSI 过热"], "fundamental": ["盈利承压"]},
+  "plan": {"entry": "N/A", "conditions": ["等待风险收益比修复"]},
+  "risks": ["回撤风险"],
+  "strategy4_chan_score": {
+    "verdict_status": "not_evaluable",
+    "cannot_formalize_reason": "模型自行编写的错误解释"
+  }
+}
+```
+
+## 结论要点
+
+重复的自由文本。
+"""
+
+    normalized = _normalize_planning_execute_final_content(content)
+
+    assert normalized.startswith("## 最终结论")
+    assert "### 技术面" in normalized
+    assert "RSI 过热" in normalized
+    assert "## 交易计划" in normalized
+    assert "```json" not in normalized
+    assert "cannot_formalize_reason" not in normalized
+    assert "模型自行编写的错误解释" not in normalized
+
+
+def test_single_stock_fundamental_supplement_is_deterministic_and_auditable():
+    registry = _make_registry_with_echo()
+    registry.register(ToolDefinition(
+        name="search_stock_fundamentals",
+        description="fundamental fallback",
+        parameters=[
+            ToolParameter(name="stock_code", type="string", description="code"),
+            ToolParameter(name="stock_name", type="string", description="name", required=False),
+        ],
+        handler=lambda **_kwargs: {
+            "status": "partial",
+            "coverage": {"financial_performance": "available"},
+            "materials": [{
+                "dimension": "financial_performance",
+                "title": "公司业绩预告",
+                "snippet": "净利润承压。",
+                "url": "https://example.com/forecast",
+                "source": "example.com",
+                "published_date": "2026-07-15",
+            }],
+        },
+    ))
+    executor = AgentExecutor(registry, _make_mock_adapter())
+    calls = [{
+        "tool": "get_stock_info",
+        "success": True,
+        "result_preview": '{"status":"partial","fundamental_context":{"status":"failed"}}',
+    }]
+
+    supplemented = executor._supplement_single_stock_fundamental_evidence(
+        tool_calls=calls,
+        context={"stock_code": "600330", "stock_name": "天通股份"},
+        progress_callback=None,
+    )
+
+    assert supplemented is True
+    assert calls[-1]["tool"] == "search_stock_fundamentals"
+    assert calls[-1]["deterministic_supplement"] is True
+    assert calls[-1]["result_json"]["materials"][0]["url"] == "https://example.com/forecast"
 
 
 # ============================================================
@@ -1624,6 +1888,54 @@ class TestBuildUserMessage(unittest.TestCase):
         self.assertIn("股票代码: 600519", msg)
         self.assertIn("报告类型: daily", msg)
 
+    def test_message_injects_prefetched_composite_scoring_evidence(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "600519",
+                "trace_composite_verdict": {
+                    "schema_version": "stock-composite-shadow.v1",
+                    "composite_verdict": {
+                        "score": 15,
+                        "scale_max": 20,
+                        "strategy4_rule_version": "strategy4.v1",
+                    },
+                },
+            },
+        )
+
+        self.assertIn("个股确定性综合评分", msg)
+        self.assertIn('"strategy4_rule_version": "strategy4.v1"', msg)
+        self.assertIn('"score": 15', msg)
+
+    def test_message_requires_partial_composite_evidence_to_be_reported(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "600487",
+                "trace_composite_verdict": {
+                    "schema_version": "stock-composite-shadow.v1",
+                    "status": "ok",
+                    "snapshot": {
+                        "symbol": "600487",
+                        "s4": {
+                            "status": "partial",
+                            "weekly_provisional": True,
+                            "resonance_count": 2,
+                        },
+                    },
+                    "composite_verdict": {
+                        "symbol": "600487",
+                        "verdict_status": "not_evaluable",
+                        "score": None,
+                    },
+                },
+            },
+        )
+
+        self.assertIn("最终报告必须包含“策略 4 / 缠论确定性评分”", msg)
+        self.assertIn("partial/provisional", msg)
+
     def test_message_injects_planning_context_and_plan(self):
         context = AgentUserContext(
             positions=[PositionContext(symbol="600519", quantity=100)],
@@ -1814,6 +2126,157 @@ class TestBuildUserMessage(unittest.TestCase):
         self.assertIn("AgentUserContext", user_message)
         self.assertIn("Planner 工具执行计划", user_message)
 
+    def test_entry_chat_keeps_natural_answer_and_rejects_submitted_trade_plan(self):
+        registry = _make_registry_with_echo()
+        registry.register(submit_trade_plan_tool)
+        adapter = _make_mock_adapter()
+        plan = {
+            "symbol": "600519",
+            "action": "open",
+            "entry_zone_low": 1470.0,
+            "entry_zone_high": 1500.0,
+            "stop_loss_price": 1420.0,
+            "invalidation_conditions": ["日线收盘跌破 1420"],
+        }
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="plan-1", name="submit_trade_plan", arguments=plan)],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+            LLMResponse(
+                content="结论偏积极，等待价格进入计划区间。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+        ]
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+
+        result = executor.chat(
+            "分析 600519 是否适合买入",
+            session_id="test-entry-trade-plan",
+            context={
+                "stock_code": "600519",
+                "signal_lifecycle_entry_intent": True,
+            },
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.content, "结论偏积极，等待价格进入计划区间。")
+        self.assertIsNone(result.trade_plan)
+        prompt = adapter.call_with_tools.call_args_list[0].args[0][0]["content"]
+        self.assertNotIn("submit_trade_plan", prompt)
+        self.assertIn("模型不提交价格计划", prompt)
+
+    def test_deprecated_submit_trade_plan_tool_cannot_create_a_plan(self):
+        result = submit_trade_plan_tool.handler(
+            symbol="600519",
+            action="open",
+            entry_zone_low=1470.0,
+            entry_zone_high=1500.0,
+            stop_loss_price=1420.0,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("deterministic_price_plan", result["error"])
+        self.assertNotIn("trade_plan", result)
+
+    def test_waiting_entry_chat_rejects_conditional_trade_plan(self):
+        registry = _make_registry_with_echo()
+        registry.register(submit_trade_plan_tool)
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(
+                    id="plan-wait-1",
+                    name="submit_trade_plan",
+                    arguments={
+                        "symbol": "600519",
+                        "action": "open",
+                        "current_action": "wait",
+                        "entry_zone_low": 1470.0,
+                        "entry_zone_high": 1500.0,
+                        "stop_loss_price": 1420.0,
+                        "invalidation_conditions": ["日线收盘跌破 1420"],
+                    },
+                )],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+            LLMResponse(
+                content="当前不追价，等待价格进入计划区间。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+        ]
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+
+        result = executor.chat(
+            "分析 600519 是否适合买入",
+            session_id="test-entry-wait-plan",
+            context={
+                "stock_code": "600519",
+                "signal_lifecycle_entry_intent": True,
+            },
+        )
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.trade_plan)
+        prompt = adapter.call_with_tools.call_args_list[0].args[0][0]["content"]
+        self.assertIn("模型不提交价格计划", prompt)
+        self.assertNotIn("submit_trade_plan", prompt)
+
+    def test_generic_single_stock_qa_rejects_llm_multi_zone_observation_plan(self):
+        registry = _make_registry_with_echo()
+        registry.register(submit_trade_plan_tool)
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(
+                    id="plan-observation-1",
+                    name="submit_trade_plan",
+                    arguments={
+                        "symbol": "600330",
+                        "action": "open",
+                        "current_action": "reject",
+                        "entry_zone_low": 19.6,
+                        "entry_zone_high": 20.5,
+                        "entry_zones": [
+                            {"label": "ideal", "low": 19.6, "high": 20.5},
+                            {"label": "secondary", "low": 21.2, "high": 22.0},
+                        ],
+                        "stop_loss_price": 18.5,
+                    },
+                )],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+            LLMResponse(
+                content="当前不建议入场，但保留两个观察区间。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+            ),
+        ]
+        executor = AgentExecutor(registry, adapter, max_steps=3)
+
+        result = executor.chat(
+            "分析一下天通股份",
+            session_id="test-qa-observation-plan",
+            context={"signal_lifecycle_plan_candidate": True},
+        )
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.trade_plan)
+        prompt = adapter.call_with_tools.call_args_list[0].args[0][0]["content"]
+        self.assertIn("不得自行填写或修改入场价", prompt)
+        self.assertNotIn("submit_trade_plan", prompt)
+
     def test_watchlist_selection_partial_report_does_not_fall_back_to_react_loop(self):
         registry = ToolRegistry()
         registry.register(
@@ -1975,7 +2438,13 @@ class TestBuildUserMessage(unittest.TestCase):
                 model="openai/tool-model",
             ),
             LLMResponse(
-                content="## 最终结论\n\n持仓策略：持有。",
+                content=(
+                    "## 最终结论\n\n持仓策略：持有，但不提高仓位。\n\n"
+                    "## 多维证据\n\n当前行情证据支持继续观察，其他维度缺失需降低确定性。\n\n"
+                    "## 交易计划\n\n维持当前动作，跌破失效条件后复查并执行止损纪律。\n\n"
+                    "## 策略 4 / 缠论确定性评分\n\n评分仅作影子证据，不直接替代交易判断。\n\n"
+                    "## 风险与缺失\n\n仓位风险和证据缺失必须持续复核。"
+                ),
                 tool_calls=[],
                 usage={"total_tokens": 20},
                 provider="openai",
@@ -2011,6 +2480,258 @@ class TestBuildUserMessage(unittest.TestCase):
         self.assertIn("## 对抗式辩论裁决", result.debate["debug_outputs"]["final_report_with_debate"])
         self.assertEqual(adapter.call_text.call_count, 3)
         self.assertEqual(result.total_tokens, 42)
+
+    def test_failed_debate_does_not_replace_a_valid_primary_report(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[ToolParameter(name="stock_code", type="string", description="Stock code")],
+                handler=lambda stock_code: {"price": 100, "stock_code": stock_code},
+            )
+        )
+        primary_report = (
+            "## 最终结论\n\n当前不追高，等待回踩确认。\n\n"
+            "## 核心证据\n\n技术面、资金面、消息面和数据质量均已逐项检查。\n\n"
+            "## 交易计划\n\n入场、止损、止盈和失效条件完整。\n\n"
+            "## 策略 4 / 缠论确定性评分\n\n评分处于影子模式，临时证据不提升为正式结论。\n\n"
+            "## 风险与缺失\n\n风险和缺失证据已明确披露。"
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="checking",
+                tool_calls=[ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "600519"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+            LLMResponse(
+                content=primary_report,
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+        ]
+        adapter.call_text.side_effect = [
+            LLMResponse(content='{"direction":"bullish","action":"hold","summary":"主观点","evidence":["price=100"]}', usage={"total_tokens": 3}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"direction":"neutral_bearish","action":"wait","summary":"反方","evidence":["回撤风险"]}', usage={"total_tokens": 4}, provider="openai", model="openai/debate"),
+            LLMResponse(content="", usage={"total_tokens": 5}, provider="openai", model="openai/debate"),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600519",
+                target_symbols=["600519"],
+            )
+        )
+
+        result = AgentExecutor(registry, adapter, max_steps=3).chat(
+            "分析 600519 是否适合买入",
+            session_id="test-debate-fallback",
+            context={"stock_code": "600519", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.content, primary_report)
+        self.assertNotIn("## 对抗式辩论裁决", result.content)
+        self.assertFalse(result.debate["success"])
+        self.assertEqual(result.debate["error"], "llm_json_parse_failed:judge_decision")
+        self.assertEqual(result.total_tokens, 42)
+
+    def test_truncated_opposing_json_stops_debate_before_judge(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[ToolParameter(name="stock_code", type="string", description="Stock code")],
+                handler=lambda stock_code: {"price": 23.25, "stock_code": stock_code},
+            )
+        )
+        primary_report = (
+            "## 最终结论\n\n等待回踩，不追高；现价没有提供足够安全边际。\n\n"
+            "## 多维证据\n\n现有价格证据支持等待，技术信号需要与资金、消息和基本面共同复核。\n\n"
+            "## 交易计划\n\n等待入场条件后再决策，并设置明确止损、止盈和失效条件。\n\n"
+            "## 策略 4 / 缠论确定性评分\n\n临时周线证据不提升正式分数，影子评分只用于审计。\n\n"
+            "## 风险与缺失\n\n资金和消息证据不足，任何缺失都必须降低确定性和动作强度。"
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="checking",
+                tool_calls=[ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "600330"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+            LLMResponse(content=primary_report, tool_calls=[], usage={"total_tokens": 20}, provider="openai", model="openai/tool-model"),
+        ]
+        adapter.call_text.side_effect = [
+            LLMResponse(content='{"direction":"bullish","action":"wait","summary":"主观点"}', usage={"total_tokens": 3}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"direction":"neutral_bearish","action":"wait","summary":"反方输出被截断', usage={"total_tokens": 4}, provider="openai", model="openai/debate"),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600330",
+                target_symbols=["600330"],
+            )
+        )
+
+        result = AgentExecutor(registry, adapter, max_steps=3).chat(
+            "天通股份可以加仓吗",
+            session_id="test-truncated-opposing",
+            context={"stock_code": "600330", "agent_user_context": context},
+        )
+
+        self.assertEqual(result.content, primary_report)
+        self.assertFalse(result.debate["success"])
+        self.assertEqual(result.debate["error"], "llm_json_parse_failed:opposing_thesis")
+        self.assertEqual(adapter.call_text.call_count, 2)
+        self.assertEqual(result.total_tokens, 37)
+
+    def test_short_primary_report_is_repaired_before_debate(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[ToolParameter(name="stock_code", type="string", description="Stock code")],
+                handler=lambda stock_code: {"price": 23.25, "stock_code": stock_code},
+            )
+        )
+        repaired_report = (
+            "## 最终结论\n\n当前不追高，等待价格回到计划区间并确认。\n\n"
+            "## 多维证据\n\n技术面显示短期过热；资金面和消息面按现有工具证据审慎处理。\n\n"
+            "## 交易计划\n\n仅在计划区间出现确认信号后执行，严格设置止损与失效条件。\n\n"
+            "## 策略 4 / 缠论确定性评分\n\n正式分数与临时分数分开披露，不用临时周线提升动作等级。\n\n"
+            "## 风险与缺失\n\n不得追高；缺失证据会降低确定性并触发等待。"
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="checking",
+                tool_calls=[ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "600330"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+            LLMResponse(
+                content="交易计划已记录，供后续风险复核。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+        ]
+        adapter.call_text.side_effect = [
+            LLMResponse(content=repaired_report, usage={"total_tokens": 6}, provider="openai", model="openai/report-repair"),
+            LLMResponse(content='{"direction":"bullish","action":"wait","summary":"主观点","evidence":["price=23.25"]}', usage={"total_tokens": 3}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"direction":"neutral_bearish","action":"wait","summary":"反方","evidence":["追高风险"]}', usage={"total_tokens": 4}, provider="openai", model="openai/debate"),
+            LLMResponse(content='{"winner":"no_trade","final_action":"wait","reason":"等待确认","risk_controls":["不得追高"]}', usage={"total_tokens": 5}, provider="openai", model="openai/debate"),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600330",
+                target_symbols=["600330"],
+            )
+        )
+
+        result = AgentExecutor(registry, adapter, max_steps=3).chat(
+            "天通股份可以加仓吗",
+            session_id="test-short-report-repair",
+            context={"stock_code": "600330", "agent_user_context": context},
+        )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.content.startswith(repaired_report))
+        self.assertIn("## 对抗式辩论裁决", result.content)
+        self.assertEqual(result.report_quality["status"], "repaired")
+        self.assertIn("report_too_short", result.report_quality["initial_issues"])
+        self.assertEqual(adapter.call_text.call_count, 4)
+        self.assertEqual(result.total_tokens, 48)
+
+    def test_failed_report_repair_uses_auditable_fallback_and_still_runs_debate(self):
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[ToolParameter(name="stock_code", type="string", description="Stock code")],
+                handler=lambda stock_code: {"price": 23.25, "stock_code": stock_code},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="checking",
+                tool_calls=[ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "600330"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+            LLMResponse(
+                content="交易计划已记录。",
+                tool_calls=[],
+                usage={"total_tokens": 20},
+                provider="openai",
+                model="openai/tool-model",
+            ),
+        ]
+        adapter.call_text.side_effect = [
+            LLMResponse(content="", usage={"total_tokens": 6}, provider="openai", model="openai/report-repair"),
+            LLMResponse(content='{"direction":"bullish","action":"monitor","summary":"主观点"}', usage={"total_tokens": 1}),
+            LLMResponse(content='{"direction":"bearish","action":"wait","summary":"反方观点"}', usage={"total_tokens": 1}),
+            LLMResponse(content=json.dumps({
+                "winner": "no_trade",
+                "final_action": "wait",
+                "decision_summary": "四维证据不足，保持观察。",
+                "reason": "证据不足",
+                "dimension_assessments": [
+                    {"dimension": dimension, "verdict": "insufficient_data", "plan_verdict": "insufficient", "weight": "medium", "summary": "证据不足", "evidence": [], "evidence_refs": [], "reason_codes": [], "scenario_ids": [], "missing": ["该维度证据不足"]}
+                    for dimension in ("technical", "capital_flow", "fundamental", "news_event")
+                ],
+            }, ensure_ascii=False), usage={"total_tokens": 1}),
+        ]
+        context = AgentUserContext(
+            report=ReportContext(
+                analysis_mode="planning_execute",
+                intent="entry_analysis",
+                primary_symbol="600330",
+                target_symbols=["600330"],
+            )
+        )
+
+        price_plan = {
+            "plan_id": "plan-test",
+            "generation_status": "generated",
+            "scenarios": [{"scenario_id": "scenario-1", "role": "observation"}],
+        }
+        with patch.object(AgentExecutor, "_prepare_price_plan_for_debate", return_value=price_plan):
+            result = AgentExecutor(registry, adapter, max_steps=3).chat(
+                "天通股份可以加仓吗",
+                session_id="test-report-fallback",
+                context={"stock_code": "600330", "agent_user_context": context},
+            )
+
+        self.assertTrue(result.success)
+        self.assertIn("## 分析状态", result.content)
+        self.assertIn("模型主报告未通过完整度校验", result.content)
+        self.assertIn("## 策略 4 / 缠论确定性评分", result.content)
+        self.assertIn("## 对抗式辩论裁决", result.content)
+        self.assertIsNotNone(result.debate)
+        self.assertTrue(result.debate["success"])
+        self.assertEqual(result.report_quality["status"], "fallback")
+        self.assertEqual(result.report_quality["source"], "deterministic_fallback")
+        self.assertEqual(adapter.call_text.call_count, 4)
+        self.assertEqual(result.total_tokens, 39)
 
 
 # ============================================================

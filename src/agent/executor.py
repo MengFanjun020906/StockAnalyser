@@ -26,6 +26,11 @@ from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.planner import build_planning_result
 from src.agent.planning_prompts import PromptBuildOptions, build_planning_system_prompt
 from src.agent.runner import run_agent_loop, parse_dashboard_json
+from src.agent.report_presentation import (
+    normalize_planning_execute_final_content as _present_planning_execute_final_content,
+    parse_internal_report_payload as _present_parse_internal_report_payload,
+    planning_report_quality_issues as _present_planning_report_quality_issues,
+)
 from src.agent.stock_selection import run_stock_selection_pipeline, should_run_stock_selection
 from src.agent.theme_momentum import build_single_stock_theme_profile
 from src.agent.tools.registry import ToolRegistry
@@ -54,6 +59,51 @@ class AgentResult:
     error: Optional[str] = None
     debate: Optional[Dict[str, Any]] = None
     stock_selection: Optional[Dict[str, Any]] = None
+    trade_plan: Optional[Dict[str, Any]] = None
+    price_plan: Optional[Dict[str, Any]] = None
+    trade_plan_result: Optional[Dict[str, Any]] = None
+    deterministic_risk_gate: Optional[Dict[str, Any]] = None
+    report_quality: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class _ReportQualityOutcome:
+    content: str
+    status: str
+    initial_issues: List[str] = field(default_factory=list)
+    final_issues: List[str] = field(default_factory=list)
+    repair_attempted: bool = False
+    source: str = "model"
+    original_chars: int = 0
+    total_tokens: int = 0
+    models_used: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "initial_issues": self.initial_issues,
+            "final_issues": self.final_issues,
+            "repair_attempted": self.repair_attempted,
+            "source": self.source,
+            "original_chars": self.original_chars,
+            "final_chars": len(self.content.strip()),
+            "error": self.error,
+        }
+
+
+def _signal_trade_plan_prompt(context: Optional[Dict[str, Any]]) -> str:
+    if not (
+        bool((context or {}).get("signal_lifecycle_entry_intent"))
+        or bool((context or {}).get("signal_lifecycle_plan_candidate"))
+    ):
+        return ""
+    return """
+## 确定性价格权限
+
+- 新请求的结构化交易计划由确定性价格引擎在报告生成后创建，模型不提交价格计划。
+- 不得自行填写或修改入场价、买点区间、止损价和目标价；相关字段写 `N/A`，只输出支持、削弱或否决计划的定性证据。
+""".strip()
 
 
 # ============================================================
@@ -92,6 +142,7 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 6. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
 7. **精确数值证据约束** — 主力资金、筹码分布、均线、市值、营收、利润、股数等精确值必须逐项来自工具返回；缺少工具证据时写 `N/A` 或“数据缺失”，禁止用看起来合理的小数补齐。
 8. **A股交易规则** — A股买入数量必须是 100 股整数倍；不要输出 146 股这类无法下单的买入建议，改用仓位比例或“按100股整数倍”。
+9. **价格计划权限** — 入场区间、止损价和目标价由确定性价格引擎在报告后处理阶段生成；模型相关字段必须写 `N/A`，不得自行报价。
 
 {skills_section}
 
@@ -191,7 +242,7 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 
 1. **核心结论先行**：一句话说清该买该卖
 2. **分持仓建议**：空仓者和持仓者给不同建议
-3. **证据绑定的狙击点**：具体价格必须来自工具或上游 key_levels，缺失时写 N/A
+3. **确定性价格权限**：狙击点字段统一写 N/A；入场、止损和目标价由报告生成后的确定性价格引擎填写，模型不得生成或修改
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出
 
@@ -228,6 +279,7 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
 4. **输出格式** — 最终响应必须是有效的决策仪表盘 JSON。
 5. **风险优先** — 必须排查风险（股东减持、业绩预警、监管问题）。
 6. **工具失败处理** — 记录失败原因，使用已有数据继续分析，不重复调用失败工具。
+7. **价格计划权限** — 入场区间、止损价和目标价由确定性价格引擎在报告后处理阶段生成；模型相关字段必须写 `N/A`，不得自行报价。
 
 {skills_section}
 
@@ -503,6 +555,9 @@ class AgentExecutor:
                 extra_sections.append(default_skill_policy_section)
             if skills_section:
                 extra_sections.append(skills_section)
+            signal_plan_section = _signal_trade_plan_prompt(context)
+            if signal_plan_section:
+                extra_sections.append(signal_plan_section)
             return build_planning_system_prompt(
                 PromptBuildOptions(
                     language="en" if report_language == "en" else "zh",
@@ -522,13 +577,15 @@ class AgentExecutor:
                 if self.use_legacy_default_prompt
                 else AGENT_SYSTEM_PROMPT
             )
-        return prompt_template.format(
+        prompt = prompt_template.format(
             market_role=market_role,
             market_guidelines=market_guidelines,
             default_skill_policy_section=default_skill_policy_section,
             skills_section=skills_section,
             language_section=_build_language_section(report_language, chat_mode=chat_mode),
         )
+        signal_plan_section = _signal_trade_plan_prompt(context)
+        return f"{prompt}\n\n{signal_plan_section}" if signal_plan_section else prompt
 
     def run(self, task: str, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the agent loop for a given task.
@@ -695,26 +752,57 @@ class AgentExecutor:
             loop_result.tool_calls_log = list(pre_tool_calls_log) + list(loop_result.tool_calls_log or [])
             loop_result.total_steps = len(loop_result.tool_calls_log)
 
-        model_str = loop_result.model
-
-        debate = self._maybe_run_debate(
-            loop_content=loop_result.content,
-            loop_tool_calls=loop_result.tool_calls_log,
-            context=context,
-            original_task=original_task,
-            progress_callback=progress_callback,
-        )
         final_content = loop_result.content
         agent_user_context = _coerce_agent_user_context((context or {}).get("agent_user_context"))
+        report_quality = None
         if _is_planning_execute_context(agent_user_context):
-            final_content = _normalize_planning_execute_final_content(final_content)
-        if debate and debate.success:
-            final_content = f"{final_content.rstrip()}\n\n{format_debate_appendix(debate)}".rstrip()
-            debate.debug_outputs["final_report_with_debate"] = final_content
+            if not parse_dashboard:
+                self._supplement_single_stock_fundamental_evidence(
+                    tool_calls=loop_result.tool_calls_log,
+                    context=context,
+                    progress_callback=progress_callback,
+                )
+                loop_result.total_steps = len(loop_result.tool_calls_log)
+                final_content = _normalize_planning_execute_final_content(final_content)
+            if not parse_dashboard and loop_result.tool_calls_log:
+                quality_outcome = _ensure_planning_report_quality(
+                    content=final_content,
+                    original_task=original_task,
+                    tool_calls=loop_result.tool_calls_log,
+                    llm_adapter=self.llm_adapter,
+                    report_language=normalize_report_language((context or {}).get("report_language", "zh")),
+                    timeout_seconds=self.timeout_seconds,
+                    progress_callback=progress_callback,
+                )
+                final_content = quality_outcome.content
+                report_quality = quality_outcome.to_dict()
+                loop_result.total_tokens += quality_outcome.total_tokens
+                for model in quality_outcome.models_used:
+                    if isinstance(model, str) and model and model not in loop_result.models_used:
+                        loop_result.models_used.append(model)
+
+        debate = None
+        if not parse_dashboard:
+            price_plan_for_review = self._prepare_price_plan_for_debate(
+                context=context,
+                agent_user_context=agent_user_context,
+            )
+            debate = self._maybe_run_debate(
+                loop_content=final_content,
+                loop_tool_calls=loop_result.tool_calls_log,
+                context=context,
+                original_task=original_task,
+                progress_callback=progress_callback,
+                deterministic_price_plan=price_plan_for_review,
+            )
+        if debate:
             loop_result.total_tokens += debate.total_tokens
             for model in debate.models_used:
-                if model and model not in loop_result.models_used:
+                if isinstance(model, str) and model and model not in loop_result.models_used:
                     loop_result.models_used.append(model)
+            if debate.success:
+                final_content = f"{final_content.rstrip()}\n\n{format_debate_appendix(debate)}".rstrip()
+                debate.debug_outputs["final_report_with_debate"] = final_content
         model_str = loop_result.model
 
         if parse_dashboard and loop_result.success:
@@ -731,6 +819,8 @@ class AgentExecutor:
                 error=None if dashboard else "Failed to parse dashboard JSON from agent response",
                 debate=debate.to_dict() if debate else None,
                 stock_selection=stock_selection.to_dict() if stock_selection else None,
+                trade_plan=None,
+                report_quality=report_quality,
             )
 
         return AgentResult(
@@ -745,6 +835,8 @@ class AgentExecutor:
             error=loop_result.error,
             debate=debate.to_dict() if debate else None,
             stock_selection=stock_selection.to_dict() if stock_selection else None,
+            trade_plan=None,
+            report_quality=report_quality,
         )
 
     def _maybe_run_stock_selection(
@@ -780,6 +872,7 @@ class AgentExecutor:
         context: Optional[Dict[str, Any]],
         original_task: str,
         progress_callback: Optional[Callable],
+        deterministic_price_plan: Optional[Dict[str, Any]] = None,
     ) -> Optional[DebateResult]:
         if not loop_content or not loop_tool_calls:
             return None
@@ -799,7 +892,55 @@ class AgentExecutor:
             llm_adapter=self.llm_adapter,
             timeout_seconds=self.timeout_seconds,
             progress_callback=progress_callback,
+            deterministic_price_plan=deterministic_price_plan,
         )
+
+    def _prepare_price_plan_for_debate(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        agent_user_context: Optional[AgentUserContext],
+    ) -> Optional[Dict[str, Any]]:
+        """Generate the reusable math plan before Judge reviews its scenarios."""
+        if agent_user_context is None:
+            return None
+        if agent_user_context.report.intent not in {"entry_analysis", "position_review", "auto"}:
+            return None
+        symbol = str(
+            agent_user_context.report.primary_symbol
+            or (context or {}).get("stock_code")
+            or ""
+        ).strip()
+        normalized = "".join(ch for ch in symbol if ch.isdigit())[-6:]
+        if len(normalized) != 6:
+            return None
+        from datetime import date, datetime
+
+        from src.agent.pricing.runtime import generate_trade_plan
+        from src.services.history_loader import get_frozen_target_date
+
+        as_of = (context or {}).get("as_of") or get_frozen_target_date() or date.today()
+        if isinstance(as_of, datetime):
+            as_of = as_of.date()
+        elif not isinstance(as_of, date):
+            as_of = datetime.fromisoformat(str(as_of)[:10]).date()
+        try:
+            result = generate_trade_plan(
+                normalized,
+                as_of=as_of,
+                trace_ref=str((context or {}).get("session_id") or "").strip() or None,
+                persist=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Pre-debate deterministic price plan unavailable for %s: %s",
+                normalized,
+                exc,
+            )
+            return None
+        if context is not None:
+            context["pre_debate_price_plan_result"] = result.model_dump(mode="json")
+        return result.price_plan.model_dump(mode="json")
 
     def _build_user_message(
         self,
@@ -855,6 +996,19 @@ class AgentExecutor:
                 parts.append(
                     "\n[系统已获取的单股主线动量分型证据]\n"
                     + json.dumps(prefetch_context["single_stock_theme_profile"], ensure_ascii=False, default=str)
+                )
+            if context.get("trace_composite_verdict"):
+                parts.append(
+                    "\n[系统预先计算的个股确定性综合评分（影子模式，仅作证据）]\n"
+                    + json.dumps(context["trace_composite_verdict"], ensure_ascii=False, default=str)
+                )
+                parts.append(
+                    "\n[确定性评分报告约束]\n"
+                    "最终报告必须包含“策略 4 / 缠论确定性评分”小节，并核对评分 symbol 与分析股票一致。"
+                    "若状态为 partial/provisional 或 not_evaluable，仍须展示已有指标和临时状态；"
+                    "不得自行解释 not_evaluable 或输出 cannot_formalize_reason，只能引用系统 formalization_reason_codes。"
+                    "回测不可用不是当前评分无法正式化的原因。"
+                    "不得把缺失分数写成 0，也不得静默省略。"
                 )
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
@@ -922,6 +1076,61 @@ class AgentExecutor:
             "selection_stage": False,
         }
 
+    def _supplement_single_stock_fundamental_evidence(
+        self,
+        *,
+        tool_calls: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]],
+        progress_callback: Optional[Callable],
+    ) -> bool:
+        """Deterministically fill incomplete fundamentals with source-linked search evidence."""
+        from src.agent.dimension_evidence import build_dimension_evidence_summary
+
+        if self.tool_registry.get("search_stock_fundamentals") is None:
+            return False
+        if any(call.get("tool") == "search_stock_fundamentals" for call in tool_calls if isinstance(call, dict)):
+            return False
+        symbol = _single_symbol_for_regime_prefetch(context)
+        if not symbol:
+            return False
+        summary = build_dimension_evidence_summary(tool_calls)
+        if summary.get("fundamental", {}).get("quality") == "ok":
+            return False
+
+        arguments = {
+            "stock_code": symbol,
+            "stock_name": _single_symbol_name_for_theme_prefetch(context, symbol),
+            "trace_id": str((context or {}).get("trace_id") or (context or {}).get("session_id") or "").strip(),
+        }
+        if progress_callback:
+            progress_callback({
+                "type": "tool_start",
+                "step": len(tool_calls) + 1,
+                "tool": "search_stock_fundamentals",
+                "arguments": arguments,
+                "display_name": "补充基本面公开资料",
+            })
+        _result, log_entry = self._execute_prefetch_tool("search_stock_fundamentals", arguments)
+        log_entry.update({
+            "step": len(tool_calls) + 1,
+            "prefetch": False,
+            "deterministic_supplement": True,
+        })
+        tool_calls.append(log_entry)
+        if progress_callback:
+            progress_callback({
+                "type": "tool_done",
+                "step": log_entry["step"],
+                "tool": "search_stock_fundamentals",
+                "arguments": arguments,
+                "success": bool(log_entry.get("success")),
+                "duration": log_entry.get("duration"),
+                "result_length": log_entry.get("result_length"),
+                "result_preview": log_entry.get("result_preview"),
+                "display_name": "补充基本面公开资料",
+            })
+        return bool(log_entry.get("success"))
+
 
 def _coerce_agent_user_context(value: Any) -> Optional[AgentUserContext]:
     """Return an AgentUserContext from a model/dict payload, or None if absent."""
@@ -958,10 +1167,19 @@ def _build_context_tool_argument_guard(
             and guarded.get("account_id") in (None, "")
         ):
             guarded["account_id"] = selected_account_id
-        if tool_name in {"search_stock_news", "search_comprehensive_intel", "score_stock_news_sentiment"}:
+        if tool_name in {
+            "search_stock_news",
+            "search_comprehensive_intel",
+            "search_stock_fundamentals",
+            "score_stock_news_sentiment",
+        }:
             code = str(guarded.get("stock_code") or "").strip()
             if code and code in position_names:
                 guarded["stock_name"] = position_names[code]
+        if tool_name == "search_stock_fundamentals":
+            trace_id = str((context or {}).get("trace_id") or (context or {}).get("session_id") or "").strip()
+            if trace_id:
+                guarded["trace_id"] = trace_id
         return guarded
 
     return guard
@@ -1067,11 +1285,269 @@ def _is_planning_execute_context(context: Optional[AgentUserContext]) -> bool:
     return bool(context and context.report.analysis_mode == "planning_execute")
 
 
-_FINAL_OUTPUT_STEP_TITLE_RE = re.compile(r"(?m)^(第[一二三四五六七八九十]+(?:步|阶段))[:：][ \t]*")
-
-
 def _normalize_planning_execute_final_content(content: str) -> str:
-    """Remove execution-step labels from final markdown while keeping analysis text."""
-    if not content:
-        return content
-    return _FINAL_OUTPUT_STEP_TITLE_RE.sub("", content)
+    """Return user-facing Markdown and keep internal JSON out of the report body."""
+    return _present_planning_execute_final_content(content)
+
+
+def _parse_internal_report_payload(value: str) -> Optional[Dict[str, Any]]:
+    return _present_parse_internal_report_payload(value)
+
+
+def _ensure_planning_report_quality(
+    *,
+    content: str,
+    original_task: str,
+    tool_calls: List[Dict[str, Any]],
+    llm_adapter: LLMToolAdapter,
+    report_language: str,
+    timeout_seconds: Optional[float],
+    progress_callback: Optional[Callable],
+) -> _ReportQualityOutcome:
+    initial_issues = _planning_report_quality_issues(
+        content,
+        report_language=report_language,
+        tool_calls=tool_calls,
+    )
+    original_chars = len((content or "").strip())
+    if not initial_issues:
+        return _ReportQualityOutcome(
+            content=content,
+            status="ok",
+            original_chars=original_chars,
+        )
+
+    _emit_report_quality_event(
+        progress_callback,
+        "report_quality_failed",
+        issues=initial_issues,
+        message="主报告不完整，正在基于已取证结果修复。",
+    )
+    evidence = _compact_report_repair_evidence(tool_calls)
+    repair_error = None
+    repair_tokens = 0
+    repair_models: List[str] = []
+    try:
+        response = llm_adapter.call_text(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是股票分析报告修复器。只能使用给定任务、原始回复和工具证据；"
+                        "不得调用工具或编造数据。输出完整 Markdown 报告，不解释修复过程。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _build_report_repair_prompt(
+                        original_task=original_task,
+                        original_content=content,
+                        evidence=evidence,
+                        report_language=report_language,
+                    ),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=6000,
+            timeout=timeout_seconds,
+        )
+        repair_tokens = int((response.usage or {}).get("total_tokens") or 0)
+        if isinstance(response.model, str) and response.model:
+            repair_models.append(response.model)
+        repaired = _normalize_planning_execute_final_content(response.content or "").strip()
+        final_issues = _planning_report_quality_issues(
+            repaired,
+            report_language=report_language,
+            tool_calls=tool_calls,
+        )
+        if not final_issues:
+            _emit_report_quality_event(
+                progress_callback,
+                "report_quality_repaired",
+                issues=[],
+                message="主报告完整度校验通过。",
+            )
+            return _ReportQualityOutcome(
+                content=repaired,
+                status="repaired",
+                initial_issues=initial_issues,
+                final_issues=[],
+                repair_attempted=True,
+                source="model_retry",
+                original_chars=original_chars,
+                total_tokens=repair_tokens,
+                models_used=repair_models,
+            )
+        repair_error = ",".join(final_issues)
+    except Exception as exc:
+        repair_error = str(exc)
+
+    fallback = _build_deterministic_report_fallback(
+        original_content=content,
+        tool_calls=tool_calls,
+        report_language=report_language,
+    )
+    final_issues = _planning_report_quality_issues(
+        fallback,
+        report_language=report_language,
+        tool_calls=tool_calls,
+    )
+    _emit_report_quality_event(
+        progress_callback,
+        "report_quality_fallback",
+        issues=final_issues,
+        message="报告修复仍不完整，已生成可审计的降级报告；价格计划评审将继续执行。",
+    )
+    return _ReportQualityOutcome(
+        content=fallback,
+        status="fallback",
+        initial_issues=initial_issues,
+        final_issues=final_issues,
+        repair_attempted=True,
+        source="deterministic_fallback",
+        original_chars=original_chars,
+        total_tokens=repair_tokens,
+        models_used=repair_models,
+        error=repair_error,
+    )
+
+
+def _planning_report_quality_issues(
+    content: str,
+    *,
+    report_language: str,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    return _present_planning_report_quality_issues(
+        content,
+        report_language=report_language,
+        tool_calls=tool_calls,
+    )
+
+
+def _compact_report_repair_evidence(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from src.agent.dimension_evidence import select_balanced_tool_calls
+
+    evidence: List[Dict[str, Any]] = []
+    for call in select_balanced_tool_calls(tool_calls or [], limit=16):
+        if not isinstance(call, dict):
+            continue
+        evidence.append({
+            "tool": call.get("tool"),
+            "success": call.get("success") is True,
+            "arguments": call.get("arguments") or {},
+            "result_preview": str(call.get("result_preview") or "")[:800],
+        })
+    return evidence
+
+
+def _build_report_repair_prompt(
+    *,
+    original_task: str,
+    original_content: str,
+    evidence: List[Dict[str, Any]],
+    report_language: str,
+) -> str:
+    from src.agent.dimension_evidence import (
+        build_dimension_evidence_summary,
+        compact_dimension_evidence_summary,
+    )
+
+    if report_language == "en":
+        language_rule = "Use English. Required H2 headings: Final Decision, Multi-Dimensional Evidence, Trade Plan, Strategy 4 / Chan Deterministic Score, Risks And Missing Evidence."
+    else:
+        language_rule = "使用中文。必须包含以下二级标题：最终结论、多维证据、交易计划、策略 4 / 缠论确定性评分、风险与缺失。"
+    return f"""{language_rule}
+将不完整回复重写为简洁但完整的股票分析报告。多维证据必须覆盖技术面、资金面、消息面、基本面和数据质量，缺失必须明示；交易计划只写当前动作和定性确认/失效依据，不得生成入场价、止损价或目标价，这些价格由确定性价格引擎后处理；正式评分与临时评分必须分开。
+
+用户任务：{original_task}
+
+原始回复：
+{original_content}
+
+工具证据：
+{json.dumps(evidence, ensure_ascii=False, indent=2, default=str)}
+
+四维证据覆盖摘要（必须按此摘要纠正“完全缺失”的错误表述）：
+{json.dumps(compact_dimension_evidence_summary(build_dimension_evidence_summary(evidence)), ensure_ascii=False, indent=2, default=str)}
+"""
+
+
+def _build_deterministic_report_fallback(
+    *,
+    original_content: str,
+    tool_calls: List[Dict[str, Any]],
+    report_language: str,
+) -> str:
+    evidence = _compact_report_repair_evidence(tool_calls)
+    readable_original = _normalize_planning_execute_final_content(original_content).strip()
+    if report_language == "en":
+        evidence_lines = [
+            f"- `{item.get('tool') or 'unknown'}`: {'available' if item.get('success') else 'failed or partial'}"
+            for item in evidence
+        ] or ["- No auditable tool evidence is available."]
+        return "\n".join([
+            "## Analysis Status",
+            "",
+            "The model report failed completeness validation. This deterministic fallback preserves the auditable facts and does not add an investment conclusion.",
+            "",
+            "## Original Conclusion",
+            "",
+            readable_original or "No usable model conclusion.",
+            "",
+            "## Evidence Collected",
+            "",
+            *evidence_lines,
+            "",
+            "## Trade Plan",
+            "",
+            "Entry, stop-loss and target prices are supplied only by the deterministic price engine after this report.",
+            "",
+            "## Strategy 4 / Chan Deterministic Score",
+            "",
+            "Use the Trace score card. Provisional weekly evidence must not be promoted to a formal score.",
+            "",
+            "## Risk And Missing Evidence",
+            "",
+            "The narrative report is incomplete. Do not increase action strength until the missing report and evidence are regenerated.",
+        ]).strip()
+    evidence_lines = [
+        f"- `{item.get('tool') or 'unknown'}`：{'证据可用' if item.get('success') else '失败或部分可用'}"
+        for item in evidence
+    ] or ["- 当前没有可审计的工具证据。"]
+    return "\n".join([
+        "## 分析状态",
+        "",
+        "模型主报告未通过完整度校验。以下为确定性降级报告，只保留可审计事实，不追加新的投资结论。",
+        "",
+        "## 原始结论",
+        "",
+        readable_original or "模型未生成可用结论。",
+        "",
+        "## 多维证据",
+        "",
+        *evidence_lines,
+        "",
+        "## 交易计划",
+        "",
+        "入场、止损和目标价只由确定性价格引擎在报告后处理阶段提供；没有有效数学计划时不得自行补全价格。",
+        "",
+        "## 策略 4 / 缠论确定性评分",
+        "",
+        "以 Trace 的确定性评分卡为准；临时周线证据不得提升为正式分数。",
+        "",
+        "## 风险与缺失",
+        "",
+        "叙事报告生成不完整。在重新生成完整报告前，不得提高交易动作强度。",
+    ]).strip()
+
+
+def _emit_report_quality_event(
+    progress_callback: Optional[Callable],
+    event_type: str,
+    *,
+    issues: List[str],
+    message: str,
+) -> None:
+    if progress_callback:
+        progress_callback({"type": event_type, "issues": issues, "message": message})

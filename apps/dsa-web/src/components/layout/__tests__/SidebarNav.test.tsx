@@ -72,6 +72,27 @@ describe('SidebarNav', () => {
     expect(screen.getByRole('link', { name: '链路' })).toHaveAttribute('href', '/agent-trace');
   });
 
+  it('renders the Kronos K-line navigation item', () => {
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'K线' })).toHaveAttribute('href', '/kronos');
+  });
+
+  it('links the signal navigation item to the preview page', () => {
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: '信号' })).toHaveAttribute('href', '/signal-preview');
+    expect(screen.queryByRole('link', { name: '复盘' })).not.toBeInTheDocument();
+  });
+
   it('replaces the candidate-pool navigation item with entry backtests', () => {
     render(
       <MemoryRouter initialEntries={['/']}>

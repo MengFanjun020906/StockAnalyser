@@ -2,14 +2,14 @@
 """
 AgentOrchestrator — multi-agent pipeline coordinator.
 
-Manages the lifecycle of specialised agents (Technical → Intel → Risk →
-Specialist → Decision) for a single stock analysis run.
+Manages the lifecycle of specialised agents (Technical → Intel → Capital →
+Fundamental → Risk → Specialist → Decision) for a single stock analysis run.
 
 Modes:
 - ``quick``   : Technical only → Decision (fastest, ~2 LLM calls)
-- ``standard``: Technical → Intel → Decision (default)
-- ``full``    : Technical → Intel → Risk → Decision
-- ``specialist``: Technical → Intel → Risk → specialist evaluation → Decision
+- ``standard``: Technical → Intel → Capital → Fundamental → Decision (default)
+- ``full``    : Technical → Intel → Capital → Fundamental → Risk → Decision
+- ``specialist``: Full evidence stages → specialist evaluation → Decision
 
 The orchestrator:
 1. Seeds an :class:`AgentContext` with the user query and stock code
@@ -304,6 +304,7 @@ class AgentOrchestrator:
             model=orch_result.model,
             error=orch_result.error,
             stock_selection=orch_result.stock_selection,
+            trade_plan=None,
         )
 
     def chat(
@@ -354,6 +355,16 @@ class AgentOrchestrator:
             parse_dashboard=False,
             progress_callback=progress_callback,
         )
+        machine_dashboard = orch_result.dashboard
+        if (
+            bool((context or {}).get("signal_lifecycle_entry_intent"))
+            or bool((context or {}).get("signal_lifecycle_plan_candidate"))
+        ) and machine_dashboard is None:
+            machine_dashboard = self._resolve_dashboard_payload(
+                ctx,
+                ctx.get_data("final_dashboard"),
+                ctx.get_data("final_dashboard_raw"),
+            )
 
         # Persist assistant response
         if orch_result.success:
@@ -367,7 +378,7 @@ class AgentOrchestrator:
         return AgentResult(
             success=orch_result.success,
             content=orch_result.content,
-            dashboard=orch_result.dashboard,
+            dashboard=machine_dashboard,
             tool_calls_log=orch_result.tool_calls_log,
             total_steps=orch_result.total_steps,
             total_tokens=orch_result.total_tokens,
@@ -375,6 +386,7 @@ class AgentOrchestrator:
             model=orch_result.model,
             error=orch_result.error,
             stock_selection=orch_result.stock_selection,
+            trade_plan=None,
         )
 
     def _maybe_run_stock_selection(
@@ -551,6 +563,20 @@ class AgentOrchestrator:
             )
             models_used.extend(result.meta.get("models_used", []))
 
+            has_dimension_opinion = any(
+                opinion.agent_name == agent.agent_name for opinion in ctx.opinions
+            )
+            if (
+                agent.agent_name in {"technical", "intel", "capital", "fundamental"}
+                and result.opinion is None
+                and not has_dimension_opinion
+            ):
+                self._record_dimension_gap(
+                    ctx,
+                    agent.agent_name,
+                    result.error or "stage returned no structured opinion",
+                )
+
             elapsed_s = time.time() - t0
             if timeout_s and elapsed_s >= timeout_s:
                 logger.error("[Orchestrator] pipeline timed out after stage '%s'", agent.agent_name)
@@ -572,12 +598,20 @@ class AgentOrchestrator:
                 )
 
             if progress_callback:
-                progress_callback({
+                stage_done_event = {
                     "type": "stage_done",
                     "stage": agent.agent_name,
                     "status": result.status.value,
                     "duration": result.duration_s,
-                })
+                }
+                if agent.agent_name in {"technical", "intel", "capital", "fundamental"}:
+                    stage_done_event["dimension_opinion"] = ctx.get_data(
+                        f"{agent.agent_name}_opinion"
+                    )
+                    stage_done_event["dimension_status"] = (
+                        ctx.meta.get("dimension_status", {}).get(agent.agent_name, {})
+                    )
+                progress_callback(stage_done_event)
 
             if ctx.meta.get("response_mode") == "chat" and agent.agent_name == "decision":
                 final_text = result.meta.get("raw_text")
@@ -589,11 +623,11 @@ class AgentOrchestrator:
 
             # Abort pipeline on critical failure.
             # Non-critical stages that degrade gracefully:
-            #   - intel / risk (standard support stages)
+            #   - intel / capital / fundamental / risk (support dimensions)
             #   - skill agents (specialist evaluation, optional)
             if result.status == StageStatus.FAILED:
                 non_critical = (
-                    agent.agent_name in ("intel", "risk")
+                    agent.agent_name in ("intel", "capital", "fundamental", "risk")
                     or agent.agent_name in getattr(self, "_skill_agent_names", set())
                 )
                 if not non_critical:
@@ -650,10 +684,34 @@ class AgentOrchestrator:
     # Agent chain construction
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _record_dimension_gap(ctx: AgentContext, agent_name: str, reason: str) -> None:
+        """Expose a missing analysis dimension to decision, risk and trace stages."""
+        data_key = f"{agent_name}_opinion"
+        if not ctx.get_data(data_key):
+            ctx.set_data(data_key, {
+                "signal": "hold",
+                "confidence": 0.0,
+                "reasoning": reason,
+                "quality": "unavailable",
+                "missing_evidence": [reason],
+            })
+        ctx.meta.setdefault("dimension_status", {})[agent_name] = {
+            "quality": "unavailable",
+            "missing_evidence": [reason],
+        }
+        ctx.add_risk_flag(
+            category="missing_evidence",
+            description=f"{agent_name} dimension unavailable: {reason}",
+            severity="medium",
+        )
+
     def _build_agent_chain(self, ctx: AgentContext) -> list:
         """Instantiate the ordered agent list based on ``self.mode``."""
         from src.agent.agents.technical_agent import TechnicalAgent
         from src.agent.agents.intel_agent import IntelAgent
+        from src.agent.agents.capital_agent import CapitalAgent
+        from src.agent.agents.fundamental_agent import FundamentalAgent
         from src.agent.agents.decision_agent import DecisionAgent
         from src.agent.agents.risk_agent import RiskAgent
 
@@ -668,21 +726,22 @@ class AgentOrchestrator:
 
         technical = self._prepare_agent(TechnicalAgent(**common_kwargs))
         intel = self._prepare_agent(IntelAgent(**common_kwargs))
+        capital = self._prepare_agent(CapitalAgent(**common_kwargs))
+        fundamental = self._prepare_agent(FundamentalAgent(**common_kwargs))
         risk = self._prepare_agent(RiskAgent(**common_kwargs))
         decision = self._prepare_agent(DecisionAgent(**common_kwargs))
-
         if self.mode == "quick":
             return [technical, decision]
         elif self.mode == "standard":
-            return [technical, intel, decision]
+            return [technical, intel, capital, fundamental, decision]
         elif self.mode == "full":
-            return [technical, intel, risk, decision]
+            return [technical, intel, capital, fundamental, risk, decision]
         elif self.mode == "specialist":
             # Specialist agents are inserted lazily right before the decision
             # stage so the router can see the finished technical opinion.
-            return [technical, intel, risk, decision]
+            return [technical, intel, capital, fundamental, risk, decision]
         else:
-            return [technical, intel, decision]
+            return [technical, intel, capital, fundamental, decision]
 
     def _build_specialist_agents(self, ctx: AgentContext) -> list:
         """Build specialist sub-agents based on requested skills.
@@ -775,6 +834,9 @@ class AgentOrchestrator:
             ctx.meta["skills_requested"] = requested_skills or []
             ctx.meta["strategies_requested"] = requested_skills or []
             ctx.meta["report_language"] = normalize_report_language(context.get("report_language", "zh"))
+            for key in ("signal_lifecycle_entry_intent", "signal_lifecycle_plan_candidate"):
+                if context.get(key):
+                    ctx.meta[key] = True
 
             # Pre-populate data fields that the caller already has
             for data_key in ("realtime_quote", "daily_history", "chip_distribution",

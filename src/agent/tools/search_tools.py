@@ -4,6 +4,7 @@ Search tools — wraps SearchService methods as agent-callable tools.
 
 Tools:
 - search_stock_news: search latest stock news
+- search_stock_fundamentals: search source-linked company fundamental materials
 - score_stock_news_sentiment: score company-level news and announcement events
 - search_stock_prompt_intel: search a user's single-stock prompt with the stock anchor
 - search_comprehensive_intel: multi-dimensional intelligence search
@@ -11,6 +12,7 @@ Tools:
 
 import logging
 import hashlib
+import json
 import sys
 import re
 import time
@@ -1285,6 +1287,7 @@ def _persist_news_response(
     stock_name: str,
     dimension: str,
     response,
+    query_context: Optional[Dict[str, str]] = None,
 ) -> None:
     """Best-effort news persistence for Agent search tools."""
     if not response or not getattr(response, "success", False) or not getattr(response, "results", None):
@@ -1298,7 +1301,7 @@ def _persist_news_response(
             dimension=dimension,
             query=response.query,
             response=response,
-            query_context=None,
+            query_context=query_context,
         )
         logger.info(
             "Agent news intel persisted for %s (dimension=%s, new_records=%s)",
@@ -1435,27 +1438,61 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
             "error": response.error_message,
         }
 
+    verified_results = list(response.results or [])
+    unverified_results = list(getattr(response, "unverified_results", []) or [])
+    visible_results = [*verified_results, *unverified_results]
+    persistence_response = response
+    if unverified_results:
+        from dataclasses import replace
+
+        persistence_response = replace(response, results=visible_results)
     _persist_news_response(
         stock_code=stock_code,
         stock_name=stock_name,
         dimension="latest_news",
-        response=response,
+        response=persistence_response,
     )
+    if verified_results:
+        status = "ok"
+        summary = (
+            f"近{getattr(response, 'search_window_days', None) or 30}天找到"
+            f"{len(verified_results)}条已核验日期的个股新闻。"
+        )
+    elif unverified_results:
+        status = "partial"
+        summary = (
+            f"近30天检索到{len(unverified_results)}条相关候选，但发布日期无法核验；"
+            "只能作为待核验消息，不能据此判断近期无新闻。"
+        )
+    else:
+        status = "empty"
+        summary = "已依次检索近7天、14天和30天，未找到可核验的近期个股新闻。"
+
+    def _item(result, *, date_verified: bool) -> dict:
+        return {
+            "title": result.title,
+            "snippet": result.snippet,
+            "url": result.url,
+            "source": result.source,
+            "published_date": result.published_date,
+            "date_verified": date_verified,
+        }
 
     return {
+        "status": status,
+        "summary": summary,
         "query": response.query,
         "provider": response.provider,
         "success": True,
-        "results_count": len(response.results),
+        "result_state": str(getattr(response, "result_state", "") or "verified_recent"),
+        "search_window_days": getattr(response, "search_window_days", None),
+        "window_attempts": list(getattr(response, "window_attempts", []) or []),
+        "results_count": len(visible_results),
+        "verified_recent_count": len(verified_results),
+        "unverified_results_count": len(unverified_results),
         "results": [
-            {
-                "title": r.title,
-                "snippet": r.snippet,
-                "url": r.url,
-                "source": r.source,
-                "published_date": r.published_date,
-            }
-            for r in response.results
+            *[_item(result, date_verified=True) for result in verified_results],
+            *[_item(result, date_verified=False) for result in unverified_results],
         ],
     }
 
@@ -2221,6 +2258,159 @@ search_comprehensive_intel_tool = ToolDefinition(
 )
 
 
+# ============================================================
+# search_stock_fundamentals
+# ============================================================
+
+_FUNDAMENTAL_SEARCH_DIMENSIONS = (
+    "financial_performance",
+    "business_and_risk",
+)
+
+
+def _handle_search_stock_fundamentals(
+    stock_code: str,
+    stock_name: str = "",
+    trace_id: str = "",
+) -> dict:
+    """Return source-linked fundamental materials as partial fallback evidence."""
+    resolved_name = _resolve_stock_name(stock_code, stock_name)
+    service = _get_search_service()
+    canonical_code = _canonical_search_code(stock_code)
+    if not service.is_available:
+        return {
+            "status": "unavailable",
+            "stock_code": canonical_code,
+            "stock_name": resolved_name,
+            "provider": "None",
+            "coverage": {dimension: "unavailable" for dimension in _FUNDAMENTAL_SEARCH_DIMENSIONS},
+            "materials": [],
+            "missing_fields": list(_FUNDAMENTAL_SEARCH_DIMENSIONS),
+            "source_chain": [],
+            "errors": ["No search engine available (no API keys configured)"],
+        }
+
+    search_results, search_err, search_ms = _run_search_task_with_timeout(
+        lambda: service.search_stock_fundamentals(
+            stock_code=canonical_code,
+            stock_name=resolved_name,
+            max_results_per_dimension=3,
+        ),
+        24.0,
+        "search_stock_fundamentals",
+    )
+    if search_err or not isinstance(search_results, dict):
+        return {
+            "status": "timeout" if search_err and "timeout" in search_err.lower() else "failed",
+            "stock_code": canonical_code,
+            "stock_name": resolved_name,
+            "provider": "None",
+            "coverage": {dimension: "failed" for dimension in _FUNDAMENTAL_SEARCH_DIMENSIONS},
+            "materials": [],
+            "missing_fields": list(_FUNDAMENTAL_SEARCH_DIMENSIONS),
+            "source_chain": [{
+                "provider": "search_stock_fundamentals",
+                "result": "failed",
+                "duration_ms": search_ms,
+            }],
+            "errors": [str(search_err or "invalid search result")],
+        }
+
+    materials: List[Dict[str, Any]] = []
+    coverage: Dict[str, str] = {}
+    errors: List[str] = []
+    providers: List[str] = []
+    for dimension in _FUNDAMENTAL_SEARCH_DIMENSIONS:
+        response = search_results.get(dimension)
+        response_results = list(getattr(response, "results", None) or [])
+        response_success = bool(response and getattr(response, "success", False))
+        coverage[dimension] = "available" if response_results else ("empty" if response_success else "failed")
+        if response and getattr(response, "provider", None):
+            providers.append(str(response.provider))
+        if response_success and response_results:
+            _persist_news_response(
+                stock_code=canonical_code,
+                stock_name=resolved_name,
+                dimension=f"fundamental_{dimension}",
+                response=response,
+                query_context={
+                    "query_id": str(trace_id or "").strip(),
+                    "query_source": "agent",
+                } if str(trace_id or "").strip() else None,
+            )
+        elif response and getattr(response, "error_message", None):
+            errors.append(f"{dimension}: {response.error_message}")
+        for item in response_results[:3]:
+            materials.append({
+                "dimension": dimension,
+                "title": str(getattr(item, "title", "") or "").strip(),
+                "snippet": str(getattr(item, "snippet", "") or "").strip()[:500],
+                "url": str(getattr(item, "url", "") or "").strip(),
+                "source": str(getattr(item, "source", "") or "").strip(),
+                "published_date": getattr(item, "published_date", None),
+            })
+
+    missing_fields = [dimension for dimension, state in coverage.items() if state != "available"]
+    provider = next((item for item in providers if item), "AnySearch" if materials else "None")
+    payload = {
+        # Search materials can fill gaps, but cannot by themselves establish a complete fundamental rating.
+        "status": "partial" if materials else ("empty" if not errors else "failed"),
+        "stock_code": canonical_code,
+        "stock_name": resolved_name,
+        "provider": provider,
+        "as_of": datetime.now(_CN_TZ).date().isoformat(),
+        "coverage": coverage,
+        "materials": materials,
+        "missing_fields": missing_fields,
+        "source_chain": [{
+            "provider": provider,
+            "result": "ok" if materials else "empty",
+            "duration_ms": search_ms,
+            "query_dimensions": list(_FUNDAMENTAL_SEARCH_DIMENSIONS),
+        }],
+        "errors": errors,
+    }
+    normalized_trace_id = str(trace_id or "").strip()
+    if normalized_trace_id:
+        try:
+            _get_db().save_fundamental_snapshot(
+                query_id=normalized_trace_id,
+                code=canonical_code,
+                payload=payload,
+                source_chain=payload["source_chain"],
+                coverage=coverage,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Agent fundamental search snapshot persistence failed for %s: %s",
+                canonical_code,
+                exc,
+            )
+    return payload
+
+
+search_stock_fundamentals_tool = ToolDefinition(
+    name="search_stock_fundamentals",
+    description=(
+        "Search source-linked company fundamental materials when structured valuation or financial APIs "
+        "are missing. Returns business, earnings and balance-sheet risk snippets with URL, source and date; "
+        "the result is supplementary evidence, not authoritative financial numbers."
+    ),
+    parameters=[
+        ToolParameter(name="stock_code", type="string", description="Stock code, e.g. 600330."),
+        ToolParameter(
+            name="stock_name",
+            type="string",
+            description="Optional stock name; resolved from the local index when omitted.",
+            required=False,
+            default="",
+        ),
+    ],
+    handler=_handle_search_stock_fundamentals,
+    category="search",
+)
+
+
 ALL_SEARCH_TOOLS = [
     search_stock_news_tool,
     search_openinvest_news_tool,
@@ -2230,4 +2420,5 @@ ALL_SEARCH_TOOLS = [
     search_stock_prompt_intel_tool,
     score_stock_news_sentiment_tool,
     search_comprehensive_intel_tool,
+    search_stock_fundamentals_tool,
 ]

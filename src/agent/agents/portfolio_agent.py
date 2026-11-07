@@ -46,7 +46,7 @@ class PortfolioAgent(BaseAgent):
 
     tool_names = [
         "get_realtime_quote",
-        "get_stock_info",
+        "get_stock_business_context",
     ]
 
     # ------------------------------------------------------------------

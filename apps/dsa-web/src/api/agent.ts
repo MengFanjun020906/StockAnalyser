@@ -21,6 +21,9 @@ export interface ChatResponse {
   content: string;
   session_id: string;
   error?: string;
+  price_plan?: Record<string, unknown>;
+  trade_plan_result?: Record<string, unknown>;
+  risk_gate?: Record<string, unknown>;
 }
 
 export interface AgentTraceRunRequest {
@@ -71,6 +74,7 @@ export interface AgentTraceToolCall {
 }
 
 export interface AgentTraceRunResponse {
+  jev_review?: import('./jev').JevTraceReview | null;
   success: boolean;
   session_id: string;
   content: string;
@@ -85,9 +89,14 @@ export interface AgentTraceRunResponse {
   planner?: Record<string, unknown> | null;
   agent_user_context?: Record<string, unknown> | null;
   context_summary?: Record<string, unknown> | null;
+  dimension_evidence?: Record<string, unknown> | null;
+  report_quality?: Record<string, unknown> | null;
   debate?: Record<string, unknown> | null;
   stock_selection?: Record<string, unknown> | null;
+  composite_verdict?: Record<string, unknown> | null;
   risk_gate?: Record<string, unknown> | null;
+  price_plan?: Record<string, unknown> | null;
+  trade_plan_result?: Record<string, unknown> | null;
   llm_telemetry?: Record<string, unknown> | null;
   judge_sanity?: Record<string, unknown> | null;
   artifact_dir?: string | null;

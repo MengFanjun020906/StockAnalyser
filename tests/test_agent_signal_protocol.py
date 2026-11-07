@@ -89,6 +89,22 @@ def test_trade_plan_rejects_invalid_entry_zone():
     assert "entry_zone_low" in str(exc_info.value)
 
 
+def test_trade_plan_primary_bounds_follow_first_structured_zone():
+    plan = TradePlan(
+        symbol="600330",
+        action="open",
+        entry_zone_low=1,
+        entry_zone_high=2,
+        entry_zones=[
+            {"label": "ideal", "low": 19.6, "high": 20.5},
+            {"label": "secondary", "low": 21.2, "high": 22.0},
+        ],
+    )
+
+    assert plan.entry_zone_low == 19.6
+    assert plan.entry_zone_high == 20.5
+
+
 def test_risk_gate_and_trace_refs_are_json_serializable():
     result = RiskGateResult(
         status="manual_review",

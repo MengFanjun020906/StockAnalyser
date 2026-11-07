@@ -31,8 +31,10 @@ class RiskAgent(BaseAgent):
     max_steps = 4
     tool_names = [
         "search_stock_news",
+        "search_comprehensive_intel",
         "get_realtime_quote",
-        "get_stock_info",
+        "get_tushare_daily_basic",
+        "get_tushare_forecast",
     ]
 
     def system_prompt(self, ctx: AgentContext) -> str:
@@ -125,4 +127,3 @@ def _risk_to_signal(risk_level: str) -> str:
         "high": "strong_sell",
     }
     return mapping.get(risk_level, "hold")
-

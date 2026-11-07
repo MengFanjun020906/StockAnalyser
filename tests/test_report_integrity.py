@@ -82,8 +82,8 @@ class TestCheckContentIntegrity(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("dashboard.core_conclusion.one_sentence", missing)
 
-    def test_fail_when_stop_loss_missing_for_buy(self) -> None:
-        """Integrity fails when stop_loss missing and decision_type is buy."""
+    def test_pass_when_llm_stop_loss_missing_for_buy(self) -> None:
+        """LLM output does not own the deterministic stop-loss price."""
         result = AnalysisResult(
             code="600519",
             name="贵州茅台",
@@ -99,8 +99,8 @@ class TestCheckContentIntegrity(unittest.TestCase):
             },
         )
         ok, missing = check_content_integrity(result)
-        self.assertFalse(ok)
-        self.assertIn("dashboard.battle_plan.sniper_points.stop_loss", missing)
+        self.assertTrue(ok)
+        self.assertNotIn("dashboard.battle_plan.sniper_points.stop_loss", missing)
 
     def test_pass_when_stop_loss_missing_for_sell(self) -> None:
         """Integrity passes when stop_loss missing and decision_type is sell."""
@@ -161,8 +161,8 @@ class TestApplyPlaceholderFill(unittest.TestCase):
         apply_placeholder_fill(result, ["analysis_summary"])
         self.assertEqual(result.analysis_summary, "待补充")
 
-    def test_fills_missing_stop_loss(self) -> None:
-        """Placeholder fills stop_loss when missing."""
+    def test_does_not_fill_llm_stop_loss_placeholder(self) -> None:
+        """Legacy placeholder filling cannot manufacture an authoritative price."""
         result = AnalysisResult(
             code="600519",
             name="贵州茅台",
@@ -174,10 +174,7 @@ class TestApplyPlaceholderFill(unittest.TestCase):
             dashboard={"battle_plan": {"sniper_points": {}}},
         )
         apply_placeholder_fill(result, ["dashboard.battle_plan.sniper_points.stop_loss"])
-        self.assertEqual(
-            result.dashboard["battle_plan"]["sniper_points"]["stop_loss"],
-            "待补充",
-        )
+        self.assertNotIn("stop_loss", result.dashboard["battle_plan"]["sniper_points"])
 
     def test_fills_risk_alerts_empty_list(self) -> None:
         """Placeholder fills risk_alerts with empty list when missing."""

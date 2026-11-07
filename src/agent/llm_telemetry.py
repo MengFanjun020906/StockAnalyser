@@ -52,6 +52,7 @@ def record_llm_telemetry(
     tool_calls: int = 0,
     ok: bool = True,
     error: Optional[str] = None,
+    finish_reason: Optional[str] = None,
 ) -> None:
     """Append one JSONL telemetry event if a trace artifact dir is active."""
     context = get_llm_telemetry_context()
@@ -74,6 +75,7 @@ def record_llm_telemetry(
         "tool_calls": int(tool_calls or 0),
         "ok": bool(ok),
         "error": error,
+        "finish_reason": finish_reason,
     }
     try:
         path = Path(str(artifact_dir)).expanduser().resolve() / "llm_usage.jsonl"

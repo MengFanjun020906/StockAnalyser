@@ -1249,7 +1249,6 @@ ALL_DATA_TOOLS = [
     get_daily_history_tool,
     get_chip_distribution_tool,
     get_analysis_context_tool,
-    get_stock_info_tool,
     get_stock_business_context_tool,
     get_portfolio_snapshot_tool,
 ]

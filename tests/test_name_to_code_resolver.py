@@ -105,6 +105,40 @@ class TestResolveNameToCode:
         assert resolve_name_to_code("贵州茅台") == "600519"
         assert resolve_name_to_code("腾讯控股") == "00700"
 
+    @patch("src.services.name_to_code_resolver._get_akshare_name_to_code")
+    @patch("src.services.name_to_code_resolver._get_stock_index_name_to_code")
+    def test_generated_index_resolves_embedded_single_stock_name_without_network(
+        self,
+        mock_index,
+        mock_akshare,
+    ):
+        mock_index.return_value = {
+            "亨通光电": "600487",
+            "三花智控": "002050",
+        }
+
+        result = resolve_name_to_code("分析一下亨通光电", allow_network=False)
+
+        assert result == "600487"
+        mock_akshare.assert_not_called()
+
+    @patch("src.services.name_to_code_resolver._get_akshare_name_to_code")
+    @patch("src.services.name_to_code_resolver._get_stock_index_name_to_code")
+    def test_embedded_multiple_stock_names_are_ambiguous(
+        self,
+        mock_index,
+        mock_akshare,
+    ):
+        mock_index.return_value = {
+            "亨通光电": "600487",
+            "三花智控": "002050",
+        }
+
+        result = resolve_name_to_code("比较亨通光电和三花智控", allow_network=False)
+
+        assert result is None
+        mock_akshare.assert_not_called()
+
     def test_returns_none_for_empty_or_invalid_input(self):
         assert resolve_name_to_code("") is None
         assert resolve_name_to_code("   ") is None
@@ -115,7 +149,8 @@ class TestResolveNameToCode:
         assert resolve_name_to_code("阿里巴巴") is None
 
     @patch("src.services.name_to_code_resolver._get_akshare_name_to_code")
-    def test_akshare_fallback_when_not_in_local(self, mock_akshare):
+    @patch("src.services.name_to_code_resolver._get_stock_index_name_to_code", return_value={})
+    def test_akshare_fallback_when_not_in_local(self, _mock_index, mock_akshare):
         mock_akshare.return_value = {"平安银行": "000001"}
         # 000001 is in local map as 平安银行, so we use a name that's only in akshare
         # Actually local has 000001 -> 平安银行. So "平安银行" would hit local first.

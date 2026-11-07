@@ -289,19 +289,19 @@ tools:
     failure_modes:
       - 仅支持 A 股；样本不足或本地 K 线不足时会低置信返回。
 
-  - tool: get_stock_info
+  - tool: get_stock_business_context
     priority: 30
     when_to_use: >-
-      获取行业/板块归属、股本、上市日期。
-      验证板块是否处于强势，判断公司是否符合低位启动的「合理基本面背景」。
+      获取行业/板块归属和业务摘要。
+      验证板块是否处于强势，判断公司是否符合低位启动的「合理业务背景」。
     typical_args:
       stock_code: "{code}"
     returns_summary: >-
-      返回行业、概念、流通股本、上市日期等基础信息。
+      返回行业、概念板块、公司名称和业务摘要。
     key_fields:
       - industry
-      - sector
-      - list_date
+      - boards
+      - business_summary
     combo_hints:
       - 板块处于弱势时，低位启动需更强的个股转强证据。
     cost: cheap

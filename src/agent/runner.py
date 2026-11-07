@@ -46,7 +46,7 @@ _THINKING_TOOL_LABELS: Dict[str, str] = {
     "get_market_indices": "市场概览获取",
     "get_sector_rankings": "行业板块分析",
     "get_analysis_context": "历史分析上下文",
-    "get_stock_info": "基本信息获取",
+    "get_stock_info": "旧版基本面聚合（已废弃）",
     "analyze_pattern": "K线形态识别",
     "get_volume_analysis": "量能分析",
     "calculate_ma": "均线计算",
@@ -195,7 +195,7 @@ def _compact_tool_payload(tool_name: str, payload: Any) -> Any:
     if profile == "tushare_table":
         return _compact_table_payload(payload)
     if profile == "news":
-        return _compact_news_payload(payload, item_keys=("results", "items", "news", "events", "announcements", "alerts", "sections"))
+        return _compact_news_payload(payload, item_keys=("results", "items", "materials", "news", "events", "announcements", "alerts", "sections"))
     if profile == "market_indices":
         return _compact_table_payload(payload, item_keys=("indices", "items", "data"))
     if profile == "market_regime":
@@ -206,6 +206,8 @@ def _compact_tool_payload(tool_name: str, payload: Any) -> Any:
         return _compact_backtest_payload(payload)
     if profile == "knowledge_graph":
         return _compact_table_payload(payload, item_keys=("results", "items", "nodes", "episodes"))
+    if profile == "trade_plan":
+        return _compact_mapping_for_model(payload, depth=0)
 
     payload = dict(payload)
     payload["etl_warning"] = f"unprofiled tool: {tool_name}"
@@ -264,6 +266,7 @@ def resolve_tool_etl_profile(tool_name: str) -> str:
         "search_stock_prompt_intel": "news",
         "score_stock_news_sentiment": "news",
         "search_comprehensive_intel": "news",
+        "search_stock_fundamentals": "news",
         "get_cls_telegraph_news": "news",
         "get_xueqiu_hot_news": "news",
         "get_macro_finance_news": "news",
@@ -282,6 +285,7 @@ def resolve_tool_etl_profile(tool_name: str) -> str:
         "get_stock_backtest_summary": "backtest",
         "search_knowledge_graph": "knowledge_graph",
         "search_openinvest_news": "news",
+        "submit_trade_plan": "trade_plan",
     }
     if tool_name in explicit:
         return explicit[tool_name]
@@ -421,7 +425,7 @@ def _compact_price_structure_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if chan:
         out["chan"] = _compact_keep_fields(
             chan,
-            ("status", "pen_count", "center_count", "structure_summary", "latest_centers", "latest_pens", "unfinished_pen"),
+            ("status", "pen_count", "center_count", "structure_summary", "signals", "latest_centers", "latest_pens", "unfinished_pen"),
         )
     if smc:
         out["smc"] = _compact_keep_fields(

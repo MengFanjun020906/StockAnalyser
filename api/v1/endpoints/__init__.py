@@ -23,6 +23,8 @@ from api.v1.endpoints import (
     seed_pool_quality,
     agent_verdict_reviews,
     agent_entry_execution_backtests,
+    kronos,
+    signal_preview,
 )
 __all__ = [
     "health",
@@ -39,4 +41,6 @@ __all__ = [
     "seed_pool_quality",
     "agent_verdict_reviews",
     "agent_entry_execution_backtests",
+    "kronos",
+    "signal_preview",
 ]

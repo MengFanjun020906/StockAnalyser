@@ -19,6 +19,9 @@ import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams } from 'react-router-dom';
 import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
 import { portfolioApi } from '../api/portfolio';
+import type { JevTraceReview as JevReview } from '../api/jev';
+import { JevTraceReview } from '../components/agent/JevTraceReview';
+import { useJevTraceReview } from '../hooks/useJevTraceReview';
 import { CandidateDecisionTable, type CandidateDecisionRow, type CandidateDecisionTone } from '../components/candidates/CandidateDecisionTable';
 import { ApiErrorAlert, Button, Collapsible, JsonViewer } from '../components/common';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
@@ -121,6 +124,16 @@ const formatCost = (value: unknown): string => {
   return `$${numberValue.toFixed(6)}`;
 };
 
+const compositeStatusLabel = (value: unknown): string => {
+  const status = String(value || 'unknown');
+  if (status === 'ok' || status === 'evaluable') return '可评估';
+  if (status === 'partial') return '部分可用';
+  if (status === 'not_implemented') return '历史不足';
+  if (status === 'not_evaluable') return '暂不可评估';
+  if (status === 'insufficient') return '数据不足';
+  return status;
+};
+
 const formatPercent = (value: unknown): string => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
   return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`;
@@ -142,9 +155,16 @@ const parseOptionalPercent = (value: string): number | undefined => {
 const shouldSendStockCode = (message: string, stockCode: string): boolean => {
   const code = stockCode.trim();
   if (!code) return false;
-  if (code !== DEFAULT_STOCK_CODE) return true;
-  if (message.includes(code)) return true;
-  return false;
+  const reserved = new Set(['AGENT', 'PLAN', 'API', 'LLM', 'AI', 'ETF', 'MACD', 'KDJ', 'RSI', 'ATR',
+    'MA', 'EMA', 'SMA', 'BOLL', 'SMC', 'BOS', 'OHLCV', 'PE', 'PB', 'ROE', 'EPS', 'USD', 'CNY', 'HKD', 'T', 'N', 'A']);
+  const normalize = (value: string) => {
+    const text = value.toUpperCase().replace(/\s/g, '');
+    const hk = /^(?:HK(\d{1,5})|(\d{1,5})\.HK)$/.exec(text);
+    return hk ? `HK${(hk[1] || hk[2]).padStart(5, '0')}` : text.replace(/^(SH|SZ|BJ)(?=\d{6}$)/, '').replace(/\.(SH|SZ|BJ|SS)$/, '');
+  };
+  const matches = message.match(/(?<![A-Za-z0-9])(?:(?:[Ss][HhZz]|[Bb][Jj])?\d{6}(?:\.(?:[Ss][HhZzSs]|[Bb][Jj]))?|[Hh][Kk]\s?\d{1,5}|\d{1,5}\.[Hh][Kk]|[A-Z]{1,5}(?:\.[A-Z])?)(?![A-Za-z0-9])/g) || [];
+  const symbols = [...new Set(matches.filter((value) => !reserved.has(value)).map(normalize))];
+  return symbols.length !== 1 || symbols[0] === normalize(code);
 };
 
 const toStringList = (value: unknown): string[] => {
@@ -220,8 +240,8 @@ const createEmptyTraceResult = (): AgentTraceRunResponse => ({
   success: false, session_id: '', content: '', error: null,
   total_steps: 0, total_tokens: 0, provider: '', model: '', mode: 'planning_execute',
   events: [], tool_calls: [], planner: null, agent_user_context: null,
-  context_summary: null, debate: null, stock_selection: null, risk_gate: null, artifact_dir: null,
-  llm_telemetry: null, judge_sanity: null, runtime_config: null,
+  context_summary: null, report_quality: null, debate: null, stock_selection: null, composite_verdict: null, risk_gate: null, artifact_dir: null,
+  dimension_evidence: null, llm_telemetry: null, judge_sanity: null, runtime_config: null,
 });
 
 const eventToToolCall = (event: TraceStreamEvent): AgentTraceToolCall => ({
@@ -451,9 +471,18 @@ const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
         position_count: result.context_summary.position_count,
         investor: asRecord(result.context_summary.investor),
       } : null,
+      report_quality: asRecord(result.report_quality) || null,
       debate: null,
       stock_selection: compactStockSelection,
       risk_gate: null,
+      jev_review: result.jev_review ? {
+        ...result.jev_review,
+        evaluation: result.jev_review.evaluation ? {
+          ...result.jev_review.evaluation,
+          state: undefined,
+          questions: undefined,
+        } : result.jev_review.evaluation,
+      } : null,
       llm_telemetry: asRecord(result.llm_telemetry) || null,
       judge_sanity: asRecord(result.judge_sanity) || null,
       artifact_dir: result.artifact_dir || null,
@@ -1864,6 +1893,10 @@ const getIntentResolution = (result: AgentTraceRunResponse): Record<string, unkn
   asRecord(asRecord(result.context_summary)?.intent_resolution)
 );
 
+const getTargetResolution = (result: AgentTraceRunResponse): Record<string, unknown> | null => (
+  asRecord(asRecord(result.context_summary)?.target_resolution)
+);
+
 const hasCandidateDimension = (groups: CandidateDimensionGroup[], dimensions: string[]): boolean => (
   groups.some((group) => dimensions.includes(group.dimension) && group.candidates.length > 0)
 );
@@ -1923,7 +1956,7 @@ const TimelineStep: React.FC<{
         </div>
 
         {narrative ? (
-          <p className="mt-1.5 text-sm leading-relaxed text-secondary-text">{narrative}</p>
+          <p className="mt-1.5 break-words text-sm leading-relaxed text-secondary-text">{narrative}</p>
         ) : null}
 
         {hasContent ? (
@@ -1979,6 +2012,7 @@ const AgentTracePage: React.FC = () => {
   const [historyItems, setHistoryItems] = useState<TraceHistoryItem[]>([]);
   const [showConfig, setShowConfig] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<Record<string, unknown> | null>(null);
+  const jev = useJevTraceReview(result?.session_id || '', result?.jev_review, !running && traceStatus !== 'running');
   const activeRunSessionIdRef = useRef<string | null>(null);
   const runtimeConfigRef = useRef<Record<string, unknown> | null>(null);
   const activeRunMetaRef = useRef<{
@@ -1992,7 +2026,7 @@ const AgentTracePage: React.FC = () => {
     setResult({
       ...placeholder,
       session_id: sessionId,
-      runtime_config: runtimeConfigRef.current || placeholder.runtime_config || runtimeConfig,
+      runtime_config: runtimeConfigRef.current || placeholder.runtime_config,
     });
     setTraceStatus('running');
     setStatusMessage(fallback ? '正在从后端加载完整 Trace 记录...' : '正在从后端加载 Trace 记录...');
@@ -2027,7 +2061,7 @@ const AgentTracePage: React.FC = () => {
           setStatusMessage('未找到该 Trace 记录');
         }
       });
-  }, [runtimeConfig]);
+  }, []);
 
   useEffect(() => {
     document.title = 'Agent Trace';
@@ -2217,7 +2251,7 @@ const AgentTracePage: React.FC = () => {
     const type = event.type || 'unknown';
     if (type === 'context_ready') {
       setStatusMessage('账户与持仓上下文已就绪');
-      setResult((prev) => ({ ...(prev || createEmptyTraceResult()), session_id: String(event.session_id || prev?.session_id || ''), context_summary: asRecord(event.context_summary), agent_user_context: asRecord(event.agent_user_context), runtime_config: asRecord(event.runtime_config) || prev?.runtime_config || runtimeConfig }));
+      setResult((prev) => ({ ...(prev || createEmptyTraceResult()), session_id: String(event.session_id || prev?.session_id || ''), context_summary: asRecord(event.context_summary), dimension_evidence: asRecord(event.dimension_evidence) || prev?.dimension_evidence || null, agent_user_context: asRecord(event.agent_user_context), runtime_config: asRecord(event.runtime_config) || prev?.runtime_config || runtimeConfig }));
       return;
     }
     if (type === 'planner_ready') {
@@ -2227,6 +2261,7 @@ const AgentTracePage: React.FC = () => {
         session_id: String(event.session_id || prev?.session_id || ''),
         planner: asRecord(event.planner),
         context_summary: asRecord(event.context_summary) || prev?.context_summary || null,
+        dimension_evidence: asRecord(event.dimension_evidence) || prev?.dimension_evidence || null,
         runtime_config: asRecord(event.runtime_config) || prev?.runtime_config || runtimeConfig,
       }));
       return;
@@ -2288,9 +2323,13 @@ const AgentTracePage: React.FC = () => {
           planner: asRecord(event.planner) || cur.planner,
           agent_user_context: asRecord(event.agent_user_context) || cur.agent_user_context,
           context_summary: asRecord(event.context_summary) || cur.context_summary,
+          dimension_evidence: asRecord(event.dimension_evidence) || cur.dimension_evidence || null,
+          report_quality: asRecord(event.report_quality) || cur.report_quality || null,
           debate: asRecord(event.debate) || cur.debate,
           stock_selection: mergeStockSelectionResult(asRecord(cur.stock_selection), asRecord(event.stock_selection)) || cur.stock_selection,
+          composite_verdict: asRecord(event.composite_verdict) || cur.composite_verdict,
           risk_gate: asRecord(event.risk_gate) || cur.risk_gate,
+          jev_review: (asRecord(event.jev_review) as JevReview | null) || cur.jev_review,
           llm_telemetry: asRecord(event.llm_telemetry) || cur.llm_telemetry || null,
           judge_sanity: asRecord(event.judge_sanity) || cur.judge_sanity || null,
           artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : cur.artifact_dir,
@@ -2333,7 +2372,11 @@ const AgentTracePage: React.FC = () => {
   /* ─── Derived data for timeline ─── */
   const planner = useMemo(() => asRecord(result?.planner), [result?.planner]);
   const debate = useMemo(() => asRecord(result?.debate), [result?.debate]);
+  const debateFailed = debate?.enabled === true && debate?.success === false;
+  const compositeVerdict = useMemo(() => asRecord(result?.composite_verdict), [result?.composite_verdict]);
+  const compositeFailed = compositeVerdict?.status === 'failed';
   const riskPayload = useMemo(() => asRecord(result?.risk_gate), [result?.risk_gate]);
+  const riskFailed = riskPayload?.status === 'failed';
   const llmTelemetry = useMemo(() => asRecord(result?.llm_telemetry), [result?.llm_telemetry]);
   const judgeSanity = useMemo(() => asRecord(result?.judge_sanity), [result?.judge_sanity]);
   const stockSelection = useMemo(() => normalizeStockSelectionPayload(asRecord(result?.stock_selection)), [result?.stock_selection]);
@@ -2394,6 +2437,7 @@ const AgentTracePage: React.FC = () => {
                 <Button
                   type="button"
                   onClick={() => void handleResumeCurrentTrace()}
+                  disabled={asRecord(result.report_quality)?.status === 'target_mismatch'}
                   isLoading={running}
                   loadingText="继续中"
                   size="sm"
@@ -2493,7 +2537,7 @@ const AgentTracePage: React.FC = () => {
           ) : null}
 
           {stockCode.trim() && !shouldSendStockCode(message, stockCode) ? (
-            <p className="mt-2 text-xs text-warning">默认股票代码未在问题中出现，本次不发送该代码；意图由后端模型识别。</p>
+            <p className="mt-2 text-xs text-warning">配置股票 {stockCode} 与问题中的股票不一致，本次以问题中的股票为准。</p>
           ) : null}
         </div>
 
@@ -2527,7 +2571,7 @@ const AgentTracePage: React.FC = () => {
                   </button>
                   <button
                     type="button"
-                    disabled={running}
+                    disabled={running || asRecord(item.result.report_quality)?.status === 'target_mismatch'}
                     onClick={() => void handleResumeHistory(item)}
                     className="inline-flex h-7 shrink-0 items-center gap-1 border border-border px-2 text-label text-secondary-text transition-colors hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     title={`从 ${item.result.session_id || item.id} 继续运行`}
@@ -2560,7 +2604,7 @@ const AgentTracePage: React.FC = () => {
               title="数据与候选池"
               status={getLayerStatus(Boolean(result.tool_calls.length || stockSelection))}
               narrative={buildL1Narrative(result, stockSelection)}
-              defaultOpen={Boolean(stockSelection || hasDiscoveryCandidates || getIntentResolution(result))}
+              defaultOpen={Boolean(stockSelection || hasDiscoveryCandidates || getIntentResolution(result) || getTargetResolution(result))}
             >
               <L1Detail result={result} stockSelection={stockSelection} traceStatus={traceStatus} />
             </TimelineStep>
@@ -2587,18 +2631,33 @@ const AgentTracePage: React.FC = () => {
             <TimelineStep
               label="L4"
               title="决策层"
-              status={getLayerStatus(Boolean(debate?.judge_decision || planner))}
+              status={debateFailed ? 'error' : getLayerStatus(Boolean(debate?.judge_decision || planner))}
               narrative={buildL4Narrative(debate, planner)}
-              defaultOpen={Boolean(debate?.judge_decision)}
+              defaultOpen={debateFailed || Boolean(debate?.judge_decision)}
             >
               <L4Detail debate={debate} planner={planner} />
             </TimelineStep>
 
             <TimelineStep
+              label="S4"
+              title="确定性评分"
+              status={compositeFailed ? 'error' : getLayerStatus(Boolean(compositeVerdict))}
+              narrative={compositeFailed
+                ? `确定性评分失败：${String(compositeVerdict?.error || '目标或数据不一致')}`
+                : compositeVerdict
+                  ? '策略 4 与缠论证据已按冻结口径完成影子评分。'
+                  : '等待确定性评分结果。'}
+              defaultOpen={Boolean(compositeVerdict)}
+            >
+              <CompositeScoreDetail compositeVerdict={compositeVerdict} />
+            </TimelineStep>
+
+            <TimelineStep
               label="L5"
               title="风控闸门"
-              status={getLayerStatus(Boolean(riskPayload))}
+              status={riskFailed ? 'error' : getLayerStatus(Boolean(riskPayload))}
               narrative={buildL5Narrative(riskPayload)}
+              defaultOpen={riskFailed}
             >
               <L5Detail riskPayload={riskPayload} />
             </TimelineStep>
@@ -2620,6 +2679,19 @@ const AgentTracePage: React.FC = () => {
               status="pending"
               narrative="模拟盘托管尚未接入，后续将展示方案执行状态和偏离原因。"
             />
+
+            <TimelineStep
+              label="JEV"
+              title="Jev 独立复核"
+              status={jev.error || ['error', 'unavailable', 'interrupted'].includes(jev.review?.status || '') ? 'error'
+                : jev.review?.status === 'pending' ? 'active' : jev.review?.status === 'ok' ? 'done' : 'pending'}
+              narrative={jev.review?.status === 'pending' ? '原分析已完成，Jev 复核中。'
+                : jev.review?.comparison?.status === 'divergent' ? 'Jev 与原动作存在分歧。'
+                : undefined}
+              defaultOpen={Boolean(jev.review && !['disabled', 'skipped', 'not_recorded'].includes(jev.review.status))}
+            >
+              <JevTraceReview review={jev.review} detail error={jev.error} onRefresh={jev.refresh} />
+            </TimelineStep>
 
             <TimelineStep
               label="L8"
@@ -2657,18 +2729,43 @@ const AgentTracePage: React.FC = () => {
                     导出 MD
                   </Button>
                 </div>
+                {jev.review && !['disabled', 'skipped', 'not_recorded'].includes(jev.review.status) && (
+                  <div className="mb-5 border-y border-border py-4">
+                    <JevTraceReview review={jev.review} />
+                  </div>
+                )}
                 {result.error ? (
                   <div className="mb-3 rounded-lg bg-danger/10 p-3 text-sm text-danger">{result.error}</div>
                 ) : null}
+                {asRecord(result.report_quality)?.status === 'repaired' ? (
+                  <div className="mb-3 border-l-2 border-warning bg-warning/10 px-3 py-2 text-xs text-warning">
+                    主报告首次输出不完整，系统已自动修复并通过完整度校验。
+                  </div>
+                ) : null}
+                {asRecord(result.report_quality)?.status === 'fallback' ? (
+                  <div className="mb-3 border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+                    主报告自动修复仍未通过，当前展示确定性降级报告；价格计划评审会继续执行。
+                  </div>
+                ) : null}
+                {asRecord(result.report_quality)?.status === 'legacy_incomplete' ? (
+                  <div className="mb-3 border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+                    该历史主报告生成于完整度门禁上线前；失败 Debate 已只读隔离，请重跑分析以生成完整报告。
+                  </div>
+                ) : null}
+                {asRecord(asRecord(result.report_quality)?.read_time_consistency)?.status === 'inconsistent' ? (
+                  <div className="mb-3 border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+                    历史报告与工具证据不一致：基本面或消息面存在可用/部分可用工具结果，但报告曾写成完全缺失；请重跑分析。该诊断仅在读取时生成，不改写历史 artifact。
+                  </div>
+                ) : null}
                 <div className="max-h-[500px] overflow-auto rounded-lg border border-border bg-card p-5">
                   <div className={markdownProseClass}>
-                    <Markdown remarkPlugins={[remarkGfm]}>{splitReportContent(result.content).main}</Markdown>
+                    <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>{splitReportContent(result.content).main}</Markdown>
                   </div>
                 </div>
                 {splitReportContent(result.content).appendix ? (
                   <Collapsible title="附录：候选池来源、逐股维度证据与风控条件" defaultOpen={false}>
                     <div className={markdownProseClass}>
-                      <Markdown remarkPlugins={[remarkGfm]}>{splitReportContent(result.content).appendix}</Markdown>
+                    <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>{splitReportContent(result.content).appendix}</Markdown>
                     </div>
                   </Collapsible>
                 ) : null}
@@ -2695,6 +2792,7 @@ const L1Detail: React.FC<{
   stockSelection: Record<string, unknown> | null;
   traceStatus: TraceStatus;
 }> = ({ result, stockSelection, traceStatus }) => {
+  const dimensionEvidence = asRecord(result.dimension_evidence) || {};
   const selCtx = asRecord(stockSelection?.selection_context) || {};
   const stages = asRecord(selCtx.stages) || {};
   const finalReport = asRecord(stockSelection?.final_report_json) || {};
@@ -2706,6 +2804,9 @@ const L1Detail: React.FC<{
   const reportIntent = getTraceReportIntent(result);
   const isWatchlistScan = reportIntent === 'watchlist_scan' || Boolean(stockSelection);
   const intentResolution = getIntentResolution(result);
+  const targetResolution = getTargetResolution(result);
+  const targetResolutionStatus = String(targetResolution?.status || '');
+  const targetResolutionFailed = ['failed', 'ambiguous', 'unresolved'].includes(targetResolutionStatus);
   const classifierConfigured = intentResolution?.classifier_configured === true;
   const classifierSuccess = intentResolution?.classifier_success === true;
   const classifierError = typeof intentResolution?.classifier_error === 'string' ? intentResolution.classifier_error : '';
@@ -2745,6 +2846,18 @@ const L1Detail: React.FC<{
 
   return (
     <div className="space-y-4">
+      {!stockSelection && Object.keys(dimensionEvidence).length ? <SingleStockDimensionEvidence dimensionEvidence={dimensionEvidence} /> : null}
+      {targetResolution && !['not_applicable', 'not_requested'].includes(targetResolutionStatus) ? (
+        <div className={cn(
+          'border-l-2 px-3 py-2 text-xs',
+          targetResolutionFailed
+            ? 'border-danger bg-danger/10 text-danger'
+            : 'border-success bg-success/10 text-success',
+        )}>
+          目标解析：{targetResolutionFailed ? '失败' : String(targetResolution.symbol || '-')} · {String(targetResolution.source || '-')}
+          {targetResolution.error ? ` · ${String(targetResolution.error)}` : ''}
+        </div>
+      ) : null}
       <div className="rounded-lg border border-border bg-surface-2 p-4">
         <div className="flex flex-wrap items-center gap-2">
           <BrainCircuit className="h-4 w-4 text-muted-text" />
@@ -3307,6 +3420,63 @@ const L1Detail: React.FC<{
   );
 };
 
+const SingleStockDimensionEvidence: React.FC<{ dimensionEvidence: Record<string, unknown> }> = ({ dimensionEvidence }) => {
+  const labels: Record<string, string> = {
+    technical: '技术面',
+    capital: '资金面',
+    intel: '消息面',
+    fundamental: '基本面',
+  };
+  const entries = ['technical', 'capital', 'intel', 'fundamental'].map((key) => ({
+    key,
+    label: labels[key],
+    detail: asRecord(dimensionEvidence[key]) || {},
+    quality: asRecord(asRecord(dimensionEvidence[key])?.tool_evidence)
+      || asRecord(asRecord(dimensionEvidence[key])?.quality)
+      || asRecord(dimensionEvidence[key])
+      || {},
+  }));
+  const qualityLabel: Record<string, string> = {
+    ok: '可用',
+    partial: '部分可用',
+    unavailable: '缺失',
+  };
+  return (
+    <div className="rounded-lg border border-border bg-surface-2 p-4">
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <div>
+          <p className="text-label font-medium uppercase tracking-wider text-muted-text">单股四维证据覆盖</p>
+          <p className="mt-1 text-xs text-secondary-text">工具结果按维度汇总，避免前置技术工具挤掉后置消息面和基本面。</p>
+        </div>
+        <span className="text-xxs text-muted-text">证据事实，不等同于买入结论</span>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {entries.map((entry) => {
+          const quality = String(entry.quality.quality || 'unavailable');
+          const availableTools = toStringList(entry.quality.available_tools);
+          const partialTools = toStringList(entry.quality.partial_tools);
+          const failedTools = toStringList(entry.quality.failed_tools);
+          const missing = toStringList(entry.quality.missing_evidence);
+          const tone = quality === 'ok' ? 'border-success/40 bg-success/5' : quality === 'partial' ? 'border-warning/40 bg-warning/5' : 'border-danger/30 bg-danger/5';
+          return (
+            <div key={entry.key} className={cn('rounded-md border px-3 py-2.5', tone)}>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-foreground">{entry.label}</span>
+                <span className="text-xxs font-medium text-secondary-text">{qualityLabel[quality] || quality}</span>
+              </div>
+              <p className="mt-1 text-xxs leading-relaxed text-secondary-text">
+                已取证：{[...availableTools, ...partialTools].join('、') || '无'}
+              </p>
+              {failedTools.length ? <p className="mt-1 text-xxs leading-relaxed text-danger">失败：{failedTools.join('、')}</p> : null}
+              {missing.length ? <p className="mt-1 text-xxs leading-relaxed text-warning">缺口：{missing.join('、')}</p> : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 const L2Detail: React.FC<{
   toolCalls: AgentTraceToolCall[];
   selectedIndex: number;
@@ -3339,13 +3509,13 @@ const L2Detail: React.FC<{
       {/* Selected tool detail */}
       {selectedTool ? (
         <div className="rounded-lg border border-border p-4">
-          <div className="mb-3 flex items-center gap-3 text-xs">
-            <Wrench className="h-3.5 w-3.5 text-muted-text" />
-            <span className="font-medium text-foreground">{String(selectedTool.tool || '-')}</span>
+          <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
+            <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-text" />
+            <span className="min-w-0 break-all font-medium text-foreground">{String(selectedTool.tool || '-')}</span>
             <span className={cn('rounded-full px-2 py-0.5 text-xxs font-medium', selectedTool.success ? 'bg-success/10 text-success' : 'bg-danger/10 text-danger')}>
               {selectedTool.success ? 'OK' : 'FAIL'}
             </span>
-            <span className="ml-auto font-mono text-muted-text">step {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
+            <span className="ml-auto whitespace-nowrap font-mono text-muted-text">step {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
           </div>
           <JsonViewer data={(selectedTool.arguments || {}) as Record<string, unknown>} maxHeight="160px" />
           {preview ? (
@@ -3412,6 +3582,14 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
   const judge = asRecord(debate?.judge_decision) || {};
   const reasonPoints = toStringList(judge.reason_points);
 
+  if (debate?.enabled === true && debate?.success === false) {
+    return (
+      <div className="border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+        Debate 未形成有效裁决，结果未写入最终报告：{String(debate.error || '结构化输出不完整')}
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       {/* Planner intent */}
@@ -3468,8 +3646,298 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
   );
 };
 
+const CompositeScoreDetail: React.FC<{ compositeVerdict: Record<string, unknown> | null }> = ({ compositeVerdict }) => {
+  if (!compositeVerdict) {
+    return <p className="text-xs text-muted-text">单股确定性评分尚未生成。</p>;
+  }
+  if (compositeVerdict.status === 'failed') {
+    return (
+      <div className="rounded-md bg-danger/10 px-3 py-2 text-xs text-danger">
+        确定性评分失败：{String(compositeVerdict.error || 'unknown error')}
+      </div>
+    );
+  }
+
+  const verdict = asRecord(compositeVerdict.composite_verdict) || {};
+  const snapshot = asRecord(compositeVerdict.snapshot) || {};
+  const metadata = asRecord(snapshot.metadata) || {};
+  const components = asRecord(verdict.components) || {};
+  const s4 = asRecord(components.s4) || {};
+  const chan = asRecord(components.chan) || {};
+  const s4Snapshot = asRecord(snapshot.s4) || {};
+  const chanSnapshot = asRecord(snapshot.chan) || {};
+  const missing = toStringList(verdict.missing_features || s4.missing_features || s4Snapshot.missing_features);
+  const score = toFiniteNumber(verdict.score);
+  const scaleMax = toFiniteNumber(verdict.scale_max) || 20;
+  const dailyBars = toFiniteNumber(metadata.daily_bar_count);
+  const dailyRequired = toFiniteNumber(metadata.daily_lookback_bars);
+  const weeklyBars = toFiniteNumber(metadata.weekly_bar_count);
+  const weeklyRequired = toFiniteNumber(metadata.weekly_min_bars_required);
+  const s4Score = toFiniteNumber(s4.score);
+  const provisionalScore = toFiniteNumber(verdict.provisional_score);
+  const s4ProvisionalScore = toFiniteNumber(s4.provisional_score);
+  const chanScore = toFiniteNumber(chan.score);
+  const formalizationReasonCodes = toStringList(verdict.formalization_reason_codes);
+  const qualityWarningCodes = toStringList(verdict.quality_warning_codes);
+  const regionPass = typeof s4Snapshot.region_pass === 'boolean' ? s4Snapshot.region_pass : null;
+  const resonanceCount = toFiniteNumber(s4Snapshot.resonance_count);
+  const volumeRatio = toFiniteNumber(s4Snapshot.volume_ratio_5d);
+  const volatilityPct = toFiniteNumber(s4Snapshot.volatility_pct);
+  const gain10dPct = toFiniteNumber(s4Snapshot.gain_10d_pct);
+  const goldenCross = typeof s4Snapshot.golden_cross_today === 'boolean' ? s4Snapshot.golden_cross_today : null;
+  const allOk = typeof s4Snapshot.all_ok === 'boolean' ? s4Snapshot.all_ok : null;
+  const weeklyProvisional = s4Snapshot.weekly_provisional === true;
+  const triggeredChanSignals = toRecordList(chanSnapshot.signals).filter((signal) => signal.triggered === true);
+  const strategyMetrics = [
+    {
+      label: '区域条件',
+      value: regionPass == null ? '-' : regionPass ? '通过' : '未通过',
+      state: regionPass == null ? 'missing' : regionPass ? 'pass' : 'fail',
+      reason: regionPass == null
+        ? '数据缺失：无法判断强势区域'
+        : regionPass
+          ? '通过：满足强势区域条件'
+          : '未通过：未满足强势区域条件',
+    },
+    {
+      label: '多周期共振',
+      value: resonanceCount == null ? '-' : `${Math.round(resonanceCount)} / 4`,
+      state: resonanceCount == null ? 'missing' : resonanceCount >= 3 ? 'pass' : 'fail',
+      reason: resonanceCount == null
+        ? '数据缺失：无法统计共振项'
+        : resonanceCount >= 3
+          ? `通过：需要至少 3 项，当前 ${Math.round(resonanceCount)} 项`
+          : `未通过：需要至少 3 项，当前 ${Math.round(resonanceCount)} 项`,
+    },
+    {
+      label: '量比',
+      value: volumeRatio == null ? '-' : volumeRatio.toFixed(2),
+      state: volumeRatio == null ? 'missing' : volumeRatio >= 1.2 ? 'pass' : 'fail',
+      reason: volumeRatio == null
+        ? '数据缺失：无法计算 5 日量比'
+        : volumeRatio >= 1.2
+          ? `通过：要求至少 1.20，当前 ${volumeRatio.toFixed(2)}`
+          : `未通过：要求至少 1.20，当前 ${volumeRatio.toFixed(2)}`,
+    },
+    {
+      label: '波动率',
+      value: volatilityPct == null ? '-' : `${volatilityPct.toFixed(2)}%`,
+      state: volatilityPct == null ? 'missing' : volatilityPct <= 6 ? 'pass' : 'fail',
+      reason: volatilityPct == null
+        ? '数据缺失：无法计算波动率'
+        : volatilityPct <= 6
+          ? `通过：要求不高于 6.00%，当前 ${volatilityPct.toFixed(2)}%`
+          : `未通过：要求不高于 6.00%，当前 ${volatilityPct.toFixed(2)}%`,
+    },
+    {
+      label: '近 10 日涨幅',
+      value: gain10dPct == null ? '-' : `${gain10dPct.toFixed(2)}%`,
+      state: gain10dPct == null ? 'missing' : gain10dPct <= 9 ? 'pass' : 'fail',
+      reason: gain10dPct == null
+        ? '数据缺失：无法计算近 10 日涨幅'
+        : gain10dPct <= 9
+          ? `通过：要求不高于 9.00%，当前 ${gain10dPct.toFixed(2)}%`
+          : `未通过：要求不高于 9.00%，当前 ${gain10dPct.toFixed(2)}%`,
+    },
+    {
+      label: '金叉 / all_ok',
+      value: `${goldenCross == null ? '-' : goldenCross ? '是' : '否'} / ${allOk == null ? '-' : allOk ? '是' : '否'}`,
+      state: goldenCross == null || allOk == null ? 'missing' : goldenCross && allOk ? 'pass' : 'fail',
+      reason: goldenCross == null || allOk == null
+        ? '数据缺失：金叉或 all_ok 状态不完整'
+        : goldenCross && allOk
+          ? '通过：今日金叉且 all_ok=是'
+          : !goldenCross
+            ? `未通过：今日未金叉，all_ok=${allOk ? '是' : '否'}`
+            : '未通过：已金叉但 all_ok=否',
+    },
+  ];
+  const chanLabels: Record<string, string> = {
+    first_buy: '一买',
+    second_buy: '二买',
+    third_buy: '三买',
+    first_sell: '一卖',
+    second_sell: '二卖',
+    third_sell: '三卖',
+    bottom_exhaustion: '底部钝化',
+    weekly_confirmation: '周线确认',
+    top_divergence: '顶部背驰',
+    top_exhaustion: '顶部钝化',
+  };
+  const chanPoints: Record<string, number> = {
+    first_buy: 5,
+    second_buy: 4,
+    third_buy: 2,
+    bottom_exhaustion: 2,
+    weekly_confirmation: 1,
+    top_divergence: -3,
+    top_exhaustion: -2,
+  };
+  const chanExitOnlySignals = new Set([
+    'top_fractal',
+    'volume_stall',
+    'line_convergence',
+    'overbought',
+    'chan_top_divergence_confirmed',
+    'first_sell',
+    'second_sell',
+    'third_sell',
+  ]);
+  const chanReasons = triggeredChanSignals.map((signal) => {
+    const name = String(signal.name || 'unknown');
+    const label = chanLabels[name] || name;
+    const metrics = asRecord(signal.metrics) || {};
+    if (metrics.provisional === true) {
+      return { label, state: 'missing', reason: `暂不计分：${label}尚未收盘` };
+    }
+    const points = chanPoints[name];
+    if (typeof points === 'number') {
+      return {
+        label,
+        state: points > 0 ? 'pass' : 'fail',
+        reason: points > 0
+          ? `已计分：${label} +${points} 分`
+          : `已扣分：${label} ${points} 分，组件最低为 0 分`,
+      };
+    }
+    if (chanExitOnlySignals.has(name)) {
+      return { label, state: 'fail', reason: `未计入买入分：${label}仅作为退出风险提示` };
+    }
+    return { label, state: 'missing', reason: `证据已记录：${label}不属于当前买入加分项` };
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-label font-semibold uppercase tracking-wider text-muted-text">确定性综合评分</p>
+          <p className="mt-1 text-xs text-secondary-text">
+            {String(verdict.symbol || snapshot.symbol || '-')} · as of {String(verdict.as_of || snapshot.as_of || '-')}
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-2xl font-semibold text-foreground">
+            {score == null ? (provisionalScore == null ? '-' : provisionalScore) : score}<span className="text-sm font-normal text-muted-text"> / {scaleMax}</span>
+          </p>
+          <p className="text-xs text-muted-text">
+            {score == null && provisionalScore != null ? '临时评分，暂不可正式评估' : compositeStatusLabel(verdict.verdict_status)}
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">策略 4</p>
+          <p className="mt-1 text-lg font-semibold text-foreground">{s4Score == null ? (s4ProvisionalScore == null ? '-' : s4ProvisionalScore) : s4Score}<span className="text-xs font-normal text-muted-text"> / 10</span></p>
+          <p className="text-xs text-secondary-text">{s4Score == null && s4ProvisionalScore != null ? '临时评分' : compositeStatusLabel(s4.status)}</p>
+        </div>
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">缠论证据</p>
+          <p className="mt-1 text-lg font-semibold text-foreground">{chanScore == null ? '-' : chanScore}<span className="text-xs font-normal text-muted-text"> / 10</span></p>
+          <p className="text-xs text-secondary-text">{compositeStatusLabel(chan.status)}</p>
+        </div>
+        <div className="rounded-lg bg-surface-2 p-3">
+          <p className="text-xxs uppercase tracking-wider text-muted-text">规则版本</p>
+          <p className="mt-1 font-mono text-sm font-semibold text-foreground">{String(verdict.strategy4_rule_version || compositeVerdict.schema_version || '-')}</p>
+          <p className="text-xs text-secondary-text">影子模式</p>
+        </div>
+      </div>
+
+      <div className="grid gap-2 text-xs text-secondary-text sm:grid-cols-2">
+        <div className="rounded-md border border-border px-3 py-2">
+          日线历史：{dailyBars == null ? '-' : Math.round(dailyBars)} / {dailyRequired == null ? '-' : Math.round(dailyRequired)} 根
+        </div>
+        <div className="rounded-md border border-border px-3 py-2">
+          周线历史：{weeklyBars == null ? '-' : Math.round(weeklyBars)} / {weeklyRequired == null ? '-' : Math.round(weeklyRequired)} 根
+        </div>
+      </div>
+
+      <div className="border-y border-border">
+        <div className="grid sm:grid-cols-2">
+          {strategyMetrics.map((metric) => (
+            <div key={metric.label} className="border-b border-border px-3 py-3 sm:[&:nth-last-child(-n+2)]:border-b-0">
+              <p className="text-xxs text-muted-text">{metric.label}</p>
+              <p className="mt-0.5 text-sm font-medium text-foreground">{metric.value}</p>
+              <p className={cn(
+                'mt-1 text-xxs leading-relaxed',
+                metric.state === 'pass' ? 'text-success' : metric.state === 'fail' ? 'text-danger' : 'text-warning',
+              )}>
+                {metric.reason}
+              </p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="mb-2 text-xxs font-medium uppercase tracking-wider text-muted-text">缠论计分说明</p>
+        <div className="space-y-1.5">
+          {chanReasons.length ? chanReasons.map((item, index) => (
+            <div key={`${item.label}-${index}`} className="flex items-start gap-2 border-b border-border py-2 last:border-b-0">
+              <span className={cn(
+                'mt-1 h-1.5 w-1.5 shrink-0 rounded-full',
+                item.state === 'pass' ? 'bg-success' : item.state === 'fail' ? 'bg-danger' : 'bg-warning',
+              )} />
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-foreground">{item.label}</p>
+                <p className="text-xxs leading-relaxed text-secondary-text">{item.reason}</p>
+              </div>
+            </div>
+          )) : (
+            <p className="text-xs text-muted-text">未触发可计分的缠论买点，当前买入分为 0。</p>
+          )}
+        </div>
+      </div>
+
+      {weeklyProvisional ? (
+        <div className="border-l-2 border-warning bg-warning/10 px-3 py-2 text-xs text-warning">
+          本周周线尚未收盘，Strategy 4 当前只显示临时分；日线指标和已确认的缠论信号仍然有效。
+        </div>
+      ) : null}
+
+      {formalizationReasonCodes.length ? (
+        <div className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
+          <p className="font-medium">正式评分暂未形成</p>
+          <ul className="mt-1 space-y-1">
+            {formalizationReasonCodes.map((code) => (
+              <li key={code}>
+                {code === 'S4_WEEKLY_BAR_UNCONFIRMED'
+                  ? 'Strategy 4 依赖的本周周线尚未确认，收盘后可转为正式分。'
+                  : code === 'S4_FEATURES_INCOMPLETE'
+                    ? 'Strategy 4 必需指标不完整。'
+                    : code === 'S4_NOT_IMPLEMENTED'
+                      ? 'Strategy 4 指标尚未实现。'
+                      : code === 'CHAN_EVIDENCE_INSUFFICIENT'
+                        ? '缠论结构证据不足，当前不能计分。'
+                        : code}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {qualityWarningCodes.some((code) => code.startsWith('BACKTEST_')) ? (
+        <p className="text-xs text-muted-text">回测状态仅用于评分后的历史校准，不决定当前分数能否计算。</p>
+      ) : null}
+
+      {missing.length ? (
+        <div className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
+          缺失或未满足：{missing.join('、')}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ riskPayload }) => {
   if (!riskPayload) return <p className="text-xs text-muted-text">尚未生成风控结果。</p>;
+  if (riskPayload.status === 'failed') {
+    return (
+      <div className="border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+        {String(riskPayload.error || '风险门目标或数据不一致，结果已拒绝使用。')}
+      </div>
+    );
+  }
   const gate = asRecord(riskPayload.risk_gate) || {};
   const checks = toRecordList(gate.checks);
   const blockedReasons = toStringList(gate.blocked_reasons);
@@ -3635,6 +4103,9 @@ function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<
 }
 
 function buildL4Narrative(debate: Record<string, unknown> | null, planner: Record<string, unknown> | null): string {
+  if (debate?.enabled === true && debate?.success === false) {
+    return `Debate 失败，未形成有效裁决：${String(debate.error || '结构化输出不完整')}`;
+  }
   const judge = asRecord(debate?.judge_decision);
   if (judge?.final_action) {
     return `Judge 裁决：${String(judge.final_action)}。${String(judge.decision_summary || '')}`;
@@ -3647,6 +4118,9 @@ function buildL4Narrative(debate: Record<string, unknown> | null, planner: Recor
 
 function buildL5Narrative(riskPayload: Record<string, unknown> | null): string {
   if (!riskPayload) return '等待风控闸门校验。';
+  if (riskPayload.status === 'failed') {
+    return `风控闸门失败：${String(riskPayload.error || '目标或数据不一致')}`;
+  }
   const gate = asRecord(riskPayload.risk_gate) || {};
   const status = String(gate.status || '-');
   const original = String(gate.original_action || '-');

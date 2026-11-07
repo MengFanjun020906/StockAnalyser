@@ -778,6 +778,27 @@ class Config:
     graphiti_outbox_job_timeout_seconds: int = 120
     graphiti_selection_search_timeout_seconds: float = 12.0
 
+    # === Jev daily shadow evaluations ===
+    jev_enabled: bool = False
+    jev_api_key: str = field(default="", repr=False)
+    jev_base_url: str = "https://api.typesafe.ai/v1"
+    jev_model: str = "jev-latest"
+    jev_timeout_seconds: float = 15.0
+
+    # === Kronos K线形态配置 ===
+    kronos_enabled: bool = False
+    kronos_repo_path: str = "Kronos"
+    kronos_tokenizer_path: str = "NeoQuasar/Kronos-Tokenizer-base"
+    kronos_model_path: str = "NeoQuasar/Kronos-small"
+    kronos_device: str = "auto"
+    kronos_max_context: int = 512
+    kronos_default_lookback_daily: int = 240
+    kronos_default_pred_len_daily: int = 10
+    kronos_sample_count: int = 1
+    kronos_top_p: float = 0.9
+    kronos_temperature: float = 1.0
+    kronos_cache_signals: bool = False
+
     # === Agent 模式配置 ===
     agent_litellm_model: str = ""  # Optional Agent-only primary model; empty inherits LITELLM_MODEL
     agent_mode: bool = False
@@ -790,7 +811,7 @@ class Config:
     agent_arch: str = "single"     # Agent architecture: 'single' (legacy) or 'multi' (orchestrator)
     agent_orchestration_mode: str = "legacy"  # Watchlist orchestration: legacy | expert_graph
     agent_candidate_discovery_mode: str = "thesis_desk_committee"  # Watchlist candidate discovery: thesis_desk_committee only during P4 tuning
-    agent_orchestrator_mode: str = "standard"  # Orchestrator mode: quick/standard/full/specialist
+    agent_orchestrator_mode: str = "standard"  # quick or four-dimension standard/full/specialist pipeline
     agent_orchestrator_timeout_s: int = 600  # Cooperative timeout budget for the whole multi-agent pipeline
     agent_tool_call_timeout_seconds: float = 30.0  # Max seconds for one Agent tool batch before degrading
     agent_candidate_expert_timeout_seconds: float = 300.0  # Max seconds for one L1 candidate expert seed packet in development traces
@@ -798,6 +819,8 @@ class Config:
     agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
     agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
     agent_veto_gate_enabled: bool = True  # Enable shared bearish red-line veto gate (thesis_desk_committee); default only hard_risk_flags trigger
+    agent_deterministic_price_plan_enabled: bool = True  # Deterministic price plan is the only source of entry/stop/target prices
+    agent_price_plan_disabled_anchor_families: List[str] = field(default_factory=list)
     agent_veto_violent_outflow_threshold: Optional[float] = None  # Net-outflow % to flag capital_violent_outflow; None disables (never triggers)
     agent_veto_breakdown_accel_threshold: Optional[float] = None  # 5-day drop % to flag breakdown_accelerating; None disables (never triggers)
     agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
@@ -957,6 +980,7 @@ class Config:
     
     # === 定时任务配置 ===
     schedule_enabled: bool = False            # 是否启用定时任务
+    position_watch_enabled: bool = True       # 定时进程内启用持仓信号扫描
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
@@ -1075,6 +1099,7 @@ class Config:
             "STOCK_LIST",
             "RUN_IMMEDIATELY",
             "SCHEDULE_ENABLED",
+            "POSITION_WATCH_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_RUN_IMMEDIATELY",
         }
@@ -1705,6 +1730,68 @@ class Config:
                 minimum=1.0,
                 maximum=60.0,
             ),
+            jev_enabled=parse_env_bool(os.getenv('JEV_ENABLED'), False),
+            jev_api_key=(os.getenv('JEV_API_KEY') or os.getenv('TYPESAFE_API_KEY') or os.getenv('TYPESAFE_AI_API_KEY') or '').strip(),
+            jev_base_url=os.getenv('JEV_BASE_URL', 'https://api.typesafe.ai/v1').strip().rstrip('/'),
+            jev_model=os.getenv('JEV_MODEL', 'jev-latest').strip() or 'jev-latest',
+            jev_timeout_seconds=parse_env_float(
+                os.getenv('JEV_TIMEOUT_SECONDS'), 15.0,
+                field_name='JEV_TIMEOUT_SECONDS', minimum=1.0, maximum=60.0,
+            ),
+            kronos_enabled=parse_env_bool(os.getenv('KRONOS_ENABLED'), False),
+            kronos_repo_path=os.getenv('KRONOS_REPO_PATH', 'Kronos').strip() or 'Kronos',
+            kronos_tokenizer_path=(
+                os.getenv('KRONOS_TOKENIZER_PATH', 'NeoQuasar/Kronos-Tokenizer-base').strip()
+                or 'NeoQuasar/Kronos-Tokenizer-base'
+            ),
+            kronos_model_path=(
+                os.getenv('KRONOS_MODEL_PATH', 'NeoQuasar/Kronos-small').strip()
+                or 'NeoQuasar/Kronos-small'
+            ),
+            kronos_device=os.getenv('KRONOS_DEVICE', 'auto').strip() or 'auto',
+            kronos_max_context=parse_env_int(
+                os.getenv('KRONOS_MAX_CONTEXT'),
+                512,
+                field_name='KRONOS_MAX_CONTEXT',
+                minimum=64,
+                maximum=2048,
+            ),
+            kronos_default_lookback_daily=parse_env_int(
+                os.getenv('KRONOS_DEFAULT_LOOKBACK_DAILY'),
+                240,
+                field_name='KRONOS_DEFAULT_LOOKBACK_DAILY',
+                minimum=30,
+                maximum=2048,
+            ),
+            kronos_default_pred_len_daily=parse_env_int(
+                os.getenv('KRONOS_DEFAULT_PRED_LEN_DAILY'),
+                10,
+                field_name='KRONOS_DEFAULT_PRED_LEN_DAILY',
+                minimum=1,
+                maximum=60,
+            ),
+            kronos_sample_count=parse_env_int(
+                os.getenv('KRONOS_SAMPLE_COUNT'),
+                1,
+                field_name='KRONOS_SAMPLE_COUNT',
+                minimum=1,
+                maximum=32,
+            ),
+            kronos_top_p=parse_env_float(
+                os.getenv('KRONOS_TOP_P'),
+                0.9,
+                field_name='KRONOS_TOP_P',
+                minimum=0.01,
+                maximum=1.0,
+            ),
+            kronos_temperature=parse_env_float(
+                os.getenv('KRONOS_TEMPERATURE'),
+                1.0,
+                field_name='KRONOS_TEMPERATURE',
+                minimum=0.01,
+                maximum=5.0,
+            ),
+            kronos_cache_signals=parse_env_bool(os.getenv('KRONOS_CACHE_SIGNALS'), False),
             agent_litellm_model=agent_litellm_model,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
@@ -1762,6 +1849,15 @@ class Config:
                 os.getenv('AGENT_VETO_GATE_ENABLED'),
                 True,
             ),
+            agent_deterministic_price_plan_enabled=parse_env_bool(
+                os.getenv('AGENT_DETERMINISTIC_PRICE_PLAN_ENABLED'),
+                True,
+            ),
+            agent_price_plan_disabled_anchor_families=[
+                family.strip()
+                for family in os.getenv('AGENT_PRICE_PLAN_DISABLED_ANCHOR_FAMILIES', '').split(',')
+                if family.strip()
+            ],
             agent_veto_violent_outflow_threshold=parse_env_optional_float(
                 os.getenv('AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD'),
                 field_name='AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD',
@@ -1975,6 +2071,11 @@ class Config:
             schedule_enabled=cls._resolve_env_value(
                 'SCHEDULE_ENABLED',
                 default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            position_watch_enabled=cls._resolve_env_value(
+                'POSITION_WATCH_ENABLED',
+                default='true',
                 prefer_env_file=True,
             ).lower() == 'true',
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',

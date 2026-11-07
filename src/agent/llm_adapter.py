@@ -103,6 +103,7 @@ class LLMResponse:
     provider: str = ""                     # which provider handled this call
     model: str = ""                        # full model name used (e.g. gemini/gemini-2.0-flash), for report meta
     raw: Any = None                        # raw provider response for debugging
+    finish_reason: Optional[str] = None     # stop/length/content_filter/provider-specific
 
 
 # Models that auto-return reasoning_content; do NOT send extra_body (may cause 400).
@@ -338,6 +339,7 @@ class LLMToolAdapter:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
         response_format: Optional[dict] = None,
+        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Send a text-only completion through the shared routing stack."""
         return self.call_completion(
@@ -348,6 +350,7 @@ class LLMToolAdapter:
             max_tokens=max_tokens,
             timeout=timeout,
             response_format=response_format,
+            disable_thinking=disable_thinking,
         )
 
     def call_completion(
@@ -360,6 +363,7 @@ class LLMToolAdapter:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
         response_format: Optional[dict] = None,
+        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
@@ -398,6 +402,7 @@ class LLMToolAdapter:
                     max_tokens=max_tokens,
                     timeout=model_timeout,
                     response_format=response_format,
+                    disable_thinking=disable_thinking,
                 )
                 record_llm_telemetry(
                     model=response.model or model,
@@ -406,6 +411,7 @@ class LLMToolAdapter:
                     latency_ms=(time.time() - call_started) * 1000,
                     tool_calls=len(response.tool_calls or []),
                     ok=True,
+                    finish_reason=response.finish_reason,
                 )
                 return response
             except Exception as e:
@@ -462,6 +468,7 @@ class LLMToolAdapter:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
         response_format: Optional[dict] = None,
+        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Call one model and enforce timeout around LiteLLM retries too.
 
@@ -479,6 +486,7 @@ class LLMToolAdapter:
                 max_tokens=max_tokens,
                 timeout=timeout,
                 response_format=response_format,
+                disable_thinking=disable_thinking,
             )
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -491,6 +499,7 @@ class LLMToolAdapter:
             max_tokens=max_tokens,
             timeout=timeout,
             response_format=response_format,
+            disable_thinking=disable_thinking,
         )
         try:
             response = future.result(timeout=max(0.1, float(timeout)))
@@ -517,13 +526,23 @@ class LLMToolAdapter:
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
         response_format: Optional[dict] = None,
+        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Call a specific litellm model with OpenAI-format messages and tools."""
         openai_messages = self._convert_messages(messages)
 
         # Use short model name (without provider prefix) for thinking model lookup
         model_short = model.split("/")[-1] if "/" in model else model
-        extra = get_thinking_extra_body(model_short)
+        supports_thinking_control = (
+            self._get_model_provider(model).lower() == "deepseek"
+            or "deepseek" in model_short.lower()
+            or model_short.lower().startswith("glm-")
+        )
+        extra = (
+            {"thinking": {"type": "disabled"}}
+            if disable_thinking and supports_thinking_control
+            else get_thinking_extra_body(model_short)
+        )
 
         call_kwargs: Dict[str, Any] = {
             "model": model,
@@ -729,4 +748,5 @@ class LLMToolAdapter:
             provider=provider_name,
             model=model,
             raw=response,
+            finish_reason=str(getattr(choice, "finish_reason", "") or "") or None,
         )

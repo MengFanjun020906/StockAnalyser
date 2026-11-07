@@ -9,6 +9,7 @@ Fixes #1066 – eliminates 45+ redundant HTTP requests per stock in Agent mode.
 from __future__ import annotations
 
 import contextvars
+from contextlib import contextmanager
 import logging
 import os
 import sqlite3
@@ -18,6 +19,13 @@ from threading import Lock
 from typing import Any, List, Optional, Tuple
 
 import pandas as pd
+
+from src.services.sequoia_price_rebaser import (
+    OHLC_COLUMNS,
+    rebase_ohlc_value_for_date,
+    resolve_amount_volume_cash_price_rebase,
+    resolve_sequoia_cash_price_rebase,
+)
 
 logger = logging.getLogger(__name__)
 _CACHE_MIN_RECORDS = 30
@@ -30,6 +38,26 @@ _CACHE_STALE_GRACE_DAYS = 4
 _frozen_target_date: contextvars.ContextVar[Optional[date]] = contextvars.ContextVar(
     "_frozen_target_date", default=None,
 )
+_captured_history: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("captured_history", default=None)
+
+
+@contextmanager
+def capture_history_reads(*, enabled: bool = True):
+    """Retain the daily inputs actually read by one Trace and its copied contexts."""
+    snapshots = {}
+    token = _captured_history.set(snapshots if enabled else None)
+    try:
+        yield snapshots
+    finally:
+        _captured_history.reset(token)
+
+
+def _observed_history(stock_code: str, frame: pd.DataFrame, source: str):
+    snapshots = _captured_history.get()
+    if snapshots is not None:
+        _, symbol = _history_code_candidates(stock_code)
+        snapshots[symbol] = (frame.tail(90).copy(deep=True), source)
+    return frame, source
 
 
 def set_frozen_target_date(d: date) -> contextvars.Token:
@@ -179,7 +207,7 @@ def _load_sequoia_history_df(stock_code: str, start: date, end: date) -> Optiona
         return None
     if not rows:
         return None
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         [
             {
                 "code": stock_code,
@@ -195,6 +223,38 @@ def _load_sequoia_history_df(stock_code: str, start: date, end: date) -> Optiona
             for row in rows
         ]
     )
+    rebase = resolve_sequoia_cash_price_rebase(stock_code, frame.to_dict("records"))
+    if rebase.adjusted:
+        frame = _apply_ohlc_rebase(frame, rebase)
+    return frame
+
+
+def _apply_ohlc_rebase(frame: pd.DataFrame, rebase: Any) -> pd.DataFrame:
+    if not getattr(rebase, "adjusted", False):
+        return frame
+    adjusted = frame.copy()
+    for column in OHLC_COLUMNS:
+        if column not in adjusted.columns:
+            continue
+        adjusted[column] = [
+            rebase_ohlc_value_for_date(value, date_value, rebase)
+            for value, date_value in zip(adjusted[column], adjusted["date"])
+        ]
+    adjusted["price_adjustment_factor"] = rebase.factor
+    adjusted["price_adjustment_basis"] = rebase.basis
+    return adjusted
+
+
+def _normalize_db_cache_price_scale(frame: pd.DataFrame) -> pd.DataFrame:
+    rebase = resolve_amount_volume_cash_price_rebase(
+        frame.to_dict("records"),
+        adjusted_basis="db_amount_volume_vwap",
+        already_cash_basis="db_amount_volume_already_cash_scale",
+        unstable_basis="db_amount_volume_unstable_ratio",
+    )
+    if rebase is None or not rebase.adjusted:
+        return frame
+    return _apply_ohlc_rebase(frame, rebase)
 
 
 def _effective_cache_end(stock_code: str, end: date) -> date:
@@ -217,9 +277,17 @@ def _effective_cache_end(stock_code: str, end: date) -> date:
         return end
 
 
-def _cache_latest_is_fresh(latest_date: date, effective_end: date, natural_end: date) -> bool:
+def _cache_latest_is_fresh(
+    latest_date: date,
+    effective_end: date,
+    natural_end: date,
+    *,
+    require_target_date: bool = False,
+) -> bool:
     """Accept latest completed trading data, with a small holiday fail-open grace."""
     if latest_date == date.min:
+        return False
+    if require_target_date and latest_date < effective_end:
         return False
     if latest_date >= effective_end:
         return True
@@ -232,11 +300,17 @@ def load_history_df(
     days: int = 60,
     target_date: Optional[date] = None,
     fallback_to_network: bool = True,
+    minimum_records: Optional[int] = None,
+    require_target_date: bool = False,
 ) -> Tuple[Optional[pd.DataFrame], str]:
     """Load K-line history, DB first with DataFetcherManager fallback.
 
+    ``minimum_records`` lets callers with a strict feature contract reject a
+    short cache and continue to the provider fallback. The default preserves
+    the historical cache behavior used by general analysis tools.
+
     Returns ``(df, source)`` where *source* is ``"db_cache"`` on DB hit or the
-    actual provider name on network fallback.  Returns ``(None, "db_cache_miss")``
+    actual provider name on network fallback. Returns ``(None, "db_cache_miss")``
     when network fallback is disabled and cache misses, or ``(None, "none")``
     when both paths fail.
     """
@@ -256,32 +330,55 @@ def load_history_df(
     try:
         db = get_db()
         _code, bars = _select_best_bars(db, stock_code, start, end)
-        required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
+        required_records = max(
+            min(days, minimum_records if minimum_records is not None else _CACHE_MIN_RECORDS),
+            1,
+        )
         latest_date = max((_bar_date(bar) for bar in bars), default=date.min)
         effective_end = _effective_cache_end(stock_code, end)
-        if bars and _cache_latest_is_fresh(latest_date, effective_end, end) and len(bars) >= required_records:
-            df = pd.DataFrame([b.to_dict() for b in bars])
+        if (
+            bars
+            and _cache_latest_is_fresh(
+                latest_date,
+                effective_end,
+                end,
+                require_target_date=require_target_date,
+            )
+            and len(bars) >= required_records
+        ):
+            df = _normalize_db_cache_price_scale(pd.DataFrame([b.to_dict() for b in bars]))
             logger.debug(
                 "load_history_df(%s): %d bars from DB (requested %d, latest=%s, effective_end=%s)",
                 stock_code, len(df), days, latest_date, effective_end,
             )
-            return df, "db_cache"
+            return _observed_history(stock_code, df, "db_cache")
     except Exception as e:
         logger.debug("load_history_df(%s): DB read failed: %s", stock_code, e)
 
     # --- 1b. Local Sequoia stock_daily fallback ---------------------------
     try:
-        required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
+        required_records = max(
+            min(days, minimum_records if minimum_records is not None else _CACHE_MIN_RECORDS),
+            1,
+        )
         df = _load_sequoia_history_df(stock_code, start, end)
         if df is not None and not df.empty:
             latest_date = max((_coerce_bar_date(value) for value in df["date"]), default=date.min)
             effective_end = _effective_cache_end(stock_code, end)
-            if _cache_latest_is_fresh(latest_date, effective_end, end) and len(df) >= required_records:
+            if (
+                _cache_latest_is_fresh(
+                    latest_date,
+                    effective_end,
+                    end,
+                    require_target_date=require_target_date,
+                )
+                and len(df) >= required_records
+            ):
                 logger.debug(
                     "load_history_df(%s): %d bars from Sequoia DB (requested %d, latest=%s, effective_end=%s)",
                     stock_code, len(df), days, latest_date, effective_end,
                 )
-                return df, "sequoia_stock_daily"
+                return _observed_history(stock_code, df, "sequoia_stock_daily")
     except Exception as e:
         logger.debug("load_history_df(%s): Sequoia fallback failed: %s", stock_code, e)
 
@@ -293,8 +390,54 @@ def load_history_df(
         manager = _get_fetcher_manager()
         df, source = manager.get_daily_data(stock_code, days=days)
         if df is not None and not df.empty:
-            return df, source
+            return _observed_history(stock_code, df, source)
     except Exception as e:
         logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
 
     return None, "none"
+
+
+def refresh_history_tail(
+    stock_code: str,
+    *,
+    days: int = 520,
+    target_date: Optional[date] = None,
+    persist: bool = True,
+) -> Tuple[Optional[pd.DataFrame], str, int]:
+    """Fetch a recent provider window and optionally upsert it into ``stock_daily``.
+
+    This helper intentionally fetches only the recent tail. Callers that render
+    full history must keep the earliest local database row as their start point.
+    """
+    end = target_date or get_frozen_target_date() or date.today()
+    manager = _get_fetcher_manager()
+    try:
+        frame, source = manager.get_daily_data(stock_code, days=max(1, int(days)))
+    except Exception as exc:
+        logger.warning("refresh_history_tail(%s): provider fetch failed: %s", stock_code, exc)
+        return None, "none", 0
+    if frame is None or frame.empty:
+        return None, source or "none", 0
+
+    normalized = frame.copy()
+    if "date" not in normalized.columns:
+        normalized = normalized.reset_index()
+        if "date" not in normalized.columns:
+            normalized = normalized.rename(columns={normalized.columns[0]: "date"})
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce")
+    normalized = normalized.dropna(subset=["date"])
+    normalized = normalized[normalized["date"].dt.date <= end]
+    normalized = normalized.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    if normalized.empty or not persist:
+        return normalized, source or "network", 0
+
+    try:
+        from data_provider.base import canonical_stock_code, normalize_stock_code
+        from src.storage import get_db
+
+        code = canonical_stock_code(normalize_stock_code(stock_code)) or str(stock_code).strip()
+        saved = get_db().save_daily_data(normalized, code=code, data_source=source or "network")
+        return normalized, source or "network", int(saved or 0)
+    except Exception as exc:
+        logger.warning("refresh_history_tail(%s): DB upsert failed: %s", stock_code, exc)
+        return normalized, source or "network", 0

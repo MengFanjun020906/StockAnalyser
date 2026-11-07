@@ -852,6 +852,72 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.assertEqual(chart["bars"][1]["source"], "sequoia_stock_daily:600403")
         self.assertAlmostEqual(chart["bars"][1]["close"], 11.3)
 
+    def test_chart_data_rebases_sequoia_hfq_prices_to_cash_prices(self) -> None:
+        seed_date = date(2026, 6, 7)
+        factor = 7.669257
+        payload = {
+            "status": "ok",
+            "market": "cn",
+            "seed_pool_summary": {
+                "seed_count": 1,
+                "preview": [{"code": "600519", "name": "贵州茅台", "source": "daily_screener"}],
+            },
+        }
+        SeedPoolQualityService().persist_candidate_discovery_snapshot(
+            candidate_discovery=payload,
+            run_id="run-sequoia-hfq-bars",
+            trace_id="trace-sequoia-hfq-bars",
+            seed_date=seed_date,
+            generated_at=datetime(2026, 6, 7, 18, 0),
+            market="cn",
+            candidate_discovery_mode="thesis_desk_committee",
+        )
+        self._save_bars(
+            "600519",
+            [
+                {"date": date(2026, 6, 5), "open": 995.0, "high": 1012.0, "low": 990.0, "close": 1000.0},
+                {"date": date(2026, 6, 8), "open": 1005.0, "high": 1022.0, "low": 1000.0, "close": 1010.0},
+            ],
+        )
+        self._save_sequoia_bars(
+            "600519",
+            [
+                {
+                    "date": date(2026, 6, 5),
+                    "open": 995.0 * factor,
+                    "high": 1012.0 * factor,
+                    "low": 990.0 * factor,
+                    "close": 1000.0 * factor,
+                    "turnover": 100,
+                },
+                {
+                    "date": date(2026, 6, 8),
+                    "open": 1005.0 * factor,
+                    "high": 1022.0 * factor,
+                    "low": 1000.0 * factor,
+                    "close": 1010.0 * factor,
+                    "turnover": 120,
+                },
+                {
+                    "date": date(2026, 6, 9),
+                    "open": 1015.0 * factor,
+                    "high": 1032.0 * factor,
+                    "low": 1010.0 * factor,
+                    "close": 1020.0 * factor,
+                    "turnover": 130,
+                },
+            ],
+        )
+
+        quality = self.client.get("/api/v1/seed-pool-quality", params={"seed_date": "2026-06-07"}).json()
+        item_id = quality["items"][0]["id"]
+        chart_resp = self.client.get(f"/api/v1/seed-pool-quality/items/{item_id}/chart-data")
+        self.assertEqual(chart_resp.status_code, 200)
+        chart = chart_resp.json()
+        self.assertEqual(chart["bars"][0]["source"], "sequoia_stock_daily:600519")
+        self.assertAlmostEqual(chart["bars"][0]["close"], 1000.0)
+        self.assertAlmostEqual(chart["bars"][-1]["close"], 1020.0)
+
     def test_chart_data_anchors_weekend_seed_to_previous_trading_day(self) -> None:
         seed_date = date(2026, 6, 7)
         payload = {

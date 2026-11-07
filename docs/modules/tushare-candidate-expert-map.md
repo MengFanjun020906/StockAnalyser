@@ -18,7 +18,7 @@
 | 资金面专家 | 涨停池、人气、游资、资金承接 | `get_tushare_moneyflow_ths`、`get_tushare_moneyflow_dc`、`get_tushare_dragon_tiger_list`、`get_tushare_dragon_tiger_inst`、`get_tushare_limit_list_ths`、`get_tushare_limit_list_d`、`get_tushare_limit_step`、`get_tushare_hot_rank`、`get_capital_flow`、`get_market_capital_flow`、StockAPI 资金相关工具 |
 | 消息事件专家 | 公司级新闻、公告、硬事件 | `search_stock_news`、`search_comprehensive_intel`、`get_tushare_reference_events` |
 | 情绪/宏观事件专家 | 宏观、地缘、主题扩散 | `event_impact`、`news_momentum` |
-| 基本面专家 | 估值、成长、财务、参考事件 | `get_stock_info`、`get_tushare_basic_data`、`get_tushare_financial_statements` |
+| 基本面专家 | 公司上下文、估值、成长、财务、参考事件 | `get_stock_business_context`、`get_tushare_daily_basic`、`get_tushare_financial_indicators`、`get_tushare_financial_statements`、`get_tushare_forecast` |
 
 ## 3. 现在已经能直接用的 TuShare 接口
 

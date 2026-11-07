@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import AgentTracePage from '../AgentTracePage';
@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getTraceSession: vi.fn(),
   runTrace: vi.fn(),
   traceStream: vi.fn(),
+  traceReview: vi.fn(),
 }));
 
 vi.mock('../../api/agent', () => ({
@@ -25,6 +26,8 @@ vi.mock('../../api/portfolio', () => ({
     getAccounts: mocks.getAccounts,
   },
 }));
+
+vi.mock('../../api/jev', () => ({ jevApi: { traceReview: mocks.traceReview } }));
 
 describe('AgentTracePage', () => {
   const renderPage = (initialEntry = '/agent-trace') => render(
@@ -43,6 +46,7 @@ describe('AgentTracePage', () => {
     mocks.getTraceSession.mockReset();
     mocks.runTrace.mockReset();
     mocks.traceStream.mockReset();
+    mocks.traceReview.mockReset();
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
     mocks.getTraceSession.mockRejectedValue(new Error('not found'));
   });
@@ -60,6 +64,7 @@ describe('AgentTracePage', () => {
         context_summary: {
           account_count: 1,
           position_count: 2,
+          target_resolution: { status: 'resolved', source: 'local_name_index', symbol: '600519' },
           investor: {
             risk_preference: 'balanced',
             trading_horizon: 'long_term',
@@ -107,7 +112,7 @@ describe('AgentTracePage', () => {
         type: 'done',
         success: true,
         session_id: 'trace-12345678123412341234123456789abc',
-        content: '## 最终结论\n\n持仓策略：**持有，但不急着加仓**',
+        content: '## 最终结论\n\n持仓策略：**持有，但不急着加仓**\n\n区间：68~79（MA120~前反弹高点）\n\n删除线：~~作废~~',
         error: null,
         total_steps: 2,
         total_tokens: 321,
@@ -127,6 +132,15 @@ describe('AgentTracePage', () => {
         ],
         planner: { intent: 'position_review', required_tools: ['get_realtime_quote'] },
         agent_user_context: { report: { analysis_mode: 'planning_execute' } },
+        report_quality: {
+          status: 'repaired',
+          initial_issues: ['report_too_short'],
+          read_time_consistency: {
+            status: 'inconsistent',
+            issues: ['report_contradicts_fundamental_evidence', 'report_contradicts_news_evidence'],
+            persisted: false,
+          },
+        },
         debate: {
           enabled: true,
           success: true,
@@ -181,6 +195,7 @@ describe('AgentTracePage', () => {
         context_summary: {
           account_count: 1,
           position_count: 2,
+          target_resolution: { status: 'resolved', source: 'local_name_index', symbol: '600519' },
           investor: {
             risk_preference: 'balanced',
             trading_horizon: 'long_term',
@@ -192,6 +207,52 @@ describe('AgentTracePage', () => {
           },
           accounts: [{ account_id: 7, account_name: 'A股主账户', market: 'cn', available_cash: 16982.65, total_equity: 736532.65 }],
           target_position: { symbol: '600519', quantity: 150000, avg_cost: 4.797, last_price: 5, unrealized_pnl: 30450, position_pct: 50.1 },
+        },
+        dimension_evidence: {
+          technical: { quality: 'ok', available_tools: ['analyze_trend'], partial_tools: [], failed_tools: [], missing_evidence: [] },
+          capital: { quality: 'partial', available_tools: ['get_capital_flow'], partial_tools: [], failed_tools: ['get_chip_distribution'], missing_evidence: ['get_chip_distribution_failed_or_unavailable'] },
+          intel: { quality: 'ok', available_tools: ['search_comprehensive_intel', 'search_stock_news'], partial_tools: [], failed_tools: [], missing_evidence: [] },
+          fundamental: { quality: 'partial', available_tools: ['get_tushare_financial_indicators', 'get_tushare_daily_basic'], partial_tools: ['get_stock_info'], failed_tools: [], missing_evidence: [] },
+        },
+        composite_verdict: {
+          schema_version: 'stock-composite-shadow.v1',
+          status: 'ok',
+          snapshot: {
+            symbol: '600519',
+            as_of: '2026-08-07',
+            s4: {
+              status: 'partial',
+              region_pass: false,
+              resonance_count: 2,
+              volume_ratio_5d: 1.32,
+              volatility_pct: 3.6,
+              gain_10d_pct: 6.94,
+              golden_cross_today: false,
+              all_ok: false,
+              weekly_provisional: true,
+              missing_features: [],
+            },
+            metadata: {
+              daily_bar_count: 520,
+              daily_lookback_bars: 520,
+              weekly_bar_count: 104,
+              weekly_min_bars_required: 60,
+            },
+          },
+          composite_verdict: {
+            symbol: '600519',
+            as_of: '2026-08-07',
+            verdict_status: 'evaluable',
+            score: 15,
+            scale_max: 20,
+            strategy4_rule_version: 'strategy4.v1',
+            shadow_mode: true,
+            components: {
+              s4: { status: 'ok', score: 8, scale_max: 10, missing_features: [] },
+              chan: { status: 'ok', score: 7, scale_max: 10, missing_features: [] },
+            },
+            missing_features: [],
+          },
         },
         risk_gate: {
           schema_version: 1,
@@ -264,7 +325,13 @@ describe('AgentTracePage', () => {
     });
     expect(screen.getByRole('heading', { name: '最终结论' })).toBeInTheDocument();
     expect(screen.getByText('持有，但不急着加仓')).toBeInTheDocument();
+    expect(screen.getByText('区间：68~79（MA120~前反弹高点）')).toBeInTheDocument();
+    const deletedNodes = document.querySelectorAll('del');
+    expect(deletedNodes).toHaveLength(1);
+    expect(deletedNodes[0]).toHaveTextContent('作废');
     expect(screen.getByText('分析完成')).toBeInTheDocument();
+    expect(screen.getByText('主报告首次输出不完整，系统已自动修复并通过完整度校验。')).toBeInTheDocument();
+    expect(screen.getByText(/历史报告与工具证据不一致/)).toBeInTheDocument();
     const createObjectURL = vi.fn((blob: Blob | MediaSource) => {
       expect(blob).toBeInstanceOf(Blob);
       return 'blob:agent-report';
@@ -281,9 +348,107 @@ describe('AgentTracePage', () => {
     expect(anchorClick).toHaveBeenCalledTimes(1);
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:agent-report');
     expect(screen.getAllByText('风控闸门').length).toBeGreaterThan(0);
+    expect(screen.getByText('确定性综合评分')).toBeInTheDocument();
+    expect(screen.getByText('strategy4.v1')).toBeInTheDocument();
+    expect(screen.getByText('日线历史：520 / 520 根')).toBeInTheDocument();
+    expect(screen.getByText(/目标解析：/)).toHaveTextContent('600519 · local_name_index');
+    expect(screen.getByText('单股四维证据覆盖')).toBeInTheDocument();
+    expect(screen.getByText('已取证：search_comprehensive_intel、search_stock_news')).toBeInTheDocument();
+    expect(screen.getByText('已取证：get_tushare_financial_indicators、get_tushare_daily_basic、get_stock_info')).toBeInTheDocument();
+    expect(screen.getByText('多周期共振')).toBeInTheDocument();
+    expect(screen.getByText('2 / 4')).toBeInTheDocument();
+    expect(screen.getByText('1.32')).toBeInTheDocument();
+    expect(screen.getByText(/本周周线尚未收盘，Strategy 4 当前只显示临时分/)).toBeInTheDocument();
     expect(screen.getAllByText('风控通过，允许执行「hold」。').length).toBeGreaterThan(0);
     expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
     expect(screen.getByText('历史')).toBeInTheDocument();
+  });
+
+  it('keeps the original report visible while Jev completes and appends its disagreement', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    let finishReview!: (value: unknown) => void;
+    mocks.traceReview.mockReturnValue(new Promise((resolve) => { finishReview = resolve; }));
+    const baseline = { action: 'open', source: 'risk_gate', trading_horizon: 'swing', summary: '原证据支持条件入场' };
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([{
+      type: 'done', success: true, session_id: 'trace-jev-ui', content: '原始最终报告保持不变',
+      tool_calls: [], jev_review: { status: 'pending', shadow_mode: true, session_id: 'trace-jev-ui', capture_id: 'one', baseline },
+    }]));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
+    expect(await screen.findByText('原始最终报告保持不变')).toBeInTheDocument();
+    await waitFor(() => expect(mocks.traceReview).toHaveBeenCalledWith('trace-jev-ui'));
+    expect(screen.getByText('原分析已完成，Jev 复核中。')).toBeInTheDocument();
+    await act(async () => finishReview({
+      status: 'ok', shadow_mode: true, session_id: 'trace-jev-ui', capture_id: 'one', shared_snapshot: true, baseline,
+      evaluation: { status: 'ok', stock_code: '600519', as_of: '2026-09-18', model: 'jev-unit', shadow_mode: true,
+        answers: { direction_1: { type: 'choice', choice: 'bearish', confidence: 0.7, probabilities: { bearish: 1 } } } },
+      comparison: { status: 'divergent', rows: [{ horizon: 1, status: 'divergent', flags: ['downside_conflict'] }] },
+    }));
+    const comparison = screen.getByRole('region', { name: 'Jev 与原结论对照' });
+    expect(await within(comparison).findByText('入场动作与 Jev 下行判断有分歧')).toBeInTheDocument();
+    expect(screen.getByText('原始最终报告保持不变')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /下单|采用 Jev/ })).not.toBeInTheDocument();
+  });
+
+  it.each(['分析立讯精密 002475 未来 1 至 5 个交易日', '分析腾讯 HK00700', '分析 AAPL 的 MACD'])(
+    'does not send the hidden historical stock code after the question switches stocks: %s', async (message) => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getTraceSession.mockResolvedValue({ id: 'trace-previous', createdAt: '2026-09-20',
+      message: '分析 600519', stockCode: '600519', status: 'success',
+      result: { success: true, session_id: 'trace-previous', content: '旧报告', tool_calls: [], events: [] } });
+    mocks.traceStream.mockResolvedValue(makeStreamResponse([{
+      type: 'done', success: true, content: '新报告', tool_calls: [],
+    }]));
+    renderPage('/agent-trace/trace-previous');
+    await screen.findByText('旧报告');
+    fireEvent.change(screen.getByPlaceholderText('输入你的问题...'), { target: { value: message } });
+    fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
+    await waitFor(() => expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
+      message, stock_code: undefined,
+    })));
+  });
+
+  it('restores a persisted Jev failure without marking the original Trace failed', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    const review = { status: 'error', shadow_mode: true, reason: 'timeout', session_id: 'trace-jev-history',
+      evaluation: { status: 'error', shadow_mode: true, state: { history_source: 'fixture', bar_count: 90, missing_evidence: [] },
+        questions: { direction_1: { type: 'choice' } } } };
+    mocks.traceReview.mockResolvedValue(review);
+    mocks.getTraceSession.mockResolvedValue({ id: 'trace-jev-history', createdAt: '2026-09-20', message: '600519',
+      stockCode: '600519', status: 'success', result: { success: true, session_id: 'trace-jev-history',
+        content: '历史原报告', total_steps: 0, total_tokens: 0, provider: 'unit', model: 'unit',
+        mode: 'planning_execute', events: [], tool_calls: [], jev_review: review } });
+    const page = renderPage('/agent-trace/trace-jev-history');
+    expect(await screen.findByText('历史原报告')).toBeInTheDocument();
+    expect(screen.getByText('已从后端加载 Trace')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Jev 复核证据' })).getByText('模型请求超时')).toBeInTheDocument();
+    expect(mocks.traceStream).not.toHaveBeenCalled();
+    const cached = JSON.parse(window.localStorage.getItem('dsa.agentTrace.history.v1') || '[]')[0].result.jev_review;
+    expect(cached.status).toBe('error');
+    expect(cached.evaluation.state).toBeUndefined();
+    expect(cached.evaluation.questions).toBeUndefined();
+    page.unmount();
+    mocks.getTraceSession.mockClear();
+    renderPage('/agent-trace/trace-jev-history');
+    expect(await screen.findByText('历史原报告')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Jev 复核证据' })).getByText('模型请求超时')).toBeInTheDocument();
+    expect(mocks.getTraceSession).not.toHaveBeenCalled();
+  });
+
+  it('preserves an edited question when runtime configuration arrives after history', async () => {
+    let finishConfig!: (value: unknown) => void;
+    mocks.getRuntimeConfig.mockReturnValue(new Promise((resolve) => { finishConfig = resolve; }));
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getTraceSession.mockResolvedValue({ id: 'trace-late-config', createdAt: '2026-09-20',
+      message: '分析 600519', stockCode: '600519', status: 'success',
+      result: { success: true, session_id: 'trace-late-config', content: '旧报告', tool_calls: [], events: [] } });
+    renderPage('/agent-trace/trace-late-config');
+    await screen.findByText('旧报告');
+    const input = screen.getByPlaceholderText('输入你的问题...');
+    fireEvent.change(input, { target: { value: '分析 002475' } });
+    await act(async () => finishConfig({ runtime_config: { agent_orchestration_mode: 'legacy' } }));
+    expect(input).toHaveValue('分析 002475');
+    expect(mocks.getTraceSession).toHaveBeenCalledTimes(1);
   });
 
   it('loads a completed trace from local history', async () => {
@@ -438,6 +603,224 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('已从后端加载 Trace')).toBeInTheDocument();
     expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-remote');
     expect(JSON.parse(window.localStorage.getItem('dsa.agentTrace.history.v1') || '[]')[0].id).toBe('trace-remote');
+  });
+
+  it('shows stored target mismatches as explicit scoring and risk gate failures', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-target-mismatch',
+      createdAt: '2026-08-11T16:26:34',
+      message: '分析一下亨通光电',
+      stockCode: '',
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-target-mismatch',
+        content: '历史报告',
+        error: null,
+        total_steps: 13,
+        total_tokens: 100,
+        provider: 'agent',
+        model: 'test',
+        mode: 'planning_execute',
+        events: [],
+        tool_calls: [{ step: 1, tool: 'analyze_trend', arguments: { stock_code: '600487' }, success: true }],
+        planner: { intent: 'position_review' },
+        context_summary: { account_count: 1, position_count: 2 },
+        composite_verdict: {
+          status: 'failed',
+          error_code: 'target_symbol_mismatch',
+          error: '确定性评分目标不一致：请求 600487，实际 002050。已拒绝使用该评分。',
+          expected_symbol: '600487',
+          actual_symbol: '002050',
+        },
+        risk_gate: {
+          status: 'failed',
+          error_code: 'target_symbol_mismatch',
+          error: '风险门目标不一致：请求 600487，实际 002050。已拒绝使用该风险门结果。',
+          expected_symbol: '600487',
+          actual_symbol: '002050',
+        },
+        artifact_dir: '/tmp/trace-target-mismatch',
+      },
+    });
+
+    renderPage('/agent-trace/trace-target-mismatch');
+
+    expect(await screen.findByText('历史报告')).toBeInTheDocument();
+    expect((await screen.findAllByText(/确定性评分失败：确定性评分目标不一致/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/风控闸门失败：风险门目标不一致/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/已拒绝使用该风险门结果/)).length).toBeGreaterThan(0);
+  });
+
+  it('shows provisional composite scores when the current weekly bar is incomplete', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-provisional-score',
+      createdAt: '2026-08-11T19:00:32',
+      message: '天通股份可以加仓吗',
+      stockCode: '600330',
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-provisional-score',
+        content: '临时评分报告',
+        total_steps: 22,
+        total_tokens: 100,
+        provider: 'deepseek',
+        model: 'deepseek/deepseek-v4-pro',
+        mode: 'planning_execute',
+        artifact_dir: '/tmp/trace-provisional-score',
+        events: [],
+        tool_calls: [],
+        composite_verdict: {
+          status: 'ok',
+          snapshot: {
+            symbol: '600330',
+            as_of: '2026-08-11',
+            s4: {
+              status: 'partial',
+              region_pass: false,
+              resonance_count: 2,
+              volume_ratio_5d: 0.78635,
+              volatility_pct: 8.422227,
+              gain_10d_pct: 25.404531,
+              golden_cross_today: false,
+              all_ok: false,
+              weekly_provisional: true,
+            },
+            chan: {
+              status: 'partial',
+              signals: [
+                { name: 'second_sell', triggered: true, timeframe: '1d', metrics: {} },
+                { name: 'weekly_confirmation', triggered: true, timeframe: '1w', metrics: { provisional: true } },
+              ],
+            },
+            metadata: {
+              daily_bar_count: 520,
+              daily_lookback_bars: 520,
+              weekly_bar_count: 112,
+              weekly_min_bars_required: 60,
+            },
+          },
+          composite_verdict: {
+            symbol: '600330',
+            as_of: '2026-08-11',
+            verdict_status: 'not_evaluable',
+            score: null,
+            provisional_score: 0,
+            scale_max: 20,
+            strategy4_rule_version: 'strategy4.v1',
+            components: {
+              s4: { status: 'partial', score: null, provisional_score: 0, scale_max: 10 },
+              chan: { status: 'partial', score: 0, scale_max: 10 },
+            },
+          },
+        },
+      },
+    });
+
+    renderPage('/agent-trace/trace-provisional-score');
+
+    await waitFor(() => expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-provisional-score'));
+    expect(await screen.findByText('临时评分报告')).toBeInTheDocument();
+    expect(await screen.findByText('临时评分，暂不可正式评估')).toBeInTheDocument();
+    expect(screen.getByText('临时评分')).toBeInTheDocument();
+    expect(screen.getByText('0.79')).toBeInTheDocument();
+    expect(screen.getByText('8.42%')).toBeInTheDocument();
+    expect(screen.getByText('25.40%')).toBeInTheDocument();
+    expect(screen.getByText(/本周周线尚未收盘，Strategy 4 当前只显示临时分/)).toBeInTheDocument();
+    expect(screen.getByText('未通过：未满足强势区域条件')).toBeInTheDocument();
+    expect(screen.getByText('未通过：需要至少 3 项，当前 2 项')).toBeInTheDocument();
+    expect(screen.getByText('未通过：要求至少 1.20，当前 0.79')).toBeInTheDocument();
+    expect(screen.getByText('未通过：要求不高于 6.00%，当前 8.42%')).toBeInTheDocument();
+    expect(screen.getByText('未通过：要求不高于 9.00%，当前 25.40%')).toBeInTheDocument();
+    expect(screen.getByText('未通过：今日未金叉，all_ok=否')).toBeInTheDocument();
+    expect(screen.getByText('未计入买入分：二卖仅作为退出风险提示')).toBeInTheDocument();
+    expect(screen.getByText('暂不计分：周线确认尚未收盘')).toBeInTheDocument();
+  });
+
+  it('surfaces report fallback and debate failure instead of presenting a judge verdict', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-degraded-report',
+      createdAt: '2026-08-11T19:00:32',
+      message: '天通股份可以加仓吗',
+      stockCode: '600330',
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-degraded-report',
+        content: '## 分析状态\n\n模型主报告未通过完整度校验。',
+        total_steps: 22,
+        total_tokens: 100,
+        provider: 'deepseek',
+        model: 'deepseek/deepseek-v4-pro',
+        mode: 'planning_execute',
+        artifact_dir: '/tmp/trace-degraded-report',
+        events: [],
+        tool_calls: [],
+        report_quality: {
+          status: 'fallback',
+          source: 'deterministic_fallback',
+          initial_issues: ['report_too_short'],
+        },
+        debate: {
+          enabled: true,
+          success: false,
+          error: 'llm_json_parse_failed:judge_decision',
+          judge_decision: { final_action: 'monitor' },
+        },
+      },
+    });
+
+    renderPage('/agent-trace/trace-degraded-report');
+
+    await waitFor(() => expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-degraded-report'));
+    expect(await screen.findByRole('heading', { name: '分析状态' })).toBeInTheDocument();
+    expect(await screen.findByText('主报告自动修复仍未通过，当前展示确定性降级报告；价格计划评审会继续执行。')).toBeInTheDocument();
+    expect((await screen.findAllByText(/Debate 失败，未形成有效裁决/)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Judge 裁决：monitor/)).not.toBeInTheDocument();
+  });
+
+  it('labels legacy incomplete reports whose failed debate was quarantined at read time', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-legacy-incomplete',
+      createdAt: '2026-08-11T19:00:32',
+      message: '天通股份可以加仓吗',
+      stockCode: '600330',
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-legacy-incomplete',
+        content: '交易计划已记录，供后续风险复核。',
+        total_steps: 22,
+        total_tokens: 100,
+        provider: 'deepseek',
+        model: 'deepseek/deepseek-v4-pro',
+        mode: 'planning_execute',
+        artifact_dir: '/tmp/trace-legacy-incomplete',
+        events: [],
+        tool_calls: [],
+        report_quality: {
+          status: 'legacy_incomplete',
+          source: 'read_time_quarantine',
+          persisted: false,
+        },
+        debate: {
+          enabled: true,
+          success: false,
+          error: 'llm_json_parse_failed:judge_decision',
+          read_time_quarantine: { type: 'legacy_debate_parse_failure', persisted: false },
+        },
+      },
+    });
+
+    renderPage('/agent-trace/trace-legacy-incomplete');
+
+    expect(await screen.findByText('该历史主报告生成于完整度门禁上线前；失败 Debate 已只读隔离，请重跑分析以生成完整报告。')).toBeInTheDocument();
+    expect((await screen.findAllByText(/Debate 失败，未形成有效裁决/)).length).toBeGreaterThan(0);
   });
 
   it('continues a loaded trace by passing the source session id to trace stream', async () => {
@@ -1421,7 +1804,7 @@ describe('AgentTracePage', () => {
           runtime_config: { agent_orchestration_mode: 'expert_graph' },
         },
       ],
-      120,
+      500,
     ));
 
     renderPage();
@@ -1431,7 +1814,7 @@ describe('AgentTracePage', () => {
     fireEvent.click(screen.getByRole('button', { name: /^运行$/ }));
 
     expect(await screen.findByText(/多专家候选发现正在运行/)).toBeInTheDocument();
-    expect(screen.getByText(/最新阶段：候选发现完成/)).toBeInTheDocument();
+    expect(await screen.findByText(/最新阶段：候选发现完成/)).toBeInTheDocument();
     expect(screen.queryByText(/请重新运行选股链路/)).not.toBeInTheDocument();
     expect(await screen.findByText(/本轮没有返回 L1 候选发现专家包/)).toBeInTheDocument();
   });

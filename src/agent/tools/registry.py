@@ -30,6 +30,7 @@ class ToolParameter:
     required: bool = True
     enum: Optional[List[str]] = None
     default: Any = None
+    items: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -51,6 +52,8 @@ class ToolDefinition:
             prop: Dict[str, Any] = {"type": p.type, "description": p.description}
             if p.enum:
                 prop["enum"] = p.enum
+            if p.items:
+                prop["items"] = p.items
             properties[p.name] = prop
             if p.required:
                 required.append(p.name)

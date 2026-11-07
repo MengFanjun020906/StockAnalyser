@@ -28,8 +28,6 @@ class IntelAgent(BaseAgent):
         "get_tushare_today_news",
         "search_stock_news",
         "search_comprehensive_intel",
-        "get_stock_info",
-        "get_capital_flow",
     ]
 
     def system_prompt(self, ctx: AgentContext) -> str:
@@ -41,15 +39,22 @@ Your task: gather the latest news, announcements, and risk signals for \
 the given stock, then produce a structured JSON opinion.
 
 ## Workflow
-1. Search latest stock news (earnings, announcements, insider activity)
+1. Search stock news using the declared 7/14/30-day adaptive window
 2. For A-shares, call get_tushare_today_news when same-day market flash \
 news is needed; it only returns today's Tushare news window
 3. Run comprehensive intel search — this covers latest news, company \
 announcements (公司公告), market analysis, risk checks, and earnings outlook
-4. For A-share stocks, call get_capital_flow to obtain capital-flow data with \
-explicit main-force vs all-order semantics and include it in your analysis
-5. Classify positive catalysts and risk alerts
-6. Assess overall sentiment
+4. Classify positive catalysts and risk alerts
+5. Assess overall sentiment
+
+## Data Quality
+- Use quality="ok" only when current news and company-announcement evidence
+  are both available with identifiable sources.
+- Use "partial" when one channel is missing, "stale" when results are outside
+  their declared freshness window, and "unavailable" when no source-backed
+  event evidence exists.
+- List incomplete searches or missing announcement/news channels in
+  missing_evidence. Never invent an event, publication time, or source.
 
 ## Risk Detection Priorities
 - Insider / major shareholder sell-downs (减持)
@@ -58,14 +63,6 @@ explicit main-force vs all-order semantics and include it in your analysis
 - Industry-wide policy headwinds
 - Large lock-up expirations (解禁)
 - PE valuation anomalies
-- Sustained main-force capital outflow (主力持续净流出)
-
-## Capital Flow Interpretation (A-shares only)
-- main_net_inflow > 0: bullish signal (主力净流入)
-- main_net_inflow < 0: bearish signal (主力净流出)
-- main_inflow_5d / main_inflow_10d: medium-term 主力 accumulation or distribution trend
-- net_inflow / net_inflow_5d / net_inflow_10d: Tushare net_mf_amount all-order active-flow口径. Never describe these fields as 主力资金.
-- amount_unit is CNY; raw_amount_unit is 10k CNY. Use the returned definitions when explaining exact capital-flow numbers.
 
 ## Output Format
 Return **only** a JSON object:
@@ -76,7 +73,8 @@ Return **only** a JSON object:
   "risk_alerts": ["list", "of", "detected", "risks"],
   "positive_catalysts": ["list", "of", "catalysts"],
   "sentiment_label": "very_positive|positive|neutral|negative|very_negative",
-  "capital_flow_signal": "inflow|outflow|neutral|not_available",
+  "quality": "ok|partial|stale|unavailable",
+  "missing_evidence": [],
   "key_news": [
     {"title": "...", "impact": "positive|negative|neutral"}
   ]
@@ -92,10 +90,9 @@ Return **only** a JSON object:
             "1. For A-shares, call get_tushare_today_news if same-day flash news is relevant.\n"
             "2. Call search_comprehensive_intel to get latest news, company announcements "
             "(公司公告), risk events, and earnings outlook.\n"
-            "3. Call get_capital_flow to obtain capital flow data (A-share only; skip for HK/US). "
-            "Use main_net_inflow/main_inflow_5d/main_inflow_10d for 主力口径; "
-            "net_inflow* is all-order net_mf_amount and must not be called 主力资金.\n"
-            "4. Output the JSON opinion including capital_flow_signal."
+            "3. Output the JSON opinion with source-backed news, catalysts, risks, "
+            "quality, and missing_evidence. Capital-flow analysis is owned by the "
+            "separate Capital Agent."
         )
         return "\n".join(parts)
 
@@ -107,7 +104,19 @@ Return **only** a JSON object:
 
         # Cache parsed intel so downstream agents (especially RiskAgent) can
         # reuse it instead of re-searching the same evidence.
+        quality = str(parsed.get("quality") or "partial").lower()
+        if quality not in {"ok", "partial", "stale", "unavailable"}:
+            quality = "partial"
+        missing_evidence = parsed.get("missing_evidence")
+        if not isinstance(missing_evidence, list):
+            missing_evidence = []
+        parsed["quality"] = quality
+        parsed["missing_evidence"] = [str(item) for item in missing_evidence if str(item).strip()]
         ctx.set_data("intel_opinion", parsed)
+        ctx.meta.setdefault("dimension_status", {})[self.agent_name] = {
+            "quality": quality,
+            "missing_evidence": parsed["missing_evidence"],
+        }
 
         # Propagate risk alerts to context
         for alert in parsed.get("risk_alerts", []):

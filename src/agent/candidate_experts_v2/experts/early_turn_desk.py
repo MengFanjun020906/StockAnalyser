@@ -30,7 +30,7 @@ EARLY_TURN_DESK_TOOLS: tuple[str, ...] = (
     "get_margin_trading_summary",
     "get_chip_distribution",
     "get_symbol_regime_probability",
-    "get_stock_info",
+    "get_stock_business_context",
 )
 
 # FactSheet flag/source kinds that mark a row as having explicit turn evidence.

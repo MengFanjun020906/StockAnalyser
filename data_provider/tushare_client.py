@@ -29,6 +29,7 @@ _TUSHARE_CREDENTIAL_QUARANTINE_SECONDS = 900.0
 _TUSHARE_CREDENTIAL_ERROR_MARKERS = (
     "token已过期",
     "token不对",
+    "token无效",
     "invalid token",
     "token invalid",
     "token expired",
@@ -152,10 +153,19 @@ class TushareHttpClient:
         if should_bypass_proxy_for_tushare_url(self._api_url):
             request_kwargs["proxies"] = {"http": None, "https": None}
         res = requests.post(self._api_url, **request_kwargs)
+        try:
+            result = json.loads(res.text)
+        except (TypeError, ValueError):
+            if res.status_code != 200:
+                raise Exception(f"Tushare API HTTP {res.status_code}")
+            raise
         if res.status_code != 200:
-            raise Exception(f"Tushare API HTTP {res.status_code}")
+            message = result.get("msg") or f"Tushare API HTTP {res.status_code}"
+            if is_tushare_credential_error(message):
+                _mark_tushare_credential_invalid(self._token, self._api_url, message)
+                raise TushareCredentialError(message)
+            raise Exception(f"Tushare API HTTP {res.status_code}: {message}")
 
-        result = json.loads(res.text)
         if result.get("code") != 0:
             message = result.get("msg") or f"Tushare API error code {result.get('code')}"
             if is_tushare_credential_error(message):
@@ -234,6 +244,10 @@ def query_tushare_api(api_name: str, params: Optional[Dict[str, Any]] = None, fi
     with _TUSHARE_QUERY_LOCK:
         try:
             result = query_tushare_api_via_sdk(api_name, params=params, fields=fields, timeout=timeout)
+            if isinstance(result, pd.DataFrame) and result.empty and not len(result.columns):
+                # The SDK returns a columnless empty frame for non-2xx responses,
+                # which otherwise hides authentication and gateway errors.
+                raise RuntimeError("Tushare SDK returned an unstructured empty response")
             return result if result is not None else pd.DataFrame()
         except TushareQueryTimeout:
             raise

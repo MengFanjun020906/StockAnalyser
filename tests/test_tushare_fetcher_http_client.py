@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from concurrent.futures import ThreadPoolExecutor
 
+import pandas as pd
+
 from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
@@ -127,6 +129,21 @@ class TestTushareHttpClient(unittest.TestCase):
         self.assertEqual(health["status"], "credential_invalid")
         self.assertFalse(health["available"])
 
+    def test_http_401_json_credential_error_is_quarantined(self) -> None:
+        client = TushareHttpClient(token="expired-token", timeout=15)
+        response = MagicMock(
+            status_code=401,
+            text=json.dumps({"code": -1, "msg": "Token无效或已过期，请联系客服续费", "data": {}}),
+        )
+
+        with patch("data_provider.tushare_client.requests.post", return_value=response):
+            with self.assertRaisesRegex(TushareCredentialError, "Token无效或已过期"):
+                client.stock_basic(exchange="", list_status="L")
+
+        health = get_tushare_runtime_health(token="expired-token", api_url=client.api_url)
+        self.assertEqual(health["status"], "credential_invalid")
+        self.assertFalse(health["available"])
+
     def test_query_tushare_api_prefers_sdk_endpoint_override(self) -> None:
         pro = MagicMock()
         pro.index_basic.return_value = "sdk-result"
@@ -150,6 +167,32 @@ class TestTushareHttpClient(unittest.TestCase):
 
         self.assertEqual(result, "http-result")
         http_client.query.assert_called_once_with("index_basic", fields="ts_code", limit=5)
+
+    def test_query_tushare_api_falls_back_when_sdk_returns_unstructured_empty_frame(self) -> None:
+        http_client = MagicMock()
+        http_client.query.return_value = "http-result"
+
+        with patch(
+            "data_provider.tushare_client.query_tushare_api_via_sdk",
+            return_value=pd.DataFrame(),
+        ), patch(
+            "data_provider.tushare_client.build_tushare_http_client",
+            return_value=http_client,
+        ):
+            result = query_tushare_api(
+                "stock_basic",
+                params={"exchange": "", "list_status": "L"},
+                fields="ts_code,name",
+                timeout=15,
+            )
+
+        self.assertEqual(result, "http-result")
+        http_client.query.assert_called_once_with(
+            "stock_basic",
+            fields="ts_code,name",
+            exchange="",
+            list_status="L",
+        )
 
     def test_query_tushare_api_does_not_retry_http_after_sdk_auth_failure(self) -> None:
         with patch(

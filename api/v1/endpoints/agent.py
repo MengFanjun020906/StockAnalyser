@@ -10,19 +10,21 @@ import math
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from src.config import get_config
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
 from src.agent.llm_telemetry import llm_telemetry_scope
+from src.agent.scoring import CompositeSnapshotBuilder, evaluate_composite_verdict, score_symbol_composite
 from src.schemas.agent_context import AgentUserContext, ReportContext, ReportIntent
 from src.schemas.agent_signal import TradeAction, TradePlan
+from src.schemas.composite_verdict import CompositeScoreSnapshot
 from src.services.agent_model_service import list_agent_model_deployments
 
 try:
@@ -37,9 +39,10 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "get_daily_history":          "获取历史K线",
     "get_chip_distribution":      "分析筹码分布",
     "get_analysis_context":       "获取分析上下文",
-    "get_stock_info":             "获取股票基本面",
+    "get_stock_info":             "旧版基本面聚合（已废弃）",
     "search_stock_news":          "搜索股票新闻",
     "search_comprehensive_intel": "搜索综合情报",
+    "search_stock_fundamentals":  "补充基本面公开资料",
     "get_tushare_today_news":     "获取当日新闻快讯",
     "analyze_trend":              "分析技术趋势",
     "calculate_ma":               "计算均线系统",
@@ -89,6 +92,9 @@ class ChatResponse(BaseModel):
     content: str
     session_id: str
     error: Optional[str] = None
+    price_plan: Optional[Dict[str, Any]] = None
+    trade_plan_result: Optional[Dict[str, Any]] = None
+    risk_gate: Optional[Dict[str, Any]] = None
 
 
 class AgentTraceRunRequest(BaseModel):
@@ -132,13 +138,19 @@ class AgentTraceRunResponse(BaseModel):
     planner: Optional[Dict[str, Any]] = None
     agent_user_context: Optional[Dict[str, Any]] = None
     context_summary: Optional[Dict[str, Any]] = None
+    dimension_evidence: Optional[Dict[str, Any]] = None
+    report_quality: Optional[Dict[str, Any]] = None
     debate: Optional[Dict[str, Any]] = None
     stock_selection: Optional[Dict[str, Any]] = None
+    composite_verdict: Optional[Dict[str, Any]] = None
     risk_gate: Optional[Dict[str, Any]] = None
+    price_plan: Optional[Dict[str, Any]] = None
+    trade_plan_result: Optional[Dict[str, Any]] = None
     llm_telemetry: Optional[Dict[str, Any]] = None
     judge_sanity: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
     runtime_config: Optional[Dict[str, Any]] = None
+    jev_review: Optional[Dict[str, Any]] = None
 
 class SkillInfo(BaseModel):
     id: str
@@ -256,6 +268,12 @@ async def agent_chat(request: ChatRequest):
         if skills is not None:
             ctx["skills"] = skills
 
+        await asyncio.to_thread(
+            _prepare_signal_lifecycle_context,
+            message=request.message,
+            context=ctx,
+        )
+
         # Offload the blocking call to a thread to avoid blocking the event loop.
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
@@ -264,11 +282,30 @@ async def agent_chat(request: ChatRequest):
                                   context=ctx),
         )
 
+        await asyncio.to_thread(
+            _ensure_single_stock_price_plan,
+            message=request.message,
+            session_id=session_id,
+            result=result,
+            context=ctx,
+        )
+
+        await asyncio.to_thread(
+            _capture_signal_lifecycle,
+            message=request.message,
+            session_id=session_id,
+            result=result,
+            context=ctx,
+        )
+
         return ChatResponse(
             success=result.success,
             content=result.content,
             session_id=session_id,
-            error=result.error
+            error=result.error,
+            price_plan=getattr(result, "price_plan", None),
+            trade_plan_result=getattr(result, "trade_plan_result", None),
+            risk_gate=getattr(result, "deterministic_risk_gate", None),
         )
             
     except Exception as e:
@@ -364,10 +401,59 @@ def _build_executor(config, skills: Optional[List[str]] = None):
     return build_agent_executor(config, skills=skills)
 
 
+def _trace_message_symbols(message: str) -> List[str]:
+    """Extract explicit securities, excluding common analysis abbreviations."""
+    import re
+    from data_provider.base import canonical_stock_code, normalize_stock_code
+
+    pattern = (
+        r"(?<![A-Za-z0-9])(?:"
+        r"(?i:(?:SH|SZ|BJ)?\d{6}(?:\.(?:SH|SZ|BJ|SS))?|HK\s?\d{1,5}|\d{1,5}\.HK)"
+        r"|[A-Z]{1,5}(?:\.[A-Z])?)(?![A-Za-z0-9])"
+    )
+    reserved = {"AGENT", "PLAN", "API", "LLM", "AI", "ETF", "MACD", "KDJ", "RSI", "ATR",
+                "MA", "EMA", "SMA", "BOLL", "SMC", "BOS", "OHLCV", "PE", "PB", "ROE", "EPS",
+                "USD", "CNY", "HKD", "T", "N", "A"}
+    return list(dict.fromkeys(
+        canonical_stock_code(normalize_stock_code(match.group(0).replace(" ", "")))
+        for match in re.finditer(pattern, message or "")
+        if match.group(0) not in reserved
+    ))
+
+
+def _trace_target_conflict(message: str, stock_code: Any) -> Optional[Dict[str, Any]]:
+    from data_provider.base import canonical_stock_code, normalize_stock_code
+
+    symbols = _trace_message_symbols(message)
+    supplied = canonical_stock_code(normalize_stock_code(str(stock_code or "").replace(" ", "")))
+    if len(symbols) != 1 or not supplied or supplied == symbols[0]:
+        return None
+    return {
+        "error": "trace_target_conflict", "expected_symbol": symbols[0], "actual_symbol": supplied,
+        "message": f"问题中的股票 {symbols[0]} 与配置股票 {supplied} 不一致，请清空或修改股票代码后重新运行。",
+    }
+
+
+def _stored_trace_target_conflict(path: Path) -> Optional[Dict[str, Any]]:
+    request = _read_trace_json_file(path / "request.json", {}) or {}
+    context = _read_trace_json_file(path / "context.json", {}) or {}
+    user = context.get("agent_user_context") or {}
+    report = user.get("report") or {}
+    message = str(request.get("message") or report.get("user_prompt") or "")
+    for symbol in (request.get("stock_code"), report.get("primary_symbol")):
+        conflict = _trace_target_conflict(message, symbol)
+        if conflict:
+            return conflict
+    return None
+
+
 def _infer_stock_code_from_message(message: str) -> str:
     """Best-effort stock code extraction for developer trace convenience."""
     import re
 
+    symbols = _trace_message_symbols(message)
+    if len(symbols) == 1:
+        return symbols[0]
     patterns = [
         r"(?<!\d)(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ|SS))?(?!\d)",
         r"\bHK\s?(\d{1,5})\b",
@@ -393,6 +479,10 @@ def _build_trace_context(
     config: Any,
 ) -> Dict[str, Any]:
     context = dict(request.context or {})
+    for symbol in (request.stock_code, context.get("stock_code")):
+        conflict = _trace_target_conflict(request.message, symbol)
+        if conflict:
+            raise HTTPException(status_code=422, detail=conflict)
     resume_session_id = _normalize_trace_session_id(request.resume_from_session_id)
     if resume_session_id:
         resume_artifact_dir = _find_trace_artifact_dir(resume_session_id)
@@ -401,13 +491,58 @@ def _build_trace_context(
                 status_code=404,
                 detail={"error": "resume_trace_not_found", "message": f"未找到可继续运行的 Trace {resume_session_id}"},
             )
+        if _stored_trace_target_conflict(resume_artifact_dir):
+            raise HTTPException(status_code=409, detail={
+                "error": "resume_trace_target_conflict",
+                "message": "原 Trace 存在股票目标冲突，不能复用其证据；请重新运行分析。",
+            })
         context["resume_from_session_id"] = resume_session_id
         context["stock_selection_resume_artifact_dir"] = str(resume_artifact_dir)
         context["planning_ledger_reuse"] = _build_planning_ledger_reuse_summary(
             resume_artifact_dir,
             source_trace_id=resume_session_id,
         )
-    stock_code = (request.stock_code or context.get("stock_code") or _infer_stock_code_from_message(request.message) or "").strip()
+    explicit_stock_code = (
+        request.stock_code
+        or context.get("stock_code")
+        or _infer_stock_code_from_message(request.message)
+        or ""
+    ).strip()
+    stock_code = explicit_stock_code
+    target_resolution: Dict[str, Any] = {
+        "status": (
+            "resolved"
+            if stock_code
+            else "unresolved"
+            if request.stock_name
+            else "not_requested"
+        ),
+        "source": "explicit_code" if stock_code else "none",
+        "symbol": stock_code or None,
+        "requested_stock_name": request.stock_name,
+    }
+    if not stock_code:
+        try:
+            from src.services.name_to_code_resolver import resolve_name_to_code
+
+            stock_reference = str(request.stock_name or request.message or "").strip()
+            stock_code = str(
+                resolve_name_to_code(stock_reference, allow_network=False) or ""
+            ).strip()
+            if stock_code:
+                target_resolution.update({
+                    "status": "resolved",
+                    "source": "local_name_index",
+                    "symbol": stock_code,
+                })
+        except Exception as exc:
+            target_resolution.update({
+                "status": "failed",
+                "source": "local_name_index",
+                "error": str(exc),
+            })
+            logger.warning("Agent trace stock target resolution failed: %s", exc)
+    context["_trace_target_resolution"] = target_resolution
     if stock_code:
         context["stock_code"] = stock_code
     if request.stock_name:
@@ -416,6 +551,8 @@ def _build_trace_context(
     context.setdefault("report_language", getattr(config, "report_language", "zh"))
     intent_resolution = _resolve_trace_report_intent(request=request, stock_code=stock_code)
     context["_trace_intent_resolution"] = intent_resolution
+    if intent_resolution["intent"] == "watchlist_scan" and not stock_code:
+        target_resolution["status"] = "not_applicable"
 
     should_inject = (
         (request.inject_portfolio_context or request.account_id is not None)
@@ -470,10 +607,128 @@ def _build_trace_context(
             intent_resolution=intent_resolution,
         )
 
+    position_name_symbols = _trace_position_name_symbols(
+        context.get("agent_user_context"),
+        request.message,
+    )
+    if len(position_name_symbols) > 1 and not explicit_stock_code:
+        stock_code = ""
+        context.pop("stock_code", None)
+        target_resolution.update({
+            "status": "ambiguous",
+            "source": "portfolio_position_names",
+            "symbol": None,
+            "candidate_symbols": position_name_symbols,
+            "error": "multiple_stock_names_in_request",
+        })
+    elif not stock_code and len(position_name_symbols) == 1:
+        stock_code = position_name_symbols[0]
+        context["stock_code"] = stock_code
+        target_resolution.update({
+            "status": "resolved",
+            "source": "portfolio_position_name",
+            "symbol": stock_code,
+            "candidate_symbols": position_name_symbols,
+        })
+
+    if stock_code:
+        _apply_trace_target_symbol(context.get("agent_user_context"), stock_code)
+        intent_resolution["stock_code_present"] = True
+    elif target_resolution.get("status") == "not_requested":
+        target_resolution["status"] = "not_applicable"
+
     if request.candidate_discovery_mode is not None:
         context["candidate_discovery_mode"] = request.candidate_discovery_mode
 
     return context
+
+
+def _trace_position_name_symbols(agent_user_context: Any, message: str) -> List[str]:
+    """Resolve position symbols whose stored names occur in the request text."""
+    if not agent_user_context or not message:
+        return []
+    positions = getattr(agent_user_context, "positions", None)
+    if positions is None and isinstance(agent_user_context, dict):
+        positions = agent_user_context.get("positions")
+    candidates: List[Any] = []
+    for position in positions or []:
+        if isinstance(position, dict):
+            symbol = position.get("symbol")
+            stock_name = position.get("stock_name") or position.get("name")
+        else:
+            symbol = getattr(position, "symbol", None)
+            stock_name = getattr(position, "stock_name", None) or getattr(position, "name", None)
+        name = str(stock_name or "").strip()
+        if name and name in message:
+            candidates.append(symbol)
+    return _trace_unique_symbols(candidates)
+
+
+def _apply_trace_target_symbol(agent_user_context: Any, stock_code: str) -> None:
+    """Keep the resolved single-stock target synchronized across context layers."""
+    if not agent_user_context or not stock_code:
+        return
+    report = getattr(agent_user_context, "report", None)
+    if report is None and isinstance(agent_user_context, dict):
+        report = agent_user_context.setdefault("report", {})
+    if report is None:
+        return
+    if isinstance(report, dict):
+        targets = [str(item) for item in report.get("target_symbols") or [] if item]
+        report["primary_symbol"] = stock_code
+        report["target_symbols"] = [stock_code, *(item for item in targets if item != stock_code)]
+        return
+    targets = [str(item) for item in getattr(report, "target_symbols", []) or [] if item]
+    report.primary_symbol = stock_code
+    report.target_symbols = [stock_code, *(item for item in targets if item != stock_code)]
+
+
+def _trace_composite_symbol(context: Dict[str, Any]) -> str:
+    symbol = str(context.get("stock_code") or "").strip()
+    agent_user_context = _coerce_trace_agent_user_context(context)
+    report = getattr(agent_user_context, "report", None)
+    intent = str(getattr(report, "intent", "") or "")
+    if not symbol or intent == "watchlist_scan":
+        return ""
+    return symbol
+
+
+def _prefetch_trace_composite_verdict(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build single-stock scoring evidence before the LLM starts reasoning."""
+    symbol = _trace_composite_symbol(context)
+    if not symbol:
+        target_resolution = context.get("_trace_target_resolution")
+        if isinstance(target_resolution, dict) and target_resolution.get("status") in {"failed", "ambiguous", "unresolved"}:
+            return {
+                "schema_version": "stock-composite-shadow.v1",
+                "status": "failed",
+                "error_code": "target_unresolved",
+                "error": "无法唯一解析单股目标，策略 4 与缠论评分未执行。",
+                "target_resolution": target_resolution,
+            }
+        return None
+    try:
+        from src.services.history_loader import get_frozen_target_date
+
+        agent_user_context = _coerce_trace_agent_user_context(context)
+        if agent_user_context is None:
+            return None
+        as_of = context.get("as_of") or get_frozen_target_date() or datetime.now().date()
+        return score_symbol_composite(
+            symbol,
+            as_of=as_of,
+            quote_basis="latest_trading_day",
+            holding=_find_trace_position(agent_user_context, symbol) is not None,
+            snapshot_builder=CompositeSnapshotBuilder(fallback_to_network=True),
+        )
+    except Exception as exc:
+        logger.warning("Agent trace composite prefetch failed for %s: %s", symbol, exc)
+        return {
+            "schema_version": "stock-composite-shadow.v1",
+            "status": "failed",
+            "symbol": symbol,
+            "error": str(exc),
+        }
 
 
 def _normalize_injected_report_intent(agent_user_context: Any, *, stock_code: str, user_message: str = "") -> None:
@@ -769,6 +1024,7 @@ def _build_trace_context_summary(context: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "context_error": context.get("_trace_context_error"),
         "intent_resolution": context.get("_trace_intent_resolution"),
+        "target_resolution": context.get("_trace_target_resolution"),
         "stock_code": context.get("stock_code"),
         "candidate_discovery_mode": context.get("candidate_discovery_mode"),
         "account_count": 0,
@@ -1019,20 +1275,252 @@ def _normalize_trace_session_id(session_id: Optional[str]) -> str:
     return normalized if normalized.startswith("trace-") else f"trace-{normalized}"
 
 
+def _enrich_legacy_trace_provisional_score(payload: Any) -> Any:
+    """Add read-only deterministic explanations missing from legacy artifacts."""
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return payload
+    snapshot_payload = payload.get("snapshot")
+    stored_verdict = payload.get("composite_verdict")
+    if not isinstance(snapshot_payload, dict) or not isinstance(stored_verdict, dict):
+        return payload
+    s4_snapshot = snapshot_payload.get("s4")
+    if not isinstance(s4_snapshot, dict):
+        return payload
+
+    try:
+        snapshot = CompositeScoreSnapshot.model_validate(snapshot_payload)
+        evaluated = evaluate_composite_verdict(snapshot)
+    except Exception as exc:
+        logger.warning("Legacy Trace provisional-score enrichment failed: %s", exc)
+        return payload
+    enriched_payload = dict(payload)
+    enriched_verdict = dict(stored_verdict)
+    stored_components = stored_verdict.get("components")
+    enriched_components = dict(stored_components) if isinstance(stored_components, dict) else {}
+    stored_s4 = enriched_components.get("s4")
+    enriched_s4 = dict(stored_s4) if isinstance(stored_s4, dict) else {}
+    evaluated_s4 = evaluated.components.s4
+
+    enrichment_types: List[str] = []
+    if (
+        stored_verdict.get("score") is None
+        and "provisional_score" not in stored_verdict
+        and evaluated.provisional_score is not None
+    ):
+        enriched_s4["provisional_score"] = evaluated_s4.provisional_score
+        enriched_s4["provisional_breakdown"] = dict(evaluated_s4.provisional_breakdown)
+        enriched_verdict["provisional_score"] = evaluated.provisional_score
+        enrichment_types.append("legacy_provisional_score")
+    if "formalization_reason_codes" not in stored_verdict:
+        enriched_verdict["formalization_reason_codes"] = list(
+            evaluated.formalization_reason_codes
+        )
+        enrichment_types.append("formalization_reason_codes")
+    if "quality_warning_codes" not in stored_verdict:
+        enriched_verdict["quality_warning_codes"] = list(evaluated.quality_warning_codes)
+        enrichment_types.append("quality_warning_codes")
+    if not enrichment_types:
+        return payload
+    enriched_components["s4"] = enriched_s4
+    enriched_verdict["components"] = enriched_components
+    enriched_payload["composite_verdict"] = enriched_verdict
+    enriched_payload["read_time_enrichment"] = {
+        "type": enrichment_types[0],
+        "types": enrichment_types,
+        "rule_version": evaluated.rule_version,
+        "persisted": False,
+    }
+    return enriched_payload
+
+
+def _quarantine_legacy_debate_parse_failure(payload: Any) -> Any:
+    """Correct legacy Debate artifacts that recorded parse failure as success."""
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return payload
+    debug_outputs = payload.get("debug_outputs")
+    if not isinstance(debug_outputs, dict):
+        return payload
+    parse_error = next(
+        (
+            str(value).strip()
+            for key, value in debug_outputs.items()
+            if str(key).endswith("_parse_error") and str(value).strip()
+        ),
+        "",
+    )
+    if not parse_error:
+        return payload
+    quarantined = dict(payload)
+    quarantined["success"] = False
+    quarantined["error"] = parse_error
+    quarantined["read_time_quarantine"] = {
+        "type": "legacy_debate_parse_failure",
+        "persisted": False,
+    }
+    return quarantined
+
+
+def _refresh_trace_debate_presentation(content: str, debate: Any) -> str:
+    """Re-render a successful stored Debate appendix without rewriting artifacts."""
+    if not isinstance(debate, dict) or debate.get("success") is not True:
+        return content
+    from src.agent.debate import format_debate_appendix
+
+    appendix = format_debate_appendix(debate).strip()
+    if not appendix:
+        return content
+    marker = "## 对抗式辩论裁决"
+    price_marker = "<!-- deterministic-price-plan:start -->"
+    text = str(content or "").strip()
+    start = text.find(marker)
+    price_start = text.find(price_marker)
+    if start >= 0:
+        end = price_start if price_start > start else len(text)
+        text = f"{text[:start].rstrip()}\n\n{appendix}{text[end:]}"
+    elif price_start >= 0:
+        text = f"{text[:price_start].rstrip()}\n\n{appendix}\n\n{text[price_start:]}"
+    else:
+        text = f"{text}\n\n{appendix}" if text else appendix
+    return text.strip()
+
+
 def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, Any]:
     summary = _read_trace_json_file(path / "summary.json", {}) or {}
     request_payload = _read_trace_json_file(path / "request.json", {}) or {}
     context_payload = _read_trace_json_file(path / "context.json", {}) or {}
+    target_conflict = _stored_trace_target_conflict(path)
     planner = _read_trace_json_file(path / "planner.json", None)
     tool_calls = _normalize_tool_calls_status(_read_trace_json_file(path / "tool_calls.json", []) or [])
+    dimension_evidence = _read_trace_json_file(path / "dimensions.json", None)
+    if not isinstance(dimension_evidence, dict):
+        dimension_evidence = (summary.get("dimension_evidence") if isinstance(summary, dict) else None)
+    if not isinstance(dimension_evidence, dict):
+        from src.agent.dimension_evidence import build_dimension_evidence_summary
+
+        dimension_evidence = build_dimension_evidence_summary(tool_calls)
+    else:
+        # Persisted multi-agent dimensions may contain opinions but predate the
+        # shared tool-coverage schema. Keep both views without mutating files.
+        from src.agent.dimension_evidence import build_dimension_evidence_summary
+
+        computed_dimensions = build_dimension_evidence_summary(tool_calls)
+        dimension_evidence = {
+            dimension: (
+                {
+                    **stored,
+                    "status": (
+                        "degraded"
+                        if computed_dimensions.get(dimension, {}).get("quality") == "unavailable"
+                        else "completed"
+                    ),
+                    "quality": computed_dimensions.get(dimension),
+                    "opinion": {
+                        "quality": computed_dimensions.get(dimension, {}).get("quality"),
+                        "evidence_tools": list(dict.fromkeys(
+                            (computed_dimensions.get(dimension, {}).get("available_tools") or [])
+                            + (computed_dimensions.get(dimension, {}).get("partial_tools") or [])
+                        )),
+                        "missing_evidence": computed_dimensions.get(dimension, {}).get("missing_evidence") or [],
+                    },
+                    "tool_evidence": computed_dimensions.get(dimension),
+                }
+                if isinstance(stored, dict) and stored.get("source") == "single_agent_tool_evidence"
+                else {
+                    **stored,
+                    "tool_evidence": stored.get("tool_evidence") or computed_dimensions.get(dimension),
+                }
+                if isinstance(stored, dict)
+                else computed_dimensions.get(dimension)
+            )
+            for dimension in set(computed_dimensions) | set(dimension_evidence)
+            for stored in [dimension_evidence.get(dimension)]
+        }
     final_content = ""
     try:
         final_content = (path / "final.md").read_text(encoding="utf-8")
     except Exception:
         final_content = ""
+    if str(request_payload.get("analysis_mode") or "planning_execute") == "planning_execute":
+        from src.agent.report_presentation import normalize_planning_execute_final_content
+
+        final_content = normalize_planning_execute_final_content(final_content)
     stock_selection = _read_trace_json_file(path / "stock_selection.json", None)
+    composite_verdict = _read_trace_json_file(
+        path / "composite_verdict.json",
+        summary.get("composite_verdict"),
+    )
     risk_gate = _read_trace_json_file(path / "risk_gate.json", summary.get("risk_gate"))
-    debate = _read_trace_json_file(path / "debate.json", None)
+    composite_verdict, risk_gate = _quarantine_stored_trace_target_mismatch(
+        context=context_payload,
+        tool_calls=tool_calls,
+        composite_payload=composite_verdict,
+        risk_gate_payload=risk_gate,
+        expected_symbol=target_conflict["expected_symbol"] if target_conflict else None,
+    )
+    composite_verdict = _enrich_legacy_trace_provisional_score(composite_verdict)
+    debate = _quarantine_legacy_debate_parse_failure(
+        _read_trace_json_file(path / "debate.json", None)
+    )
+    report_quality = _read_trace_json_file(path / "report_quality.json", summary.get("report_quality"))
+    if isinstance(report_quality, dict):
+        from src.agent.report_presentation import planning_report_quality_issues
+
+        request_language = str(request_payload.get("report_language") or "zh")
+        consistency_issues = planning_report_quality_issues(
+            final_content,
+            report_language=request_language,
+            tool_calls=tool_calls,
+        )
+        contradiction_issues = [
+            issue for issue in consistency_issues
+            if issue.startswith("report_contradicts_")
+        ]
+        if contradiction_issues:
+            report_quality = dict(report_quality)
+            report_quality["read_time_consistency"] = {
+                "status": "inconsistent",
+                "issues": contradiction_issues,
+                "persisted": False,
+                "message": "历史报告把已有工具证据误写为完全缺失，建议重跑该 Trace。",
+            }
+    if (
+        report_quality is None
+        and isinstance(debate, dict)
+        and isinstance(debate.get("read_time_quarantine"), dict)
+    ):
+        report_quality = {
+            "status": "legacy_incomplete",
+            "source": "read_time_quarantine",
+            "initial_issues": ["report_quality_not_recorded", "debate_json_parse_failed"],
+            "final_issues": ["legacy_report_requires_rerun"],
+            "repair_attempted": False,
+            "persisted": False,
+        }
+        debug_outputs = debate.get("debug_outputs")
+        if isinstance(debug_outputs, dict):
+            primary_report_raw = str(debug_outputs.get("primary_report_raw") or "").strip()
+            if primary_report_raw:
+                final_content = primary_report_raw
+    if str(request_payload.get("analysis_mode") or "planning_execute") == "planning_execute":
+        from src.agent.report_presentation import normalize_planning_execute_final_content
+
+        final_content = normalize_planning_execute_final_content(final_content)
+    final_content = _refresh_trace_debate_presentation(final_content, debate)
+    final_content = _refresh_trace_price_plan_presentation(
+        final_content,
+        risk_gate_payload=risk_gate,
+        debate_payload=debate,
+        tool_calls=tool_calls,
+        summary=summary,
+    )
+    if target_conflict:
+        mismatch_message = (
+            f"本次问题指定 {target_conflict['expected_symbol']}，但分析上下文及价格计划使用了 "
+            f"{target_conflict['actual_symbol']}。该报告存在标的混用，价格计划、裁决和复核结果已隔离；请重新运行分析。"
+        )
+        final_content = f"## 分析结果已隔离\n\n{mismatch_message}"
+        report_quality = {"status": "target_mismatch", "persisted": False, **target_conflict}
+        debate = {"enabled": True, "success": False, "error": "target_symbol_mismatch"}
     llm_telemetry = _read_trace_json_file(path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(path)
     judge_sanity = _read_trace_json_file(path / "judge_sanity.json", None) or _build_judge_sanity_summary(stock_selection)
     events = _read_trace_events(path / "events.ndjson")
@@ -1042,10 +1530,10 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
         or (context_payload.get("context_summary") if isinstance(context_payload, dict) else None)
     )
     result = {
-        "success": bool(summary.get("success")),
+        "success": bool(summary.get("success")) and not target_conflict,
         "session_id": session_id,
         "content": final_content,
-        "error": summary.get("error"),
+        "error": mismatch_message if target_conflict else summary.get("error"),
         "total_steps": int(summary.get("total_steps") or len(tool_calls)),
         "total_tokens": int(summary.get("total_tokens") or 0),
         "provider": str(summary.get("provider") or ""),
@@ -1056,16 +1544,20 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
         "planner": planner,
         "agent_user_context": agent_user_context,
         "context_summary": context_summary,
+        "dimension_evidence": dimension_evidence,
+        "report_quality": report_quality,
         "debate": debate,
         "stock_selection": stock_selection,
+        "composite_verdict": composite_verdict,
         "risk_gate": risk_gate,
         "llm_telemetry": llm_telemetry,
         "judge_sanity": judge_sanity,
         "artifact_dir": str(path),
         "runtime_config": None,
+        "jev_review": _read_trace_jev(path, session_id),
     }
     message = str(request_payload.get("message") or "")
-    stock_code = str(request_payload.get("stock_code") or "")
+    stock_code = str(target_conflict["expected_symbol"] if target_conflict else request_payload.get("stock_code") or "")
     return {
         "id": session_id,
         "createdAt": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
@@ -1075,6 +1567,58 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
         "status": "success" if result["success"] else "error",
         "result": result,
     }
+
+
+def _refresh_trace_price_plan_presentation(
+    content: str,
+    *,
+    risk_gate_payload: Any,
+    debate_payload: Any,
+    tool_calls: List[Dict[str, Any]],
+    summary: Dict[str, Any],
+) -> str:
+    """Render current read-model semantics without mutating immutable Trace files."""
+    if not isinstance(risk_gate_payload, dict):
+        return content
+    raw_result = risk_gate_payload.get("trade_plan_result")
+    if not isinstance(raw_result, dict):
+        return content
+    try:
+        from types import SimpleNamespace
+
+        from src.agent.pricing.decision import build_review_artifact
+        from src.agent.pricing.report import merge_price_plan_into_report
+        from src.agent.pricing.schemas import TradePlanResult
+
+        stored = TradePlanResult.model_validate(raw_result)
+        review_debate = debate_payload
+        if (
+            debate_payload is None
+            and isinstance(summary.get("report_quality"), dict)
+            and summary["report_quality"].get("status") == "fallback"
+        ):
+            review_debate = {
+                "enabled": True,
+                "success": False,
+                "error": "legacy_report_fallback_skipped_debate",
+            }
+        review = build_review_artifact(
+            stored.price_plan,
+            result=SimpleNamespace(
+                content=content,
+                dashboard=None,
+                trade_plan=None,
+                debate=review_debate,
+                provider=str(summary.get("provider") or ""),
+                model=str(summary.get("model") or ""),
+            ),
+            tool_calls=tool_calls,
+        )
+        refreshed = stored.model_copy(update={"review": review or stored.review})
+        return merge_price_plan_into_report(content, refreshed)
+    except Exception as exc:
+        logger.debug("Trace price-plan read model refresh failed: %s", exc)
+        return content
 
 
 @router.get("/trace/sessions/{session_id}")
@@ -1092,6 +1636,31 @@ async def get_agent_trace_session(session_id: str):
             detail={"error": "not_found", "message": f"未找到 Trace session {normalized} 的落盘记录"},
         )
     return _trace_history_item_from_artifact(normalized, artifact_dir)
+
+
+def _read_trace_jev(path: Path, session_id: str, *, outcomes: bool = False) -> dict:
+    try:
+        conflict = _stored_trace_target_conflict(path)
+        if conflict:
+            return {"status": "unavailable", "reason": "target_symbol_mismatch", "shadow_mode": True,
+                    "session_id": session_id, "shared_snapshot": False}
+        from src.services.jev_trace_service import JevTraceService
+
+        return JevTraceService().read(path, session_id, outcomes=outcomes)
+    except Exception:
+        logger.warning("Jev Trace review read unavailable for %s", session_id)
+        return {"status": "unavailable", "reason": "review_read_error", "shadow_mode": True}
+
+
+@router.get("/trace/sessions/{session_id}/jev")
+def get_trace_jev_review(session_id: str):
+    normalized = session_id.strip()
+    if not normalized.startswith("trace-"):
+        normalized = f"trace-{normalized}"
+    artifact_dir = _find_trace_artifact_dir(normalized)
+    if artifact_dir is None:
+        raise HTTPException(status_code=404, detail="Trace session not found")
+    return _read_trace_jev(artifact_dir, normalized, outcomes=True)
 
 
 def _write_trace_json(path: Path, payload: Any) -> None:
@@ -1580,24 +2149,56 @@ def _build_trace_risk_gate_payload(
     result: Any,
     context: Dict[str, Any],
     tool_calls: List[Dict[str, Any]],
+    composite_payload: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build and evaluate the deterministic risk gate payload for a trace run."""
     agent_user_context = _coerce_trace_agent_user_context(context)
     if agent_user_context is None:
         return None
 
-    primary_symbol = _resolve_trace_primary_symbol(context, agent_user_context, result=result)
+    primary_symbol = _resolve_trace_primary_symbol(
+        context,
+        agent_user_context,
+        result=result,
+        tool_calls=tool_calls,
+    )
     if not primary_symbol:
         return None
+    if (
+        isinstance(composite_payload, dict)
+        and composite_payload.get("error_code") == "target_symbol_mismatch"
+    ):
+        return _trace_risk_gate_target_mismatch_payload(
+            expected_symbol=str(composite_payload.get("expected_symbol") or primary_symbol),
+            actual_symbol=str(composite_payload.get("actual_symbol") or ""),
+            source="composite_verdict",
+            observed_tool_symbols=(
+                composite_payload.get("observed_tool_symbols")
+                if isinstance(composite_payload.get("observed_tool_symbols"), list)
+                else _trace_tool_target_symbols(tool_calls)
+            ),
+        )
 
-    trade_plan = _build_trace_trade_plan(
+    price_plan_result = _build_trace_price_plan_result(
+        primary_symbol=primary_symbol,
+        context=context,
+        result=result,
+        tool_calls=tool_calls,
+        composite_payload=composite_payload,
+    )
+    price_plan = price_plan_result.price_plan
+    trade_plan = _project_price_plan_to_legacy_trade_plan(
+        price_plan=price_plan,
         result=result,
         context=context,
         agent_user_context=agent_user_context,
-        primary_symbol=primary_symbol,
+        selected_scenario_id=(
+            price_plan_result.account_decision.selected_scenario_id
+            if price_plan_result.account_decision is not None
+            else None
+        ),
+        account_decision=price_plan_result.account_decision,
     )
-    if trade_plan is None:
-        return None
 
     try:
         from src.agent.risk_gate import QuoteState, RiskGateEvaluator, RiskGateInput
@@ -1605,6 +2206,16 @@ def _build_trace_risk_gate_payload(
         position = _find_trace_position(agent_user_context, primary_symbol)
         account = _find_trace_account(agent_user_context, position)
         quote = _build_trace_quote_state(primary_symbol, tool_calls, fallback_position=position)
+        composite_verdict = (
+            composite_payload.get("composite_verdict")
+            if isinstance(composite_payload, dict)
+            and isinstance(composite_payload.get("composite_verdict"), dict)
+            else None
+        )
+        trade_plan, composite_clamp_applied, composite_pre_clamp = _clamp_trace_trade_plan(
+            trade_plan,
+            composite_verdict,
+        )
         gate_input = RiskGateInput(
             plan=trade_plan,
             quote=quote or QuoteState(symbol=primary_symbol),
@@ -1615,22 +2226,523 @@ def _build_trace_risk_gate_payload(
             failed_tools=_trace_failed_tools(tool_calls),
             l3_confidence=_extract_trace_l3_confidence(result),
             current_total_exposure_pct=_current_total_exposure_pct(agent_user_context),
+            composite_verdict=composite_verdict,
+            composite_clamp_applied=composite_clamp_applied,
+            composite_pre_clamp_target_position_pct=composite_pre_clamp,
         )
         gate_result = RiskGateEvaluator().evaluate(gate_input)
+        price_plan_result = _finalize_trace_price_plan_result(
+            price_plan_result,
+            gate_result=gate_result,
+            result=result,
+            context=context,
+        )
         return {
             "schema_version": 1,
+            "price_plan": price_plan.model_dump(mode="json"),
+            "trade_plan_result": price_plan_result.model_dump(mode="json"),
             "trade_plan": trade_plan.model_dump(mode="json"),
             "risk_gate": gate_result.model_dump(mode="json"),
             "quote": quote.__dict__ if quote is not None else None,
-            "source": _trace_trade_plan_source(result),
+            "source": "deterministic_price_plan",
         }
     except Exception as exc:
         logger.warning("Agent trace risk gate build failed: %s", exc, exc_info=True)
         return {
             "schema_version": 1,
             "error": str(exc),
+            "price_plan": price_plan.model_dump(mode="json"),
+            "trade_plan_result": price_plan_result.model_dump(mode="json"),
             "trade_plan": trade_plan.model_dump(mode="json"),
         }
+
+
+def _build_trace_price_plan_result(
+    *,
+    primary_symbol: str,
+    context: Dict[str, Any],
+    result: Any,
+    tool_calls: List[Dict[str, Any]],
+    composite_payload: Optional[Dict[str, Any]] = None,
+) -> Any:
+    from src.agent.pricing.runtime import enrich_trade_plan_result, generate_trade_plan
+    from src.agent.pricing.schemas import TradePlanResult
+    from src.services.history_loader import get_frozen_target_date
+
+    existing = getattr(result, "trade_plan_result", None)
+    if existing is None:
+        existing = context.get("pre_debate_price_plan_result")
+    price_plan_result = None
+    if existing is not None:
+        try:
+            price_plan_result = (
+                existing
+                if isinstance(existing, TradePlanResult)
+                else TradePlanResult.model_validate(existing)
+            )
+        except Exception:
+            pass
+    if price_plan_result is None:
+        as_of = (
+            context.get("as_of")
+            or _trace_composite_as_of(primary_symbol, tool_calls)
+            or get_frozen_target_date()
+            or datetime.now().date()
+        )
+        if isinstance(as_of, datetime):
+            as_of = as_of.date()
+        elif not isinstance(as_of, date):
+            as_of = datetime.fromisoformat(str(as_of)[:10]).date()
+        trace_ref = str(context.get("session_id") or context.get("trace_id") or "").strip() or None
+        price_plan_result = generate_trade_plan(
+            primary_symbol,
+            as_of=as_of,
+            trace_ref=trace_ref,
+            persist=True,
+        )
+    decision_context = dict(context)
+    decision_context["price_plan_composite_payload"] = composite_payload
+    price_plan_result = enrich_trade_plan_result(
+        price_plan_result,
+        agent_result=result,
+        context=decision_context,
+    )
+    try:
+        setattr(result, "price_plan", price_plan_result.price_plan.model_dump(mode="json"))
+        setattr(result, "trade_plan_result", price_plan_result.model_dump(mode="json"))
+        from src.agent.pricing.report import merge_price_plan_into_report
+
+        setattr(
+            result,
+            "content",
+            merge_price_plan_into_report(
+                str(getattr(result, "content", "") or ""),
+                price_plan_result,
+            ),
+        )
+    except Exception:
+        pass
+    return price_plan_result
+
+
+def _project_price_plan_to_legacy_trade_plan(
+    *,
+    price_plan: Any,
+    result: Any,
+    context: Dict[str, Any],
+    agent_user_context: AgentUserContext,
+    selected_scenario_id: Optional[str] = None,
+    account_decision: Any = None,
+) -> TradePlan:
+    from src.agent.pricing.schemas import ScenarioRole
+
+    scenarios = list(getattr(price_plan, "scenarios", []) or [])
+    primary = next(
+        (item for item in scenarios if selected_scenario_id and item.scenario_id == selected_scenario_id),
+        None,
+    ) or next((item for item in scenarios if item.role is ScenarioRole.PRIMARY), None)
+    llm_action = _extract_trace_action(result) or "wait"
+    pre_gate_entry_allowed = bool(
+        account_decision is not None
+        and account_decision.execution_status == "risk_blocked"
+        and account_decision.reason_codes == ["RISK_GATE_PENDING"]
+        and account_decision.target_position_pct is not None
+        and account_decision.target_position_pct > 0
+    )
+    if llm_action in {"open", "add"} and primary is not None and pre_gate_entry_allowed:
+        action = llm_action
+        current_action = llm_action
+    elif llm_action in {"open", "add"}:
+        action = "wait"
+        current_action = "wait"
+    else:
+        action = llm_action
+        current_action = llm_action
+    zones = [
+        {
+            "label": {
+                "primary": "主入场区",
+                "secondary": "次入场区",
+                "observation": "观察区",
+            }[item.role.value],
+            "low": float(item.entry_low),
+            "high": float(item.entry_high),
+            "rationale": (
+                f"{','.join(item.source_families)}; "
+                f"scenario={item.scenario_id}; role={item.role.value}"
+            ),
+        }
+        for item in scenarios
+    ]
+    target_position_pct = (
+        float(account_decision.target_position_pct)
+        if account_decision is not None and account_decision.target_position_pct is not None
+        else None
+    )
+    return TradePlan(
+        symbol=price_plan.symbol,
+        action=action,
+        current_action=current_action,
+        order_type="manual",
+        target_position_pct=target_position_pct,
+        entry_zone_low=float(primary.entry_low) if primary is not None else None,
+        entry_zone_high=float(primary.entry_high) if primary is not None else None,
+        entry_zones=zones,
+        stop_loss_price=float(primary.stop_loss) if primary and primary.stop_loss else None,
+        take_profit_price=float(primary.target_1) if primary and primary.target_1 else None,
+        invalidation_conditions=(
+            [rule.rule_type for rule in primary.invalidation_rules]
+            if primary is not None
+            else []
+        ),
+        execution_window=(
+            f"confirmation_deadline={primary.confirmation_deadline.isoformat()}; "
+            f"confirmation_days={primary.confirmation_valid_trading_days}; "
+            f"order_days={primary.order_valid_trading_days}"
+            if primary is not None
+            else None
+        ),
+        review_triggers=_extract_trace_review_triggers(result),
+        notes="Compatibility projection from deterministic PricePlanArtifact.",
+        metadata={
+            "price_source": "deterministic_price_plan",
+            "plan_id": price_plan.plan_id,
+            "selected_scenario_id": primary.scenario_id if primary else None,
+            "generation_status": price_plan.generation_status.value,
+            "analysis_mode": agent_user_context.report.analysis_mode,
+            "intent": agent_user_context.report.intent,
+            "stock_name": context.get("stock_name"),
+        },
+    )
+
+
+def _finalize_trace_price_plan_result(
+    price_plan_result: Any,
+    *,
+    gate_result: Any,
+    result: Any,
+    context: Optional[Dict[str, Any]] = None,
+) -> Any:
+    decision = getattr(price_plan_result, "account_decision", None)
+    if decision is None:
+        return price_plan_result
+    from src.agent.pricing.decision import finalize_account_decision
+    from src.agent.pricing.report import merge_price_plan_into_report
+    from src.agent.pricing.repository import PricePlanRepository
+    from src.agent.pricing.runtime import _decision_identity
+
+    final_decision = finalize_account_decision(decision, risk_gate_result=gate_result)
+    owner_id, account_id, _ = _decision_identity(context)
+    final_decision = PricePlanRepository().save_account_decision(
+        final_decision,
+        owner_id=owner_id,
+        account_id=account_id,
+    )
+    reason_codes = sorted(
+        set(
+            code
+            for code in [*price_plan_result.reason_codes, *final_decision.reason_codes]
+            if code != "RISK_GATE_PENDING"
+        )
+    )
+    final_result = price_plan_result.model_copy(
+        update={
+            "account_decision": final_decision,
+            "execution_status": final_decision.execution_status,
+            "reason_codes": reason_codes,
+        }
+    )
+    try:
+        result.price_plan = final_result.price_plan.model_dump(mode="json")
+        result.trade_plan_result = final_result.model_dump(mode="json")
+        result.content = merge_price_plan_into_report(
+            str(getattr(result, "content", "") or ""),
+            final_result,
+        )
+    except Exception:
+        pass
+    return final_result
+
+
+def _clamp_trace_trade_plan(
+    trade_plan: Any,
+    composite_verdict: Optional[Dict[str, Any]],
+) -> tuple[Any, bool, Optional[float]]:
+    """Apply the composite cap once before constructing RiskGateInput."""
+    if not isinstance(composite_verdict, dict) or composite_verdict.get("shadow_mode", True):
+        return trade_plan, False, None
+    raw_cap = composite_verdict.get("target_position_cap_pct")
+    try:
+        cap = float(raw_cap) if raw_cap is not None else None
+    except (TypeError, ValueError):
+        cap = None
+    if cap is not None and 0 <= cap <= 1:
+        cap *= 100.0
+    target = getattr(trade_plan, "target_position_pct", None)
+    if cap is None or target is None or target <= cap:
+        return trade_plan, False, target
+    return trade_plan.model_copy(update={"target_position_pct": cap}), True, target
+
+
+def _build_trace_composite_verdict_payload(
+    *,
+    result: Any,
+    context: Dict[str, Any],
+    tool_calls: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Build one shadow verdict for a single-stock trace."""
+    agent_user_context = _coerce_trace_agent_user_context(context)
+    if agent_user_context is None:
+        return None
+    primary_symbol = _resolve_trace_primary_symbol(
+        context,
+        agent_user_context,
+        result=result,
+        tool_calls=tool_calls,
+    )
+    if not primary_symbol:
+        return None
+
+    tool_symbols = _trace_tool_target_symbols(tool_calls)
+    if len(tool_symbols) == 1 and tool_symbols[0] != _normalize_trace_symbol(primary_symbol):
+        return _trace_target_mismatch_payload(
+            expected_symbol=primary_symbol,
+            actual_symbol=tool_symbols[0],
+            source="tool_calls",
+            observed_tool_symbols=tool_symbols,
+        )
+
+    prefetched = context.get("trace_composite_verdict")
+    if isinstance(prefetched, dict) and prefetched.get("status") != "failed":
+        prefetched_symbol = _trace_composite_payload_symbol(prefetched)
+        if prefetched_symbol and prefetched_symbol != _normalize_trace_symbol(primary_symbol):
+            return _trace_target_mismatch_payload(
+                expected_symbol=primary_symbol,
+                actual_symbol=prefetched_symbol,
+                source="prefetched_composite",
+                observed_tool_symbols=tool_symbols,
+            )
+        market_regime = _trace_market_regime(tool_calls)
+        snapshot_payload = prefetched.get("snapshot")
+        if market_regime is not None and isinstance(snapshot_payload, dict):
+            snapshot = CompositeScoreSnapshot.model_validate(snapshot_payload)
+            verdict = evaluate_composite_verdict(snapshot, market_regime=market_regime)
+            return {
+                **prefetched,
+                "composite_verdict": verdict.model_dump(mode="json"),
+            }
+        return prefetched
+
+    selection_payload = _trace_selection_composite_payload(result, primary_symbol)
+    if selection_payload is not None:
+        selection_symbol = _trace_composite_payload_symbol(selection_payload)
+        if selection_symbol and selection_symbol != _normalize_trace_symbol(primary_symbol):
+            return _trace_target_mismatch_payload(
+                expected_symbol=primary_symbol,
+                actual_symbol=selection_symbol,
+                source="stock_selection",
+                observed_tool_symbols=tool_symbols,
+            )
+        return selection_payload
+    if isinstance(getattr(result, "stock_selection", None), dict):
+        return None
+
+    try:
+        from src.services.history_loader import get_frozen_target_date
+
+        as_of = _trace_composite_as_of(primary_symbol, tool_calls) or get_frozen_target_date() or datetime.now().date()
+        payload = score_symbol_composite(
+            primary_symbol,
+            as_of=as_of,
+            quote_basis="latest_trading_day",
+            holding=_find_trace_position(agent_user_context, primary_symbol) is not None,
+            snapshot_builder=CompositeSnapshotBuilder(fallback_to_network=True),
+            market_regime=_trace_market_regime(tool_calls),
+        )
+        actual_symbol = _trace_composite_payload_symbol(payload)
+        if actual_symbol and actual_symbol != _normalize_trace_symbol(primary_symbol):
+            return _trace_target_mismatch_payload(
+                expected_symbol=primary_symbol,
+                actual_symbol=actual_symbol,
+                source="runtime_composite",
+                observed_tool_symbols=tool_symbols,
+            )
+        return payload
+    except Exception as exc:
+        logger.warning("Agent trace composite shadow scoring failed for %s: %s", primary_symbol, exc)
+        return {
+            "schema_version": "stock-composite-shadow.v1",
+            "status": "failed",
+            "symbol": primary_symbol,
+            "error": str(exc),
+        }
+
+
+def _trace_composite_payload_symbol(payload: Dict[str, Any]) -> str:
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    verdict = (
+        payload.get("composite_verdict")
+        if isinstance(payload.get("composite_verdict"), dict)
+        else {}
+    )
+    return _normalize_trace_symbol(
+        snapshot.get("symbol") or verdict.get("symbol") or payload.get("symbol")
+    )
+
+
+def _trace_target_mismatch_payload(
+    *,
+    expected_symbol: str,
+    actual_symbol: str,
+    source: str,
+    observed_tool_symbols: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    expected = _normalize_trace_symbol(expected_symbol)
+    actual = _normalize_trace_symbol(actual_symbol)
+    logger.error(
+        "Agent trace composite target mismatch: expected=%s actual=%s source=%s tool_symbols=%s",
+        expected,
+        actual,
+        source,
+        observed_tool_symbols or [],
+    )
+    return {
+        "schema_version": "stock-composite-shadow.v1",
+        "status": "failed",
+        "error_code": "target_symbol_mismatch",
+        "error": f"确定性评分目标不一致：请求 {expected or '-'}，实际 {actual or '-'}。已拒绝使用该评分。",
+        "expected_symbol": expected or None,
+        "actual_symbol": actual or None,
+        "mismatch_source": source,
+        "observed_tool_symbols": observed_tool_symbols or [],
+    }
+
+
+def _quarantine_stored_trace_target_mismatch(
+    *,
+    context: Dict[str, Any],
+    tool_calls: List[Dict[str, Any]],
+    composite_payload: Any,
+    risk_gate_payload: Any,
+    expected_symbol: Optional[str] = None,
+) -> tuple[Any, Any]:
+    """Reject persisted scoring artifacts that belong to a different security."""
+    agent_user_context = _coerce_trace_agent_user_context(context)
+    if agent_user_context is None and not expected_symbol:
+        return composite_payload, risk_gate_payload
+
+    expected_symbol = expected_symbol or _resolve_trace_primary_symbol(
+        context,
+        agent_user_context,
+        tool_calls=tool_calls,
+    )
+    if not expected_symbol:
+        return composite_payload, risk_gate_payload
+
+    tool_symbols = _trace_tool_target_symbols(tool_calls)
+    actual_composite = (
+        _trace_composite_payload_symbol(composite_payload)
+        if isinstance(composite_payload, dict)
+        else ""
+    )
+    if actual_composite and actual_composite != _normalize_trace_symbol(expected_symbol):
+        composite_payload = _trace_target_mismatch_payload(
+            expected_symbol=expected_symbol,
+            actual_symbol=actual_composite,
+            source="stored_artifact",
+            observed_tool_symbols=tool_symbols,
+        )
+
+    actual_gate = ""
+    if isinstance(risk_gate_payload, dict):
+        trade_plan = risk_gate_payload.get("trade_plan")
+        quote = risk_gate_payload.get("quote")
+        if isinstance(trade_plan, dict):
+            actual_gate = _normalize_trace_symbol(trade_plan.get("symbol"))
+        if not actual_gate and isinstance(quote, dict):
+            actual_gate = _normalize_trace_symbol(quote.get("symbol"))
+    if actual_gate and actual_gate != _normalize_trace_symbol(expected_symbol):
+        risk_gate_payload = _trace_risk_gate_target_mismatch_payload(
+            expected_symbol=expected_symbol,
+            actual_symbol=actual_gate,
+            source="stored_artifact",
+            observed_tool_symbols=tool_symbols,
+        )
+    return composite_payload, risk_gate_payload
+
+
+def _trace_risk_gate_target_mismatch_payload(
+    *,
+    expected_symbol: str,
+    actual_symbol: str,
+    source: str,
+    observed_tool_symbols: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    expected = _normalize_trace_symbol(expected_symbol)
+    actual = _normalize_trace_symbol(actual_symbol)
+    logger.error(
+        "Agent trace risk gate target mismatch: expected=%s actual=%s source=%s tool_symbols=%s",
+        expected,
+        actual,
+        source,
+        observed_tool_symbols or [],
+    )
+    return {
+        "schema_version": 1,
+        "status": "failed",
+        "error_code": "target_symbol_mismatch",
+        "error": f"风险门目标不一致：请求 {expected or '-'}，实际 {actual or '-'}。已拒绝使用该风险门结果。",
+        "expected_symbol": expected or None,
+        "actual_symbol": actual or None,
+        "mismatch_source": source,
+        "observed_tool_symbols": observed_tool_symbols or [],
+    }
+
+
+def _trace_selection_composite_payload(result: Any, primary_symbol: str) -> Optional[Dict[str, Any]]:
+    stock_selection = getattr(result, "stock_selection", None) if result is not None else None
+    if not isinstance(stock_selection, dict):
+        return None
+    final_report = stock_selection.get("final_report_json")
+    if not isinstance(final_report, dict):
+        return None
+    stage = final_report.get("deterministic_scoring")
+    full = stage.get("full") if isinstance(stage, dict) and isinstance(stage.get("full"), dict) else {}
+    results = full.get("results") if isinstance(full.get("results"), list) else []
+    normalized_target = _normalize_trace_symbol(primary_symbol)
+    for item in results:
+        if not isinstance(item, dict) or _normalize_trace_symbol(item.get("code")) != normalized_target:
+            continue
+        payload = dict(item)
+        payload.pop("code", None)
+        return payload
+    return None
+
+
+def _trace_composite_as_of(primary_symbol: str, tool_calls: List[Dict[str, Any]]) -> Optional[Any]:
+    structure = _latest_tool_payload(tool_calls, "analyze_price_structure", stock_code=primary_symbol) or {}
+    latest_bar = structure.get("latest_bar") if isinstance(structure.get("latest_bar"), dict) else {}
+    for key in ("time", "date", "datetime"):
+        if latest_bar.get(key):
+            return latest_bar[key]
+
+    history = _latest_tool_payload(tool_calls, "get_daily_history", stock_code=primary_symbol) or {}
+    rows = history.get("data") if isinstance(history.get("data"), list) else []
+    if rows and isinstance(rows[-1], dict):
+        for key in ("date", "time", "datetime"):
+            if rows[-1].get(key):
+                return rows[-1][key]
+    return None
+
+
+def _trace_market_regime(tool_calls: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    payload = _latest_tool_payload(tool_calls, "detect_market_regime")
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "regime": payload.get("regime"),
+        "volatility_bucket": payload.get("volatility_bucket"),
+    }
 
 
 def _coerce_trace_agent_user_context(context: Dict[str, Any]) -> Optional[AgentUserContext]:
@@ -1648,6 +2760,7 @@ def _resolve_trace_primary_symbol(
     agent_user_context: AgentUserContext,
     *,
     result: Any = None,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     report = agent_user_context.report
     explicit_candidates = [
@@ -1661,15 +2774,31 @@ def _resolve_trace_primary_symbol(
             return explicit_symbols[0]
         return _extract_trace_stock_selection_symbol(result)
 
-    fallback_candidates = [
-        *explicit_candidates,
-        *((position.symbol for position in agent_user_context.positions if position.quantity > 0)),
-    ]
-    for symbol in fallback_candidates:
-        normalized = str(symbol or "").strip()
-        if normalized:
-            return normalized
-    return None
+    if explicit_symbols:
+        return explicit_symbols[0]
+
+    tool_symbols = _trace_tool_target_symbols(tool_calls or [])
+    if len(tool_symbols) == 1:
+        return tool_symbols[0]
+
+    sidecar = getattr(result, "trade_plan", None)
+    sidecar_symbols = _trace_unique_symbols([
+        sidecar.get("symbol") if isinstance(sidecar, dict) else None,
+    ])
+    return sidecar_symbols[0] if len(sidecar_symbols) == 1 else None
+
+
+def _trace_tool_target_symbols(tool_calls: List[Dict[str, Any]]) -> List[str]:
+    """Return unique security symbols explicitly used by single-stock tools."""
+    candidates: List[Any] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        arguments = call.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        candidates.extend((arguments.get("stock_code"), arguments.get("symbol")))
+    return _trace_unique_symbols(candidates)
 
 
 def _extract_trace_stock_selection_symbol(result: Any) -> Optional[str]:
@@ -1720,45 +2849,15 @@ def _normalize_trace_symbol(value: Any) -> str:
     return text
 
 
-def _build_trace_trade_plan(
-    *,
-    result: Any,
-    context: Dict[str, Any],
-    agent_user_context: AgentUserContext,
-    primary_symbol: str,
-) -> Optional[TradePlan]:
-    action = _extract_trace_action(result)
-    if action is None:
-        return None
-    position = _find_trace_position(agent_user_context, primary_symbol)
-    target_position_pct = _extract_trace_target_position_pct(result, position)
-    stop_loss_price = _extract_trace_stop_loss_price(result, position)
-    stop_loss_pct = _extract_trace_stop_loss_pct(result, agent_user_context)
-    invalidation_conditions = _extract_trace_invalidation_conditions(result)
-    if action in {"open", "add", "reduce", "sell"} and not invalidation_conditions:
-        invalidation_conditions = _fallback_invalidation_conditions(action, agent_user_context)
-
-    return TradePlan(
-        symbol=primary_symbol,
-        action=action,
-        order_type="manual",
-        target_position_pct=target_position_pct,
-        stop_loss_price=stop_loss_price,
-        stop_loss_pct=stop_loss_pct,
-        invalidation_conditions=invalidation_conditions,
-        review_triggers=_extract_trace_review_triggers(result),
-        notes="Generated from agent trace output for deterministic risk_gate evaluation.",
-        metadata={
-            "analysis_mode": agent_user_context.report.analysis_mode,
-            "intent": agent_user_context.report.intent,
-            "stock_name": context.get("stock_name"),
-        },
-    )
-
-
 def _extract_trace_action(result: Any) -> Optional[TradeAction]:
     debate = getattr(result, "debate", None) if result is not None else None
     candidates: List[Any] = []
+    dashboard = getattr(result, "dashboard", None) if result is not None else None
+    if isinstance(dashboard, dict):
+        candidates.extend(_trace_dashboard_values(
+            dashboard,
+            {"decision_type", "operation_advice", "final_action", "action"},
+        ))
     if isinstance(debate, dict):
         judge = debate.get("judge_decision") or {}
         candidates.extend([
@@ -1804,54 +2903,35 @@ def _normalize_trace_trade_action(value: Any) -> Optional[TradeAction]:
         "no_trade": "wait",
         "watch": "monitor",
         "review": "manual_review",
+        "买入": "open",
+        "开仓": "open",
+        "加仓": "add",
+        "减仓": "reduce",
+        "卖出": "sell",
+        "清仓": "sell",
+        "持有": "hold",
+        "观望": "wait",
     }
     text = mapping.get(text, text)
     allowed = {"open", "add", "reduce", "sell", "hold", "wait", "monitor", "manual_review", "reject"}
     return text if text in allowed else None  # type: ignore[return-value]
 
 
-def _extract_trace_target_position_pct(result: Any, position: Any) -> Optional[float]:
-    debate = getattr(result, "debate", None) if result is not None else None
-    if isinstance(debate, dict):
-        judge = debate.get("judge_decision") or {}
-        for key in ("target_position_pct", "position_pct", "first_position_pct"):
-            value = _to_float(judge.get(key))
-            if value is not None:
-                return value
-    return getattr(position, "position_pct", None) if position is not None else None
-
-
-def _extract_trace_stop_loss_price(result: Any, position: Any) -> Optional[float]:
-    debate = getattr(result, "debate", None) if result is not None else None
-    if isinstance(debate, dict):
-        judge = debate.get("judge_decision") or {}
-        value = _to_float(judge.get("stop_loss_price") or judge.get("stop_loss"))
-        if value is not None:
-            return value
-    return getattr(position, "stop_loss", None) if position is not None else None
-
-
-def _extract_trace_stop_loss_pct(result: Any, agent_user_context: AgentUserContext) -> Optional[float]:
-    debate = getattr(result, "debate", None) if result is not None else None
-    if isinstance(debate, dict):
-        judge = debate.get("judge_decision") or {}
-        value = _to_float(judge.get("stop_loss_pct"))
-        if value is not None:
-            return value
-    return agent_user_context.investor.default_stop_loss_pct
-
-
-def _extract_trace_invalidation_conditions(result: Any) -> List[str]:
+def _trace_dashboard_values(payload: Dict[str, Any], keys: set[str]) -> List[Any]:
     values: List[Any] = []
-    debate = getattr(result, "debate", None) if result is not None else None
-    if isinstance(debate, dict):
-        judge = debate.get("judge_decision") or {}
-        values.extend([
-            judge.get("invalidation_conditions"),
-            judge.get("failure_conditions"),
-            judge.get("risk_controls"),
-        ])
-    return _string_list(values)
+    for key, value in payload.items():
+        if key in keys and value not in (None, ""):
+            if isinstance(value, dict) and key == "operation_advice":
+                values.extend(item for item in value.values() if item not in (None, ""))
+            else:
+                values.append(value)
+        if isinstance(value, dict):
+            values.extend(_trace_dashboard_values(value, keys))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    values.extend(_trace_dashboard_values(item, keys))
+    return values
 
 
 def _extract_trace_review_triggers(result: Any) -> List[str]:
@@ -1860,23 +2940,6 @@ def _extract_trace_review_triggers(result: Any) -> List[str]:
         return []
     judge = debate.get("judge_decision") or {}
     return _string_list([judge.get("review_triggers"), judge.get("next_review"), judge.get("risk_controls")])
-
-
-def _fallback_invalidation_conditions(action: TradeAction, agent_user_context: AgentUserContext) -> List[str]:
-    if action in {"open", "add"} and agent_user_context.investor.default_stop_loss_pct is not None:
-        return [f"跌破默认止损 {agent_user_context.investor.default_stop_loss_pct:.2f}%"]
-    if action in {"reduce", "sell"}:
-        return ["卖出/减仓计划需结合可执行交易状态复核"]
-    return []
-
-
-def _trace_trade_plan_source(result: Any) -> str:
-    debate = getattr(result, "debate", None) if result is not None else None
-    if isinstance(debate, dict) and debate.get("judge_decision"):
-        return "debate_judge"
-    if isinstance(getattr(result, "stock_selection", None), dict):
-        return "stock_selection"
-    return "fallback_wait"
 
 
 def _find_trace_position(agent_user_context: AgentUserContext, symbol: str) -> Any:
@@ -2184,11 +3247,30 @@ class TraceArtifactWriter:
         event_type = str(event.get("type") or event.get("event") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         artifact_payload = event.get("__artifact_payload") if isinstance(event.get("__artifact_payload"), dict) else None
+        if event_type == "stage_done":
+            stage_name = str(event.get("stage") or "")
+            dimension_opinion = event.get("dimension_opinion")
+            if (
+                stage_name in {"technical", "intel", "capital", "fundamental"}
+                and isinstance(dimension_opinion, dict)
+            ):
+                dimensions = _read_trace_json_file(self.path / "dimensions.json", {})
+                if not isinstance(dimensions, dict):
+                    dimensions = {}
+                dimensions[stage_name] = {
+                    "stage": stage_name,
+                    "status": event.get("status"),
+                    "duration": event.get("duration"),
+                    "quality": event.get("dimension_status") or {},
+                    "opinion": dimension_opinion,
+                }
+                _write_trace_json(self.path / "dimensions.json", dimensions)
         stage_name_by_event = {
             "selection_candidate_discovery_done": "candidate_discovery",
             "selection_balanced_candidate_evidence_done": "balanced_candidate_evidence",
             "selection_candidate_screening_done": "candidate_screening",
             "selection_deep_dive_done": "single_stock_deep_dive",
+            "selection_deterministic_scoring_done": "deterministic_scoring",
             "selection_meta_orchestrator_done": "meta_orchestrator",
             "selection_pricing_agent_done": "pricing_agent",
             "selection_allocation_done": "portfolio_allocation",
@@ -2272,18 +3354,61 @@ class TraceArtifactWriter:
             payload["context_summary"] = _build_trace_context_summary(context)
         _write_trace_json(self.path / "tool_calls.json", tool_calls)
         _write_trace_json(self.path / "evidence_ledger.json", _build_evidence_ledger(tool_calls))
+        from src.agent.dimension_evidence import build_dimension_evidence_summary
+
+        dimension_evidence = build_dimension_evidence_summary(tool_calls)
+        existing_dimensions = _read_trace_json_file(self.path / "dimensions.json", {})
+        if not isinstance(existing_dimensions, dict):
+            existing_dimensions = {}
+        stored_dimensions: Dict[str, Any] = {}
+        for dimension, details in dimension_evidence.items():
+            existing = existing_dimensions.get(dimension)
+            if isinstance(existing, dict):
+                stored_dimensions[dimension] = {
+                    **existing,
+                    "tool_evidence": details,
+                }
+                continue
+            stored_dimensions[dimension] = {
+                "stage": dimension,
+                "status": "completed" if details["quality"] != "unavailable" else "degraded",
+                "source": "single_agent_tool_evidence",
+                "quality": details,
+                "opinion": {
+                    "quality": details["quality"],
+                    "missing_evidence": details["missing_evidence"],
+                    "evidence_tools": details["available_tools"] + details["partial_tools"],
+                },
+            }
+        _write_trace_json(
+            self.path / "dimensions.json",
+            stored_dimensions,
+        )
+        payload["dimension_evidence"] = dimension_evidence
         debate = getattr(result, "debate", None) if result is not None else None
         if debate is None:
             debate = _build_debate_from_trace_events(self._events)
         _write_trace_json(self.path / "debate.json", debate)
+        report_quality = getattr(result, "report_quality", None) if result is not None else None
+        _write_trace_json(self.path / "report_quality.json", report_quality)
+        payload["report_quality"] = report_quality
+        composite_verdict = None
         risk_gate = None
         if context is not None:
-            risk_gate = _build_trace_risk_gate_payload(
+            composite_verdict = _build_trace_composite_verdict_payload(
                 result=result,
                 context=context,
                 tool_calls=tool_calls,
             )
+            risk_gate = _build_trace_risk_gate_payload(
+                result=result,
+                context=context,
+                tool_calls=tool_calls,
+                composite_payload=composite_verdict,
+            )
+        _write_trace_json(self.path / "composite_verdict.json", composite_verdict)
         _write_trace_json(self.path / "risk_gate.json", risk_gate)
+        payload["composite_verdict"] = composite_verdict
         payload["risk_gate"] = risk_gate
         stock_selection = getattr(result, "stock_selection", None) if result is not None else None
         if stock_selection:
@@ -2312,6 +3437,7 @@ class TraceArtifactWriter:
         payload["llm_telemetry"] = llm_telemetry
         payload["judge_sanity"] = judge_sanity
         _write_trace_json(self.path / "summary.json", payload)
+        final_content = getattr(result, "content", final_content) if result is not None else final_content
         (self.path / "final.md").write_text(final_content or "", encoding="utf-8")
         if context is not None:
             planner = _build_planner_trace(context)
@@ -2400,11 +3526,8 @@ def _ingest_trace_to_graphiti(
                 "tool_calls": normalized_tool_calls,
                 "debate": getattr(result, "debate", None) if result is not None else None,
                 "stock_selection": getattr(result, "stock_selection", None) if result is not None else None,
-                "risk_gate": _build_trace_risk_gate_payload(
-                    result=result,
-                    context=context,
-                    tool_calls=normalized_tool_calls,
-                ),
+                "composite_verdict": _read_trace_json_file(Path(artifact_dir) / "composite_verdict.json", None),
+                "risk_gate": _read_trace_json_file(Path(artifact_dir) / "risk_gate.json", None),
                 "artifact_dir": artifact_dir,
             },
             context={
@@ -2416,6 +3539,7 @@ def _ingest_trace_to_graphiti(
                 "account_id": request.account_id,
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "context_summary": _build_trace_context_summary(context),
+                "dimension_evidence": _read_trace_json_file(Path(artifact_dir) / "dimensions.json", None),
                 "planner": _build_planner_trace(context),
             },
             artifact_dir=artifact_dir,
@@ -2495,8 +3619,194 @@ def _safe_artifact_finalize(
         logger.warning("Agent trace artifact finalize failed: %s", exc)
 
 
+def _capture_signal_lifecycle(
+    *,
+    message: str,
+    session_id: str,
+    result: Any,
+    context: Optional[Dict[str, Any]] = None,
+    composite_payload: Optional[Dict[str, Any]] = None,
+    risk_gate_payload: Optional[Dict[str, Any]] = None,
+    capture_jev: bool = True,
+) -> None:
+    try:
+        from src.services.signal_lifecycle_service import SignalLifecycleService
+
+        if risk_gate_payload is None:
+            candidate = getattr(result, "deterministic_risk_gate", None)
+            if isinstance(candidate, dict):
+                risk_gate_payload = candidate
+
+        SignalLifecycleService().capture_agent_result(
+            message=message,
+            session_id=session_id,
+            result=result,
+            context=context,
+            composite_payload=composite_payload,
+            risk_gate_payload=risk_gate_payload,
+        )
+    except Exception as exc:
+        logger.warning("Signal lifecycle capture skipped: %s", exc, exc_info=True)
+
+    if not capture_jev:
+        return
+    try:
+        from src.services.jev_evaluation_service import JevEvaluationService
+
+        jev_context = context or {}
+        user_context = _coerce_trace_agent_user_context(jev_context)
+        primary_symbol = user_context.report.primary_symbol if user_context else None
+        symbol = str(primary_symbol or jev_context.get("stock_code") or _infer_stock_code_from_message(message) or "")
+        JevEvaluationService().capture_agent_result(
+            stock_code=symbol, session_id=session_id, result=result,
+            context=jev_context, risk_gate_payload=risk_gate_payload,
+        )
+    except Exception:
+        logger.warning("Jev shadow capture unavailable; analysis result preserved")
+
+
+def _prepare_trace_jev_review(writer: TraceArtifactWriter, *, result: Any, context: dict,
+                              risk_gate: dict | None, histories: dict,
+                              background_tasks: BackgroundTasks | None) -> dict:
+    try:
+        from src.services.jev_trace_service import JevTraceService
+
+        user = _coerce_trace_agent_user_context(context)
+        symbol = str((user.report.primary_symbol if user else None) or context.get("stock_code") or "")
+        service = JevTraceService()
+        review = service.prepare(path=writer.path, session_id=writer.session_id, symbol=symbol,
+                                 result=result, context=context, risk_gate=risk_gate, histories=histories)
+        if review["status"] == "pending" and background_tasks is not None:
+            background_tasks.add_task(service.finish, writer.path, review)
+        _safe_artifact_event(writer, {"type": "jev_review_ready", "session_id": writer.session_id,
+                                      "status": review["status"], "capture_id": review["capture_id"]})
+        return review
+    except Exception:
+        logger.warning("Jev Trace review preparation failed for %s", writer.session_id)
+        return {"status": "error", "reason": "shadow_prepare_error", "shadow_mode": True}
+
+
+def _ensure_single_stock_price_plan(
+    *,
+    message: str,
+    session_id: str,
+    result: Any,
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Generate one reusable plan artifact for non-trace single-stock paths."""
+    if result is None or not bool(getattr(result, "success", False)):
+        return None
+    if isinstance(getattr(result, "stock_selection", None), dict):
+        return None
+    existing = getattr(result, "trade_plan_result", None)
+    if existing is None:
+        existing = context.get("pre_debate_price_plan_result")
+    trade_plan_result = None
+    if isinstance(existing, dict) and isinstance(existing.get("price_plan"), dict):
+        try:
+            from src.agent.pricing.schemas import TradePlanResult
+
+            trade_plan_result = TradePlanResult.model_validate(existing)
+        except Exception:
+            pass
+    symbol = str(
+        context.get("stock_code")
+        or (trade_plan_result.price_plan.symbol if trade_plan_result is not None else "")
+        or _infer_stock_code_from_message(message)
+        or ""
+    ).strip()
+    normalized = _normalize_trace_symbol(symbol)
+    if len(normalized) != 6 or not normalized.isdigit():
+        return None
+    from src.agent.pricing.runtime import enrich_trade_plan_result, generate_trade_plan
+    from src.services.history_loader import get_frozen_target_date
+
+    as_of = context.get("as_of") or get_frozen_target_date() or datetime.now().date()
+    if isinstance(as_of, datetime):
+        as_of = as_of.date()
+    elif not isinstance(as_of, date):
+        as_of = datetime.fromisoformat(str(as_of)[:10]).date()
+    if trade_plan_result is None:
+        trade_plan_result = generate_trade_plan(
+            normalized,
+            as_of=as_of,
+            trace_ref=session_id,
+            persist=True,
+        )
+    decision_context = dict(context)
+    composite_payload = decision_context.get("price_plan_composite_payload")
+    if not isinstance(composite_payload, dict):
+        try:
+            composite_payload = score_symbol_composite(
+                normalized,
+                as_of=as_of,
+                quote_basis="latest_trading_day",
+                holding=False,
+                snapshot_builder=CompositeSnapshotBuilder(fallback_to_network=True),
+                market_regime=_trace_market_regime(
+                    getattr(result, "tool_calls_log", []) or []
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Single-stock position sizing evidence unavailable for %s: %s",
+                normalized,
+                exc,
+            )
+            composite_payload = None
+    decision_context["price_plan_composite_payload"] = composite_payload
+    trade_plan_result = enrich_trade_plan_result(
+        trade_plan_result,
+        agent_result=result,
+        context=decision_context,
+    )
+    result.price_plan = trade_plan_result.price_plan.model_dump(mode="json")
+    result.trade_plan_result = trade_plan_result.model_dump(mode="json")
+    from src.agent.pricing.report import merge_price_plan_into_report
+
+    result.content = merge_price_plan_into_report(
+        str(getattr(result, "content", "") or ""),
+        trade_plan_result,
+    )
+    gate_context = dict(decision_context)
+    if _coerce_trace_agent_user_context(gate_context) is None:
+        gate_context["agent_user_context"] = AgentUserContext(
+            report=ReportContext(
+                intent="entry_analysis",
+                primary_symbol=normalized,
+                target_symbols=[normalized],
+            )
+        )
+    gate_context["stock_code"] = normalized
+    gate_payload = _build_trace_risk_gate_payload(
+        result=result,
+        context=gate_context,
+        tool_calls=getattr(result, "tool_calls_log", []) or [],
+        composite_payload=composite_payload,
+    )
+    if isinstance(gate_payload, dict):
+        result.deterministic_risk_gate = gate_payload
+    return result.trade_plan_result
+
+
+def _prepare_signal_lifecycle_context(*, message: str, context: Dict[str, Any]) -> None:
+    try:
+        from src.services.signal_lifecycle_service import SignalLifecycleService
+
+        service = SignalLifecycleService()
+        if service.is_entry_request(message=message, context=context):
+            context["signal_lifecycle_entry_intent"] = True
+        if service.should_request_plan(message=message, context=context):
+            context["signal_lifecycle_plan_candidate"] = True
+        active = service.reconcile_for_request(message=message, context=context)
+        if active:
+            context["active_entry_signals"] = active
+    except Exception as exc:
+        logger.warning("Signal lifecycle reconciliation skipped: %s", exc, exc_info=True)
+
+
 @router.post("/trace/run", response_model=AgentTraceRunResponse)
-async def run_agent_trace(request: AgentTraceRunRequest):
+async def run_agent_trace(request: AgentTraceRunRequest, background_tasks: BackgroundTasks = None):
     """Run an Agent request and return developer-oriented plan/execute trace data."""
     config = get_config()
     if not config.is_agent_available():
@@ -2512,10 +3822,16 @@ async def run_agent_trace(request: AgentTraceRunRequest):
     )
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
+    context["trace_composite_verdict"] = await asyncio.to_thread(_prefetch_trace_composite_verdict, context)
     context["session_id"] = session_id
     context["trace_id"] = session_id
     if skills is not None:
         context["skills"] = skills
+    await asyncio.to_thread(
+        _prepare_signal_lifecycle_context,
+        message=request.message,
+        context=context,
+    )
     events: List[Dict[str, Any]] = []
     artifact_writer = TraceArtifactWriter(session_id)
     _safe_artifact_initialize(artifact_writer, request=request, context=context)
@@ -2531,18 +3847,23 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         events.append(event_payload)
 
     def run_sync():
+        from src.services.history_loader import capture_history_reads
+
         executor = _build_executor(config, skills or None)
-        with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
-            return executor.chat(
-                message=request.message,
-                session_id=session_id,
-                progress_callback=progress_callback,
-                context=context,
-            )
+        with capture_history_reads(enabled=bool(getattr(config, "jev_enabled", False))) as histories:
+            with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+                result = executor.chat(
+                    message=request.message,
+                    session_id=session_id,
+                    progress_callback=progress_callback,
+                    context=context,
+                )
+            _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
+            return result, histories
 
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, run_sync)
+        result, histories = await loop.run_in_executor(None, run_sync)
     except Exception as exc:
         logger.error("Agent trace run failed: %s", exc, exc_info=True)
         _safe_artifact_finalize(artifact_writer, error=str(exc), context=context, request=request)
@@ -2557,15 +3878,26 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         except Exception as exc:
             logger.debug("Agent trace session cleanup skipped: %s", exc)
 
-    _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
     normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
-    risk_gate = _build_trace_risk_gate_payload(
+    composite_verdict = _read_trace_json_file(artifact_writer.path / "composite_verdict.json", None)
+    risk_gate = _read_trace_json_file(artifact_writer.path / "risk_gate.json", None)
+    await asyncio.to_thread(
+        _capture_signal_lifecycle,
+        message=request.message,
+        session_id=session_id,
         result=result,
         context=context,
-        tool_calls=normalized_tool_calls,
+        composite_payload=composite_verdict,
+        risk_gate_payload=risk_gate,
+        capture_jev=False,
+    )
+    jev_review = await asyncio.to_thread(
+        _prepare_trace_jev_review, artifact_writer, result=result, context=context,
+        risk_gate=risk_gate, histories=histories, background_tasks=background_tasks,
     )
     llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
     judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
+    dimension_evidence = _read_trace_json_file(artifact_writer.path / "dimensions.json", None)
 
     return AgentTraceRunResponse(
         success=result.success,
@@ -2582,18 +3914,24 @@ async def run_agent_trace(request: AgentTraceRunRequest):
         planner=_build_planner_trace(context),
         agent_user_context=_serialize_agent_user_context(context.get("agent_user_context")),
         context_summary=_build_trace_context_summary(context),
+        dimension_evidence=dimension_evidence,
+        report_quality=getattr(result, "report_quality", None),
         debate=result.debate,
         stock_selection=getattr(result, "stock_selection", None),
+        composite_verdict=composite_verdict,
         risk_gate=risk_gate,
+        price_plan=getattr(result, "price_plan", None),
+        trade_plan_result=getattr(result, "trade_plan_result", None),
         llm_telemetry=llm_telemetry,
         judge_sanity=judge_sanity,
         artifact_dir=str(artifact_writer.path),
         runtime_config=_build_agent_runtime_config(config),
+        jev_review=jev_review,
     )
 
 
 @router.post("/trace/stream")
-async def stream_agent_trace(request: AgentTraceRunRequest):
+async def stream_agent_trace(request: AgentTraceRunRequest, background_tasks: BackgroundTasks = None):
     """Run an Agent trace request and stream plan/execute events as SSE."""
     config = get_config()
     if not config.is_agent_available():
@@ -2611,10 +3949,16 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
     queue: asyncio.Queue = asyncio.Queue()
     skills = request.effective_skills
     context = _build_trace_context(request=request, config=config)
+    context["trace_composite_verdict"] = await asyncio.to_thread(_prefetch_trace_composite_verdict, context)
     context["session_id"] = session_id
     context["trace_id"] = session_id
     if skills is not None:
         context["skills"] = skills
+    await asyncio.to_thread(
+        _prepare_signal_lifecycle_context,
+        message=request.message,
+        context=context,
+    )
     artifact_writer = TraceArtifactWriter(session_id)
     _safe_artifact_initialize(artifact_writer, request=request, context=context)
 
@@ -2647,7 +3991,8 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
             put_event({
                 "type": "context_ready",
                 "session_id": session_id,
-                "context_summary": _build_trace_context_summary(context),
+            "context_summary": _build_trace_context_summary(context),
+                "dimension_evidence": _read_trace_json_file(artifact_writer.path / "dimensions.json", None),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "runtime_config": _build_agent_runtime_config(config),
             })
@@ -2659,22 +4004,36 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "runtime_config": _build_agent_runtime_config(config),
             })
             executor = _build_executor(config, skills or None)
-            with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
-                result = executor.chat(
-                    message=request.message,
-                    session_id=session_id,
-                    progress_callback=progress_callback,
-                    context=context,
-                )
-            _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
+            from src.services.history_loader import capture_history_reads
+
+            with capture_history_reads(enabled=bool(getattr(config, "jev_enabled", False))) as histories:
+                with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+                    result = executor.chat(
+                        message=request.message,
+                        session_id=session_id,
+                        progress_callback=progress_callback,
+                        context=context,
+                    )
+                _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
             normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
-            risk_gate = _build_trace_risk_gate_payload(
+            composite_verdict = _read_trace_json_file(artifact_writer.path / "composite_verdict.json", None)
+            risk_gate = _read_trace_json_file(artifact_writer.path / "risk_gate.json", None)
+            _capture_signal_lifecycle(
+                message=request.message,
+                session_id=session_id,
                 result=result,
                 context=context,
-                tool_calls=normalized_tool_calls,
+                composite_payload=composite_verdict,
+                risk_gate_payload=risk_gate,
+                capture_jev=False,
+            )
+            jev_review = _prepare_trace_jev_review(
+                artifact_writer, result=result, context=context, risk_gate=risk_gate,
+                histories=histories, background_tasks=background_tasks,
             )
             llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
             judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
+            dimension_evidence = _read_trace_json_file(artifact_writer.path / "dimensions.json", None)
             put_event({
                 "type": "done",
                 "success": result.success,
@@ -2691,13 +4050,19 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
                 "planner": _build_planner_trace(context),
                 "agent_user_context": _serialize_agent_user_context(context.get("agent_user_context")),
                 "context_summary": _build_trace_context_summary(context),
+                "dimension_evidence": dimension_evidence,
+                "report_quality": getattr(result, "report_quality", None),
                 "debate": result.debate,
                 "stock_selection": getattr(result, "stock_selection", None),
+                "composite_verdict": composite_verdict,
                 "risk_gate": risk_gate,
+                "price_plan": getattr(result, "price_plan", None),
+                "trade_plan_result": getattr(result, "trade_plan_result", None),
                 "llm_telemetry": llm_telemetry,
                 "judge_sanity": judge_sanity,
                 "artifact_dir": str(artifact_writer.path),
                 "runtime_config": _build_agent_runtime_config(config),
+                "jev_review": jev_review,
             })
         except Exception as exc:
             logger.error("Agent trace stream failed: %s", exc, exc_info=True)
@@ -2729,6 +4094,7 @@ async def stream_agent_trace(request: AgentTraceRunRequest):
 
     return StreamingResponse(
         event_generator(),
+        background=background_tasks,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -2869,11 +4235,24 @@ async def agent_chat_stream(request: ChatRequest):
 
     def run_sync():
         try:
+            _prepare_signal_lifecycle_context(message=request.message, context=stream_ctx)
             executor = _build_executor(config, skills or None)
             result = executor.chat(
                 message=request.message,
                 session_id=session_id,
                 progress_callback=progress_callback,
+                context=stream_ctx,
+            )
+            _ensure_single_stock_price_plan(
+                message=request.message,
+                session_id=session_id,
+                result=result,
+                context=stream_ctx,
+            )
+            _capture_signal_lifecycle(
+                message=request.message,
+                session_id=session_id,
+                result=result,
                 context=stream_ctx,
             )
             asyncio.run_coroutine_threadsafe(
@@ -2888,6 +4267,9 @@ async def agent_chat_stream(request: ChatRequest):
                     "model": result.model,
                     "tool_calls": result.tool_calls_log,
                     "session_id": session_id,
+                    "price_plan": getattr(result, "price_plan", None),
+                    "trade_plan_result": getattr(result, "trade_plan_result", None),
+                    "risk_gate": getattr(result, "deterministic_risk_gate", None),
                 }),
                 loop,
             )
