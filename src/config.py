@@ -835,6 +835,7 @@ class Config:
     agent_regime_component_timeout_seconds: float = 25.0  # Max seconds for one market-regime auxiliary component
     agent_tushare_tool_timeout_seconds: float = 20.0  # Max seconds for one Tushare Agent tool request
     agent_seed_fact_max_workers: int = 12  # Max concurrent (seed, tool) workers before thesis desks
+    agent_desk_row_concurrency: int = 3  # Max concurrent stock rows analyzed inside one thesis desk
     agent_seed_fact_tool_timeout_seconds: float = 30.0  # Max seconds for one SeedFactPacket tool call
     agent_seed_fact_tools: List[str] = field(
         default_factory=lambda: [
@@ -1924,6 +1925,13 @@ class Config:
                 12,
                 field_name='AGENT_SEED_FACT_MAX_WORKERS',
                 minimum=1,
+            ),
+            agent_desk_row_concurrency=parse_env_int(
+                os.getenv('AGENT_DESK_ROW_CONCURRENCY'),
+                3,
+                field_name='AGENT_DESK_ROW_CONCURRENCY',
+                minimum=1,
+                maximum=8,
             ),
             agent_seed_fact_tool_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_SEED_FACT_TOOL_TIMEOUT_SECONDS'),

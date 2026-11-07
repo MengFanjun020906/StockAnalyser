@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [改进] 选股候选发现席位支持按股票有界并发（AGENT_DESK_ROW_CONCURRENCY，默认 3），在保持逐股证据、输出顺序和超时/熔断语义的前提下，减少多股票 desk 的串行 LLM 等待。
 - [chore] 顶层目录整理：Kronos / Sequoia-X / alphasift / graphiti / openInvest 统一迁入 `vendor/`，品牌素材 `sources/` 迁入 `docs/assets/`，`review.md` 归档到 `docs/reviews/`；同步更新默认路径、Dockerfile、CI 排除项、安装脚本、`.env.example` 和相关文档。
 - [改进] 保留 `data/`、`logs/`、`reports/` 运行目录边界，旧日志与旧报告按时间归档，清理本地缓存和临时文件；docs 中带空格的文件名统一为 kebab-case。
 - [文档] 新增仓库布局与命名规范，说明顶层目录职责、第三方仓库只读边界、运行产物归档方式和文件命名约定。

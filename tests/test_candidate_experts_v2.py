@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Dict, List
 
@@ -352,6 +353,62 @@ def test_base_desk_expert_runs_and_saves_one_prompt_per_seed(tmp_path, monkeypat
     dumped = packet.model_dump(mode="json")
     assert len(dumped["per_seed_packets"]) == 2
     assert len(list(tmp_path.glob("*.json"))) == 2
+
+
+def test_base_desk_expert_runs_rows_concurrently_in_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+    barrier = threading.Barrier(2, timeout=2.0)
+
+    class _BarrierLLM:
+        def __call__(self, messages, tool_decls):  # noqa: D401
+            # Both rows must be in-flight at the same time, otherwise the first
+            # call blocks until the barrier times out.
+            barrier.wait()
+            prompt = str(messages[-1]["content"])
+            code = "600000" if "600000" in prompt else "000001"
+            return LLMTurn(
+                text=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "code": code,
+                                "name": code,
+                                "market": "cn",
+                                "setup_type": "early_turn",
+                                "stance": "support",
+                                "reason": "concurrent row",
+                                "evidence": [{"tool": "manual_check", "summary": "ok"}],
+                            }
+                        ],
+                        "rejected": [],
+                    }
+                )
+            )
+
+    desk = BaseDeskExpert(
+        allowed_tools=(),
+        tool_registry={},
+        tool_decls=[],
+        llm=_BarrierLLM(),
+        system_prompt="test desk",
+        max_llm_rounds=1,
+    )
+    rows = [
+        FeatureRow(code="600000", name="浦发银行", recall_sources=["daily_screener"]),
+        FeatureRow(code="000001", name="平安银行", recall_sources=["fundamental_snapshot"]),
+    ]
+
+    packet = desk.run_desk(
+        rows,
+        market="cn",
+        regime="unknown",
+        row_concurrency=2,
+        per_seed_timeout_s=5.0,
+    )
+
+    assert [candidate.code for candidate in packet.candidates] == ["600000", "000001"]
+    statuses = [item["status"] for item in packet.model_dump(mode="json")["per_seed_packets"]]
+    assert statuses == ["partial", "partial"]
 
 
 def test_base_desk_expert_fails_and_stops_after_per_seed_timeouts(tmp_path, monkeypatch):

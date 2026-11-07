@@ -6,7 +6,6 @@ import {
   Check,
   ChevronDown,
   Circle,
-  Download,
   History,
   Loader2,
   Play,
@@ -19,10 +18,9 @@ import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams } from 'react-router-dom';
 import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
 import { portfolioApi } from '../api/portfolio';
-import type { JevTraceReview as JevReview } from '../api/jev';
-import { JevTraceReview } from '../components/agent/JevTraceReview';
-import { useJevTraceReview } from '../hooks/useJevTraceReview';
 import { CandidateDecisionTable, type CandidateDecisionRow, type CandidateDecisionTone } from '../components/candidates/CandidateDecisionTable';
+import { TraceStepNav, type TraceNavStep } from '../components/agent/TraceStepNav';
+import { TraceVerdictPanel } from '../components/agent/TraceVerdictPanel';
 import { ApiErrorAlert, Button, Collapsible, JsonViewer } from '../components/common';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import type { PortfolioAccountItem } from '../types/portfolio';
@@ -55,12 +53,26 @@ const REPORT_INTENT_OPTIONS = [
   { value: 'risk_review', label: '账户风控' },
   { value: 'event_impact', label: '事件影响' },
 ];
+const SINGLE_REPORT_INTENT_VALUES = ['entry_analysis', 'position_review', 'risk_review', 'event_impact'];
+const TRACE_INTENT_LABELS: Record<string, string> = {
+  watchlist_scan: '候选池',
+  entry_analysis: '入场分析',
+  position_review: '持仓诊断',
+  risk_review: '风险复盘',
+  event_impact: '事件影响',
+};
+type TraceRoute = 'auto' | 'selection' | 'single';
+const TRACE_ROUTE_OPTIONS: Array<{ value: TraceRoute; label: string; desc: string }> = [
+  { value: 'auto', label: '自动识别', desc: '由后端根据问题判断走哪条链路' },
+  { value: 'selection', label: '选股', desc: '生成候选池，不针对单只股票' },
+  { value: 'single', label: '单股询问', desc: '围绕一只股票做入场、持仓或风险分析' },
+];
 const CANDIDATE_DISCOVERY_OPTIONS = [
   { value: 'thesis_desk_committee', label: '打法席位委员会 (P4)', desc: '当前调试阶段只允许四席位链路：召回层 → 低位启动/动量/质量修复/主题催化 → Regime 分配名额' },
 ] as const;
 const CANDIDATE_DISCOVERY_STORAGE_KEY = 'dsa.candidateDiscoveryMode';
 const TRACE_HISTORY_KEY = 'dsa.agentTrace.history.v1';
-const TRACE_HISTORY_LIMIT = 10;
+const TRACE_HISTORY_LIMIT = 30;
 const TRACE_SESSION_PREFIX = 'trace-';
 
 type TraceStatus = 'idle' | 'running' | 'done' | 'error';
@@ -83,6 +95,7 @@ type TraceHistoryItem = {
   stockCode: string;
   accountId?: number;
   status: 'success' | 'error';
+  route?: 'selection' | 'single';
   result: AgentTraceRunResponse;
   isCompact?: boolean;
 };
@@ -90,6 +103,18 @@ type TraceHistoryItem = {
 /* ═══════════════════════════════════════════════
    Helpers
    ═══════════════════════════════════════════════ */
+
+const formatHistoryTime = (value: string): string => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+};
 
 const formatDuration = (duration?: number): string => {
   if (typeof duration !== 'number' || !Number.isFinite(duration)) return '-';
@@ -134,11 +159,6 @@ const compositeStatusLabel = (value: unknown): string => {
   return status;
 };
 
-const formatPercent = (value: unknown): string => {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
-  return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}%`;
-};
-
 const formatPercentInput = (value: unknown): string => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '';
   return String(value);
@@ -150,6 +170,19 @@ const parseOptionalPercent = (value: string): number | undefined => {
   const parsed = Number(normalized);
   if (!Number.isFinite(parsed)) return undefined;
   return Math.min(100, Math.max(0, parsed));
+};
+
+const extractStockCodeFromMessage = (message: string): string => {
+  const matches = message.match(/(?<![A-Za-z0-9])(?:(?:[Ss][HhZz]|[Bb][Jj])?\d{6}(?:\.(?:[Ss][HhZzSs]|[Bb][Jj]))?|[Hh][Kk]\s?\d{1,5}|\d{1,5}\.[Hh][Kk]|[A-Z]{1,5}(?:\.[A-Z])?)(?![A-Za-z0-9])/g) || [];
+  const reserved = new Set(['AGENT', 'PLAN', 'API', 'LLM', 'AI', 'ETF', 'MACD', 'KDJ', 'RSI', 'ATR',
+    'MA', 'EMA', 'SMA', 'BOLL', 'SMC', 'BOS', 'OHLCV', 'PE', 'PB', 'ROE', 'EPS', 'USD', 'CNY', 'HKD', 'T', 'N', 'A']);
+  const normalize = (value: string) => {
+    const text = value.toUpperCase().replace(/\s/g, '');
+    const hk = /^(?:HK(\d{1,5})|(\d{1,5})\.HK)$/.exec(text);
+    return hk ? 'HK' + (hk[1] || hk[2]).padStart(5, '0') : text.replace(/^(SH|SZ|BJ)(?=\d{6}$)/, '').replace(/\.(SH|SZ|BJ|SS)$/, '');
+  };
+  const candidate = matches.find((value) => !reserved.has(value.toUpperCase()));
+  return candidate ? normalize(candidate) : '';
 };
 
 const shouldSendStockCode = (message: string, stockCode: string): boolean => {
@@ -450,6 +483,7 @@ const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
 
   return {
     ...item,
+    route: item.route || inferTraceRoute(result, item.stockCode),
     isCompact: true,
     result: {
       ...createEmptyTraceResult(),
@@ -475,14 +509,6 @@ const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
       debate: null,
       stock_selection: compactStockSelection,
       risk_gate: null,
-      jev_review: result.jev_review ? {
-        ...result.jev_review,
-        evaluation: result.jev_review.evaluation ? {
-          ...result.jev_review.evaluation,
-          state: undefined,
-          questions: undefined,
-        } : result.jev_review.evaluation,
-      } : null,
       llm_telemetry: asRecord(result.llm_telemetry) || null,
       judge_sanity: asRecord(result.judge_sanity) || null,
       artifact_dir: result.artifact_dir || null,
@@ -1889,6 +1915,34 @@ const getTraceReportIntent = (result: AgentTraceRunResponse): string => {
   );
 };
 
+const inferTraceRoute = (result: AgentTraceRunResponse, fallbackStockCode = ''): 'selection' | 'single' => {
+  const intent = getTraceReportIntent(result);
+  if (intent === 'watchlist_scan') return 'selection';
+  if (SINGLE_REPORT_INTENT_VALUES.includes(intent)) return 'single';
+  if (result.stock_selection?.enabled) return 'selection';
+  return fallbackStockCode.trim() ? 'single' : 'selection';
+};
+
+const traceHistoryStockCode = (item: TraceHistoryItem): string => {
+  if (item.stockCode.trim()) return item.stockCode.trim();
+  const fromMessage = extractStockCodeFromMessage(item.message);
+  if (fromMessage) return fromMessage;
+  const report = asRecord(asRecord(item.result.agent_user_context)?.report);
+  const planner = asRecord(item.result.planner);
+  const target = asRecord(asRecord(item.result.context_summary)?.target_position);
+  return String(report?.primary_symbol || planner?.primary_symbol || target?.symbol || '');
+};
+
+const traceHistoryRoute = (item: TraceHistoryItem): 'selection' | 'single' => (
+  item.route || inferTraceRoute(item.result, traceHistoryStockCode(item))
+);
+
+const traceRouteLabel = (route: 'selection' | 'single' | null, intent?: string): string => {
+  if (route === 'selection') return '选股 · 候选池';
+  if (route === 'single') return '单股 · ' + (TRACE_INTENT_LABELS[String(intent || '')] || '个股分析');
+  return '自动识别';
+};
+
 const getIntentResolution = (result: AgentTraceRunResponse): Record<string, unknown> | null => (
   asRecord(asRecord(result.context_summary)?.intent_resolution)
 );
@@ -1994,6 +2048,7 @@ const AgentTracePage: React.FC = () => {
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
   const [reportIntent, setReportIntent] = useState('auto');
+  const [analysisRoute, setAnalysisRoute] = useState<TraceRoute>('auto');
   const [candidateDiscoveryMode, setCandidateDiscoveryMode] = useState<'thesis_desk_committee'>('thesis_desk_committee');
   const [riskPreference, setRiskPreference] = useState('balanced');
   const [tradingHorizon, setTradingHorizon] = useState('long_term');
@@ -2008,18 +2063,20 @@ const AgentTracePage: React.FC = () => {
   const [error, setError] = useState<ParsedApiError | null>(null);
   const [running, setRunning] = useState(false);
   const [traceStatus, setTraceStatus] = useState<TraceStatus>('idle');
+  const [activeStep, setActiveStep] = useState('L4');
   const [statusMessage, setStatusMessage] = useState('等待运行');
   const [historyItems, setHistoryItems] = useState<TraceHistoryItem[]>([]);
   const [showConfig, setShowConfig] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<Record<string, unknown> | null>(null);
-  const jev = useJevTraceReview(result?.session_id || '', result?.jev_review, !running && traceStatus !== 'running');
   const activeRunSessionIdRef = useRef<string | null>(null);
   const runtimeConfigRef = useRef<Record<string, unknown> | null>(null);
   const activeRunMetaRef = useRef<{
     message: string;
     stockCode: string;
     accountId?: number;
-  }>({ message: DEFAULT_PROMPT, stockCode: DEFAULT_STOCK_CODE });
+    startedAt: string;
+    route: TraceRoute;
+  }>({ message: DEFAULT_PROMPT, stockCode: DEFAULT_STOCK_CODE, startedAt: '', route: 'auto' });
 
   const hydrateTraceSessionFromBackend = useCallback((sessionId: string, fallback?: TraceHistoryItem) => {
     const placeholder = fallback?.result || createEmptyTraceResult();
@@ -2044,6 +2101,8 @@ const AgentTracePage: React.FC = () => {
         setStatusMessage(next.status === 'success' ? '已从后端加载 Trace' : '已从后端加载失败记录');
         setMessage(next.message);
         setStockCode(next.stockCode);
+        setAnalysisRoute(next.route || inferTraceRoute(next.result, next.stockCode));
+        setReportIntent(getTraceReportIntent(next.result) || 'auto');
         setSelectedAccountId(next.accountId ? String(next.accountId) : '');
         setHistoryItems((items) => persistTraceHistory(items, next));
       })
@@ -2054,6 +2113,8 @@ const AgentTracePage: React.FC = () => {
           setStatusMessage('后端完整 Trace 加载失败，当前显示本地轻量历史摘要');
           setMessage(fallback.message);
           setStockCode(fallback.stockCode);
+          setAnalysisRoute(fallback.route || inferTraceRoute(fallback.result, fallback.stockCode));
+          setReportIntent(getTraceReportIntent(fallback.result) || 'auto');
           setSelectedAccountId(fallback.accountId ? String(fallback.accountId) : '');
         } else {
           setError(getParsedApiError(err));
@@ -2084,8 +2145,17 @@ const AgentTracePage: React.FC = () => {
     setStatusMessage(historyItem.status === 'success' ? '已加载历史' : '已加载失败记录');
     setMessage(historyItem.message);
     setStockCode(historyItem.stockCode);
+    setAnalysisRoute(historyItem.route || inferTraceRoute(historyItem.result, historyItem.stockCode));
+    setReportIntent(getTraceReportIntent(historyItem.result) || 'auto');
     setSelectedAccountId(historyItem.accountId ? String(historyItem.accountId) : '');
   }, [routeSessionId, hydrateTraceSessionFromBackend]);
+
+  const resultSessionId = result?.session_id;
+  const resultContent = result?.content;
+  useEffect(() => {
+    if (!resultSessionId && !resultContent) return;
+    setActiveStep(resultContent ? 'report' : 'L2');
+  }, [resultSessionId, resultContent]);
 
   useEffect(() => {
     let alive = true;
@@ -2121,21 +2191,56 @@ const AgentTracePage: React.FC = () => {
 
   const selectedTool = result?.tool_calls[selectedToolIndex] ?? null;
 
+  const handleRouteChange = (route: TraceRoute) => {
+    setAnalysisRoute(route);
+    if (route === 'selection') {
+      setReportIntent('watchlist_scan');
+      setStockCode('');
+    } else if (route === 'single') {
+      setReportIntent((previous) => SINGLE_REPORT_INTENT_VALUES.includes(previous) ? previous : 'entry_analysis');
+    } else {
+      setReportIntent('auto');
+    }
+  };
+
+  const reportIntentOptions = analysisRoute === 'selection'
+    ? REPORT_INTENT_OPTIONS.filter((option) => option.value === 'watchlist_scan')
+    : analysisRoute === 'single'
+      ? REPORT_INTENT_OPTIONS.filter((option) => SINGLE_REPORT_INTENT_VALUES.includes(option.value))
+      : REPORT_INTENT_OPTIONS;
+
+  const routeHelp = analysisRoute === 'selection'
+    ? '选股模式：只生成候选池，不发送股票代码。'
+    : analysisRoute === 'single'
+      ? '单股模式：围绕一只股票分析；请在问题里写明代码，或在配置里填写股票代码。'
+      : '自动模式：由后端根据问题判断是选股还是单股；运行后会显示实际路由。';
+
   const handleRun = async (options?: {
     resumeFromSessionId?: string;
     messageOverride?: string;
     stockCodeOverride?: string;
     accountIdOverride?: number | null;
+    routeOverride?: TraceRoute;
+    reportIntentOverride?: string;
   }) => {
     const sessionId = createTraceSessionId();
     activeRunSessionIdRef.current = sessionId;
     const runMessage = options?.messageOverride ?? message;
     const runStockCode = options?.stockCodeOverride ?? stockCode;
+    const runRoute = options?.routeOverride ?? analysisRoute;
+    const runReportIntent = options?.reportIntentOverride ?? reportIntent;
+    const effectiveReportIntent = runRoute === 'selection'
+      ? 'watchlist_scan'
+      : runRoute === 'single'
+        ? (SINGLE_REPORT_INTENT_VALUES.includes(runReportIntent) ? runReportIntent : 'entry_analysis')
+        : (runReportIntent === 'auto' ? undefined : runReportIntent);
     const selectedAccountNumber = options?.accountIdOverride !== undefined
       ? (options.accountIdOverride ?? undefined)
       : (selectedAccountId ? Number(selectedAccountId) : undefined);
-    const stockCodeToSend = shouldSendStockCode(runMessage, runStockCode) ? runStockCode.trim() : undefined;
-    activeRunMetaRef.current = { message: runMessage, stockCode: runStockCode, accountId: selectedAccountNumber };
+    const stockCodeToSend = runRoute === 'selection'
+      ? undefined
+      : shouldSendStockCode(runMessage, runStockCode) ? runStockCode.trim() : undefined;
+    activeRunMetaRef.current = { message: runMessage, stockCode: runStockCode, accountId: selectedAccountNumber, startedAt: new Date().toISOString(), route: runRoute };
     const shouldInjectPortfolioContext = injectPortfolioContext || selectedAccountNumber != null;
     navigate(`/agent-trace/${encodeURIComponent(sessionId)}`, { replace: false });
     setRunning(true);
@@ -2152,7 +2257,7 @@ const AgentTracePage: React.FC = () => {
         stock_code: stockCodeToSend,
         inject_portfolio_context: shouldInjectPortfolioContext,
         analysis_mode: 'planning_execute',
-        report_intent: reportIntent === 'auto' ? undefined : reportIntent,
+        report_intent: effectiveReportIntent,
         risk_preference: riskPreference,
         trading_horizon: tradingHorizon,
         max_single_position_pct: parseOptionalPercent(maxSinglePositionPct),
@@ -2160,7 +2265,7 @@ const AgentTracePage: React.FC = () => {
         max_acceptable_drawdown_pct: parseOptionalPercent(maxAcceptableDrawdownPct),
         default_stop_loss_pct: parseOptionalPercent(defaultStopLossPct),
         investor_notes: investorNotes.trim() || undefined,
-        candidate_discovery_mode: candidateDiscoveryMode,
+        candidate_discovery_mode: runRoute === 'single' ? undefined : candidateDiscoveryMode,
         resume_from_session_id: options?.resumeFromSessionId,
       });
       await consumeTraceStream(response);
@@ -2188,6 +2293,8 @@ const AgentTracePage: React.FC = () => {
       messageOverride: item.message,
       stockCodeOverride: item.stockCode,
       accountIdOverride: item.accountId ?? null,
+      routeOverride: item.route || inferTraceRoute(item.result, item.stockCode),
+      reportIntentOverride: getTraceReportIntent(item.result) || undefined,
     });
   };
 
@@ -2207,10 +2314,11 @@ const AgentTracePage: React.FC = () => {
     setStatusMessage(item.status === 'success' ? '已加载历史' : '已加载失败记录');
     setMessage(item.message);
     setStockCode(item.stockCode);
+    setAnalysisRoute(item.route || inferTraceRoute(item.result, item.stockCode));
     setSelectedAccountId(item.accountId ? String(item.accountId) : '');
     const investor = (item.result.context_summary?.investor || {}) as Record<string, unknown>;
     const plannerIntent = item.result.planner?.intent;
-    setReportIntent(typeof plannerIntent === 'string' ? plannerIntent : 'auto');
+    setReportIntent(typeof plannerIntent === 'string' ? plannerIntent : (getTraceReportIntent(item.result) || 'auto'));
     setRiskPreference(typeof investor.risk_preference === 'string' ? investor.risk_preference : 'balanced');
     setTradingHorizon(typeof investor.trading_horizon === 'string' ? investor.trading_horizon : 'long_term');
     setMaxSinglePositionPct(formatPercentInput(investor.max_single_position_pct));
@@ -2329,19 +2437,19 @@ const AgentTracePage: React.FC = () => {
           stock_selection: mergeStockSelectionResult(asRecord(cur.stock_selection), asRecord(event.stock_selection)) || cur.stock_selection,
           composite_verdict: asRecord(event.composite_verdict) || cur.composite_verdict,
           risk_gate: asRecord(event.risk_gate) || cur.risk_gate,
-          jev_review: (asRecord(event.jev_review) as JevReview | null) || cur.jev_review,
           llm_telemetry: asRecord(event.llm_telemetry) || cur.llm_telemetry || null,
           judge_sanity: asRecord(event.judge_sanity) || cur.judge_sanity || null,
           artifact_dir: typeof event.artifact_dir === 'string' ? event.artifact_dir : cur.artifact_dir,
           runtime_config: asRecord(event.runtime_config) || cur.runtime_config || runtimeConfig,
         };
         setHistoryItems((items) => persistTraceHistory(items, {
-          id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
+          id: next.session_id || `${Date.now()}`, createdAt: activeRunMetaRef.current.startedAt || new Date().toISOString(),
           message: activeRunMetaRef.current.message,
           stockCode: shouldSendStockCode(activeRunMetaRef.current.message, activeRunMetaRef.current.stockCode)
             ? activeRunMetaRef.current.stockCode.trim()
             : '',
           accountId: activeRunMetaRef.current.accountId,
+          route: activeRunMetaRef.current.route === 'auto' ? inferTraceRoute(next, activeRunMetaRef.current.stockCode) : activeRunMetaRef.current.route,
           status: next.success ? 'success' : 'error', result: next,
         }));
         return next;
@@ -2355,12 +2463,13 @@ const AgentTracePage: React.FC = () => {
         const cur = prev || createEmptyTraceResult();
         const next = { ...cur, success: false, error: event.message || 'Trace 运行失败', events: [...cur.events, eventToTraceEvent(event)] };
         setHistoryItems((items) => persistTraceHistory(items, {
-          id: next.session_id || `${Date.now()}`, createdAt: new Date().toISOString(),
+          id: next.session_id || `${Date.now()}`, createdAt: activeRunMetaRef.current.startedAt || new Date().toISOString(),
           message: activeRunMetaRef.current.message,
           stockCode: shouldSendStockCode(activeRunMetaRef.current.message, activeRunMetaRef.current.stockCode)
             ? activeRunMetaRef.current.stockCode.trim()
             : '',
           accountId: activeRunMetaRef.current.accountId,
+          route: activeRunMetaRef.current.route === 'auto' ? inferTraceRoute(next, activeRunMetaRef.current.stockCode) : activeRunMetaRef.current.route,
           status: 'error',
           result: next,
         }));
@@ -2385,6 +2494,8 @@ const AgentTracePage: React.FC = () => {
     () => Boolean(result && extractDiscoveryCandidates(result, stockSelection).length),
     [result, stockSelection],
   );
+  const resolvedRoute = result ? inferTraceRoute(result, String(result.planner?.primary_symbol || '')) : null;
+  const resolvedIntent = result ? getTraceReportIntent(result) : '';
 
   const getLayerStatus = (hasData: boolean): StepStatus => {
     if (hasData) return 'done';
@@ -2393,16 +2504,182 @@ const AgentTracePage: React.FC = () => {
     return 'pending';
   };
 
+  const reportQuality = result ? asRecord(result.report_quality) : null;
+  const finalReportContent = result ? (
+    <div className="space-y-3">
+      {result.error ? (
+        <div className="rounded-lg bg-danger/10 p-3 text-sm text-danger">{result.error}</div>
+      ) : null}
+      {reportQuality?.status === 'repaired' ? (
+        <div className="border-l-2 border-warning bg-warning/10 px-3 py-2 text-xs text-warning">
+          主报告首次输出不完整，系统已自动修复并通过完整度校验。
+        </div>
+      ) : null}
+      {reportQuality?.status === 'fallback' ? (
+        <div className="border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+          主报告自动修复仍未通过，当前展示确定性降级报告；价格计划评审会继续执行。
+        </div>
+      ) : null}
+      {reportQuality?.status === 'legacy_incomplete' ? (
+        <div className="border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+          该历史主报告生成于完整度门禁上线前；失败 Debate 已只读隔离，请重跑分析以生成完整报告。
+        </div>
+      ) : null}
+      {asRecord(reportQuality?.read_time_consistency)?.status === 'inconsistent' ? (
+        <div className="border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
+          历史报告与工具证据不一致：基本面或消息面存在可用/部分可用工具结果，但报告曾写成完全缺失；请重跑分析。该诊断仅在读取时生成，不改写历史 artifact。
+        </div>
+      ) : null}
+      {result.content ? (
+        <>
+          <div className="max-h-[620px] overflow-auto rounded-lg border border-border bg-card p-4">
+            <div className={markdownProseClass}>
+              <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>{splitReportContent(result.content).main}</Markdown>
+            </div>
+          </div>
+          {splitReportContent(result.content).appendix ? (
+            <Collapsible title="附录：候选池来源、逐股维度证据与风控条件" defaultOpen={false}>
+              <div className={markdownProseClass}>
+                <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>{splitReportContent(result.content).appendix}</Markdown>
+              </div>
+            </Collapsible>
+          ) : null}
+        </>
+      ) : (
+        <p className="rounded-lg border border-dashed border-border px-4 py-10 text-center text-sm text-muted-text">
+          Trace 尚未生成最终报告。
+        </p>
+      )}
+    </div>
+  ) : null;
+
+  const traceSteps: Array<{
+    key: string;
+    label: string;
+    title: string;
+    status: StepStatus;
+    narrative: string;
+    content?: React.ReactNode;
+  }> = result ? [
+    {
+      key: 'L1',
+      label: 'L1',
+      title: resolvedRoute === 'single' ? '个股数据' : '数据与候选池',
+      status: getLayerStatus(Boolean(result.tool_calls.length || stockSelection || hasDiscoveryCandidates)),
+      narrative: buildL1Narrative(result, stockSelection),
+      content: <L1Detail result={result} stockSelection={stockSelection} traceStatus={traceStatus} />,
+    },
+    {
+      key: 'L2',
+      label: 'L2',
+      title: '证据取证',
+      status: getLayerStatus(result.tool_calls.length > 0),
+      narrative: '已完成 ' + result.tool_calls.length + ' 次工具调用' + (failedToolCount ? '，其中 ' + failedToolCount + ' 次失败' : '') + '。',
+      content: <L2Detail toolCalls={result.tool_calls} selectedIndex={selectedToolIndex} onSelect={setSelectedToolIndex} selectedTool={selectedTool} />,
+    },
+    {
+      key: 'L3',
+      label: 'L3',
+      title: '信号层',
+      status: getLayerStatus(Boolean(debate || result.content)),
+      narrative: '将证据压缩为方向、置信度和冲突点，形成结构化信号。',
+      content: <L3Detail result={result} debate={debate} />,
+    },
+    {
+      key: 'L4',
+      label: 'L4',
+      title: resolvedRoute === 'single' ? '单股裁决' : '组合裁决',
+      status: debateFailed ? 'error' : getLayerStatus(Boolean(debate?.judge_decision || planner)),
+      narrative: buildL4Narrative(debate, planner),
+      content: <L4Detail debate={debate} planner={planner} />,
+    },
+    {
+      key: 'S4',
+      label: 'S4',
+      title: '确定性评分',
+      status: compositeFailed ? 'error' : getLayerStatus(Boolean(compositeVerdict)),
+      narrative: compositeFailed
+        ? '确定性评分失败：' + String(compositeVerdict?.error || '目标或数据不一致')
+        : compositeVerdict
+          ? '策略 4 与缠论证据已按冻结口径完成影子评分。'
+          : '等待确定性评分结果。',
+      content: <CompositeScoreDetail compositeVerdict={compositeVerdict} />,
+    },
+    {
+      key: 'L5',
+      label: 'L5',
+      title: '风控闸门',
+      status: riskFailed ? 'error' : getLayerStatus(Boolean(riskPayload)),
+      narrative: buildL5Narrative(riskPayload),
+      content: <L5Detail riskPayload={riskPayload} />,
+    },
+    {
+      key: 'L7',
+      label: 'L7',
+      title: '托管跟踪',
+      status: 'pending',
+      narrative: '模拟盘托管尚未接入，后续将展示方案执行状态和偏离原因。',
+    },
+    {
+      key: 'L8',
+      label: 'L8',
+      title: '可观测性',
+      status: getLayerStatus(Boolean(llmTelemetry || judgeSanity)),
+      narrative: buildObservabilityNarrative(llmTelemetry, judgeSanity),
+      content: <ObservabilityDetail llmTelemetry={llmTelemetry} judgeSanity={judgeSanity} />,
+    },
+    {
+      key: 'L9',
+      label: 'L9',
+      title: '复盘进化',
+      status: getLayerStatus(Boolean(result.artifact_dir)),
+      narrative: result.artifact_dir ? 'Trace 已落盘：' + result.artifact_dir : '等待 Trace 完成后落盘。',
+    },
+    ...(result.content ? [{
+      key: 'report',
+      label: 'OUT',
+      title: '最终报告',
+      status: 'done' as StepStatus,
+      narrative: 'Agent 最终输出与质量校验。',
+      content: finalReportContent,
+    }] : []),
+  ] : [];
+
+  const navSteps: TraceNavStep[] = traceSteps.map((step) => ({
+    key: step.key,
+    label: step.label,
+    title: step.title,
+    status: step.status,
+    meta: step.key === 'L2' ? String(result?.tool_calls.length || 0) + ' tools' : undefined,
+  }));
+
   /* ─── Render ─── */
   return (
     <div className="min-h-screen bg-surface-2">
-      <div className="mx-auto max-w-[1100px] px-6 py-10">
+      <div className="mx-auto max-w-[1600px] px-4 py-6 lg:px-6">
         {/* Header */}
         <header className="mb-8">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
+                {result && resolvedRoute ? (
+                  <span className={cn(
+                    'rounded border px-2 py-0.5 text-[10px] font-medium',
+                    resolvedRoute === 'selection'
+                      ? 'border-cyan/25 bg-cyan/10 text-cyan'
+                      : 'border-purple/25 bg-purple/10 text-purple',
+                  )}>
+                    {traceRouteLabel(resolvedRoute, resolvedIntent)}
+                  </span>
+                ) : null}
+              </div>
               <p className="mt-1 text-sm text-muted-text">从用户问题出发，观察 Agent 如何逐层取证、辩论和裁决。</p>
+              {result && analysisRoute !== 'auto' && resolvedRoute && analysisRoute !== resolvedRoute ? (
+                <p className="mt-1 text-[10px] text-warning">
+                  你选择的是「{analysisRoute === 'selection' ? '选股' : '单股询问'}」，后端实际识别为「{traceRouteLabel(resolvedRoute, resolvedIntent)}」，以实际 Trace 为准。
+                </p>
+              ) : null}
             </div>
             <button
               type="button"
@@ -2421,6 +2698,41 @@ const AgentTracePage: React.FC = () => {
 
         {/* Input area */}
         <div className="mb-8 rounded-xl border border-border bg-card p-5 shadow-sm">
+          <div className="mb-3 grid gap-2 sm:grid-cols-3">
+            {TRACE_ROUTE_OPTIONS.map((option) => {
+              const active = analysisRoute === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => handleRouteChange(option.value)}
+                  className={cn(
+                    'rounded-lg border px-3 py-2.5 text-left transition-colors',
+                    active
+                      ? option.value === 'selection'
+                        ? 'border-cyan/70 bg-cyan/15 ring-1 ring-cyan/25'
+                        : option.value === 'single'
+                          ? 'border-purple/70 bg-purple/15 ring-1 ring-purple/25'
+                          : 'border-border bg-surface-2 ring-1 ring-border/60'
+                      : 'border-border/60 bg-surface-2/20 hover:border-border hover:bg-surface-2',
+                  )}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className={cn(
+                      'text-xs font-semibold',
+                      active
+                        ? option.value === 'selection' ? 'text-cyan' : option.value === 'single' ? 'text-purple' : 'text-foreground'
+                        : 'text-secondary-text',
+                    )}>{option.label}</span>
+                    {active ? <Check className={cn('h-3.5 w-3.5', option.value === 'selection' ? 'text-cyan' : option.value === 'single' ? 'text-purple' : 'text-muted-text')} /> : null}
+                  </span>
+                  <span className="mt-1 block text-[10px] leading-4 text-muted-text">{option.desc}</span>
+                </button>
+              );
+            })}
+          </div>
+          <p className="mb-3 text-[10px] leading-5 text-muted-text">{routeHelp}</p>
           <div className="flex gap-3">
             <textarea
               value={message}
@@ -2460,10 +2772,12 @@ const AgentTracePage: React.FC = () => {
           {showConfig ? (
             <div className="mt-4 border-t border-border pt-4">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <label className="block">
-                  <span className="mb-1 block text-label text-muted-text">股票代码</span>
-                  <input value={stockCode} onChange={(e) => setStockCode(e.target.value)} className={inputClass} placeholder="可选，输入后才会随请求发送" />
-                </label>
+                {analysisRoute !== 'selection' ? (
+                  <label className="block">
+                    <span className="mb-1 block text-label text-muted-text">股票代码</span>
+                    <input value={stockCode} onChange={(e) => setStockCode(e.target.value)} className={inputClass} placeholder="可选，输入后才会随请求发送" />
+                  </label>
+                ) : null}
                 <label className="block">
                   <span className="mb-1 block text-label text-muted-text">账户</span>
                   <select value={selectedAccountId} onChange={(e) => setSelectedAccountId(e.target.value)} className={selectClass}>
@@ -2473,27 +2787,34 @@ const AgentTracePage: React.FC = () => {
                 </label>
                 <label className="block">
                   <span className="mb-1 block text-label text-muted-text">报告意图</span>
-                  <select value={reportIntent} onChange={(e) => setReportIntent(e.target.value)} className={selectClass}>
-                    {REPORT_INTENT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                  </select>
-                </label>
-                <label className="block" title={CANDIDATE_DISCOVERY_OPTIONS.find((o) => o.value === candidateDiscoveryMode)?.desc || ''}>
-                  <span className="mb-1 block text-label text-muted-text">候选发现</span>
                   <select
-                    aria-label="候选发现模式"
-                    value={candidateDiscoveryMode}
-                    onChange={(e) => {
-                      const next = e.target.value === 'thesis_desk_committee' ? 'thesis_desk_committee' : 'thesis_desk_committee';
-                      setCandidateDiscoveryMode(next);
-                      if (typeof window !== 'undefined') {
-                        window.localStorage.setItem(CANDIDATE_DISCOVERY_STORAGE_KEY, next);
-                      }
-                    }}
+                    value={reportIntent}
+                    onChange={(e) => setReportIntent(e.target.value)}
                     className={selectClass}
+                    disabled={analysisRoute === 'selection'}
                   >
-                    {CANDIDATE_DISCOVERY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    {reportIntentOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </label>
+                {analysisRoute !== 'single' ? (
+                  <label className="block" title={CANDIDATE_DISCOVERY_OPTIONS.find((o) => o.value === candidateDiscoveryMode)?.desc || ''}>
+                    <span className="mb-1 block text-label text-muted-text">候选发现</span>
+                    <select
+                      aria-label="候选发现模式"
+                      value={candidateDiscoveryMode}
+                      onChange={(e) => {
+                        const next = e.target.value === 'thesis_desk_committee' ? 'thesis_desk_committee' : 'thesis_desk_committee';
+                        setCandidateDiscoveryMode(next);
+                        if (typeof window !== 'undefined') {
+                          window.localStorage.setItem(CANDIDATE_DISCOVERY_STORAGE_KEY, next);
+                        }
+                      }}
+                      className={selectClass}
+                    >
+                      {CANDIDATE_DISCOVERY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    </select>
+                  </label>
+                ) : null}
                 <label className="block">
                   <span className="mb-1 block text-label text-muted-text">风险偏好</span>
                   <select value={riskPreference} onChange={(e) => setRiskPreference(e.target.value)} className={selectClass}>
@@ -2547,16 +2868,21 @@ const AgentTracePage: React.FC = () => {
         {historyItems.length ? (
           <div className="mb-8">
             <div className="mb-2 flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-xs text-muted-text"><History className="h-3 w-3" /> 历史</span>
+              <span className="flex items-center gap-1.5 text-xs text-muted-text">
+                <History className="h-3 w-3" />
+                <span>历史</span>
+                <span className="text-[10px] text-muted-text">最近 {historyItems.length} 条 · 最多 {TRACE_HISTORY_LIMIT} 条</span>
+              </span>
               <button type="button" onClick={() => { saveTraceHistory([]); setHistoryItems([]); }} className="flex items-center gap-1 text-label text-muted-text hover:text-danger">
                 <Trash2 className="h-3 w-3" /> 清空
               </button>
             </div>
-            <div className="flex max-h-64 flex-col gap-2 overflow-y-auto pr-1">
+            <div className="flex max-h-[320px] flex-col gap-2 overflow-y-auto pr-1">
               {historyItems.map((item) => (
                 <div
                   key={`${item.id}-${item.createdAt}`}
                   className="flex w-full items-start gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs transition-all hover:border-border hover:shadow-sm"
+                  title={new Date(item.createdAt).toLocaleString()}
                 >
                   <button
                     type="button"
@@ -2565,8 +2891,24 @@ const AgentTracePage: React.FC = () => {
                   >
                     <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', item.status === 'success' ? 'bg-success' : 'bg-danger')} />
                     <span className="min-w-0 flex-1">
-                      <span className="block font-mono text-foreground">{item.stockCode || '选股'}</span>
+                      <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                        <span className={cn(
+                          'rounded border px-1 py-0.5 text-[9px]',
+                          traceHistoryRoute(item) === 'selection'
+                            ? 'border-cyan/25 bg-cyan/10 text-cyan'
+                            : 'border-purple/25 bg-purple/10 text-purple',
+                        )}>
+                          {traceHistoryRoute(item) === 'selection' ? '选股' : '单股'}
+                        </span>
+                        <span className="font-mono text-foreground">{traceHistoryStockCode(item) || (traceHistoryRoute(item) === 'selection' ? '候选池' : '未指定')}</span>
+                        <span className="text-[10px] text-muted-text">{formatHistoryTime(item.createdAt)}</span>
+                        <span className={cn('text-[10px]', item.status === 'success' ? 'text-success' : 'text-danger')}>{item.status === 'success' ? '成功' : '失败'}</span>
+                      </span>
                       <span className="mt-0.5 line-clamp-2 block break-words leading-5 text-muted-text">{item.message}</span>
+                      <span className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-text">
+                        <span>{formatCount(item.result.total_steps || 0)} 步</span>
+                        <span>{formatCount(item.result.total_tokens || 0)} tok</span>
+                      </span>
                     </span>
                   </button>
                   <button
@@ -2596,182 +2938,47 @@ const AgentTracePage: React.FC = () => {
           </div>
         ) : null}
 
-        {/* Timeline */}
+        {/* Trace cockpit */}
         {result ? (
-          <div className="rounded-xl border border-border bg-card px-6 py-8 shadow-sm">
-            <TimelineStep
-              label="L1"
-              title="数据与候选池"
-              status={getLayerStatus(Boolean(result.tool_calls.length || stockSelection))}
-              narrative={buildL1Narrative(result, stockSelection)}
-              defaultOpen={Boolean(stockSelection || hasDiscoveryCandidates || getIntentResolution(result) || getTargetResolution(result))}
-            >
-              <L1Detail result={result} stockSelection={stockSelection} traceStatus={traceStatus} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L2"
-              title="证据取证"
-              status={getLayerStatus(result.tool_calls.length > 0)}
-              narrative={`已完成 ${result.tool_calls.length} 次工具调用${failedToolCount ? `，其中 ${failedToolCount} 次失败` : ''}。`}
-              defaultOpen={true}
-            >
-              <L2Detail toolCalls={result.tool_calls} selectedIndex={selectedToolIndex} onSelect={setSelectedToolIndex} selectedTool={selectedTool} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L3"
-              title="信号层"
-              status={getLayerStatus(Boolean(debate || result.content))}
-              narrative="将证据压缩为方向、置信度和冲突点，形成结构化信号。"
-            >
-              <L3Detail result={result} debate={debate} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L4"
-              title="决策层"
-              status={debateFailed ? 'error' : getLayerStatus(Boolean(debate?.judge_decision || planner))}
-              narrative={buildL4Narrative(debate, planner)}
-              defaultOpen={debateFailed || Boolean(debate?.judge_decision)}
-            >
-              <L4Detail debate={debate} planner={planner} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="S4"
-              title="确定性评分"
-              status={compositeFailed ? 'error' : getLayerStatus(Boolean(compositeVerdict))}
-              narrative={compositeFailed
-                ? `确定性评分失败：${String(compositeVerdict?.error || '目标或数据不一致')}`
-                : compositeVerdict
-                  ? '策略 4 与缠论证据已按冻结口径完成影子评分。'
-                  : '等待确定性评分结果。'}
-              defaultOpen={Boolean(compositeVerdict)}
-            >
-              <CompositeScoreDetail compositeVerdict={compositeVerdict} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L5"
-              title="风控闸门"
-              status={riskFailed ? 'error' : getLayerStatus(Boolean(riskPayload))}
-              narrative={buildL5Narrative(riskPayload)}
-              defaultOpen={riskFailed}
-            >
-              <L5Detail riskPayload={riskPayload} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L6"
-              title="方案层"
-              status={getLayerStatus(Boolean(asRecord(riskPayload?.trade_plan)))}
-              narrative={buildL6Narrative(riskPayload)}
-            >
-              {asRecord(riskPayload?.trade_plan) ? (
-                <JsonViewer data={asRecord(riskPayload?.trade_plan) as Record<string, unknown>} maxHeight="300px" />
-              ) : null}
-            </TimelineStep>
-
-            <TimelineStep
-              label="L7"
-              title="托管跟踪"
-              status="pending"
-              narrative="模拟盘托管尚未接入，后续将展示方案执行状态和偏离原因。"
-            />
-
-            <TimelineStep
-              label="JEV"
-              title="Jev 独立复核"
-              status={jev.error || ['error', 'unavailable', 'interrupted'].includes(jev.review?.status || '') ? 'error'
-                : jev.review?.status === 'pending' ? 'active' : jev.review?.status === 'ok' ? 'done' : 'pending'}
-              narrative={jev.review?.status === 'pending' ? '原分析已完成，Jev 复核中。'
-                : jev.review?.comparison?.status === 'divergent' ? 'Jev 与原动作存在分歧。'
-                : undefined}
-              defaultOpen={Boolean(jev.review && !['disabled', 'skipped', 'not_recorded'].includes(jev.review.status))}
-            >
-              <JevTraceReview review={jev.review} detail error={jev.error} onRefresh={jev.refresh} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L8"
-              title="可观测性"
-              status={getLayerStatus(Boolean(llmTelemetry || judgeSanity))}
-              narrative={buildObservabilityNarrative(llmTelemetry, judgeSanity)}
-              defaultOpen={Boolean(llmTelemetry || judgeSanity)}
-            >
-              <ObservabilityDetail llmTelemetry={llmTelemetry} judgeSanity={judgeSanity} />
-            </TimelineStep>
-
-            <TimelineStep
-              label="L9"
-              title="复盘进化"
-              status={getLayerStatus(Boolean(result.artifact_dir))}
-              narrative={result.artifact_dir ? `Trace 已落盘：${result.artifact_dir}` : '等待 Trace 完成后落盘。'}
-              isLast={true}
-            />
-
-            {/* Final Output */}
-            {result.content ? (
-              <div className="mt-8 border-t border-border pt-6">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                  <h3 className="text-sm font-medium text-foreground">最终报告</h3>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    size="sm"
-                    className="border-border bg-card text-foreground hover:bg-surface-2"
-                    onClick={() => downloadMarkdownReport(result)}
-                    title="导出 Markdown 文件"
-                    aria-label="导出 MD"
-                  >
-                    <Download className="h-4 w-4" aria-hidden="true" />
-                    导出 MD
-                  </Button>
-                </div>
-                {jev.review && !['disabled', 'skipped', 'not_recorded'].includes(jev.review.status) && (
-                  <div className="mb-5 border-y border-border py-4">
-                    <JevTraceReview review={jev.review} />
-                  </div>
-                )}
-                {result.error ? (
-                  <div className="mb-3 rounded-lg bg-danger/10 p-3 text-sm text-danger">{result.error}</div>
-                ) : null}
-                {asRecord(result.report_quality)?.status === 'repaired' ? (
-                  <div className="mb-3 border-l-2 border-warning bg-warning/10 px-3 py-2 text-xs text-warning">
-                    主报告首次输出不完整，系统已自动修复并通过完整度校验。
-                  </div>
-                ) : null}
-                {asRecord(result.report_quality)?.status === 'fallback' ? (
-                  <div className="mb-3 border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
-                    主报告自动修复仍未通过，当前展示确定性降级报告；价格计划评审会继续执行。
-                  </div>
-                ) : null}
-                {asRecord(result.report_quality)?.status === 'legacy_incomplete' ? (
-                  <div className="mb-3 border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
-                    该历史主报告生成于完整度门禁上线前；失败 Debate 已只读隔离，请重跑分析以生成完整报告。
-                  </div>
-                ) : null}
-                {asRecord(asRecord(result.report_quality)?.read_time_consistency)?.status === 'inconsistent' ? (
-                  <div className="mb-3 border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
-                    历史报告与工具证据不一致：基本面或消息面存在可用/部分可用工具结果，但报告曾写成完全缺失；请重跑分析。该诊断仅在读取时生成，不改写历史 artifact。
-                  </div>
-                ) : null}
-                <div className="max-h-[500px] overflow-auto rounded-lg border border-border bg-card p-5">
-                  <div className={markdownProseClass}>
-                    <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>{splitReportContent(result.content).main}</Markdown>
-                  </div>
-                </div>
-                {splitReportContent(result.content).appendix ? (
-                  <Collapsible title="附录：候选池来源、逐股维度证据与风控条件" defaultOpen={false}>
-                    <div className={markdownProseClass}>
-                    <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>{splitReportContent(result.content).appendix}</Markdown>
-                    </div>
-                  </Collapsible>
-                ) : null}
+          <div className="grid gap-3 xl:grid-cols-[240px_minmax(0,1fr)_310px]">
+            <TraceStepNav steps={navSteps} activeKey={activeStep} onSelect={setActiveStep} />
+            <section className="min-w-0 rounded-xl border border-border bg-card px-4 py-4 shadow-sm">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-2">
+                <span className="text-[10px] uppercase tracking-[0.14em] text-muted-text">Trace Detail</span>
+                <span className="truncate font-mono text-[10px] text-muted-text">{activeStep}</span>
               </div>
-            ) : null}
+              {traceSteps.map((step) => (
+                <div key={step.key} className={cn(activeStep === step.key ? 'block' : 'hidden')}>
+                  <TimelineStep
+                    label={step.label}
+                    title={step.title + ' 详情'}
+                    status={step.status}
+                    narrative={step.narrative}
+                    defaultOpen={true}
+                    isLast={true}
+                  >
+                    {step.content}
+                  </TimelineStep>
+                </div>
+              ))}
+            </section>
+            <TraceVerdictPanel
+              result={result}
+              traceStatus={traceStatus}
+              planner={planner}
+              debate={debate}
+              compositeVerdict={compositeVerdict}
+              riskPayload={riskPayload}
+              llmTelemetry={llmTelemetry}
+              l1Narrative={buildL1Narrative(result, stockSelection)}
+              decisionNarrative={buildL4Narrative(debate, planner)}
+              riskNarrative={buildL5Narrative(riskPayload)}
+              failedToolCount={failedToolCount}
+              routeLabel={resolvedRoute ? traceRouteLabel(resolvedRoute, resolvedIntent) : undefined}
+              onExport={() => downloadMarkdownReport(result)}
+            />
           </div>
+
         ) : (
           <div className="rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
             <p className="text-sm text-muted-text">输入问题并点击「运行」，观察 Agent 的完整推理链路。</p>
@@ -3529,51 +3736,144 @@ const L2Detail: React.FC<{
   );
 };
 
+const SIGNAL_VERDICT_LABELS: Record<string, string> = {
+  supports_primary: '支持主观点',
+  supporting: '支持主观点',
+  supports_opposing: '支持反方',
+  opposing: '支持反方',
+  neutral: '中性',
+  mixed: '多空混合',
+  insufficient: '证据不足',
+  insufficient_data: '证据不足',
+  '-': '未评估',
+};
+
+const MISSING_LABELS: Record<string, string> = {
+  capital_evidence_unavailable: '资金证据不可用',
+  fundamental_evidence_unavailable: '基本面证据不可用',
+  search_stock_news_failed_or_unavailable: '新闻检索失败或不可用',
+  intel_coverage_incomplete: '情报覆盖不完整',
+};
+
+const signalVerdictStyle = (verdict: string): string => {
+  if (verdict === 'supports_primary' || verdict === 'supporting') return 'border-success/20 bg-success/10 text-success';
+  if (verdict === 'supports_opposing' || verdict === 'opposing') return 'border-danger/20 bg-danger/10 text-danger';
+  if (verdict === 'mixed' || verdict === 'neutral') return 'border-warning/20 bg-warning/10 text-warning';
+  return 'border-border/60 bg-surface-2 text-muted-text';
+};
+
 const L3Detail: React.FC<{ result: AgentTraceRunResponse; debate: Record<string, unknown> | null }> = ({ result, debate }) => {
   const judge = asRecord(debate?.judge_decision);
   const dims = toRecordList(judge?.dimension_assessments);
+  const primary = asRecord(debate?.primary_thesis);
+  const opposing = asRecord(debate?.opposing_thesis);
+  const conflicts = toStringList(judge?.unresolved_conflicts || debate?.unresolved_conflicts);
+  const failedTools = result.tool_calls.filter((tool) => !tool.success).length;
+  const covered = dims.filter((item) => {
+    const verdict = String(item.plan_verdict || item.verdict || '-');
+    return verdict !== 'insufficient' && verdict !== 'insufficient_data' && verdict !== '-';
+  }).length;
+  const missingCount = dims.length - covered;
+  const finalAction = String(judge?.final_action || '-');
 
-  if (dims.length) {
+  if (debate?.enabled === true && debate?.success === false) {
     return (
-      <div className="space-y-2">
-        {dims.map((item, i) => {
-          const dim = String(item.dimension || '-');
-          const verdict = String(item.verdict || '-');
+      <div className="rounded-lg border border-danger/25 bg-danger/5 p-3 text-xs text-danger">
+        信号层未形成：Debate 失败。{String(debate.error || '结构化输出不完整')}
+      </div>
+    );
+  }
+
+  if (!dims.length) {
+    return (
+      <div className="rounded-lg border border-dashed border-border bg-surface-2/20 p-4">
+        <p className="text-sm font-medium text-foreground">本轮没有形成结构化信号</p>
+        <p className="mt-1.5 text-xs leading-5 text-secondary-text">
+          {String(debate?.skipped_reason || debate?.error || 'Debate 未返回维度评估；可以先检查 L2 的工具取证是否完整。')}
+        </p>
+        <div className="mt-3 flex flex-wrap gap-1.5 text-[10px] text-muted-text">
+          <span className="rounded border border-border/60 px-1.5 py-0.5">工具 {result.tool_calls.length} 次</span>
+          <span className="rounded border border-border/60 px-1.5 py-0.5">失败 {failedTools} 次</span>
+          <span className="rounded border border-border/60 px-1.5 py-0.5">动作 {finalAction}</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <section className="rounded-lg border border-cyan/20 bg-cyan/5 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-[0.1em] text-muted-text">信号结论</span>
+            <span className="rounded border border-cyan/25 bg-cyan/10 px-1.5 py-0.5 text-[10px] text-cyan">{traceActionLabel(finalAction)}</span>
+          </div>
+          <div className="flex items-center gap-2 text-[10px] text-muted-text">
+            <span>维度覆盖 <b className="font-mono text-foreground">{covered}/{dims.length}</b></span>
+            <span>缺失 <b className={cn('font-mono', missingCount ? 'text-warning' : 'text-success')}>{missingCount}</b></span>
+          </div>
+        </div>
+        <p className="mt-2 text-sm leading-6 text-secondary-text">
+          {String(judge?.decision_summary || primary?.summary || '信号层尚未给出明确结论。')}
+        </p>
+        {conflicts.length ? (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {conflicts.slice(0, 3).map((conflict) => (
+              <span key={conflict} className="rounded border border-warning/20 bg-warning/5 px-1.5 py-0.5 text-[10px] text-warning">{conflict}</span>
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      <div className="grid gap-2 lg:grid-cols-2">
+        {dims.map((item, index) => {
+          const dimension = String(item.dimension || '-');
+          const rawVerdict = String(item.plan_verdict || item.verdict || '-');
+          const verdictLabel = SIGNAL_VERDICT_LABELS[rawVerdict] || rawVerdict.replace(/_/g, ' ');
+          const summary = String(item.summary || '暂无摘要');
+          const evidenceRefs = toStringList(item.evidence_refs);
+          const missing = toStringList(item.missing);
+          const weight = String(item.weight || '');
           return (
-            <div key={`${dim}-${i}`} className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-              <span className="text-xs text-foreground">{DIMENSION_LABELS[dim] || dim}</span>
-              <span className={cn(
-                'rounded-full px-2 py-0.5 text-xxs font-medium',
-                verdict === 'supports_primary' && 'bg-success/10 text-success',
-                verdict === 'supports_opposing' && 'bg-danger/10 text-danger',
-                verdict === 'mixed' && 'bg-warning/10 text-warning',
-                verdict === 'insufficient_data' && 'bg-surface-2 text-muted-text',
-              )}>
-                {verdict.replace(/_/g, ' ')}
-              </span>
+            <div key={dimension + '-' + index} className="rounded-lg border border-border/60 bg-surface-2/20 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-medium text-foreground">{DIMENSION_LABELS[dimension] || dimension}</span>
+                <span className={cn('rounded border px-1.5 py-0.5 text-[10px]', signalVerdictStyle(rawVerdict))}>{verdictLabel}</span>
+              </div>
+              <p className="mt-1.5 text-[11px] leading-5 text-secondary-text">{summary}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[9px] text-muted-text">
+                {weight && weight !== '-' ? <span className="rounded border border-border/60 px-1.5 py-0.5">权重 {weight}</span> : null}
+                {evidenceRefs.length ? (
+                  <details className="rounded border border-border/60 px-1.5 py-0.5">
+                    <summary className="cursor-pointer">证据引用 {evidenceRefs.length} 条</summary>
+                    <div className="mt-1 space-y-0.5 font-mono text-[9px] text-secondary-text">
+                      {evidenceRefs.slice(0, 8).map((ref) => <div key={ref}>{ref}</div>)}
+                    </div>
+                  </details>
+                ) : null}
+                {missing.map((itemKey) => (
+                  <span key={itemKey} className="rounded border border-warning/20 bg-warning/5 px-1.5 py-0.5 text-warning">
+                    缺失：{MISSING_LABELS[itemKey] || itemKey}
+                  </span>
+                ))}
+              </div>
             </div>
           );
         })}
       </div>
-    );
-  }
 
-  // Fallback: show tool evidence summary
-  if (result.tool_calls.length) {
-    return (
-      <div className="space-y-1">
-        {result.tool_calls.slice(0, 8).map((t, i) => (
-          <div key={`${t.tool}-${i}`} className="flex items-center gap-2 text-xs">
-            <span className={cn('h-1.5 w-1.5 rounded-full', t.success ? 'bg-success' : 'bg-danger')} />
-            <span className="text-secondary-text">{t.tool}</span>
-            <span className="text-muted-text">{t.success ? '证据可用' : '取证失败'}</span>
-          </div>
-        ))}
-      </div>
-    );
-  }
+      {opposing?.summary ? (
+        <section className="rounded-lg border border-warning/20 bg-warning/5 p-3">
+          <div className="text-[10px] uppercase tracking-[0.1em] text-warning">反方关注</div>
+          <p className="mt-1.5 text-[11px] leading-5 text-secondary-text">{String(opposing.summary)}</p>
+        </section>
+      ) : null}
 
-  return <p className="text-xs text-muted-text">等待证据进入信号层。</p>;
+      <p className="text-[10px] leading-5 text-muted-text">
+        信号层只回答“证据支持什么方向、哪些维度不足”，最终执行权限在 L4 裁决和 L5 风控。
+      </p>
+    </div>
+  );
 };
 
 const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Record<string, unknown> | null }> = ({ debate, planner }) => {
@@ -3628,15 +3928,15 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
 
       {/* Judge */}
       {judge.final_action ? (
-        <div className="rounded-lg bg-foreground p-4 text-background">
+        <div className="rounded-lg border border-cyan/20 bg-cyan/5 p-4 text-foreground">
           <div className="flex items-center gap-2">
-            <BrainCircuit className="h-4 w-4 text-background/60" />
-            <span className="text-label font-semibold uppercase tracking-wider text-background/60">Judge 裁决</span>
-            <span className="ml-auto rounded-full bg-card/10 px-2.5 py-0.5 text-xs font-medium">{String(judge.final_action)}</span>
+            <BrainCircuit className="h-4 w-4 text-cyan" />
+            <span className="text-label font-semibold uppercase tracking-wider text-muted-text">Judge 裁决</span>
+            <span className="ml-auto rounded-full border border-cyan/25 bg-cyan/10 px-2.5 py-0.5 text-xs font-medium text-cyan">{String(judge.final_action)}</span>
           </div>
-          <p className="mt-2 text-sm leading-relaxed text-background/85">{String(judge.decision_summary || judge.reason || '-')}</p>
+          <p className="mt-2 text-sm leading-relaxed text-secondary-text">{String(judge.decision_summary || judge.reason || '-')}</p>
           {reasonPoints.length ? (
-            <ul className="mt-3 space-y-1 text-xs text-background/60">
+            <ul className="mt-3 space-y-1 text-xs text-muted-text">
               {reasonPoints.map((p, i) => <li key={i}>· {p}</li>)}
             </ul>
           ) : null}
@@ -3929,43 +4229,163 @@ const CompositeScoreDetail: React.FC<{ compositeVerdict: Record<string, unknown>
   );
 };
 
+const TRACE_ACTION_LABELS: Record<string, string> = {
+  wait: '等待',
+  monitor: '观察',
+  buy: '买入',
+  add: '加仓',
+  hold: '持有',
+  reduce: '减仓',
+  sell: '卖出',
+  reject: '回避',
+  avoid: '回避',
+  insufficient: '证据不足',
+  insufficient_data: '证据不足',
+};
+
+const TRACE_RULE_LABELS: Record<string, string> = {
+  a_share_price_limit: '涨跌停限制',
+  critical_data_quality: '关键数据质量',
+  composite_verdict_ceiling: '综合评分仓位上限',
+};
+
+const traceActionLabel = (value: unknown): string => {
+  const raw = String(value || '-');
+  return TRACE_ACTION_LABELS[raw] ? TRACE_ACTION_LABELS[raw] + ' · ' + raw : raw;
+};
+
 const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ riskPayload }) => {
-  if (!riskPayload) return <p className="text-xs text-muted-text">尚未生成风控结果。</p>;
-  if (riskPayload.status === 'failed') {
+  if (!riskPayload) {
     return (
-      <div className="border-l-2 border-danger bg-danger/10 px-3 py-2 text-xs text-danger">
-        {String(riskPayload.error || '风险门目标或数据不一致，结果已拒绝使用。')}
+      <div className="rounded-lg border border-dashed border-border bg-surface-2/20 p-4 text-xs text-muted-text">
+        风控闸门尚未执行。它会检查涨跌停限制、关键数据质量和综合评分仓位上限，决定“能不能做、能做到什么程度”。
       </div>
     );
   }
+  if (riskPayload.status === 'failed') {
+    return (
+      <div className="rounded-lg border border-danger/25 bg-danger/5 p-3 text-xs text-danger">
+        风控结果已拒绝使用：{String(riskPayload.error || '目标或数据不一致')}
+      </div>
+    );
+  }
+
   const gate = asRecord(riskPayload.risk_gate) || {};
   const checks = toRecordList(gate.checks);
   const blockedReasons = toStringList(gate.blocked_reasons);
+  const warnings = toStringList(gate.warnings);
+  const status = String(gate.status || 'unknown');
+  const original = String(gate.original_action || '-');
+  const allowed = String(gate.allowed_action || '-');
+  const passedCount = checks.filter((check) => check.passed === true).length;
+  const requiredManualReview = gate.required_manual_review === true;
+  const dataQualityCheck = checks.find((check) => String(check.rule_id) === 'critical_data_quality');
+  const failedTools = toStringList(asRecord(dataQualityCheck?.details)?.failed_tools);
+  const statusLabel = status === 'passed' ? '通过' : status === 'downgraded' ? '降级' : status === 'blocked' ? '阻断' : status;
+  const statusStyle = status === 'passed'
+    ? 'border-success/25 bg-success/5'
+    : status === 'blocked'
+      ? 'border-danger/25 bg-danger/5'
+      : 'border-warning/25 bg-warning/5';
+  const statusTextStyle = status === 'passed' ? 'text-success' : status === 'blocked' ? 'text-danger' : 'text-warning';
+  const meaning = status === 'passed'
+    ? '风控通过，允许按「' + traceActionLabel(allowed) + '」执行；仓位与止损仍需遵守计划。'
+    : status === 'blocked'
+      ? '风控阻断了本轮动作，当前不能执行；需要补证据、降低风险或人工复核。'
+      : '风控将「' + traceActionLabel(original) + '」降级为「' + traceActionLabel(allowed) + '」；本轮不允许开新仓，只能观察或等待数据补充。';
 
   return (
     <div className="space-y-3">
-      {checks.length ? (
+      <section className={cn('rounded-lg border p-3', statusStyle)}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-[0.1em] text-muted-text">风控结论</span>
+            <span className={cn('rounded border border-current/20 px-1.5 py-0.5 text-[10px] font-medium', statusTextStyle)}>{statusLabel}</span>
+          </div>
+          <span className="text-[10px] text-muted-text">检查 {passedCount}/{checks.length} 项通过</span>
+        </div>
+        <div className="mt-2 grid gap-2 sm:grid-cols-3">
+          <div className="rounded border border-border/50 bg-card/50 px-2 py-1.5">
+            <div className="text-[9px] text-muted-text">原动作</div>
+            <div className="mt-0.5 text-xs font-medium text-foreground">{traceActionLabel(original)}</div>
+          </div>
+          <div className="rounded border border-border/50 bg-card/50 px-2 py-1.5">
+            <div className="text-[9px] text-muted-text">允许动作</div>
+            <div className={cn('mt-0.5 text-xs font-medium', statusTextStyle)}>{traceActionLabel(allowed)}</div>
+          </div>
+          <div className="rounded border border-border/50 bg-card/50 px-2 py-1.5">
+            <div className="text-[9px] text-muted-text">人工复核</div>
+            <div className="mt-0.5 text-xs font-medium text-foreground">{requiredManualReview ? '需要' : '不需要'}</div>
+          </div>
+        </div>
+        <p className="mt-2 text-xs leading-5 text-secondary-text">{meaning}</p>
+      </section>
+
+      <section>
+        <div className="mb-1.5 flex items-center justify-between">
+          <h4 className="text-[10px] uppercase tracking-[0.08em] text-muted-text">检查明细</h4>
+          <span className="text-[10px] text-muted-text">{checks.length} 条</span>
+        </div>
         <div className="space-y-1.5">
-          {checks.map((check, i) => {
+          {checks.length ? checks.map((check, index) => {
             const passed = check.passed === true;
+            const ruleId = String(check.rule_id || '-');
+            const severity = String(check.severity || '');
             return (
-              <div key={`${String(check.rule_id)}-${i}`} className="flex items-start gap-2 text-xs">
-                <span className={cn('mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full', passed ? 'bg-success' : 'bg-danger')} />
-                <span className="font-mono text-muted-text">{String(check.rule_id || '-')}</span>
-                <span className="flex-1 text-secondary-text">{String(check.message || '-')}</span>
+              <div key={ruleId + '-' + index} className="rounded-lg border border-border/60 bg-surface-2/20 p-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={cn('inline-flex h-4 w-4 items-center justify-center rounded-full border text-[9px]', passed ? 'border-success/30 bg-success/10 text-success' : 'border-warning/30 bg-warning/10 text-warning')}>
+                    {passed ? '✓' : '!'}
+                  </span>
+                  <span className="text-xs font-medium text-foreground">{TRACE_RULE_LABELS[ruleId] || ruleId}</span>
+                  <span className="ml-auto rounded border border-border/60 px-1.5 py-0.5 text-[9px] text-muted-text">{passed ? '通过' : '需关注'}{severity ? ' · ' + severity : ''}</span>
+                </div>
+                <p className="mt-1.5 text-[11px] leading-5 text-secondary-text">{String(check.message || '-')}</p>
+                {check.suggested_action ? (
+                  <p className="mt-1 text-[10px] text-muted-text">建议动作：{traceActionLabel(check.suggested_action)}</p>
+                ) : null}
               </div>
             );
-          })}
+          }) : <p className="text-xs text-muted-text">本轮没有生成检查项。</p>}
         </div>
+      </section>
+
+      {failedTools.length ? (
+        <section className="rounded-lg border border-warning/20 bg-warning/5 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className="text-[10px] uppercase tracking-[0.08em] text-warning">受影响的工具</h4>
+            <span className="text-[10px] text-warning">{failedTools.length} 个</span>
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {failedTools.map((tool) => (
+              <span key={tool} className="rounded border border-warning/20 bg-card/50 px-1.5 py-0.5 font-mono text-[9px] text-warning">{tool}</span>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[10px] leading-4 text-muted-text">这些工具失败会降低证据完整度，风控因此只允许观察/等待。</p>
+        </section>
       ) : null}
+
       {blockedReasons.length ? (
-        <div className="rounded-lg bg-danger/10 p-3">
-          <p className="text-label font-medium text-danger">阻断原因</p>
-          <ul className="mt-1 space-y-0.5 text-xs text-danger">
-            {blockedReasons.map((r, i) => <li key={i}>· {r}</li>)}
+        <section className="rounded-lg border border-danger/25 bg-danger/5 p-3">
+          <h4 className="text-[10px] uppercase tracking-[0.08em] text-danger">阻断原因</h4>
+          <ul className="mt-1.5 space-y-0.5 text-[11px] text-danger">
+            {blockedReasons.map((reason, index) => <li key={reason + index}>· {reason}</li>)}
           </ul>
-        </div>
+        </section>
       ) : null}
+
+      {warnings.length ? (
+        <section className="rounded-lg border border-border/60 bg-surface-2/20 p-3">
+          <h4 className="text-[10px] uppercase tracking-[0.08em] text-muted-text">提示</h4>
+          <ul className="mt-1.5 space-y-0.5 text-[11px] text-secondary-text">
+            {warnings.map((warning, index) => <li key={warning + index}>· {warning}</li>)}
+          </ul>
+        </section>
+      ) : null}
+
+      <p className="text-[10px] leading-5 text-muted-text">
+        风控只决定“能不能做、能做到什么程度”，不重新选股；真正的买卖动作仍以 L4 裁决和你的账户约束为准。
+      </p>
     </div>
   );
 };
@@ -4129,12 +4549,6 @@ function buildL5Narrative(riskPayload: Record<string, unknown> | null): string {
   if (status === 'blocked') return `风控阻断：原动作「${original}」被改为「${allowed}」。`;
   if (status === 'downgraded') return `动作已降级：「${original}」调整为「${allowed}」。`;
   return `风控状态：${status}`;
-}
-
-function buildL6Narrative(riskPayload: Record<string, unknown> | null): string {
-  const tradePlan = asRecord(riskPayload?.trade_plan);
-  if (!tradePlan) return '等待风控通过后生成交易方案。';
-  return `已生成 ${String(tradePlan.symbol || '-')} 的「${String(tradePlan.action || '-')}」方案，目标仓位 ${formatPercent(tradePlan.target_position_pct)}。`;
 }
 
 function buildObservabilityNarrative(

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import AgentTracePage from '../AgentTracePage';
@@ -9,7 +9,6 @@ const mocks = vi.hoisted(() => ({
   getTraceSession: vi.fn(),
   runTrace: vi.fn(),
   traceStream: vi.fn(),
-  traceReview: vi.fn(),
 }));
 
 vi.mock('../../api/agent', () => ({
@@ -27,7 +26,6 @@ vi.mock('../../api/portfolio', () => ({
   },
 }));
 
-vi.mock('../../api/jev', () => ({ jevApi: { traceReview: mocks.traceReview } }));
 
 describe('AgentTracePage', () => {
   const renderPage = (initialEntry = '/agent-trace') => render(
@@ -46,7 +44,6 @@ describe('AgentTracePage', () => {
     mocks.getTraceSession.mockReset();
     mocks.runTrace.mockReset();
     mocks.traceStream.mockReset();
-    mocks.traceReview.mockReset();
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
     mocks.getTraceSession.mockRejectedValue(new Error('not found'));
   });
@@ -364,32 +361,6 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('历史')).toBeInTheDocument();
   });
 
-  it('keeps the original report visible while Jev completes and appends its disagreement', async () => {
-    mocks.getAccounts.mockResolvedValue({ accounts: [] });
-    let finishReview!: (value: unknown) => void;
-    mocks.traceReview.mockReturnValue(new Promise((resolve) => { finishReview = resolve; }));
-    const baseline = { action: 'open', source: 'risk_gate', trading_horizon: 'swing', summary: '原证据支持条件入场' };
-    mocks.traceStream.mockResolvedValue(makeStreamResponse([{
-      type: 'done', success: true, session_id: 'trace-jev-ui', content: '原始最终报告保持不变',
-      tool_calls: [], jev_review: { status: 'pending', shadow_mode: true, session_id: 'trace-jev-ui', capture_id: 'one', baseline },
-    }]));
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
-    expect(await screen.findByText('原始最终报告保持不变')).toBeInTheDocument();
-    await waitFor(() => expect(mocks.traceReview).toHaveBeenCalledWith('trace-jev-ui'));
-    expect(screen.getByText('原分析已完成，Jev 复核中。')).toBeInTheDocument();
-    await act(async () => finishReview({
-      status: 'ok', shadow_mode: true, session_id: 'trace-jev-ui', capture_id: 'one', shared_snapshot: true, baseline,
-      evaluation: { status: 'ok', stock_code: '600519', as_of: '2026-09-18', model: 'jev-unit', shadow_mode: true,
-        answers: { direction_1: { type: 'choice', choice: 'bearish', confidence: 0.7, probabilities: { bearish: 1 } } } },
-      comparison: { status: 'divergent', rows: [{ horizon: 1, status: 'divergent', flags: ['downside_conflict'] }] },
-    }));
-    const comparison = screen.getByRole('region', { name: 'Jev 与原结论对照' });
-    expect(await within(comparison).findByText('入场动作与 Jev 下行判断有分歧')).toBeInTheDocument();
-    expect(screen.getByText('原始最终报告保持不变')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /下单|采用 Jev/ })).not.toBeInTheDocument();
-  });
-
   it.each(['分析立讯精密 002475 未来 1 至 5 个交易日', '分析腾讯 HK00700', '分析 AAPL 的 MACD'])(
     'does not send the hidden historical stock code after the question switches stocks: %s', async (message) => {
     mocks.getAccounts.mockResolvedValue({ accounts: [] });
@@ -406,33 +377,6 @@ describe('AgentTracePage', () => {
     await waitFor(() => expect(mocks.traceStream).toHaveBeenCalledWith(expect.objectContaining({
       message, stock_code: undefined,
     })));
-  });
-
-  it('restores a persisted Jev failure without marking the original Trace failed', async () => {
-    mocks.getAccounts.mockResolvedValue({ accounts: [] });
-    const review = { status: 'error', shadow_mode: true, reason: 'timeout', session_id: 'trace-jev-history',
-      evaluation: { status: 'error', shadow_mode: true, state: { history_source: 'fixture', bar_count: 90, missing_evidence: [] },
-        questions: { direction_1: { type: 'choice' } } } };
-    mocks.traceReview.mockResolvedValue(review);
-    mocks.getTraceSession.mockResolvedValue({ id: 'trace-jev-history', createdAt: '2026-09-20', message: '600519',
-      stockCode: '600519', status: 'success', result: { success: true, session_id: 'trace-jev-history',
-        content: '历史原报告', total_steps: 0, total_tokens: 0, provider: 'unit', model: 'unit',
-        mode: 'planning_execute', events: [], tool_calls: [], jev_review: review } });
-    const page = renderPage('/agent-trace/trace-jev-history');
-    expect(await screen.findByText('历史原报告')).toBeInTheDocument();
-    expect(screen.getByText('已从后端加载 Trace')).toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: 'Jev 复核证据' })).getByText('模型请求超时')).toBeInTheDocument();
-    expect(mocks.traceStream).not.toHaveBeenCalled();
-    const cached = JSON.parse(window.localStorage.getItem('dsa.agentTrace.history.v1') || '[]')[0].result.jev_review;
-    expect(cached.status).toBe('error');
-    expect(cached.evaluation.state).toBeUndefined();
-    expect(cached.evaluation.questions).toBeUndefined();
-    page.unmount();
-    mocks.getTraceSession.mockClear();
-    renderPage('/agent-trace/trace-jev-history');
-    expect(await screen.findByText('历史原报告')).toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: 'Jev 复核证据' })).getByText('模型请求超时')).toBeInTheDocument();
-    expect(mocks.getTraceSession).not.toHaveBeenCalled();
   });
 
   it('preserves an edited question when runtime configuration arrives after history', async () => {

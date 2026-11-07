@@ -2295,6 +2295,9 @@ def _run_candidate_discovery_tool(
                         getattr(Config.get_instance(), "agent_seed_fact_tool_timeout_seconds", 30.0) or 30.0
                     ),
                     per_seed_timeout_budget_s=per_desk_llm_timeout,
+                    desk_row_concurrency=int(
+                        getattr(Config.get_instance(), "agent_desk_row_concurrency", 3) or 3
+                    ),
                 )
             if not isinstance(payload, dict):
                 raise RuntimeError(f"committee discovery returned {type(payload).__name__}")

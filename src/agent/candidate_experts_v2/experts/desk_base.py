@@ -87,6 +87,7 @@ class BaseDeskExpert(BaseExpert):
         deadline_s: Optional[float] = None,
         per_seed_timeout_s: Optional[float] = None,
         max_consecutive_seed_timeouts: int = 2,
+        row_concurrency: int = 1,
     ) -> ExpertPacketV2:
         """Run this desk on a list of FeatureRows.
 
@@ -132,6 +133,28 @@ class BaseDeskExpert(BaseExpert):
         consecutive_failure_statuses: List[str] = []
         seed_timeout_s = float(per_seed_timeout_s or 180.0)
         stop_reason = ""
+
+        concurrency = max(1, int(row_concurrency or 1))
+        if concurrency > 1 and len(eligible) > 1:
+            filter_diagnostics.append(
+                {
+                    "source": "desk_row_concurrency",
+                    "status": "enabled",
+                    "row_concurrency": concurrency,
+                    "eligible_rows": len(eligible),
+                }
+            )
+            return self._run_rows_concurrent(
+                eligible,
+                market=market,
+                regime=regime,
+                deadline_s=deadline_s,
+                seed_timeout_s=seed_timeout_s,
+                max_consecutive_seed_timeouts=max_consecutive_seed_timeouts,
+                concurrency=concurrency,
+                filter_diagnostics=filter_diagnostics,
+                started=started,
+            )
 
         for idx, row in enumerate(eligible):
             if deadline_s is not None:
@@ -180,6 +203,115 @@ class BaseDeskExpert(BaseExpert):
                     )
                     for skipped in eligible[idx + 1 :]
                 )
+                break
+
+        return self._merge_row_packets(
+            eligible,
+            row_packets,
+            elapsed_ms=int((time.time() - started) * 1000),
+            stop_reason=stop_reason,
+            initial_diagnostics=filter_diagnostics,
+        )
+
+    def _run_rows_concurrent(
+        self,
+        eligible: List[FeatureRow],
+        *,
+        market: str,
+        regime: str,
+        deadline_s: Optional[float],
+        seed_timeout_s: float,
+        max_consecutive_seed_timeouts: int,
+        concurrency: int,
+        filter_diagnostics: List[Dict[str, Any]],
+        started: float,
+    ) -> ExpertPacketV2:
+        """Run rows in bounded batches while preserving per-seed output order."""
+        row_packets: List[ExpertPacketV2] = []
+        stop_reason = ""
+        consecutive_failures = 0
+        consecutive_failure_statuses: List[str] = []
+        batch_size = max(1, int(concurrency))
+
+        for batch_start in range(0, len(eligible), batch_size):
+            batch = eligible[batch_start : batch_start + batch_size]
+            if deadline_s is not None:
+                remaining = deadline_s - time.time()
+                if remaining <= 1.0:
+                    stop_reason = "desk_deadline_exhausted"
+                    row_packets.extend(
+                        self._skipped_row_packet(
+                            skipped,
+                            reason=stop_reason,
+                            market=market,
+                            regime=regime,
+                        )
+                        for skipped in eligible[batch_start:]
+                    )
+                    break
+                effective_timeout = max(1.0, min(seed_timeout_s, remaining - 0.5))
+            else:
+                effective_timeout = seed_timeout_s
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                futures = [
+                    pool.submit(
+                        self._run_one_row_with_timeout,
+                        row,
+                        market=market,
+                        regime=regime,
+                        timeout_s=effective_timeout,
+                    )
+                    for row in batch
+                ]
+
+            batch_packets: List[ExpertPacketV2] = []
+            for row, future in zip(batch, futures):
+                try:
+                    batch_packets.append(future.result())
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "%s concurrent row failed for %s: %s",
+                        self.expert_name,
+                        row.code,
+                        exc,
+                    )
+                    packet = self._skipped_row_packet(
+                        row,
+                        reason=f"row_exception:{type(exc).__name__}",
+                        market=market,
+                        regime=regime,
+                    )
+                    packet.status = "failed"
+                    packet.errors = [str(exc)]
+                    batch_packets.append(packet)
+
+            row_packets.extend(batch_packets)
+            for packet in batch_packets:
+                if packet.status in {"failed", "timeout"}:
+                    consecutive_failures += 1
+                    consecutive_failure_statuses.append(str(packet.status))
+                else:
+                    consecutive_failures = 0
+                    consecutive_failure_statuses = []
+                if consecutive_failures >= max(1, int(max_consecutive_seed_timeouts)):
+                    stop_reason = (
+                        "consecutive_seed_timeouts"
+                        if set(consecutive_failure_statuses) == {"timeout"}
+                        else "consecutive_seed_failures"
+                    )
+                    remaining_rows = eligible[batch_start + len(batch) :]
+                    row_packets.extend(
+                        self._skipped_row_packet(
+                            skipped,
+                            reason=stop_reason,
+                            market=market,
+                            regime=regime,
+                        )
+                        for skipped in remaining_rows
+                    )
+                    break
+            if stop_reason:
                 break
 
         return self._merge_row_packets(
