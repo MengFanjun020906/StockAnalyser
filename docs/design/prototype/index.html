@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>StockAnalyser · DSA Terminal Prototype</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <svg class="svg-defs" aria-hidden="true">
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 16 9 5 9-5"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-route" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M7.5 6h5a4 4 0 0 1 0 8h-1a4 4 0 0 0 0 8H16"/></symbol>
+    <symbol id="i-news" viewBox="0 0 24 24"><path d="M4 5h12v14H4z"/><path d="M16 9h4v8a2 2 0 0 1-2 2h-2"/><path d="M7 9h6M7 13h6M7 17h4"/></symbol>
+    <symbol id="i-candles" viewBox="0 0 24 24"><path d="M6 3v18M6 8h3v7H6zM15 3v18M15 6h3v6h-3z"/></symbol>
+    <symbol id="i-crosshair" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></symbol>
+    <symbol id="i-briefcase" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M3 12h18"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2 2-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-3v-.8a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1-2-2 .1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3v-3h.8a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 2-2 .1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V3h3v.8a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1 2 2-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.8v3h-.8a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v5l-4 2v-7L3 5Z"/></symbol>
+    <symbol id="i-columns" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6v5h-5"/><path d="M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 7M5.5 15A7 7 0 0 0 18 17"/></symbol>
+    <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 4h12v17l-6-4-6 4V4Z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4.5 4.5L19 6.5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 3 20h18L12 4Z"/><path d="M12 9v5M12 17h.01"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></symbol>
+    <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3 1.4 4.6L18 9l-4.6 1.4L12 15l-1.4-4.6L6 9l4.6-1.4L12 3Z"/><path d="m19 14 .8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14Z"/></symbol>
+    <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></symbol>
+    <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M7 7l10 10M17 8v9H8"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></symbol>
+    <symbol id="i-git" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M8 7c4 0 8 1 8 5"/></symbol>
+    <symbol id="i-command" viewBox="0 0 24 24"><path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6Z"/></symbol>
+  </svg>
+
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg class="icon"><use href="#i-candles"></use></svg>
+        </div>
+        <div class="brand-copy">
+          <div class="brand-name">StockAnalyser</div>
+          <div class="brand-sub">DSA TERMINAL</div>
+        </div>
+        <span class="brand-tag">v0.1</span>
+      </div>
+
+      <nav class="nav" aria-label="主导航">
+        <div class="nav-group">
+          <div class="nav-label">概览</div>
+          <a class="nav-item" href="#" data-toast="工作台原型下一步补：指数、宽度、板块、今日信号。">
+            <svg class="icon"><use href="#i-grid"></use></svg><span>工作台</span>
+          </a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">市场</div>
+          <a class="nav-item" href="#" data-toast="市场总览原型下一步补。">
+            <svg class="icon"><use href="#i-chart"></use></svg><span>市场总览</span>
+          </a>
+          <a class="nav-item" href="#" data-toast="板块/情绪原型下一步补。">
+            <svg class="icon"><use href="#i-layers"></use></svg><span>板块 / 情绪</span>
+          </a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">研究</div>
+          <a class="nav-item is-active" href="#candidates" data-view="candidates">
+            <svg class="icon"><use href="#i-filter"></use></svg><span>候选池</span><span class="nav-count">12</span>
+          </a>
+          <a class="nav-item" href="#" data-toast="个股详情原型下一步补：K线 + 判断卡 + Tabs。">
+            <svg class="icon"><use href="#i-candles"></use></svg><span>个股详情</span>
+          </a>
+          <a class="nav-item" href="#" data-toast="新闻/信号原型下一步补。">
+            <svg class="icon"><use href="#i-news"></use></svg><span>新闻 / 信号</span>
+          </a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">策略</div>
+          <a class="nav-item" href="#" data-toast="回测原型下一步补。">
+            <svg class="icon"><use href="#i-chart"></use></svg><span>回测</span>
+          </a>
+          <a class="nav-item" href="#" data-toast="入场回测原型下一步补。">
+            <svg class="icon"><use href="#i-crosshair"></use></svg><span>入场回测</span>
+          </a>
+          <a class="nav-item" href="#" data-toast="Seed 质量原型下一步补。">
+            <svg class="icon"><use href="#i-database"></use></svg><span>Seed 质量</span>
+          </a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">Agent</div>
+          <a class="nav-item" href="#trace" data-view="trace">
+            <svg class="icon"><use href="#i-route"></use></svg><span>Agent Trace</span><span class="nav-dot"></span>
+          </a>
+          <a class="nav-item" href="#" data-toast="任务/定时原型下一步补。">
+            <svg class="icon"><use href="#i-clock"></use></svg><span>任务 / 定时</span>
+          </a>
+        </div>
+        <div class="nav-group">
+          <div class="nav-label">系统</div>
+          <a class="nav-item" href="#" data-toast="持仓原型下一步补。">
+            <svg class="icon"><use href="#i-briefcase"></use></svg><span>持仓</span>
+          </a>
+          <a class="nav-item" href="#" data-toast="设置沿用现有页面。">
+            <svg class="icon"><use href="#i-settings"></use></svg><span>设置</span>
+          </a>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="health-card">
+          <div class="health-head"><span class="health-title"><span class="live-dot"></span>数据状态</span><span class="health-time">18:42</span></div>
+          <div class="health-row"><span>最新交易日</span><b>2026-11-06</b></div>
+          <div class="health-row"><span>日线覆盖</span><b>98.7%</b></div>
+          <div class="health-bar"><i style="width:98.7%"></i></div>
+          <div class="health-foot">5,585 / 5,599 标的 · 已同步</div>
+        </div>
+        <div class="user-card">
+          <div class="avatar small">MF</div>
+          <div class="user-copy"><b>本地工作区</b><span>个人版 · 未登录</span></div>
+          <svg class="icon tiny"><use href="#i-chevron-down"></use></svg>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="market-tabs">
+          <button class="is-active">沪深</button>
+          <button>港股</button>
+          <button>美股</button>
+        </div>
+        <div class="topbar-divider"></div>
+        <label class="global-search">
+          <svg class="icon"><use href="#i-search"></use></svg>
+          <input id="global-search" placeholder="搜索股票、代码、行业或 Trace ID" autocomplete="off" />
+          <kbd><svg class="icon tiny"><use href="#i-command"></use></svg>K</kbd>
+        </label>
+        <div class="topbar-spacer"></div>
+        <div class="status-pill"><span class="status-dot ok"></span>收盘数据 <b>11-06</b></div>
+        <div class="status-pill agent"><span class="status-dot cyan"></span>Agent 正常</div>
+        <button class="icon-btn" title="通知"><svg class="icon"><use href="#i-bell"></use></svg><span class="notify-badge">3</span></button>
+        <button class="icon-btn" title="设置"><svg class="icon"><use href="#i-settings"></use></svg></button>
+        <div class="avatar">MF</div>
+      </header>
+
+      <main class="content">
+        <section class="view is-active" id="view-candidates">
+          <div class="page-head">
+            <div>
+              <div class="eyebrow">RESEARCH / SCREENER</div>
+              <h1>候选池</h1>
+              <p class="sub">2026-11-06 收盘 · 全市场 5,599 标的 · 1,374,965 行日线 · 最近同步 18:42</p>
+            </div>
+            <div class="page-actions">
+              <button class="btn ghost"><svg class="icon"><use href="#i-bookmark"></use></svg>保存视图</button>
+              <button class="btn ghost"><svg class="icon"><use href="#i-columns"></use></svg>列设置</button>
+              <button class="btn primary" id="refresh-btn"><svg class="icon"><use href="#i-refresh"></use></svg>刷新数据</button>
+            </div>
+          </div>
+
+          <div class="kpi-grid" id="kpi-grid"></div>
+
+          <div class="panel">
+            <div class="panel-toolbar">
+              <div class="segmented" id="signal-tabs">
+                <button class="is-active" data-filter="all">全部 <span id="count-all">32</span></button>
+                <button data-filter="strong">强信号 <span id="count-strong">8</span></button>
+                <button data-filter="watch">观察 <span id="count-watch">19</span></button>
+                <button data-filter="risk">风险 <span id="count-risk">5</span></button>
+              </div>
+              <div class="toolbar-spacer"></div>
+              <label class="search-inline">
+                <svg class="icon"><use href="#i-search"></use></svg>
+                <input id="candidate-search" placeholder="搜索代码 / 名称 / 行业" />
+              </label>
+              <button class="icon-btn small" title="筛选"><svg class="icon"><use href="#i-filter"></use></svg></button>
+              <button class="icon-btn small" title="列设置"><svg class="icon"><use href="#i-columns"></use></svg></button>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">筛选</span>
+              <button class="chip active">评分 ≥ 70 <span class="chip-x">×</span></button>
+              <button class="chip">主力净流入</button>
+              <button class="chip">有新闻催化</button>
+              <button class="chip">非 ST / 非停牌</button>
+              <button class="chip muted">+ 添加条件</button>
+              <div class="toolbar-spacer"></div>
+              <span class="result-count">显示 <b id="visible-count">12</b> / 12</span>
+              <select class="select" aria-label="保存视图">
+                <option>今日强信号</option>
+                <option>全部候选</option>
+                <option>低估值 + 资金流入</option>
+              </select>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="candidate-table">
+                <thead>
+                  <tr>
+                    <th class="w-code">代码</th>
+                    <th>名称</th>
+                    <th>行业</th>
+                    <th class="num">现价</th>
+                    <th class="num">涨跌幅</th>
+                    <th class="num">成交额</th>
+                    <th class="num">换手</th>
+                    <th>信号</th>
+                    <th class="sortable" data-sort="score">评分 <span class="sort-ind">↓</span></th>
+                    <th class="num">主力资金</th>
+                    <th>催化</th>
+                    <th class="num">更新</th>
+                  </tr>
+                </thead>
+                <tbody id="candidate-rows"></tbody>
+              </table>
+            </div>
+            <div class="table-footer">
+              <span><span class="status-dot ok"></span>数据来源：Tushare / Sequoia / 新闻信号 · 仅供研究</span>
+              <span>更新时间 18:42:17 · 单位：元</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-trace">
+          <div class="page-head trace-head">
+            <div>
+              <div class="eyebrow">AGENT / TRACE</div>
+              <div class="trace-title-row">
+                <h1>Agent Trace</h1>
+                <span class="run-id">run-20261106-1842</span>
+                <span class="badge success"><span class="status-dot ok"></span>成功</span>
+              </div>
+              <p class="sub">三花智控 002050 · 单股分析 · 2m 18s · 42.8k tokens · deepseek-v3 · 数据 2026-11-06</p>
+            </div>
+            <div class="page-actions">
+              <button class="btn ghost" data-toast="两次运行 diff 原型下一步补。">对比运行</button>
+              <button class="btn ghost" data-toast="导出 Trace 原型下一步补。">导出 Trace</button>
+              <button class="btn primary" data-toast="完整链路页原型下一步补。"><svg class="icon"><use href="#i-route"></use></svg>打开链路</button>
+            </div>
+          </div>
+
+          <div class="trace-layout">
+            <aside class="panel trace-steps">
+              <div class="panel-head"><span>运行步骤</span><span class="muted">9 / 9</span></div>
+              <div class="trace-filter">
+                <button class="is-active" data-trace-filter="all">全部</button>
+                <button data-trace-filter="tools">工具</button>
+                <button data-trace-filter="error">异常 <span class="mini-count">0</span></button>
+              </div>
+              <div id="trace-steps"></div>
+              <div class="trace-summary">
+                <div><span>总耗时</span><b>2m 18s</b></div>
+                <div><span>Token</span><b>42.8k</b></div>
+                <div><span>数据版本</span><b>11-06</b></div>
+              </div>
+            </aside>
+
+            <section class="panel trace-detail">
+              <div id="trace-detail-head"></div>
+              <div class="detail-tabs" id="trace-tabs">
+                <button class="is-active" data-tab="overview">概览</button>
+                <button data-tab="input">输入</button>
+                <button data-tab="output">输出</button>
+                <button data-tab="evidence">证据 <span class="tab-count">4</span></button>
+              </div>
+              <div class="detail-body" id="trace-detail-body"></div>
+            </section>
+
+            <aside class="panel verdict-panel">
+              <div class="panel-head"><span>Agent 结论</span><span class="muted">Judge</span></div>
+              <div id="verdict-card"></div>
+            </aside>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="drawer-overlay" id="drawer-overlay"></div>
+  <aside class="drawer" id="drawer" aria-label="候选详情"></aside>
+  <div class="toast" id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
