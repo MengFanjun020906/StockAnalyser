@@ -193,6 +193,7 @@ journalctl -u stock-analyzer -f
 | Config Item | Default | Description |
 |--------|--------|------|
 | `SCHEDULE_ENABLED` | `false` | Enable scheduled tasks |
+| `POSITION_WATCH_ENABLED` | `true` | Enable position-signal monitoring in the separate scheduler process; A/H at 18:00 and US after market close |
 | `SCHEDULE_TIME` | `18:00` | Daily execution time |
 | `MARKET_REVIEW_ENABLED` | `true` | Enable market review |
 | `ANYSEARCH_API_KEY` | - | Unified news and web search (optional) |

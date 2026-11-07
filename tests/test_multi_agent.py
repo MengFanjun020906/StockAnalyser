@@ -458,6 +458,62 @@ class TestIntelAgentPostProcess(unittest.TestCase):
         self.assertEqual(ctx.risk_flags[0]["description"], "股东减持")
 
 
+class TestCapitalAgentPostProcess(unittest.TestCase):
+    """Test capital evidence normalization and shared-context writes."""
+
+    def test_caches_capital_opinion_and_quality(self):
+        from src.agent.agents.capital_agent import CapitalAgent
+
+        agent = CapitalAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        ctx = AgentContext(query="test", stock_code="600519")
+        raw = json.dumps({
+            "signal": "buy",
+            "confidence": 0.71,
+            "reasoning": "主力口径连续净流入，但融资数据缺失。",
+            "quality": "partial",
+            "capital_flow_signal": "inflow",
+            "capital_metrics": {"main_inflow_5d": 120000000},
+            "risk_alerts": ["融资融券数据未覆盖"],
+            "missing_evidence": ["margin_trading"],
+        }, ensure_ascii=False)
+
+        opinion = agent.post_process(ctx, raw)
+
+        self.assertIsNotNone(opinion)
+        self.assertEqual(opinion.signal, "buy")
+        self.assertEqual(ctx.get_data("capital_opinion")["quality"], "partial")
+        self.assertEqual(ctx.meta["dimension_status"]["capital"]["missing_evidence"], ["margin_trading"])
+        self.assertEqual(ctx.risk_flags[0]["category"], "capital")
+
+
+class TestFundamentalAgentPostProcess(unittest.TestCase):
+    """Test fundamental evidence normalization and shared-context writes."""
+
+    def test_caches_fundamental_opinion_and_quality(self):
+        from src.agent.agents.fundamental_agent import FundamentalAgent
+
+        agent = FundamentalAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        ctx = AgentContext(query="test", stock_code="600519")
+        raw = json.dumps({
+            "signal": "hold",
+            "confidence": 0.66,
+            "reasoning": "盈利质量稳定，但估值缺少可比公司校验。",
+            "quality": "partial",
+            "valuation_assessment": "fair",
+            "financial_health": "strong",
+            "key_metrics": {"roe": 31.2},
+            "risk_alerts": [],
+            "missing_evidence": ["peer_valuation"],
+        }, ensure_ascii=False)
+
+        opinion = agent.post_process(ctx, raw)
+
+        self.assertIsNotNone(opinion)
+        self.assertEqual(opinion.signal, "hold")
+        self.assertEqual(ctx.get_data("fundamental_opinion")["financial_health"], "strong")
+        self.assertEqual(ctx.meta["dimension_status"]["fundamental"]["quality"], "partial")
+
+
 # ============================================================
 # AgentOrchestrator (with mocked sub-agents)
 # ============================================================
@@ -487,14 +543,14 @@ class TestOrchestratorModes(unittest.TestCase):
         ctx = AgentContext(query="test", stock_code="600519")
         chain = orch._build_agent_chain(ctx)
         names = [a.agent_name for a in chain]
-        self.assertEqual(names, ["technical", "intel", "decision"])
+        self.assertEqual(names, ["technical", "intel", "capital", "fundamental", "decision"])
 
     def test_full_mode(self):
         orch = self._make_orchestrator("full")
         ctx = AgentContext(query="test", stock_code="600519")
         chain = orch._build_agent_chain(ctx)
         names = [a.agent_name for a in chain]
-        self.assertEqual(names, ["technical", "intel", "risk", "decision"])
+        self.assertEqual(names, ["technical", "intel", "capital", "fundamental", "risk", "decision"])
 
     def test_invalid_mode_falls_back_to_standard(self):
         orch = self._make_orchestrator("nonsense")
@@ -507,21 +563,21 @@ class TestOrchestratorModes(unittest.TestCase):
         high_limit_chain = orch._build_agent_chain(AgentContext(query="test", stock_code="600519"))
         self.assertEqual(
             {agent.agent_name: agent.max_steps for agent in high_limit_chain},
-            {"technical": 6, "intel": 4, "risk": 4, "decision": 3},
+            {"technical": 6, "intel": 4, "capital": 5, "fundamental": 5, "risk": 4, "decision": 3},
         )
 
         orch.max_steps = 5
         low_limit_chain = orch._build_agent_chain(AgentContext(query="test", stock_code="600519"))
         self.assertEqual(
             {agent.agent_name: agent.max_steps for agent in low_limit_chain},
-            {"technical": 5, "intel": 4, "risk": 4, "decision": 3},
+            {"technical": 5, "intel": 4, "capital": 5, "fundamental": 5, "risk": 4, "decision": 3},
         )
 
         orch.max_steps = AGENT_MAX_STEPS_DEFAULT + 2
         raised_limit_chain = orch._build_agent_chain(AgentContext(query="test", stock_code="600519"))
         self.assertEqual(
             {agent.agent_name: agent.max_steps for agent in raised_limit_chain},
-            {"technical": AGENT_MAX_STEPS_DEFAULT + 2, "intel": AGENT_MAX_STEPS_DEFAULT + 2, "risk": AGENT_MAX_STEPS_DEFAULT + 2, "decision": AGENT_MAX_STEPS_DEFAULT + 2},
+            {"technical": AGENT_MAX_STEPS_DEFAULT + 2, "intel": AGENT_MAX_STEPS_DEFAULT + 2, "capital": AGENT_MAX_STEPS_DEFAULT + 2, "fundamental": AGENT_MAX_STEPS_DEFAULT + 2, "risk": AGENT_MAX_STEPS_DEFAULT + 2, "decision": AGENT_MAX_STEPS_DEFAULT + 2},
         )
 
     def test_prepare_agent_raised_limit_overrides_low_default_agent(self):
@@ -624,6 +680,90 @@ class TestOrchestratorExecution(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertIn("Analysis Summary", result.content)
+        self.assertEqual(ctx.get_data("intel_opinion")["quality"], "unavailable")
+        self.assertEqual(ctx.meta["dimension_status"]["intel"]["missing_evidence"], ["news down"])
+
+    def test_execute_pipeline_degrades_on_capital_and_fundamental_failure(self):
+        orch = self._make_orchestrator()
+        ctx = AgentContext(query="test", stock_code="600519")
+        ctx.add_opinion(AgentOpinion(
+            agent_name="technical",
+            signal="buy",
+            confidence=0.8,
+            reasoning="Strong trend",
+        ))
+
+        capital = MagicMock(agent_name="capital")
+        capital.run.return_value = self._stage_result(
+            "capital", StageStatus.FAILED, error="capital provider down"
+        )
+        fundamental = MagicMock(agent_name="fundamental")
+        fundamental.run.return_value = self._stage_result(
+            "fundamental", StageStatus.FAILED, error="financial provider down"
+        )
+        decision = MagicMock(agent_name="decision")
+        decision.run.return_value = self._stage_result("decision")
+
+        with patch.object(
+            orch,
+            "_build_agent_chain",
+            return_value=[capital, fundamental, decision],
+        ):
+            result = orch._execute_pipeline(ctx, parse_dashboard=False)
+
+        self.assertTrue(result.success)
+        self.assertEqual(ctx.get_data("capital_opinion")["quality"], "unavailable")
+        self.assertEqual(ctx.get_data("fundamental_opinion")["quality"], "unavailable")
+        self.assertEqual(
+            {flag["category"] for flag in ctx.risk_flags},
+            {"missing_evidence"},
+        )
+
+    def test_execute_pipeline_emits_structured_dimension_event(self):
+        orch = self._make_orchestrator()
+        ctx = AgentContext(query="test", stock_code="600519")
+        events = []
+        technical = MagicMock(agent_name="technical")
+
+        def _run_technical(run_ctx, progress_callback=None):
+            payload = {
+                "signal": "buy",
+                "confidence": 0.8,
+                "reasoning": "trend supports",
+                "quality": "ok",
+                "missing_evidence": [],
+            }
+            run_ctx.set_data("technical_opinion", payload)
+            run_ctx.meta["dimension_status"] = {
+                "technical": {"quality": "ok", "missing_evidence": []}
+            }
+            opinion = AgentOpinion(
+                agent_name="technical",
+                signal="buy",
+                confidence=0.8,
+                reasoning="trend supports",
+                raw_data=payload,
+            )
+            run_ctx.add_opinion(opinion)
+            result = self._stage_result("technical")
+            result.opinion = opinion
+            return result
+
+        technical.run.side_effect = _run_technical
+        with patch.object(orch, "_build_agent_chain", return_value=[technical]):
+            result = orch._execute_pipeline(
+                ctx,
+                parse_dashboard=False,
+                progress_callback=events.append,
+            )
+
+        self.assertTrue(result.success)
+        stage_event = next(
+            event for event in events
+            if event.get("type") == "stage_done" and event.get("stage") == "technical"
+        )
+        self.assertEqual(stage_event["dimension_opinion"]["signal"], "buy")
+        self.assertEqual(stage_event["dimension_status"]["quality"], "ok")
 
     def test_execute_pipeline_degrades_on_skill_agent_failure_and_continues_to_decision(self):
         orch = self._make_orchestrator()
@@ -896,6 +1036,92 @@ class TestOrchestratorExecution(unittest.TestCase):
         self.assertEqual(add_message.call_count, 2)
         add_message.assert_any_call("session-1", "user", "hello")
         add_message.assert_any_call("session-1", "assistant", "assistant reply")
+
+    def test_entry_chat_keeps_free_form_content_and_exposes_machine_dashboard(self):
+        from src.agent.orchestrator import OrchestratorResult
+
+        orch = self._make_orchestrator()
+
+        def fake_execute(ctx, parse_dashboard=False, progress_callback=None):
+            ctx.set_data("realtime_quote", {"current_price": 310.0, "as_of": "2026-08-11T15:00:00"})
+            ctx.add_opinion(AgentOpinion(
+                agent_name="technical",
+                signal="buy",
+                confidence=0.78,
+                reasoning="趋势偏多，等待支撑区确认。",
+                key_levels={"support": 300.0, "stop_loss": 292.0, "resistance": 330.0},
+                raw_data={"quality": "ok", "trend_score": 74},
+            ))
+            ctx.add_opinion(AgentOpinion(
+                agent_name="decision",
+                signal="buy",
+                confidence=0.72,
+                reasoning="证据支持条件式买入。",
+            ))
+            ctx.set_data("final_response_text", "结论偏积极，等待价格进入计划区间。")
+            return OrchestratorResult(success=True, content="结论偏积极，等待价格进入计划区间。")
+
+        with patch.object(orch, "_execute_pipeline", side_effect=fake_execute):
+            with patch("src.agent.conversation.conversation_manager.add_message"):
+                result = orch.chat(
+                    "分析 600519 是否适合买入",
+                    "session-machine-dashboard",
+                    context={"stock_code": "600519", "signal_lifecycle_entry_intent": True},
+                )
+
+        self.assertEqual(result.content, "结论偏积极，等待价格进入计划区间。")
+        self.assertEqual(result.dashboard["decision_type"], "buy")
+        sniper = result.dashboard["dashboard"]["battle_plan"]["sniper_points"]
+        self.assertEqual(sniper["ideal_buy"], 300.0)
+        self.assertEqual(sniper["stop_loss"], 292.0)
+
+    def test_generic_qa_chat_rejects_decision_trade_plan_sidecar(self):
+        from src.agent.orchestrator import OrchestratorResult
+
+        orch = self._make_orchestrator()
+        tool_log = [{
+            "tool": "submit_trade_plan",
+            "success": True,
+            "arguments": {
+                "symbol": "600330",
+                "action": "open",
+                "current_action": "reject",
+                "entry_zone_low": 19.6,
+                "entry_zone_high": 20.5,
+                "entry_zones": [
+                    {"label": "ideal", "low": 19.6, "high": 20.5},
+                    {"label": "secondary", "low": 21.2, "high": 22.0},
+                ],
+                "stop_loss_price": 18.5,
+            },
+        }]
+        fake_result = OrchestratorResult(
+            success=True,
+            content="当前不建议入场，但保留两个观察区间。",
+            tool_calls_log=tool_log,
+        )
+        with patch.object(orch, "_execute_pipeline", return_value=fake_result):
+            with patch("src.agent.conversation.conversation_manager.add_message"):
+                result = orch.chat(
+                    "分析一下天通股份",
+                    "session-qa-sidecar",
+                    context={"signal_lifecycle_plan_candidate": True},
+                )
+
+        self.assertIsNone(result.trade_plan)
+
+    def test_plan_candidate_does_not_get_legacy_trade_plan_tool(self):
+        orch = self._make_orchestrator()
+        candidate_ctx = orch._build_context(
+            "分析一下天通股份",
+            {"signal_lifecycle_plan_candidate": True},
+        )
+        candidate_decision = orch._build_agent_chain(candidate_ctx)[-1]
+        ordinary_decision = orch._build_agent_chain(AgentContext(query="解释什么是 MACD"))[-1]
+
+        self.assertEqual(candidate_decision.tool_names, [])
+        self.assertNotIn("submit_trade_plan", candidate_decision.system_prompt(candidate_ctx))
+        self.assertEqual(ordinary_decision.tool_names, [])
 
     def test_chat_persists_failure_message(self):
         from src.agent.orchestrator import OrchestratorResult

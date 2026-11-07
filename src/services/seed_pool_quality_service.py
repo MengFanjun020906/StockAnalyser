@@ -19,6 +19,7 @@ import pandas as pd
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import is_meaningful_stock_name
 from src.repositories.seed_pool_quality_repo import SeedPoolQualityRepository
+from src.services.sequoia_price_rebaser import rebase_ohlc_value_for_date, resolve_sequoia_cash_price_rebase
 from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -898,7 +899,7 @@ def _load_from_sequoia_db(symbol: str, start_date: date, end_date: date) -> List
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -922,6 +923,7 @@ def _load_from_sequoia_db(symbol: str, start_date: date, end_date: date) -> List
         logger.debug("seed quality Sequoia DB read failed for %s: %s", symbol, exc)
         return []
     bars: List[DailyBar] = []
+    rebase = resolve_sequoia_cash_price_rebase(symbol, rows)
     for row in rows:
         parsed_date = _parse_date(row["date"])
         if parsed_date is None:
@@ -931,10 +933,10 @@ def _load_from_sequoia_db(symbol: str, start_date: date, end_date: date) -> List
                 DailyBar(
                     code=symbol,
                     trade_date=parsed_date,
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
+                    open=float(rebase_ohlc_value_for_date(row["open"], row["date"], rebase)),
+                    high=float(rebase_ohlc_value_for_date(row["high"], row["date"], rebase)),
+                    low=float(rebase_ohlc_value_for_date(row["low"], row["date"], rebase)),
+                    close=float(rebase_ohlc_value_for_date(row["close"], row["date"], rebase)),
                     volume=_safe_float(row["volume"]),
                     amount=_safe_float(row["turnover"]),
                     source=f"sequoia_stock_daily:{row['symbol']}",

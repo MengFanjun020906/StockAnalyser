@@ -26,7 +26,7 @@ from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SEQUOIA_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
+DEFAULT_SEQUOIA_DB_PATH = "vendor/Sequoia-X/data/sequoia_v2.db"
 
 _REQUIRED_COLUMNS = {"symbol", "date", "open", "high", "low", "close", "volume", "turnover"}
 

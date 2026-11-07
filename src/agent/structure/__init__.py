@@ -4,7 +4,8 @@
 from src.agent.structure.price_structure import (
     PriceBar,
     analyze_price_structure,
+    classify_chan_signals,
     coerce_price_bars,
 )
 
-__all__ = ["PriceBar", "analyze_price_structure", "coerce_price_bars"]
+__all__ = ["PriceBar", "analyze_price_structure", "classify_chan_signals", "coerce_price_bars"]

@@ -28,7 +28,7 @@
 
 <div align="center">
   <a href="https://serpapi.com/baidu-search-api?utm_source=github_stockanalyser" target="_blank">
-    <img src="../../sources/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
+    <img src="../assets/serpapi_banner_zh.png" alt="輕鬆抓取搜尋引擎上的即時金融新聞數據 - SerpApi" height="160">
   </a>
 </div>
 <br>
@@ -205,7 +205,7 @@ python main.py --serve-only
 
 ## 🖥️ Web 介面
 
-![FastAPI Web UI](../../sources/fastapi_server.png)
+![FastAPI Web UI](../assets/fastapi_server.png)
 
 Web 工作台提供配置管理、任務監控、手動分析、歷史報告、回測、持倉管理、智能匯入和淺色 / 深色主題。啟動方式：
 
@@ -248,7 +248,7 @@ StockAnalyser 聚焦日常分析報告；以下兩個同系列項目分別覆蓋
 
 | 支付寶 (Alipay) | 微信支付 (WeChat) | 小紅書 |
 | :---: | :---: | :---: |
-| <img src="../../sources/alipay.jpg" width="200" alt="Alipay"> | <img src="../../sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../../sources/xiaohongshu.png" width="200" alt="小紅書"> |
+| <img src="../assets/alipay.jpg" width="200" alt="Alipay"> | <img src="../assets/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../assets/xiaohongshu.png" width="200" alt="小紅書"> |
 
 ## 🤝 貢獻
 

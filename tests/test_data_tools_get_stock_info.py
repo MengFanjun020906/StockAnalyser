@@ -25,6 +25,10 @@ from src.agent.tools.data_tools import (
 )
 
 
+def test_deprecated_get_stock_info_is_not_agent_callable() -> None:
+    assert "get_stock_info" not in {tool.name for tool in ALL_DATA_TOOLS}
+
+
 class _FixedDateTimeBeforeCjzcCutoff(datetime):
     @classmethod
     def now(cls, tz=None):

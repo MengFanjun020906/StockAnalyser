@@ -2631,7 +2631,7 @@ def _build_daily_screener_seeds(*, trade_date: str, limit: int) -> Tuple[List[Se
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -2873,7 +2873,7 @@ def _build_local_price_volume_seeds(*, limit: int) -> Tuple[List[SeedItem], Dict
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -3452,7 +3452,7 @@ def _build_low_base_structure_seeds(*, limit: int) -> List[SeedItem]:
     db_path = (
         os.getenv("SEQUOIA_CANDIDATE_DB_PATH")
         or os.getenv("ALPHASIFT_CANDIDATE_DB_PATH")
-        or "Sequoia-X/data/sequoia_v2.db"
+        or "vendor/Sequoia-X/data/sequoia_v2.db"
     )
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -3586,6 +3586,7 @@ def run_committee_discovery(
     seed_fact_max_workers: int = 12,
     seed_fact_tool_timeout_seconds: float = 30.0,
     per_seed_timeout_budget_s: Optional[float] = None,
+    desk_row_concurrency: int = 3,
 ) -> Dict[str, Any]:
     """Run the LLM expert committee and return a discover-compatible payload.
 
@@ -3687,6 +3688,7 @@ def run_committee_discovery(
             seed_fact_max_workers=seed_fact_max_workers,
             seed_fact_tool_timeout_seconds=seed_fact_tool_timeout_seconds,
             per_seed_timeout_budget_s=per_seed_timeout_budget_s,
+            desk_row_concurrency=desk_row_concurrency,
         )
         # Merge thesis result into payload while preserving seed-pool diagnostics.
         # Empty desk output is a hard candidate-discovery failure, not permission
@@ -3826,6 +3828,7 @@ def run_thesis_desk_committee(
     seed_fact_max_workers: int = 12,
     seed_fact_tool_timeout_seconds: float = 30.0,
     per_seed_timeout_budget_s: Optional[float] = None,
+    desk_row_concurrency: int = 3,
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
 
@@ -4022,6 +4025,7 @@ def run_thesis_desk_committee(
             regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=effective_per_seed_timeout_s,
+            row_concurrency=desk_row_concurrency,
         ),
         "momentum_desk": lambda: momentum_desk.run_desk(
             rows,
@@ -4029,6 +4033,7 @@ def run_thesis_desk_committee(
             regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=effective_per_seed_timeout_s,
+            row_concurrency=desk_row_concurrency,
         ),
         "quality_repair_desk": lambda: quality_repair_desk.run_desk(
             rows,
@@ -4036,6 +4041,7 @@ def run_thesis_desk_committee(
             regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=effective_per_seed_timeout_s,
+            row_concurrency=desk_row_concurrency,
         ),
         "theme_catalyst_desk": lambda: theme_catalyst_desk.run_desk(
             rows,
@@ -4043,6 +4049,7 @@ def run_thesis_desk_committee(
             regime=regime_key,
             deadline_s=desk_deadline_s,
             per_seed_timeout_s=effective_per_seed_timeout_s,
+            row_concurrency=desk_row_concurrency,
         ),
     }
     skipped_desk_packets: List[ExpertPacketV2] = []

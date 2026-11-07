@@ -75,8 +75,10 @@ class AgentContext:
 
     # --- collected data (populated by data-fetching stages) ---
     data: Dict[str, Any] = field(default_factory=dict)
-    # Typical keys: "realtime_quote", "daily_history", "trend_result",
-    #               "chip_distribution", "news_context"
+    # Typical keys: raw evidence plus dimension opinions such as
+    # "technical_opinion", "intel_opinion", "capital_opinion", and
+    # "fundamental_opinion".  Each dimension opinion carries a quality and
+    # missing_evidence list so downstream stages can degrade explicitly.
 
     # --- opinions from individual agents ---
     opinions: List["AgentOpinion"] = field(default_factory=list)

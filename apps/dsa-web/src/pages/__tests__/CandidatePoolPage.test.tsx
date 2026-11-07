@@ -40,6 +40,35 @@ describe('CandidatePoolPage', () => {
     expect(screen.getAllByText('新进入').length).toBeGreaterThanOrEqual(1);
   });
 
+  it('opens the candidate evidence drawer', async () => {
+    mocks.getLatest.mockResolvedValue(makeDetail('run-1'));
+    mocks.getRuns.mockResolvedValue({ runs: [makeDetail('run-1').run] });
+
+    render(<CandidatePoolPage />);
+
+    fireEvent.click(await screen.findByText('贵州茅台'));
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByText('证据拆解')).toBeInTheDocument();
+    expect(screen.getByText('关闭')).toBeInTheDocument();
+  });
+
+  it('treats fallback_seed_pool as a fallback candidate', async () => {
+    const detail = makeDetail('run-1');
+    detail.items[0].source = 'fallback_seed_pool';
+    detail.items[0].recallSources = ['fallback_seed_pool'];
+    detail.items[0].signalScore = 50;
+    detail.items[0].reason = '兜底种子池，仅用于保证后续取证链路可运行';
+    mocks.getLatest.mockResolvedValue(detail);
+    mocks.getRuns.mockResolvedValue({ runs: [detail.run] });
+
+    render(<CandidatePoolPage />);
+
+    expect(await screen.findByText('观察跟踪')).toBeInTheDocument();
+    expect(screen.getByText('兜底种子池')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /风险/ }).textContent).toContain('1');
+  });
+
   it('can switch to a historical run', async () => {
     mocks.getLatest.mockResolvedValue(makeDetail('run-1'));
     mocks.getRuns.mockResolvedValue({

@@ -542,9 +542,13 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
                     <div className="text-foreground">{reasonLabel(result.exitReason || result.entryReason)}</div>
                     <div className="mt-1 grid grid-cols-[34px_1fr] gap-x-1 gap-y-0.5 text-xs text-secondary-text">
                       <span>入</span>
-                      <span className="truncate tabular-nums" title={result.entryDate || ''}>{compactDateTime(result.entryDate)}</span>
+                      <span className="truncate tabular-nums" aria-label={result.entryDate || undefined}>
+                        {compactDateTime(result.entryDate)}
+                      </span>
                       <span>出</span>
-                      <span className="truncate tabular-nums" title={result.exitDate || ''}>{compactDateTime(result.exitDate)}</span>
+                      <span className="truncate tabular-nums" aria-label={result.exitDate || undefined}>
+                        {compactDateTime(result.exitDate)}
+                      </span>
                     </div>
                     <div className="mt-1 text-xs tabular-nums text-secondary-text">价 {fmtPrice(result.exitPrice)}</div>
                   </td>
@@ -556,7 +560,7 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
                       strategyName={selectedStrategy}
                     />
                   </td>
-                  <td className="w-[140px] max-w-[140px] truncate px-4 py-3 text-xs text-secondary-text" title={row.traceId || row.traceDir || ''}>
+                  <td className="w-[140px] max-w-[140px] truncate px-4 py-3 text-xs text-secondary-text" aria-label={row.traceId || row.traceDir || undefined}>
                     {row.traceId || '--'}
                   </td>
                 </tr>

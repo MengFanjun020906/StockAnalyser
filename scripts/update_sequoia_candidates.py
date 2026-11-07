@@ -6,24 +6,23 @@ The Agent candidate provider reads a local SQLite table:
 
     stock_daily(symbol, date, open, high, low, close, volume, turnover)
 
-Parallelism note
-----------------
-baostock rejects concurrent logins from the same account, so fetching is
-always done in a single baostock session (one login, sequential per-symbol
-calls, one logout).  The primary speedup comes from auto-incremental mode.
+Data sources
+------------
+The standalone CLI keeps baostock as its compatibility default.  The daily
+pipeline explicitly selects Tushare, which downloads one full-market snapshot
+per missing trading day plus adjustment factors instead of opening a baostock
+session and querying every symbol.  When an existing baostock database is
+migrated, overlap-day scales preserve its historical adjusted-price basis.
 
-Auto-incremental mode
----------------------
-If the DB already has data within --incremental-threshold calendar days of
-today, only the missing days are fetched.  For a daily refresh this cuts
-the per-stock response from ~260 rows down to ~13 rows, reducing wall time
-from 30+ minutes to roughly 10-15 minutes.
+Baostock compatibility
+----------------------
+Baostock rejects concurrent logins from the same account, so that path remains
+single-session and sequential.  Its auto-incremental and resume behavior is
+kept for callers that still select ``--source baostock``.
 
-Resume behavior
----------------
-Rows are committed after each symbol.  On restart, the script skips symbols
-whose local max date already reaches the latest date seen in the DB unless
---no-resume is set, so a disconnected full run does not restart from symbol 0.
+Tushare completion metadata is advanced only after an unfiltered full-market
+snapshot succeeds.  Partial smoke runs and index-only refreshes therefore
+cannot make a later daily run skip missing stock data.
 """
 
 from __future__ import annotations
@@ -43,11 +42,12 @@ if str(ROOT) not in sys.path:
 
 from src.core.trading_calendar import get_effective_trading_date
 
-DEFAULT_DB_PATH = "Sequoia-X/data/sequoia_v2.db"
+DEFAULT_DB_PATH = "vendor/Sequoia-X/data/sequoia_v2.db"
 DEFAULT_TRADING_DAYS = 260
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 420
 DEFAULT_INCREMENTAL_THRESHOLD = 30
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 50
+MIN_TUSHARE_SNAPSHOT_COVERAGE_RATIO = 0.8
 BENCHMARK_INDEX_SYMBOL = "000001.SH"
 BENCHMARK_INDEX_BAOSTOCK_CODE = "sh.000001"
 REGIME_INDEX_SYMBOL = "000300.SH"
@@ -55,6 +55,10 @@ REGIME_INDEX_BAOSTOCK_CODE = "sh.000300"
 INDEX_SYMBOLS = (
     (BENCHMARK_INDEX_SYMBOL, BENCHMARK_INDEX_BAOSTOCK_CODE),
     (REGIME_INDEX_SYMBOL, REGIME_INDEX_BAOSTOCK_CODE),
+)
+TUSHARE_INDEX_SYMBOLS = (
+    (BENCHMARK_INDEX_SYMBOL, "000001.SH"),
+    (REGIME_INDEX_SYMBOL, "000300.SH"),
 )
 BAOSTOCK_SESSION_EXPIRED_MARKERS = (
     "用户未登录",
@@ -78,10 +82,33 @@ CREATE TABLE IF NOT EXISTS stock_daily (
 );
 """
 CREATE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);"
+CREATE_METADATA_SQL = """
+CREATE TABLE IF NOT EXISTS stock_daily_metadata (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+CREATE_SOURCE_SCALE_SQL = """
+CREATE TABLE IF NOT EXISTS stock_daily_source_scale (
+    source      TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    scale       REAL NOT NULL,
+    anchor_date TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source, symbol)
+);
+"""
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Update Sequoia candidate daily-bar SQLite DB.")
+    parser.add_argument(
+        "--source",
+        choices=("baostock", "tushare"),
+        default="baostock",
+        help="Daily-bar source (default: baostock)",
+    )
     parser.add_argument("--db-path", default=os.getenv("SEQUOIA_CANDIDATE_DB_PATH", DEFAULT_DB_PATH))
     parser.add_argument("--trading-days", type=int, default=DEFAULT_TRADING_DAYS)
     parser.add_argument("--calendar-days", type=int, default=DEFAULT_LOOKBACK_CALENDAR_DAYS)
@@ -116,6 +143,8 @@ def init_db(db_path: str) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(CREATE_TABLE_SQL)
         conn.execute(CREATE_INDEX_SQL)
+        conn.execute(CREATE_METADATA_SQL)
+        conn.execute(CREATE_SOURCE_SCALE_SQL)
         conn.commit()
 
 
@@ -384,6 +413,527 @@ def parse_symbol_arg(raw: str) -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _format_tushare_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-":
+        return text[:10]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    raise ValueError(f"invalid Tushare trade_date: {value!r}")
+
+
+def _tushare_number(value: Any, *, default: Optional[float] = None) -> Optional[float]:
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _normalize_tushare_stock_rows(
+    daily_df: Any,
+    factor_df: Any,
+    *,
+    include_zero_volume: bool = False,
+) -> Tuple[List[Tuple], List[str]]:
+    if daily_df is None or getattr(daily_df, "empty", True):
+        return [], []
+
+    factor_by_key: Dict[Tuple[str, str], float] = {}
+    if factor_df is not None and not getattr(factor_df, "empty", True):
+        for item in factor_df.to_dict("records"):
+            code = str(item.get("ts_code") or "").strip().upper()
+            trade_date = _format_tushare_date(item.get("trade_date"))
+            factor = _tushare_number(item.get("adj_factor"))
+            if code and factor is not None and factor > 0:
+                factor_by_key[(code, trade_date)] = factor
+
+    rows: List[Tuple] = []
+    missing_factors: List[str] = []
+    for item in daily_df.to_dict("records"):
+        ts_code = str(item.get("ts_code") or "").strip().upper()
+        trade_date = _format_tushare_date(item.get("trade_date"))
+        factor = factor_by_key.get((ts_code, trade_date))
+        if factor is None:
+            missing_factors.append(f"{ts_code}@{trade_date}")
+            continue
+
+        close_value = _tushare_number(item.get("close"))
+        volume_lots = _tushare_number(item.get("vol"), default=0.0)
+        if not ts_code or close_value is None:
+            continue
+        if not include_zero_volume and volume_lots is not None and volume_lots <= 0:
+            continue
+
+        symbol = ts_code.split(".", 1)[0]
+        rows.append(
+            (
+                symbol,
+                trade_date,
+                _tushare_number(item.get("open")) * factor if item.get("open") not in (None, "") else None,
+                _tushare_number(item.get("high")) * factor if item.get("high") not in (None, "") else None,
+                _tushare_number(item.get("low")) * factor if item.get("low") not in (None, "") else None,
+                close_value * factor,
+                volume_lots * 100.0 if volume_lots is not None else None,
+                (_tushare_number(item.get("amount"), default=0.0) or 0.0) * 1000.0,
+            )
+        )
+    return rows, missing_factors
+
+
+def _normalize_tushare_index_rows(index_df: Any, symbol: str) -> List[Tuple]:
+    if index_df is None or getattr(index_df, "empty", True):
+        return []
+    rows: List[Tuple] = []
+    for item in index_df.to_dict("records"):
+        close_value = _tushare_number(item.get("close"))
+        volume_lots = _tushare_number(item.get("vol"), default=0.0)
+        if close_value is None:
+            continue
+        rows.append(
+            (
+                symbol,
+                _format_tushare_date(item.get("trade_date")),
+                _tushare_number(item.get("open")),
+                _tushare_number(item.get("high")),
+                _tushare_number(item.get("low")),
+                close_value,
+                volume_lots * 100.0 if volume_lots is not None else None,
+                (_tushare_number(item.get("amount"), default=0.0) or 0.0) * 1000.0,
+            )
+        )
+    return rows
+
+
+def _load_metadata(db_path: str) -> Dict[str, str]:
+    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+        rows = conn.execute("SELECT key, value FROM stock_daily_metadata").fetchall()
+    return {str(key): str(value) for key, value in rows}
+
+
+def _load_tushare_scales(db_path: str) -> Dict[str, Tuple[float, str]]:
+    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+        rows = conn.execute(
+            "SELECT symbol, scale, anchor_date FROM stock_daily_source_scale WHERE source = 'tushare'"
+        ).fetchall()
+    return {str(symbol): (float(scale), str(anchor_date)) for symbol, scale, anchor_date in rows}
+
+
+def _load_latest_symbol_rows(db_path: str) -> Dict[str, Tuple[str, float]]:
+    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+        rows = conn.execute(
+            """
+            SELECT current.symbol, current.date, current.close
+            FROM stock_daily AS current
+            JOIN (
+                SELECT symbol, MAX(date) AS max_date
+                FROM stock_daily
+                WHERE symbol NOT LIKE '%.%'
+                GROUP BY symbol
+            ) AS latest
+              ON latest.symbol = current.symbol AND latest.max_date = current.date
+            WHERE current.close IS NOT NULL
+            """
+        ).fetchall()
+    return {str(symbol): (str(trade_date), float(close)) for symbol, trade_date, close in rows}
+
+
+def _load_symbol_history(
+    db_path: str,
+    symbols: Iterable[str],
+) -> Dict[str, List[Tuple[str, float]]]:
+    """Load local close history used to find a source overlap for a symbol."""
+    requested = sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()})
+    if not requested:
+        return {}
+
+    history: Dict[str, List[Tuple[str, float]]] = {}
+    # Keep each IN clause below SQLite's default host-parameter limit.
+    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+        for offset in range(0, len(requested), 900):
+            batch = requested[offset : offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"""
+                SELECT symbol, date, close
+                FROM stock_daily
+                WHERE symbol IN ({placeholders})
+                  AND symbol NOT LIKE '%.%'
+                  AND close IS NOT NULL
+                ORDER BY symbol, date DESC
+                """,
+                batch,
+            ).fetchall()
+            for symbol, trade_date, close in rows:
+                history.setdefault(str(symbol), []).append((str(trade_date), float(close)))
+    return history
+
+
+def _to_tushare_stock_code(symbol: str) -> str:
+    """Convert a local six-digit A-share code to a Tushare ``ts_code``."""
+    normalized = str(symbol or "").strip().upper()
+    if normalized.startswith(("6", "9")):
+        exchange = "SH"
+    elif normalized.startswith(("4", "8")):
+        exchange = "BJ"
+    else:
+        exchange = "SZ"
+    return f"{normalized}.{exchange}"
+
+
+def _apply_price_scales(rows: Iterable[Tuple], scales: Dict[str, Tuple[float, str]]) -> List[Tuple]:
+    scaled_rows: List[Tuple] = []
+    for row in rows:
+        symbol = str(row[0])
+        scale = scales[symbol][0]
+        scaled_rows.append(
+            (
+                symbol,
+                row[1],
+                row[2] * scale if row[2] is not None else None,
+                row[3] * scale if row[3] is not None else None,
+                row[4] * scale if row[4] is not None else None,
+                row[5] * scale if row[5] is not None else None,
+                row[6],
+                row[7],
+            )
+        )
+    return scaled_rows
+
+
+def _save_tushare_batch(
+    db_path: str,
+    rows: Iterable[Tuple],
+    scales: Dict[str, Tuple[float, str]],
+    completed_date: str,
+    *,
+    mark_complete: bool,
+) -> int:
+    normalized_rows = list(rows)
+    with sqlite3.connect(str(Path(db_path).expanduser())) as conn:
+        conn.executemany(
+            """INSERT INTO stock_daily(symbol,date,open,high,low,close,volume,turnover)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(symbol,date) DO UPDATE SET
+                 open=excluded.open, high=excluded.high, low=excluded.low,
+                 close=excluded.close, volume=excluded.volume, turnover=excluded.turnover""",
+            normalized_rows,
+        )
+        conn.executemany(
+            """INSERT INTO stock_daily_source_scale(source,symbol,scale,anchor_date,updated_at)
+               VALUES('tushare',?,?,?,CURRENT_TIMESTAMP)
+               ON CONFLICT(source,symbol) DO UPDATE SET
+                 scale=excluded.scale,
+                 anchor_date=excluded.anchor_date,
+                 updated_at=CURRENT_TIMESTAMP""",
+            [(symbol, scale, anchor_date) for symbol, (scale, anchor_date) in scales.items()],
+        )
+        if mark_complete:
+            conn.executemany(
+                """INSERT INTO stock_daily_metadata(key,value,updated_at)
+                   VALUES(?,?,CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET
+                     value=excluded.value,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (
+                    ("active_source", "tushare"),
+                    ("price_basis", "legacy_hfq_bridge"),
+                    ("last_completed_date", completed_date),
+                ),
+            )
+        conn.commit()
+    return len(normalized_rows)
+
+
+def _run_tushare_update(args: argparse.Namespace, db_path: str, end: date) -> int:
+    from data_provider.tushare_client import get_tushare_token, query_tushare_api
+
+    if not get_tushare_token():
+        print("TUSHARE_TOKEN is not configured", file=sys.stderr)
+        return 2
+
+    end_text = end.strftime("%Y-%m-%d")
+    end_compact = end.strftime("%Y%m%d")
+    metadata = _load_metadata(db_path)
+    latest_local = _load_latest_symbol_rows(db_path)
+    scales = _load_tushare_scales(db_path)
+    completed_date = metadata.get("last_completed_date") if metadata.get("active_source") == "tushare" else None
+    legacy_stock_date = max((item[0] for item in latest_local.values()), default=None)
+    resume_date = completed_date or (legacy_stock_date if latest_local and not scales else None)
+    rolling_start = (end - timedelta(days=max(args.trading_days, args.calendar_days))).strftime("%Y-%m-%d")
+    query_start = rolling_start if args.no_incremental or args.no_resume or not resume_date else resume_date
+    query_start_compact = query_start.replace("-", "")
+
+    print(
+        f"Updating Sequoia candidate DB: source=tushare db={db_path}, "
+        f"range={query_start}..{end_text} resume_date={resume_date}",
+        flush=True,
+    )
+
+    index_rows_by_symbol: Dict[str, List[Tuple]] = {}
+    for index_symbol, ts_code in TUSHARE_INDEX_SYMBOLS:
+        try:
+            frame = query_tushare_api(
+                "index_daily",
+                params={
+                    "ts_code": ts_code,
+                    "start_date": query_start_compact,
+                    "end_date": end_compact,
+                },
+                fields="ts_code,trade_date,open,high,low,close,vol,amount",
+                timeout=60,
+            )
+        except Exception as exc:
+            print(f"Tushare index_daily failed for {ts_code}: {exc}", file=sys.stderr)
+            return 5
+        rows = _normalize_tushare_index_rows(frame, index_symbol)
+        if not rows:
+            print(f"Tushare index_daily returned no rows for {ts_code}", file=sys.stderr)
+            return 5
+        index_rows_by_symbol[index_symbol] = rows
+
+    benchmark_rows = index_rows_by_symbol[BENCHMARK_INDEX_SYMBOL]
+    available_dates = sorted({str(row[1]) for row in benchmark_rows if str(row[1]) <= end_text})
+    if not available_dates:
+        print("Tushare returned no completed trading dates", file=sys.stderr)
+        return 3
+    if available_dates[-1] != end_text:
+        print(
+            f"Tushare index data is not ready for target date {end_text}; latest={available_dates[-1]}",
+            file=sys.stderr,
+        )
+        return 3
+
+    force_rolling_refresh = args.no_incremental or args.no_resume or not resume_date
+    if force_rolling_refresh:
+        dates_to_fetch = available_dates[-max(1, args.trading_days):]
+        anchor_date = None
+    else:
+        anchor_candidates = [item for item in available_dates if item <= resume_date]
+        anchor_date = anchor_candidates[-1] if anchor_candidates else None
+        dates_to_fetch = ([anchor_date] if anchor_date else []) + [
+            item for item in available_dates if item > resume_date
+        ]
+
+    if args.index_only:
+        dates_to_fetch = []
+
+    selected_symbols = set(parse_symbol_arg(args.symbols))
+    snapshots: Dict[str, List[Tuple]] = {}
+    raw_snapshots: Dict[str, Tuple[List[Tuple], List[str]]] = {}
+
+    def fetch_stock_snapshot(trade_date: str) -> Tuple[List[Tuple], List[str]]:
+        cached = raw_snapshots.get(trade_date)
+        if cached is not None:
+            return cached
+        compact_date = trade_date.replace("-", "")
+        daily_frame = query_tushare_api(
+            "daily",
+            params={"trade_date": compact_date},
+            fields="ts_code,trade_date,open,high,low,close,vol,amount",
+            timeout=60,
+        )
+        factor_frame = query_tushare_api(
+            "adj_factor",
+            params={"trade_date": compact_date},
+            fields="ts_code,trade_date,adj_factor",
+            timeout=60,
+        )
+        rows, missing_factors = _normalize_tushare_stock_rows(daily_frame, factor_frame)
+        raw_snapshots[trade_date] = (rows, missing_factors)
+        return rows, missing_factors
+
+    targeted_snapshots: Dict[str, List[Tuple]] = {}
+
+    def fetch_targeted_stock_history(
+        symbol: str,
+        start_date: str,
+        end_date: str,
+    ) -> List[Tuple]:
+        """Fetch one symbol when a full-market snapshot omitted its overlap."""
+        cached = targeted_snapshots.get(symbol)
+        if cached is not None:
+            return cached
+        params = {
+            "ts_code": _to_tushare_stock_code(symbol),
+            "start_date": start_date.replace("-", ""),
+            "end_date": end_date.replace("-", ""),
+        }
+        daily_frame = query_tushare_api(
+            "daily",
+            params=params,
+            fields="ts_code,trade_date,open,high,low,close,vol,amount",
+            timeout=60,
+        )
+        factor_frame = query_tushare_api(
+            "adj_factor",
+            params=params,
+            fields="ts_code,trade_date,adj_factor",
+            timeout=60,
+        )
+        rows, _missing_factors = _normalize_tushare_stock_rows(
+            daily_frame,
+            factor_frame,
+            # A zero-volume bar can still provide the close needed to bridge
+            # an existing adjusted-price basis (for example, a suspension).
+            include_zero_volume=True,
+        )
+        targeted_snapshots[symbol] = rows
+        return rows
+
+    missing_factor_count = 0
+    for trade_date in dates_to_fetch:
+        try:
+            rows, missing_factors = fetch_stock_snapshot(trade_date)
+        except Exception as exc:
+            print(f"Tushare daily snapshot failed for {trade_date}: {exc}", file=sys.stderr)
+            return 3
+        if selected_symbols:
+            rows = [row for row in rows if row[0] in selected_symbols]
+        if args.limit_symbols > 0:
+            allowed = {row[0] for row in rows[: args.limit_symbols]}
+            rows = [row for row in rows if row[0] in allowed]
+        if not rows:
+            print(f"Tushare daily snapshot returned no rows for {trade_date}", file=sys.stderr)
+            return 3
+        snapshots[trade_date] = rows
+        missing_factor_count += len(missing_factors)
+
+    if missing_factor_count:
+        print(f"Tushare snapshots missing {missing_factor_count} adjustment factors", file=sys.stderr)
+        return 3
+    if not selected_symbols and args.limit_symbols <= 0 and len(dates_to_fetch) > 1:
+        previous_count = len(snapshots[dates_to_fetch[0]])
+        for trade_date in dates_to_fetch[1:]:
+            current_count = len(snapshots[trade_date])
+            minimum_count = max(1, int(previous_count * MIN_TUSHARE_SNAPSHOT_COVERAGE_RATIO))
+            if current_count < minimum_count:
+                print(
+                    f"Tushare daily snapshot coverage is incomplete for {trade_date}: "
+                    f"rows={current_count}, expected_at_least={minimum_count}",
+                    file=sys.stderr,
+                )
+                return 3
+            previous_count = current_count
+
+    if anchor_date and anchor_date in snapshots:
+        for row in snapshots[anchor_date]:
+            symbol = str(row[0])
+            local = latest_local.get(symbol)
+            source_close = float(row[5]) if row[5] is not None else 0.0
+            if local and local[0] == anchor_date and source_close > 0:
+                scales[symbol] = (local[1] / source_close, anchor_date)
+
+    write_dates = dates_to_fetch if force_rolling_refresh else [item for item in dates_to_fetch if item != anchor_date]
+    missing_scale_symbols = {
+        str(row[0])
+        for trade_date in write_dates
+        for row in snapshots.get(trade_date, [])
+        if str(row[0]) not in scales and str(row[0]) in latest_local
+    }
+    fallback_dates: Dict[str, List[str]] = {}
+    for symbol in missing_scale_symbols:
+        fallback_dates.setdefault(latest_local[symbol][0], []).append(symbol)
+
+    for fallback_date, symbols in fallback_dates.items():
+        try:
+            fallback_rows, fallback_missing_factors = fetch_stock_snapshot(fallback_date)
+        except Exception as exc:
+            print(f"Tushare source bridge failed for {fallback_date}: {exc}", file=sys.stderr)
+            return 3
+        if fallback_missing_factors:
+            print(
+                f"Tushare source bridge missing adjustment factors for {fallback_date}",
+                file=sys.stderr,
+            )
+            return 3
+        fallback_by_symbol = {str(row[0]): row for row in fallback_rows}
+        for symbol in symbols:
+            source_row = fallback_by_symbol.get(symbol)
+            if source_row is None or source_row[5] in (None, 0):
+                continue
+            scales[symbol] = (latest_local[symbol][1] / float(source_row[5]), fallback_date)
+
+    # A full-market endpoint can omit an otherwise valid symbol because of
+    # pagination, suspension, or source-side filtering.  Recover only the
+    # symbols still missing a scale with a bounded per-symbol history query.
+    bridge_candidates = missing_scale_symbols.difference(scales)
+    if bridge_candidates:
+        local_history = _load_symbol_history(db_path, bridge_candidates)
+        for symbol in sorted(bridge_candidates):
+            history = local_history.get(symbol, [])
+            if not history:
+                continue
+            try:
+                targeted_rows = fetch_targeted_stock_history(
+                    symbol,
+                    min(trade_date for trade_date, _close in history),
+                    max(trade_date for trade_date, _close in history),
+                )
+            except Exception as exc:
+                print(f"Tushare targeted source bridge failed for {symbol}: {exc}", file=sys.stderr)
+                continue
+            source_by_date = {
+                str(row[1]): row
+                for row in targeted_rows
+                if row[5] not in (None, 0)
+            }
+            for local_date, local_close in history:
+                source_row = source_by_date.get(local_date)
+                if source_row is None:
+                    continue
+                scales[symbol] = (local_close / float(source_row[5]), local_date)
+                print(
+                    f"Tushare targeted source bridge recovered {symbol} using overlap={local_date}",
+                    flush=True,
+                )
+                break
+
+    rows_to_write: List[Tuple] = []
+    unresolved: List[str] = []
+    for trade_date in write_dates:
+        for row in snapshots.get(trade_date, []):
+            symbol = str(row[0])
+            if symbol not in scales:
+                if symbol in latest_local:
+                    unresolved.append(symbol)
+                    continue
+                scales[symbol] = (1.0, trade_date)
+            rows_to_write.extend(_apply_price_scales((row,), scales))
+
+    if unresolved:
+        examples = ",".join(sorted(set(unresolved))[:10])
+        print(
+            f"Tushare source bridge is missing overlap for {len(set(unresolved))} existing symbols: {examples}",
+            file=sys.stderr,
+        )
+        return 3
+
+    if not args.skip_benchmark_index:
+        for rows in index_rows_by_symbol.values():
+            rows_to_write.extend(
+                row for row in rows if force_rolling_refresh or resume_date is None or str(row[1]) > resume_date
+            )
+
+    final_date = available_dates[-1]
+    mark_complete = not args.index_only and not selected_symbols and args.limit_symbols <= 0
+    written_rows = _save_tushare_batch(
+        db_path,
+        rows_to_write,
+        scales,
+        final_date,
+        mark_complete=mark_complete,
+    )
+    deleted_by_date, cutoff = prune_to_latest_trading_days(db_path, max(1, args.trading_days))
+    deleted_by_symbol = prune_symbol_row_limit(db_path, max(1, args.trading_days))
+    total_rows, symbol_count, min_date, max_date = db_summary(db_path)
+    print(
+        f"Done. source=tushare written_rows={written_rows} scales={len(scales)} "
+        f"pruned_by_date={deleted_by_date} pruned_by_symbol={deleted_by_symbol} cutoff={cutoff} "
+        f"db_rows={total_rows} symbols={symbol_count} date_range={min_date}..{max_date}",
+        flush=True,
+    )
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     db_path = str(Path(args.db_path).expanduser())
@@ -392,6 +942,9 @@ def main() -> int:
     end_text = end.strftime("%Y-%m-%d")
 
     init_db(db_path)
+
+    if args.source == "tushare":
+        return _run_tushare_update(args, db_path, end)
 
     max_db_date = get_max_date_in_db(db_path)
     if (

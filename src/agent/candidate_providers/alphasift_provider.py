@@ -25,7 +25,7 @@ from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALPHASIFT_STRATEGY_DIR = "alphasift/alphasift/strategies"
+DEFAULT_ALPHASIFT_STRATEGY_DIR = "vendor/alphasift/alphasift/strategies"
 _REQUIRED_COLUMNS = {"symbol", "date", "open", "high", "low", "close", "volume", "turnover"}
 
 

@@ -55,6 +55,15 @@ output a structured JSON opinion.
 3. Analyse volume and chip distribution
 4. Identify chart patterns
 
+## Data Quality
+- Use quality="ok" only when quote/history, trend, and volume evidence are
+  available for the same stock and time window.
+- Use "partial" when a supporting indicator or chip source is missing,
+  "stale" when the latest evidence is explicitly stale, and "unavailable"
+  when no usable technical basis exists.
+- Put every absent required input in missing_evidence. Never infer exact
+  prices, indicator values, or support/resistance levels from prose.
+
 {baseline}
 {skills}
 ## Output Format
@@ -71,7 +80,9 @@ Return **only** a JSON object (no markdown fences):
   "trend_score": 0-100,
   "ma_alignment": "bullish|neutral|bearish",
   "volume_status": "heavy|normal|light",
-  "pattern": "<detected pattern or none>"
+  "pattern": "<detected pattern or none>",
+  "quality": "ok|partial|stale|unavailable",
+  "missing_evidence": []
 }}
 """
 
@@ -89,6 +100,20 @@ Return **only** a JSON object (no markdown fences):
             logger.warning("[TechnicalAgent] failed to parse opinion JSON")
             return None
 
+        quality = str(parsed.get("quality") or "partial").lower()
+        if quality not in {"ok", "partial", "stale", "unavailable"}:
+            quality = "partial"
+        missing_evidence = parsed.get("missing_evidence")
+        if not isinstance(missing_evidence, list):
+            missing_evidence = []
+        parsed["quality"] = quality
+        parsed["missing_evidence"] = [str(item) for item in missing_evidence if str(item).strip()]
+        ctx.set_data("technical_opinion", parsed)
+        ctx.meta.setdefault("dimension_status", {})[self.agent_name] = {
+            "quality": quality,
+            "missing_evidence": parsed["missing_evidence"],
+        }
+
         return AgentOpinion(
             agent_name=self.agent_name,
             signal=parsed.get("signal", "hold"),
@@ -100,4 +125,3 @@ Return **only** a JSON object (no markdown fences):
             },
             raw_data=parsed,
         )
-

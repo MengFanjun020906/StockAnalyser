@@ -4,7 +4,7 @@
 
 约束（与 [迁移到一台全新 Windows 电脑](./deploy-to-new-windows.md) 一致）：
 - 包含 `.env` 配置文件迁移
-- **不**迁移本地数据库（`data/stock_analysis.db`、`Sequoia-X/data/sequoia_v2.db` 等）
+- **不**迁移本地数据库（`data/stock_analysis.db`、`vendor/Sequoia-X/data/sequoia_v2.db` 等）
 - **不**部署 graphiti / Neo4j（强制禁用）
 
 支持的 Mac：
@@ -28,7 +28,7 @@ StockAnalyser/
 排除项（**不要**带过去）：
 
 - `.venv/`、`apps/dsa-web/node_modules/`、`apps/dsa-desktop/node_modules/`
-- `data/`、`logs/`、`.cache/`、`Sequoia-X/data/*.db`
+- `data/`、`logs/`、`.cache/`、`vendor/Sequoia-X/data/*.db`
 - `__pycache__/`、`*.pyc`、`.pytest_cache/`
 
 打包示例（macOS 或 Linux 旧机器）：
@@ -41,7 +41,7 @@ tar --exclude='StockAnalyser/.venv' \
     --exclude='StockAnalyser/data' \
     --exclude='StockAnalyser/logs' \
     --exclude='StockAnalyser/.cache' \
-    --exclude='StockAnalyser/Sequoia-X/data/*.db' \
+    --exclude='StockAnalyser/vendor/Sequoia-X/data/*.db' \
     --exclude='*/__pycache__' --exclude='*/.pytest_cache' \
     -czf stockanalyser.tar.gz StockAnalyser
 # 拷贝 stockanalyser.tar.gz 到 U 盘 / 网盘 / scp 到新机器
@@ -91,7 +91,7 @@ bash scripts/install-mac.sh
 3. `brew install python@3.11 node@22 uv git sqlite`。
 4. 用 Python 3.11 建 `.venv`，并 `uv pip install`（自动剔除 `graphiti`、`neo4j` 行）。
 5. 在 `apps/dsa-web/` 跑 `npm ci`。
-6. 建空目录 `data/`、`logs/`、`Sequoia-X/data/`、`.cache/candidate_experts_v2/`。
+6. 建空目录 `data/`、`logs/`、`vendor/Sequoia-X/data/`、`.cache/candidate_experts_v2/`。
 7. 没有 `.env` 时 `cp .env.example .env`，并强制追加 `GRAPHITI_ENABLED=false`。
 8. 可选下载 Sequoia 候选 DB（设置 `SEQUOIA_DB_URL` 后才会触发）。
 9. 给 `scripts/start-*.sh` / `scripts/start-*.command` 加可执行位。
@@ -158,7 +158,7 @@ Finder 进入 `scripts/`，双击：
 
 ## 6. 不在本流程范围内的事
 
-- **数据库迁移**：旧机器的 `data/stock_analysis.db` 和 `Sequoia-X/data/sequoia_v2.db` 不会带过来。新机器空库启动后会按需重新生成。
+- **数据库迁移**：旧机器的 `data/stock_analysis.db` 和 `vendor/Sequoia-X/data/sequoia_v2.db` 不会带过来。新机器空库启动后会按需重新生成。
 - **graphiti / Neo4j**：脚本强制 `GRAPHITI_ENABLED=false`，并在 `requirements.txt` 安装阶段直接 `grep -v` 掉 `graphiti` / `neo4j` 行。如果某天确实需要，请单独走 graphiti 的安装文档，而不是改本脚本。
 - **桌面端（dsa-desktop）**：默认 `SKIP_DESKTOP=1`，需要时再 `SKIP_DESKTOP=0 bash scripts/install-mac.sh`。
 - **CI / 自动 tag / Docker**：仅影响本地开发环境，不动远端流水线。

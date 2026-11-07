@@ -46,6 +46,11 @@ from api.v1.schemas.backtest import (
     BacktestResultsResponse,
     PerformanceMetrics,
 )
+from api.v1.schemas.kronos import (
+    KronosAnalyzeRequest,
+    KronosAnalyzeResponse,
+    KronosStatusResponse,
+)
 from api.v1.schemas.system_config import (
     SystemConfigFieldSchema,
     SystemConfigCategorySchema,
@@ -126,6 +131,10 @@ __all__ = [
     "BacktestResultItem",
     "BacktestResultsResponse",
     "PerformanceMetrics",
+    # kronos
+    "KronosAnalyzeRequest",
+    "KronosAnalyzeResponse",
+    "KronosStatusResponse",
     # system config
     "SystemConfigFieldSchema",
     "SystemConfigCategorySchema",

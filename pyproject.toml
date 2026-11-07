@@ -14,6 +14,7 @@ exclude = '''
     | buck-out
     | build
     | dist
+    | vendor
     | __pycache__
 )/
 '''
@@ -21,7 +22,7 @@ exclude = '''
 [tool.isort]
 profile = "black"
 line_length = 120
-skip = [".git", "__pycache__", ".env", "venv", ".venv"]
+skip = [".git", "__pycache__", ".env", "venv", ".venv", "vendor"]
 
 [tool.bandit]
 exclude_dirs = ["tests", "test_*.py"]

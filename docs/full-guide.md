@@ -50,7 +50,7 @@ StockAnalyser/
 进入你 Fork 的仓库 → `Settings` → `Secrets and variables` → `Actions` → `New repository secret`
 
 <div align="center">
-  <img src="../sources/secret_config.png" alt="GitHub Secrets 配置示意图" width="600">
+  <img src="assets/secret_config.png" alt="GitHub Secrets 配置示意图" width="600">
 </div>
 
 #### AI 模型配置（二选一）
@@ -260,8 +260,8 @@ StockAnalyser/
 | `ANYSEARCH_API_KEY` | AnySearch 统一搜索 API Key，覆盖股票新闻、市场复盘、Agent 搜索和通用网页搜索 | 推荐 |
 | `SOCIAL_SENTIMENT_API_KEY` | Stock Sentiment API Key（Reddit / X / Polymarket，可选） | 可选 |
 | `SOCIAL_SENTIMENT_API_URL` | Stock Sentiment API 地址（默认 `https://api.adanos.org`） | 可选 |
-| `NEWS_STRATEGY_PROFILE` | 新闻策略窗口档位：`ultra_short`(1天)/`short`(3天)/`medium`(7天)/`long`(30天)；实际窗口取与 `NEWS_MAX_AGE_DAYS` 的最小值 | 默认 `short` |
-| `NEWS_MAX_AGE_DAYS` | 新闻最大时效（天），搜索时限制结果在近期内 | 默认 `3` |
+| `NEWS_STRATEGY_PROFILE` | 通用新闻与市场情报窗口档位；单股 `search_stock_news` 固定使用 7→14→30 天自适应窗口 | 默认 `short` |
+| `NEWS_MAX_AGE_DAYS` | 通用新闻最大时效；不缩短单股 7→14→30 天自适应窗口 | 默认 `3` |
 | `BIAS_THRESHOLD` | 乖离率阈值（%），超过提示不追高；强势趋势股自动放宽到 1.5 倍 | 默认 `5.0` |
 
 > 行为说明：搜索服务与社交舆情服务为可选增强链路。任一服务初始化失败时，系统会记录 warning 并降级为跳过该服务，仅影响对应环节，不会阻塞技术面主链路和主任务流。
@@ -292,8 +292,8 @@ StockAnalyser/
 | `AGENT_CHIP_DISTRIBUTION_TIMEOUT_SECONDS` | Agent 显式调用 `get_chip_distribution` 的预算（秒）；当前默认按私有 Tushare `cyq_chips` 最近交易日窗口预留更长预算 | `12.0` | 可选 |
 | `ENABLE_EASTMONEY_PATCH` | 东财接口补丁：东财接口频繁失败（如 RemoteDisconnected、连接被关闭）时建议设为 `true`，注入 NID 令牌与随机 User-Agent 以降低被限流概率 | `false` | 可选 |
 | `REALTIME_SOURCE_PRIORITY` | 实时行情数据源优先级（逗号分隔），如 `tencent,akshare_sina,efinance,akshare_em` | 见 .env.example | 可选 |
-| `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia 风格量化候选池 SQLite 路径；`watchlist_scan` 候选发现会读取 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` 并运行形态策略；Agent 历史 K 线工具在主库缺日线时也会读取该本地表 | `Sequoia-X/data/sequoia_v2.db` | 可选 |
-| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML 候选策略目录；`discover_watchlist_candidates` 的 `auto` 模式会优先读取启用的 YAML 策略做 L1 硬筛和因子召回 | `alphasift/alphasift/strategies` | 可选 |
+| `SEQUOIA_CANDIDATE_DB_PATH` | Sequoia 风格量化候选池 SQLite 路径；`watchlist_scan` 候选发现会读取 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` 并运行形态策略；Agent 历史 K 线工具在主库缺日线时也会读取该本地表 | `vendor/Sequoia-X/data/sequoia_v2.db` | 可选 |
+| `ALPHASIFT_STRATEGY_DIR` | AlphaSift YAML 候选策略目录；`discover_watchlist_candidates` 的 `auto` 模式会优先读取启用的 YAML 策略做 L1 硬筛和因子召回 | `vendor/alphasift/alphasift/strategies` | 可选 |
 | `ALPHASIFT_CANDIDATE_DB_PATH` | AlphaSift 候选池 SQLite 路径；未配置时复用 `SEQUOIA_CANDIDATE_DB_PATH`，表结构同 `stock_daily(symbol,date,open,high,low,close,volume,turnover)` | `SEQUOIA_CANDIDATE_DB_PATH` | 可选 |
 | `ENABLE_FUNDAMENTAL_PIPELINE` | 基本面聚合总开关；关闭时仅返回 `not_supported` 块，不改变原分析链路 | `true` | 可选 |
 | `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` | 基本面阶段总时延预算（秒） | `8.0` | 可选 |
@@ -321,7 +321,7 @@ StockAnalyser/
 > - Agent 最终报告会执行事实校验门禁：资金流精确值必须来自 `get_capital_flow` 的成功来源链，筹码分布精确值必须来自 `get_chip_distribution`，均线精确值必须来自 `calculate_ma` 或 `analyze_trend`。缺少对应工具证据时，最终 dashboard 会将这些字段替换为 `N/A` 并写入 `data_quality_warnings`。A 股买入股数还会按 100 股整数倍校验，模型输出的零散买入股数会被替换为“按100股整数倍”。
 > - `discover_watchlist_candidates` 的 `auto` 模式按 AlphaSift YAML 多因子召回、Sequoia 形态策略、强势板块成分股、固定种子池的顺序补齐候选；AlphaSift 只接入 L1 硬筛/因子层，不在候选发现阶段额外调用 LLM 排名。
 > - 四席位候选发现中，`momentum_desk` 的业务语义是“趋势/形态延续席”，优先消费 Sequoia、AlphaSift、涨停池和资金异常召回；`early_turn_desk` 代码名保留，但业务上降级为“结构反转席”，必须同时满足 `range_pct_120` 低位和明确转强证据，低位本身不再天然加分。防守 regime（`risk_off`/`panic`/`trending_down`）会跳过零配额动量席，避免无效席位消耗 LLM 预算。
-> - Sequoia 候选池数据库可通过 `python scripts/update_sequoia_candidates.py --trading-days 260` 更新；脚本从 baostock 拉取 A 股最近约 260 个交易日的日线数据，逐股票写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并额外维护 `000001.SH` 上证指数和 `000300.SH` 沪深 300。前者供 Seed Pool 质量页计算 Alpha，后者供市场状态与前向概率在主缓存不足时补历史。中断后重跑会默认跳过本地已达到最新日期的股票，继续补剩余股票；如需完全重刷可加 `--no-incremental --no-resume`。
+> - `scripts/daily_run.sh` 的 Sequoia 日线步骤使用 `python scripts/update_sequoia_candidates.py --source tushare --trading-days 260`：按缺失交易日批量拉取 Tushare 全市场 `daily` 与 `adj_factor`，写入 `SEQUOIA_CANDIDATE_DB_PATH` 指向的 SQLite，并维护 `000001.SH` 上证指数和 `000300.SH` 沪深 300。首次从旧 Baostock 库迁移时，脚本按每只股票的重叠交易日计算价格比例并持久化，避免两家后复权基准不同造成价格跳变；只有未过滤的全市场快照成功后才推进完成日期，局部 smoke 或 `--index-only` 不会误标完成。命令需要有效的 `TUSHARE_TOKEN`；独立调用若不传 `--source` 仍保留 Baostock 兼容默认值。
 > - Seed Pool 质量页按 `seed_date` 只保留最新一个池子；同一天多次生成候选池时，新池会替换旧池，T+1 评估和页面总览只针对最新池。候选池会优先使用 seed 自身的 `freshness`/`as_of`/`trade_date` 归属日期；缺少这些字段时，北京时间 09:00 前生成的候选池归属到前一自然日，例如 6 月 10 日 09:00 前生成的池子计入 6 月 9 日。
 > - 历史 Seed Pool 快照可用 `python scripts/backfill_seed_pool_quality_from_traces.py --trace-root data/agent_traces --dry-run` 预览，再去掉 `--dry-run` 回填；到期 T+1 评估可用 `python scripts/evaluate_seed_pool_quality.py --days 30 --limit 500` 手动运行。`scripts/daily_run.sh` 第四步默认 opt-in，设置 `SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED=true` 后会自动评估，缺行情时保留结构化 skipped 并在下次续跑重试。
 > - 每次 `discover_watchlist_candidates` 返回候选池后，会 best-effort 写入 `agent_candidate_pool_runs` 和 `agent_candidate_pool_items`；写入失败不会中断选股链路。前端“候选池”页面读取 `/api/v1/candidate-pool/latest` 和 `/api/v1/candidate-pool/runs/{run_id}` 展示独立候选池视图。
@@ -348,10 +348,10 @@ StockAnalyser/
 >   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`）；
 >   - `fundamental_context.earnings.data.financial_report` = 财报摘要（报告期、营收、归母净利润、经营现金流、ROE）；
 >   - `fundamental_context.earnings.data.dividend` = 分红指标（仅现金分红税前口径，含 `events`、`ttm_cash_dividend_per_share`、`ttm_dividend_yield_pct`）；
->   - `get_stock_info.belong_boards` = 个股所属板块列表；
->   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；
->   - `get_stock_info.sector_rankings` 与 `fundamental_context.boards.data` 保持一致。
-> - 选股前置 `SeedFactPacket` 默认使用 `get_stock_business_context` 补齐 `industry/boards/business_summary`，不再为了第一层业务归属调用完整 `get_stock_info`；`get_stock_info` 仍保留给深层基本面、估值和财务上下文。
+>   - `get_stock_business_context` = 当前公司名称、行业、板块和业务摘要入口；
+>   - `get_tushare_daily_basic`、`get_tushare_financial_indicators`、`get_tushare_financial_statements`、`get_tushare_forecast` = 当前估值、财务质量、报表和业绩预告入口；
+>   - `get_stock_info` 已从 Agent 运行时注册表废弃，仅保留旧实现和历史 Trace 只读兼容。
+> - 选股前置 `SeedFactPacket` 默认使用 `get_stock_business_context` 补齐 `industry/boards/business_summary`；深层基本面使用上述 Tushare 工具，结构化证据不足时再调用 `search_stock_fundamentals`。
 >   - `AnalysisReport.details.belong_boards` = 结构化报告详情中的关联板块列表；
 >   - `AnalysisReport.details.sector_rankings` = 结构化报告详情中的板块涨跌榜（用于前端板块联动展示）。
 > - 板块涨跌榜使用数据源顺序：与全局 priority 一致。
@@ -371,6 +371,7 @@ StockAnalyser/
 | `MARKET_REVIEW_REGION` | 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、both(三市场)，us 适合仅关注美股的用户 | `cn` |
 | `TRADING_DAY_CHECK_ENABLED` | 交易日检查：默认 `true`，非交易日跳过执行；设为 `false` 或使用 `--force-run` 可强制执行（Issue #373） | `true` |
 | `SCHEDULE_ENABLED` | 启用定时任务 | `false` |
+| `POSITION_WATCH_ENABLED` | 独立定时进程内启用持仓信号监控 | `true` |
 | `SCHEDULE_TIME` | 定时执行时间 | `18:00` |
 | `LOG_DIR` | 日志目录 | `./logs` |
 
@@ -644,6 +645,7 @@ python main.py --schedule --no-run-immediately
 | 变量名 | 说明 | 默认值 | 示例 |
 |--------|------|:-------:|:-----:|
 | `SCHEDULE_ENABLED` | 是否启用定时任务 | `false` | `true` |
+| `POSITION_WATCH_ENABLED` | 是否启用持仓信号监控（A/H 18:00、美股收盘后） | `true` | `false` |
 | `SCHEDULE_TIME` | 每日执行时间 (HH:MM) | `18:00` | `09:30` |
 | `SCHEDULE_RUN_IMMEDIATELY` | 启动服务时是否立即运行一次 | `true` | `false` |
 | `TRADING_DAY_CHECK_ENABLED` | 交易日检查：非交易日跳过执行；设为 `false` 可强制执行 | `true` | `false` |
@@ -1202,8 +1204,8 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - `get_daily_history` 会先尝试复用本地 `stock_daily` 日线缓存；缓存新鲜且至少覆盖首页默认的 30 条记录时，不再重复请求外部数据源。
 - 当 Agent 请求的天数多于本地缓存记录数时，工具会返回实际可用记录，并通过 `partial_cache=true`、`requested_days`、`actual_records` 标明这是部分缓存命中。
 - 缓存缺失或过期时，工具仍会按原逻辑从数据源获取日线数据；获取成功后会 best-effort 写回 `stock_daily`，保存失败不会阻断 Agent 回复。
-- `search_stock_news` 与 `search_comprehensive_intel` 成功返回后会 best-effort 写入 `news_intel`，复用现有 URL / fallback key 去重逻辑。
-- `search_openinvest_news` 接入 `openInvest/services/news_sources` 的多源新闻适配，默认走 `yfinance.Ticker.news` 做 ticker 关联新闻补充；RSS / DDGS 为可选源，其中 DDGS 需要额外安装 `ddgs` 等依赖，缺依赖或单源失败会在 `source_chain` 中说明，不阻断工具返回。
+- `search_stock_news` 按 7、14、30 天逐级扩展检索：结果必须在标题、摘要或链接中直接出现公司名或证券代码，行情、F10、公告目录等静态入口不算新闻；有可核验发布日期的相关新闻即返回，只有无日期候选时返回 `date_unverified/partial`，不会伪装成“0 条新闻”；各窗口原始数、无关过滤数、静态入口过滤数、过期过滤数与错误写入 `window_attempts`。已核验和日期待核验候选都会 best-effort 写入 `news_intel`，后者保持 `published_date=null`，不能作为近期消息强证据。`search_comprehensive_intel` 继续按自身维度口径持久化。
+- `search_openinvest_news` 接入 `vendor/openInvest/services/news_sources` 的多源新闻适配，默认走 `yfinance.Ticker.news` 做 ticker 关联新闻补充；RSS / DDGS 为可选源，其中 DDGS 需要额外安装 `ddgs` 等依赖，缺依赖或单源失败会在 `source_chain` 中说明，不阻断工具返回。
 - `get_realtime_quote` 不复用 `stock_daily` 作为实时行情缓存，也不会把盘中实时行情写入日线表；如需实时行情缓存，应单独设计实时行情存储。
 
 ## 持仓管理说明
@@ -1257,10 +1259,17 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - Web 侧边栏的“链路”页面面向开发者排查 Agent 执行链路，调用 `POST /api/v1/agent/trace/run` 执行一次独立调试请求。
 - 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
 - 页面支持选择持仓账户、报告意图、风险偏好、持有周期、单票上限、总权益仓位上限、最大回撤、默认止损和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
-- 页面会把最近 10 次 Trace 完整结果保存在当前浏览器的 localStorage，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
-- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`debate.json`、`final.md`、`todo.md` 和 `summary.json`；当 `watchlist_scan` 使用阶段化选股流水线时，还会写入 `stock_selection.json`、`selection_context.json`、`final_report.json` 以及各阶段 JSON 产物，便于复盘候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决。选股链路还会落盘 `candidate_evidence.json` 和 `candidate_evidence.md`，按策略、消息、资金、基本面四类各最多 2 只候选保存统一证据包，供后续规划和排障复用；候选级取证并行执行，若同一股票在多个维度重复出现，则以前序维度为准跳过重复项并继续向后补位。页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
+- 修改历史问题时，如果正文中唯一明确的股票代码与配置中的旧代码不同，页面会省略旧代码并使用问题中的标的；直接 API 请求仍携带冲突代码时，普通和流式接口均在取数前返回 `422 / trace_target_conflict`。代码别名会先标准化，多标的比较不按单股冲突处理。
+- 已保存的 Trace 若问题标的与原配置/上下文标的不一致，读取时将报告标为 `target_mismatch`，隔离错误价格、评分、风控、裁决及 Jev 对照，原始 artifact 保留；Jev 轮询不会恢复错标的结果。此类 Trace 不允许续跑复用旧证据（`409 / resume_trace_target_conflict`），需按正确标的重新运行。
+- 页面会把最近 10 次 Trace 的轻量摘要保存在当前浏览器的 localStorage，完整记录按 session 从后端读取，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
+- 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`report_quality.json`、`debate.json`、`composite_verdict.json`、`risk_gate.json`、`final.md`、`todo.md` 和 `summary.json`；当 `watchlist_scan` 使用阶段化选股流水线时，还会写入 `stock_selection.json`、`selection_context.json`、`final_report.json` 以及各阶段 JSON 产物，便于复盘候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决。选股链路还会落盘 `candidate_evidence.json` 和 `candidate_evidence.md`，按策略、消息、资金、基本面四类各最多 2 只候选保存统一证据包，供后续规划和排障复用；候选级取证并行执行，若同一股票在多个维度重复出现，则以前序维度为准跳过重复项并继续向后补位。页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
 - planning prompt 包含独立的 `Execute Protocol`：要求执行器把工具结果落入 Evidence Ledger，记录失败降级、停止条件和最终输出审计门槛；`planner.json` 和 `todo.md` 会记录主/辅维度、初始假设、工具预期结果、下游使用方式、失败降级、停止条件和 replan 策略，`todo.md` 初始写入计划，执行结束后会补充工具成功/失败、参数、结果预览和 Execute 复核状态。
-- planning_execute 工具证据形成后会进入对抗式 Debate：主观点 Agent、强制反方 Agent 和 Judge Agent 共用同一份 Evidence Bundle；Judge 会按证据强弱、账户风险、数据可靠性和用户目标裁决，页面 `Debate Judge` 模块和 `debate.json` 可用于排查持仓模式与选股/入场模式的裁决链路。Judge 输出会拆成结论摘要、分维度证据、要点化理由、采纳/驳回论点和风控条件，并分别标注账户风险、技术面、资金面、消息面、基本面和数据质量；资金面或消息面缺失时必须显式写出缺口，不能被技术面结论覆盖。
+- planning_execute 工具证据形成后会进入对抗式 Debate：主观点 Agent、强制反方 Agent 和 Judge Agent 共用同一份 Evidence Bundle；Judge 使用关闭推理的紧凑结构化协议，只接收四维证据摘要、真实工具引用和数学场景，必须分别输出技术、资金、基本面和消息面对价格计划的绝对结论。四维意见只允许保持或降低执行权限，不能修改数学价格。Trace 记录 Judge 的结束原因、正文字符数、推理字符数和 completion tokens，避免“消耗 token 但无正文”被误报为普通 JSON 解析失败。
+- 单股主报告在进入 Debate 前执行完整度校验，检查最小信息量、Markdown 结构、交易计划、策略 4/缠论评分和风险缺失。首次输出不完整时只重试一次；重试仍失败则生成明确标注的确定性降级报告并写入 `report_quality.json`，但数学价格计划和 Debate 仍继续执行，避免报告表现层故障切断决策层。Judge 收到数学场景时必须覆盖技术面、资金面、基本面和消息面的结构化 `plan_verdict`；Primary、Opposing 或 Judge 的 JSON 为空、截断或无法严格解析时，Debate 标记失败且不追加到最终报告，页面直接展示失败原因。
+- 修复前的历史 Trace 若已保存完整评分 snapshot 但缺少临时分或正式化原因码，API 读取时按确定性评分器补充 `provisional_score`、临时分项、`formalization_reason_codes` 和非阻断的 `quality_warning_codes`，并标记 `read_time_enrichment.persisted = false`；磁盘 artifact、正式分数、信号等级和 Risk Gate 均不改变。若旧 `debate.json` 同时记录了解析错误和 `success=true`，读取时会将 Debate 只读隔离为失败、恢复原始主报告并显示“历史报告需重跑”，不再把保守 fallback 伪装成有效 Judge 裁决。
+- 已成功保存结构化 Judge 裁决的 Trace 在读取时会按当前中文模板重新渲染 Debate 附录，使其直接展示“支持执行、证据混合、反对执行、硬否决”等绝对价格计划结论；该刷新只改变 HTTP 展示文本，不重调模型、不修改判决或落盘 artifact。
+- Trace 的“确定性评分”会逐项展示 Strategy4 的阈值、当前值以及通过、未通过或数据缺失原因；缠论部分会说明每个已触发信号是计入买入分、因周线未收盘暂不计分，还是仅作为卖出/退出风险提示，避免只看到 `0` 分却无法判断原因。
+- 单股 Trace 还会按技术面、资金面、消息面、基本面展示证据覆盖：列出实际调用的工具、可用/部分可用状态和缺口。报告修复器与 Debate 使用同一份按维度均衡的证据选择；历史报告若把已有工具结果写成“完全缺失”，页面会标记为证据不一致并建议重跑，不会回写旧 artifact。
 - 开发调试模式下，`Debate Judge` 还会展示同一 session 内的原始主报告输出、Primary/Opposing/Judge 原始 JSON 输出和最终合并输出；这些内容用于调试模型可见输出，不展示隐藏思维链。
 - 默认调试 Prompt 使用真实用户问题示例，例如“我持有 600519，帮我分析未来走势，适合继续拿长线吗？”，而不是面向开发者的内部链路描述。
 - 页面把 Planner 压缩为 `Execution Thesis` 摘要，把事件流压缩为可点击的 `Evidence Timeline`，点击任一事件可查看完整载荷；最终输出使用大尺寸 Markdown 渲染窗口，适合阅读完整报告。

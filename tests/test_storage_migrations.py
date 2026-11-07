@@ -118,6 +118,41 @@ class StorageMigrationTestCase(unittest.TestCase):
             finally:
                 engine.dispose()
 
+    def test_trade_plan_schema_migration_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "migration.db"
+            engine = create_engine(f"sqlite:///{db_path}")
+            try:
+                with engine.begin() as conn:
+                    conn.exec_driver_sql(
+                        "CREATE TABLE entry_signals (id INTEGER PRIMARY KEY, signal_id VARCHAR(128))"
+                    )
+                manager = object.__new__(DatabaseManager)
+                manager._engine = engine
+                manager._migrate_trade_plan_schema()
+                manager._migrate_trade_plan_schema()
+                with engine.begin() as conn:
+                    entry_columns = {
+                        str(row[1])
+                        for row in conn.exec_driver_sql("PRAGMA table_info('entry_signals')").fetchall()
+                    }
+                    artifact_table = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='trade_plan_artifacts'"
+                    ).fetchone()
+                    lifecycle_table = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='plan_lifecycle_states'"
+                    ).fetchone()
+                    trace_link_table = conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='trade_plan_trace_links'"
+                    ).fetchone()
+
+                self.assertEqual({"plan_id", "scenario_id"} - entry_columns, set())
+                self.assertIsNotNone(artifact_table)
+                self.assertIsNotNone(lifecycle_table)
+                self.assertIsNotNone(trace_link_table)
+            finally:
+                engine.dispose()
+
 
 if __name__ == "__main__":
     unittest.main()

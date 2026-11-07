@@ -12,6 +12,7 @@ from src.agent.tools.search_tools import (
     _handle_get_macro_finance_news,
     _handle_get_xueqiu_hot_news,
     _handle_search_comprehensive_intel,
+    _handle_search_stock_fundamentals,
     _handle_search_openinvest_news,
     _handle_score_stock_news_sentiment,
     _handle_search_stock_prompt_intel,
@@ -20,6 +21,7 @@ from src.agent.tools.search_tools import (
     get_macro_finance_news_tool,
     get_xueqiu_hot_news_tool,
     search_stock_prompt_intel_tool,
+    search_stock_fundamentals_tool,
     ALL_SEARCH_TOOLS,
 )
 from src.search_service import SearchResponse, SearchResult
@@ -44,6 +46,67 @@ def _response(query: str, *, success: bool = True) -> SearchResponse:
 
 
 class SearchToolsPersistenceTest(unittest.TestCase):
+    def test_search_stock_fundamentals_returns_structured_sources_and_persists_dimensions(self) -> None:
+        earnings = SearchResponse(
+            query="天通股份 600330 财报",
+            provider="AnySearch",
+            success=True,
+            results=[SearchResult(
+                title="天通股份2026年半年度业绩预告",
+                snippet="预计净利润亏损2.2亿元至3亿元。",
+                url="https://example.com/earnings",
+                source="example.com",
+                published_date="2026-07-15",
+            )],
+        )
+        business = SearchResponse(
+            query="天通股份 600330 主营业务",
+            provider="AnySearch",
+            success=True,
+            results=[SearchResult(
+                title="天通股份主营业务与行业风险",
+                snippet="主营电子材料和专用设备，应收账款风险上升。",
+                url="https://example.com/business",
+                source="example.com",
+                published_date="2026-06-30",
+            )],
+        )
+        service = SimpleNamespace(
+            is_available=True,
+            search_stock_fundamentals=MagicMock(return_value={
+                "financial_performance": earnings,
+                "business_and_risk": business,
+            }),
+        )
+        db = SimpleNamespace(
+            save_news_intel=MagicMock(return_value=1),
+            save_fundamental_snapshot=MagicMock(return_value=1),
+        )
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db):
+            result = _handle_search_stock_fundamentals(
+                "600330",
+                "天通股份",
+                trace_id="trace-fundamental-demo",
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["provider"], "AnySearch")
+        self.assertEqual(result["coverage"]["financial_performance"], "available")
+        self.assertEqual(result["coverage"]["business_and_risk"], "available")
+        self.assertEqual(result["materials"][0]["url"], "https://example.com/earnings")
+        self.assertEqual(result["materials"][0]["published_date"], "2026-07-15")
+        self.assertEqual(db.save_news_intel.call_count, 2)
+        first_save = db.save_news_intel.call_args_list[0].kwargs
+        self.assertEqual(first_save["query_context"]["query_id"], "trace-fundamental-demo")
+        db.save_fundamental_snapshot.assert_called_once()
+        snapshot = db.save_fundamental_snapshot.call_args.kwargs
+        self.assertEqual(snapshot["query_id"], "trace-fundamental-demo")
+        self.assertEqual(snapshot["coverage"]["financial_performance"], "available")
+        self.assertEqual(len(snapshot["payload"]["materials"]), 2)
+        self.assertIn(search_stock_fundamentals_tool, ALL_SEARCH_TOOLS)
+
     def test_get_cls_telegraph_news_normalizes_cls_v1_response(self) -> None:
         response = MagicMock()
         response.raise_for_status.return_value = None
@@ -314,6 +377,43 @@ class SearchToolsPersistenceTest(unittest.TestCase):
             response=response,
             query_context=None,
         )
+
+    def test_search_stock_news_does_not_report_undated_candidates_as_zero(self) -> None:
+        response = SearchResponse(
+            query="贵州茅台 600519 新闻",
+            results=[],
+            unverified_results=[
+                SearchResult(
+                    title="贵州茅台经营动态",
+                    snippet="发布日期待核验",
+                    url="https://example.com/undated",
+                    source="example.com",
+                )
+            ],
+            provider="AnySearch",
+            success=True,
+            result_state="date_unverified",
+            search_window_days=30,
+            window_attempts=[{"window_days": 7}, {"window_days": 14}, {"window_days": 30}],
+        )
+        service = SimpleNamespace(
+            is_available=True,
+            search_stock_news=MagicMock(return_value=response),
+        )
+        db = SimpleNamespace(save_news_intel=MagicMock(return_value=1))
+
+        with patch("src.agent.tools.search_tools._get_search_service", return_value=service), \
+             patch("src.agent.tools.search_tools._get_db", return_value=db):
+            result = _handle_search_stock_news("600519", "贵州茅台")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["results_count"], 1)
+        self.assertEqual(result["verified_recent_count"], 0)
+        self.assertEqual(result["unverified_results_count"], 1)
+        self.assertIn("发布日期", result["summary"])
+        persisted_response = db.save_news_intel.call_args.kwargs["response"]
+        self.assertEqual(len(persisted_response.results), 1)
+        self.assertIsNone(persisted_response.results[0].published_date)
 
     def test_search_openinvest_news_normalizes_yfinance_items(self) -> None:
         item = SimpleNamespace(

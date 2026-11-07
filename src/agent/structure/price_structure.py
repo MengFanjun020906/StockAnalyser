@@ -103,6 +103,12 @@ def analyze_price_structure(
         "latest_pens": pens[-8:],
         "latest_centers": centers[-5:],
         "unfinished_pen": unfinished_pen,
+        "signals": classify_chan_signals(
+            pens=pens,
+            centers=centers,
+            macd_bars=macd_bars,
+            timeframe="1d",
+        ),
         "structure_summary": _summarize_chan(pens, centers, unfinished_pen),
     }
 
@@ -314,6 +320,273 @@ def _build_chan_pens(
             pens[-1]["power"]["amplitude_ratio_vs_prev"] = round(amp / prev_amp, 3) if prev_amp else None
             pens[-1]["power"]["macd_area_ratio_vs_prev"] = round(curr_macd_area / prev_macd_area, 3) if prev_macd_area else None
     return pens
+
+
+def classify_chan_signals(
+    *,
+    pens: Sequence[Dict[str, Any]],
+    centers: Sequence[Dict[str, Any]],
+    macd_bars: Sequence[float],
+    timeframe: str,
+    divergence_ratio_max: float = 0.8,
+) -> List[Dict[str, Any]]:
+    """Label deterministic Chan evidence without assigning trading scores."""
+    signals: List[Dict[str, Any]] = []
+    if not pens:
+        return signals
+
+    latest = pens[-1]
+    previous_same = next(
+        (pen for pen in reversed(pens[:-1]) if pen.get("direction") == latest.get("direction")),
+        None,
+    )
+    if latest.get("direction") == "down" and previous_same:
+        previous_price = _pen_end_price(previous_same)
+        latest_price = _pen_end_price(latest)
+        ratio = _same_direction_macd_ratio(latest, previous_same)
+        if previous_price is not None and latest_price is not None and latest_price > previous_price:
+            signals.append(_chan_signal(
+                "second_buy",
+                timeframe,
+                {
+                    "previous_pen_id": previous_same.get("id"),
+                    "current_pen_id": latest.get("id"),
+                    "previous_low": previous_price,
+                    "current_low": latest_price,
+                },
+            ))
+        elif (
+            previous_price is not None
+            and latest_price is not None
+            and latest_price < previous_price
+            and ratio is not None
+            and ratio <= divergence_ratio_max
+        ):
+            metrics = {
+                "previous_pen_id": previous_same.get("id"),
+                "current_pen_id": latest.get("id"),
+                "previous_price": previous_price,
+                "current_price": latest_price,
+                "macd_area_ratio": round(ratio, 3),
+                "threshold": divergence_ratio_max,
+            }
+            signals.append(_chan_signal("bottom_divergence", timeframe, metrics))
+            signals.append(_chan_signal("first_buy", timeframe, metrics))
+    elif latest.get("direction") == "up" and previous_same:
+        previous_price = _pen_end_price(previous_same)
+        latest_price = _pen_end_price(latest)
+        ratio = _same_direction_macd_ratio(latest, previous_same)
+        if (
+            previous_price is not None
+            and latest_price is not None
+            and latest_price > previous_price
+            and ratio is not None
+            and ratio <= divergence_ratio_max
+        ):
+            signals.append(_chan_signal(
+                "top_divergence",
+                timeframe,
+                {
+                    "previous_pen_id": previous_same.get("id"),
+                    "current_pen_id": latest.get("id"),
+                    "previous_price": previous_price,
+                    "current_price": latest_price,
+                    "macd_area_ratio": round(ratio, 3),
+                    "threshold": divergence_ratio_max,
+                },
+            ))
+            signals.append(_chan_signal("first_sell", timeframe, {
+                "previous_pen_id": previous_same.get("id"),
+                "current_pen_id": latest.get("id"),
+                "previous_price": previous_price,
+                "current_price": latest_price,
+                "macd_area_ratio": round(ratio, 3),
+                "threshold": divergence_ratio_max,
+            }))
+        elif (
+            previous_price is not None
+            and latest_price is not None
+            and latest_price < previous_price
+        ):
+            signals.append(_chan_signal(
+                "second_sell",
+                timeframe,
+                {
+                    "previous_pen_id": previous_same.get("id"),
+                    "current_pen_id": latest.get("id"),
+                    "previous_high": previous_price,
+                    "current_high": latest_price,
+                },
+            ))
+
+    if centers and latest.get("direction") == "up":
+        center = centers[-1]
+        try:
+            center_end = int(center.get("end_index"))
+            center_upper = float(center.get("ZG"))
+            center_lower = float(center.get("ZD"))
+        except (TypeError, ValueError):
+            center_end = -1
+            center_upper = math.inf
+            center_lower = -math.inf
+        upward_breakout_pens = [
+            pen for pen in pens
+            if pen.get("direction") == "up"
+            and _pen_end_index(pen) > center_end
+            and (_pen_end_price(pen) or -math.inf) > center_upper
+        ]
+        downward_breakout_pens = [
+            pen for pen in pens
+            if pen.get("direction") == "down"
+            and _pen_end_index(pen) > center_end
+            and (_pen_end_price(pen) or math.inf) < center_lower
+        ]
+        if upward_breakout_pens and upward_breakout_pens[0].get("id") == latest.get("id"):
+            signals.append(_chan_signal(
+                "center_breakout",
+                timeframe,
+                {
+                    "center_id": center.get("id"),
+                    "center_upper": center_upper,
+                    "current_pen_id": latest.get("id"),
+                    "breakout_price": _pen_end_price(latest),
+                },
+            ))
+        previous_pen = pens[-2] if len(pens) >= 2 else None
+        if (
+            previous_pen is not None
+            and previous_pen.get("id") == (downward_breakout_pens[-1].get("id") if downward_breakout_pens else None)
+            and _pen_end_price(latest) is not None
+            and _pen_end_price(latest) < center_lower
+        ):
+            signals.append(_chan_signal(
+                "third_sell",
+                timeframe,
+                {
+                    "center_id": center.get("id"),
+                    "center_lower": center_lower,
+                    "breakdown_pen_id": previous_pen.get("id"),
+                    "current_pen_id": latest.get("id"),
+                    "pullback_price": _pen_end_price(latest),
+                },
+            ))
+
+    if centers and latest.get("direction") == "down":
+        center = centers[-1]
+        try:
+            center_end = int(center.get("end_index"))
+            center_upper = float(center.get("ZG"))
+            center_lower = float(center.get("ZD"))
+        except (TypeError, ValueError):
+            center_end = -1
+            center_upper = math.inf
+            center_lower = -math.inf
+        upward_breakout_pens = [
+            pen for pen in pens
+            if pen.get("direction") == "up"
+            and _pen_end_index(pen) > center_end
+            and (_pen_end_price(pen) or -math.inf) > center_upper
+        ]
+        downward_breakout_pens = [
+            pen for pen in pens
+            if pen.get("direction") == "down"
+            and _pen_end_index(pen) > center_end
+            and (_pen_end_price(pen) or math.inf) < center_lower
+        ]
+        if downward_breakout_pens and downward_breakout_pens[0].get("id") == latest.get("id"):
+            signals.append(_chan_signal(
+                "center_breakdown",
+                timeframe,
+                {
+                    "center_id": center.get("id"),
+                    "center_lower": center_lower,
+                    "current_pen_id": latest.get("id"),
+                    "breakdown_price": _pen_end_price(latest),
+                },
+            ))
+        previous_pen = pens[-2] if len(pens) >= 2 else None
+        if (
+            previous_pen is not None
+            and previous_pen.get("id") == (upward_breakout_pens[-1].get("id") if upward_breakout_pens else None)
+            and _pen_end_price(latest) is not None
+            and _pen_end_price(latest) > center_upper
+        ):
+            signals.append(_chan_signal(
+                "third_buy",
+                timeframe,
+                {
+                    "center_id": center.get("id"),
+                    "center_upper": center_upper,
+                    "breakout_pen_id": previous_pen.get("id"),
+                    "current_pen_id": latest.get("id"),
+                    "pullback_price": _pen_end_price(latest),
+                },
+            ))
+
+    if _macd_histogram_contracting(macd_bars, sign=-1, count=4):
+        signals.append(_chan_signal(
+            "bottom_exhaustion",
+            timeframe,
+            {"bar_count": 4, "histogram": [round(float(value), 6) for value in macd_bars[-4:]]},
+        ))
+    if _macd_histogram_contracting(macd_bars, sign=1, count=4):
+        signals.append(_chan_signal(
+            "top_exhaustion",
+            timeframe,
+            {"bar_count": 4, "histogram": [round(float(value), 6) for value in macd_bars[-4:]]},
+        ))
+    return signals
+
+
+def _pen_end_price(pen: Dict[str, Any]) -> Optional[float]:
+    end = pen.get("end") if isinstance(pen.get("end"), dict) else {}
+    try:
+        return float(end.get("price"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pen_end_index(pen: Dict[str, Any]) -> int:
+    end = pen.get("end") if isinstance(pen.get("end"), dict) else {}
+    try:
+        return int(end.get("index"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _same_direction_macd_ratio(current: Dict[str, Any], previous: Dict[str, Any]) -> Optional[float]:
+    current_power = current.get("power") if isinstance(current.get("power"), dict) else {}
+    previous_power = previous.get("power") if isinstance(previous.get("power"), dict) else {}
+    try:
+        current_area = float(current_power.get("macd_area"))
+        previous_area = float(previous_power.get("macd_area"))
+    except (TypeError, ValueError):
+        return None
+    if previous_area <= 0:
+        return None
+    return current_area / previous_area
+
+
+def _macd_histogram_contracting(values: Sequence[float], *, sign: int, count: int) -> bool:
+    if len(values) < count:
+        return False
+    tail = [float(value) for value in values[-count:]]
+    if sign < 0 and not all(value < 0 for value in tail):
+        return False
+    if sign > 0 and not all(value > 0 for value in tail):
+        return False
+    magnitudes = [abs(value) for value in tail]
+    return all(current < previous for previous, current in zip(magnitudes, magnitudes[1:]))
+
+
+def _chan_signal(name: str, timeframe: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "timeframe": timeframe,
+        "triggered": True,
+        "metrics": metrics,
+        "evidence": [],
+    }
 
 
 def _detect_chan_centers(pens: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:

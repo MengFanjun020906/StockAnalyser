@@ -21,7 +21,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import setup_env  # noqa: E402
-from data_provider.tushare_client import get_tushare_token, query_tushare_api  # noqa: E402
+from data_provider.tushare_client import (  # noqa: E402
+    TushareCredentialError,
+    get_tushare_token,
+    query_tushare_api,
+)
 from src.agent.candidate_providers.fundamental_provider import (  # noqa: E402
     ensure_fundamental_candidate_schema,
     upsert_fundamental_snapshots,
@@ -51,9 +55,19 @@ def main() -> int:
         print("TUSHARE_TOKEN is not configured", file=sys.stderr)
         return 2
     db_path = ensure_fundamental_candidate_schema(args.db_path)
-    basics = _fetch_stock_basic(limit=args.limit)
+    try:
+        basics = _fetch_stock_basic(limit=args.limit)
+    except TushareCredentialError as exc:
+        print(
+            f"TUSHARE_TOKEN 无效或已过期，请更新凭证后重试（上游信息: {exc}）",
+            file=sys.stderr,
+        )
+        return 2
+    except Exception as exc:
+        print(f"stock_basic 请求失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     if not basics:
-        print("No stock_basic rows returned", file=sys.stderr)
+        print("stock_basic 返回 0 行；凭证有效，但上游当前没有可用股票列表", file=sys.stderr)
         return 1
     existing_codes = _load_existing_codes(db_path) if args.resume and not args.force else set()
     skipped = 0

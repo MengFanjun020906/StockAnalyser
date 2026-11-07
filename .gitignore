@@ -70,11 +70,12 @@ run.sh
 verify_*.py
 
 # Local reference clones and agent plugin cache
-/Sequoia-X/
-/alphasift/
 /.agents/
 /skills-lock.json
-/openInvest/
+
+# Third-party repositories under vendor/; submodules are tracked separately.
+/vendor/Kronos/
+/vendor/openInvest/
 
 # Local runtime cache and stray dependencies
 /.cache/

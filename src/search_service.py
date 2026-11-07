@@ -16,7 +16,8 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -129,6 +130,11 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    result_state: str = "verified_recent"
+    search_window_days: Optional[int] = None
+    unverified_results: List[SearchResult] = field(default_factory=list)
+    window_attempts: List[Dict[str, Any]] = field(default_factory=list)
+    filter_counts: Dict[str, int] = field(default_factory=dict)
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -140,6 +146,23 @@ class SearchResponse:
             lines.append(f"\n{i}. {result.to_text()}")
         
         return "\n".join(lines)
+
+
+def _dedupe_search_results(items: List[SearchResult]) -> List[SearchResult]:
+    """Keep source candidates once while preserving provider order."""
+    output: List[SearchResult] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for item in items:
+        key = (
+            str(item.url or "").strip().lower(),
+            str(item.title or "").strip().lower(),
+            str(item.source or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
 
 
 class BaseSearchProvider(ABC):
@@ -2459,17 +2482,7 @@ class SearchService:
             else:
                 other_results.append(item)
 
-        return (
-            SearchResponse(
-                query=response.query,
-                results=chinese_results + other_results,
-                provider=response.provider,
-                success=response.success,
-                error_message=response.error_message,
-                search_time=response.search_time,
-            ),
-            len(chinese_results),
-        )
+        return (replace(response, results=chinese_results + other_results), len(chinese_results))
 
     @classmethod
     def _is_better_preferred_news_response(
@@ -2758,8 +2771,10 @@ class SearchService:
         search_days: int,
         max_results: int,
         log_scope: str,
+        stock_code: Optional[str] = None,
+        stock_name: Optional[str] = None,
     ) -> SearchResponse:
-        """Hard-filter results by published_date recency and normalize date strings."""
+        """Filter individual-stock news by relevance and publication recency."""
         if not response.success or not response.results:
             return response
 
@@ -2768,14 +2783,28 @@ class SearchService:
         latest = today + timedelta(days=self.FUTURE_TOLERANCE_DAYS)
 
         filtered: List[SearchResult] = []
+        unverified: List[SearchResult] = []
         dropped_unknown = 0
         dropped_old = 0
         dropped_future = 0
+        dropped_irrelevant = 0
+        dropped_non_news = 0
 
         for item in response.results:
+            if not self._is_stock_news_relevant(
+                item,
+                stock_code=stock_code,
+                stock_name=stock_name,
+            ):
+                dropped_irrelevant += 1
+                continue
+            if self._looks_like_stock_news_landing_page(item):
+                dropped_non_news += 1
+                continue
             published = self._normalize_news_publish_date(item.published_date)
             if published is None:
                 dropped_unknown += 1
+                unverified.append(item)
                 continue
             if published < earliest:
                 dropped_old += 1
@@ -2796,9 +2825,15 @@ class SearchService:
             if len(filtered) >= max_results:
                 break
 
-        if dropped_unknown or dropped_old or dropped_future:
+        if (
+            dropped_unknown
+            or dropped_old
+            or dropped_future
+            or dropped_irrelevant
+            or dropped_non_news
+        ):
             logger.info(
-                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, window=[%s,%s]",
+                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, drop_irrelevant=%s, drop_non_news=%s, window=[%s,%s]",
                 log_scope,
                 response.provider,
                 len(response.results),
@@ -2806,18 +2841,93 @@ class SearchService:
                 dropped_unknown,
                 dropped_old,
                 dropped_future,
+                dropped_irrelevant,
+                dropped_non_news,
                 earliest.isoformat(),
                 latest.isoformat(),
             )
 
-        return SearchResponse(
-            query=response.query,
+        return replace(
+            response,
             results=filtered,
-            provider=response.provider,
-            success=response.success,
-            error_message=response.error_message,
-            search_time=response.search_time,
+            unverified_results=_dedupe_search_results(
+                [*response.unverified_results, *unverified]
+            ),
+            result_state=(
+                "verified_recent"
+                if filtered
+                else ("date_unverified" if unverified else "no_verified_recent")
+            ),
+            search_window_days=search_days,
+            filter_counts={
+                "raw": len(response.results),
+                "verified_recent": len(filtered),
+                "date_unverified": len(unverified),
+                "dropped_old": dropped_old,
+                "dropped_future": dropped_future,
+                "dropped_irrelevant": dropped_irrelevant,
+                "dropped_non_news": dropped_non_news,
+            },
         )
+
+    @staticmethod
+    def _is_stock_news_relevant(
+        item: SearchResult,
+        *,
+        stock_code: Optional[str],
+        stock_name: Optional[str],
+    ) -> bool:
+        """Require a direct stock identifier instead of trusting search rank alone."""
+        code = str(stock_code or "").strip().casefold()
+        name = str(stock_name or "").strip().casefold()
+        if not code and not name:
+            return True
+
+        content = " ".join(
+            str(value or "")
+            for value in (item.title, item.snippet, item.url)
+        ).casefold()
+        if name and name in content:
+            return True
+        if not code:
+            return False
+
+        # Symbols such as AAPL need token boundaries; digit-only A-share codes
+        # are also bounded so an unrelated longer identifier cannot match.
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(code)}(?![a-z0-9])",
+                content,
+            )
+        )
+
+    @staticmethod
+    def _looks_like_stock_news_landing_page(item: SearchResult) -> bool:
+        """Reject quote, F10, and directory pages that search engines label as news."""
+        title = re.sub(r"\s+", "", str(item.title or "")).casefold()
+        static_markers = (
+            "行情首页",
+            "实时走势图",
+            "股价分析预测",
+            "股票最新价格行情",
+            "_股票行情",
+            ")股票行情",
+            "公司公告_",
+            ")公司公告",
+            "_f10",
+            ")f10",
+        )
+        if any(marker in title for marker in static_markers):
+            return True
+        if "股票股价" in title and (
+            title.endswith("股票股价")
+            or any(
+                marker in title
+                for marker in ("实时行情", "走势图", "市值", "行情,新闻", "行情，新闻")
+            )
+        ):
+            return True
+        return False
 
     def _normalize_and_limit_response(
         self,
@@ -2844,14 +2954,7 @@ class SearchService:
                 )
             )
 
-        return SearchResponse(
-            query=response.query,
-            results=normalized_results,
-            provider=response.provider,
-            success=response.success,
-            error_message=response.error_message,
-            search_time=response.search_time,
-        )
+        return replace(response, results=normalized_results)
 
     @staticmethod
     def _limit_search_response(
@@ -2867,14 +2970,7 @@ class SearchService:
         if len(limited_results) == len(response.results):
             return response
 
-        return SearchResponse(
-            query=response.query,
-            results=limited_results,
-            provider=response.provider,
-            success=response.success,
-            error_message=response.error_message,
-            search_time=response.search_time,
-        )
+        return replace(response, results=limited_results)
 
     def search_stock_news(
         self,
@@ -2897,9 +2993,11 @@ class SearchService:
         Returns:
             SearchResponse 对象
         """
-        # 策略窗口优先：ultra_short/short/medium/long = 1/3/7/30 天，
-        # 并统一受 NEWS_MAX_AGE_DAYS 上限约束。
-        search_days = self._effective_news_window_days()
+        # 个股消息面必须覆盖完整的一周；没有已核验结果时依次扩展到
+        # 两周和一个月。供应商不支持 freshness 参数时，查询文本中的
+        # 明确日期范围与本地日期校验共同保证窗口语义。
+        search_windows = (7, 14, 30)
+        search_days = search_windows[-1]
         provider_max_results = self._provider_request_size(max_results)
         prefer_chinese = self._should_prefer_chinese_news(
             stock_code,
@@ -2910,10 +3008,10 @@ class SearchService:
         # 构建搜索查询（优化搜索效果）
         is_foreign = self._is_foreign_stock(stock_code)
         if focus_keywords:
-            # 如果提供了关键词，直接使用关键词作为查询
-            query = " ".join(focus_keywords)
+            # 焦点词只能收窄主题，不能丢失个股身份锚点。
+            query = f"{stock_name} {stock_code} {' '.join(focus_keywords)}"
         elif prefer_chinese:
-            query = f"{stock_name} {stock_code} 股票 最新消息"
+            query = f"{stock_name} {stock_code} 新闻 公告 业绩 经营 监管"
         elif is_foreign:
             # 港股/美股使用英文搜索关键词
             query = f"{stock_name} {stock_code} stock latest news"
@@ -2923,22 +3021,19 @@ class SearchService:
 
         logger.info(
             (
-                "搜索股票新闻: %s(%s), query='%s', 时间范围: 近%s天 "
-                "(profile=%s, NEWS_MAX_AGE_DAYS=%s, prefer_chinese=%s), 目标条数=%s, provider请求条数=%s"
+                "搜索股票新闻: %s(%s), query='%s', 自适应窗口: 7/14/30天 "
+                "(prefer_chinese=%s), 目标条数=%s, provider请求条数=%s"
             ),
             stock_name,
             stock_code,
             query,
-            search_days,
-            self.news_strategy_profile,
-            self.news_max_age_days,
             prefer_chinese,
             max_results,
             provider_max_results,
         )
 
         cache_key = self._cache_key(
-            f"{query}|news_pref={'zh' if prefer_chinese else 'default'}",
+            f"{query}|news_pref={'zh' if prefer_chinese else 'default'}|adaptive=7,14,30|relevance=v2",
             max_results,
             search_days,
         )
@@ -2958,46 +3053,62 @@ class SearchService:
                 return cached
 
         try:
-            # 依次尝试各个搜索引擎（若过滤后为空，继续尝试下一引擎）
+            # 每个窗口内依次尝试 provider；窗口内找不到已核验新闻时再扩窗。
             had_provider_success = False
-            fallback_response: Optional[SearchResponse] = None
-            best_preferred_response: Optional[SearchResponse] = None
-            best_preferred_count = 0
-            provider_attempts = 0
-            for provider in self._providers:
-                if not provider.is_available:
-                    continue
-                if max_provider_attempts is not None and provider_attempts >= max(1, int(max_provider_attempts)):
-                    logger.info(
-                        "股票新闻搜索已达到 provider 尝试上限: %s(%s), attempts=%s",
-                        stock_name,
-                        stock_code,
-                        provider_attempts,
-                    )
-                    break
-                provider_attempts += 1
-
-                search_kwargs: Dict[str, Any] = {}
-                if isinstance(provider, TavilySearchProvider):
-                    search_kwargs["topic"] = "news"
-                elif isinstance(provider, BraveSearchProvider):
-                    search_kwargs.update(
-                        self._brave_search_locale(
-                            stock_code,
-                            prefer_chinese=prefer_chinese,
+            all_unverified: List[SearchResult] = []
+            window_attempts: List[Dict[str, Any]] = []
+            for window_days in search_windows:
+                earliest = datetime.now().date() - timedelta(days=window_days - 1)
+                dated_query = f"{query} 近{window_days}天 {earliest.isoformat()}至{datetime.now().date().isoformat()}"
+                fallback_response: Optional[SearchResponse] = None
+                best_preferred_response: Optional[SearchResponse] = None
+                best_preferred_count = 0
+                provider_attempts = 0
+                for provider in self._providers:
+                    if not provider.is_available:
+                        continue
+                    if max_provider_attempts is not None and provider_attempts >= max(1, int(max_provider_attempts)):
+                        break
+                    provider_attempts += 1
+                    search_kwargs: Dict[str, Any] = {}
+                    if isinstance(provider, TavilySearchProvider):
+                        search_kwargs["topic"] = "news"
+                    elif isinstance(provider, BraveSearchProvider):
+                        search_kwargs.update(
+                            self._brave_search_locale(stock_code, prefer_chinese=prefer_chinese)
                         )
+
+                    response = provider.search(
+                        dated_query,
+                        provider_max_results,
+                        days=window_days,
+                        **search_kwargs,
                     )
+                    filtered_response = self._filter_news_response(
+                        response,
+                        search_days=window_days,
+                        max_results=provider_max_results,
+                        log_scope=f"{stock_code}:{provider.name}:stock_news:{window_days}d",
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                    )
+                    had_provider_success = had_provider_success or bool(response.success)
+                    all_unverified.extend(filtered_response.unverified_results)
+                    window_attempts.append({
+                        "window_days": window_days,
+                        "provider": provider.name,
+                        "success": bool(response.success),
+                        "raw_count": len(response.results),
+                        "verified_recent_count": len(filtered_response.results),
+                        "date_unverified_count": len(filtered_response.unverified_results),
+                        "dropped_old_count": filtered_response.filter_counts.get("dropped_old", 0),
+                        "dropped_irrelevant_count": filtered_response.filter_counts.get("dropped_irrelevant", 0),
+                        "dropped_non_news_count": filtered_response.filter_counts.get("dropped_non_news", 0),
+                        "error": response.error_message,
+                    })
 
-                response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=search_days,
-                    max_results=provider_max_results,
-                    log_scope=f"{stock_code}:{provider.name}:stock_news",
-                )
-                had_provider_success = had_provider_success or bool(response.success)
-
-                if filtered_response.success and filtered_response.results:
+                    if not (filtered_response.success and filtered_response.results):
+                        continue
                     prioritized_response, preferred_count = self._prioritize_news_language(
                         filtered_response,
                         prefer_chinese=prefer_chinese,
@@ -3006,58 +3117,56 @@ class SearchService:
                         prioritized_response,
                         max_results=max_results,
                     )
-                    visible_preferred_count = min(preferred_count, len(limited_response.results))
-
-                    if not prefer_chinese:
-                        logger.info(f"使用 {provider.name} 搜索成功")
-                        self._put_cache(cache_key, limited_response)
-                        return limited_response
-
-                    if fallback_response is None:
-                        fallback_response = limited_response
-
-                    if visible_preferred_count > 0:
-                        logger.info(
-                            "%s 搜索成功，识别到 %s/%s 条中文新闻",
-                            provider.name,
-                            visible_preferred_count,
-                            len(limited_response.results),
-                        )
-                        if self._is_better_preferred_news_response(
+                    fallback_response = fallback_response or limited_response
+                    if self._is_better_preferred_news_response(
+                        limited_response,
+                        candidate_preferred_count=preferred_count,
+                        best_response=best_preferred_response,
+                        best_preferred_count=best_preferred_count,
+                    ):
+                        best_preferred_response = limited_response
+                        best_preferred_count = preferred_count
+                    visible_preferred_count = min(
+                        preferred_count,
+                        len(limited_response.results),
+                    )
+                    if not prefer_chinese or visible_preferred_count >= max_results:
+                        completed = replace(
                             limited_response,
-                            candidate_preferred_count=visible_preferred_count,
-                            best_response=best_preferred_response,
-                            best_preferred_count=best_preferred_count,
-                        ):
-                            best_preferred_response = limited_response
-                            best_preferred_count = visible_preferred_count
+                            result_state="verified_recent",
+                            search_window_days=window_days,
+                            window_attempts=window_attempts,
+                            unverified_results=_dedupe_search_results(all_unverified),
+                        )
+                        self._put_cache(cache_key, completed)
+                        return completed
 
-                        if visible_preferred_count >= max_results:
-                            self._put_cache(cache_key, limited_response)
-                            return limited_response
-                    else:
-                        logger.info(
-                            "%s 搜索成功但结果仍以英文为主，继续尝试下一引擎",
-                            provider.name,
-                        )
-                else:
-                    if response.success and not filtered_response.results:
-                        logger.info(
-                            "%s 搜索成功但过滤后无有效新闻，继续尝试下一引擎",
-                            provider.name,
-                        )
-                    else:
-                        logger.warning(
-                            "%s 搜索失败: %s，尝试下一个引擎",
-                            provider.name,
-                            response.error_message,
-                        )
-
-            if prefer_chinese:
                 best_to_return = best_preferred_response or fallback_response
                 if best_to_return is not None:
+                    best_to_return = replace(
+                        best_to_return,
+                        result_state="verified_recent",
+                        search_window_days=window_days,
+                        window_attempts=window_attempts,
+                        unverified_results=_dedupe_search_results(all_unverified),
+                    )
                     self._put_cache(cache_key, best_to_return)
                     return best_to_return
+
+            deduped_unverified = _dedupe_search_results(all_unverified)
+            if had_provider_success and deduped_unverified:
+                response = SearchResponse(
+                    query=query,
+                    results=[],
+                    provider="Filtered",
+                    success=True,
+                    result_state="date_unverified",
+                    search_window_days=30,
+                    unverified_results=deduped_unverified[:max_results],
+                    window_attempts=window_attempts,
+                )
+                self._put_cache(cache_key, response)
+                return response
 
             if had_provider_success:
                 return SearchResponse(
@@ -3066,6 +3175,9 @@ class SearchService:
                     provider="Filtered",
                     success=True,
                     error_message=None,
+                    result_state="no_verified_recent",
+                    search_window_days=30,
+                    window_attempts=window_attempts,
                 )
             
             # 所有引擎都失败
@@ -3430,6 +3542,78 @@ class SearchService:
             time.sleep(0.5)
         
         return results
+
+    def search_stock_fundamentals(
+        self,
+        stock_code: str,
+        stock_name: str,
+        max_results_per_dimension: int = 3,
+    ) -> Dict[str, SearchResponse]:
+        """Search slow-moving company fundamentals without news freshness filtering.
+
+        These materials supplement structured financial APIs. They remain source
+        documents rather than authoritative numeric statements, so callers must
+        preserve URLs and publication dates and mark the result as partial evidence.
+        """
+        if self._is_foreign_stock(stock_code):
+            queries = {
+                "financial_performance": (
+                    f"{stock_name} {stock_code} annual report revenue net income cash flow debt earnings"
+                ),
+                "business_and_risk": (
+                    f"{stock_name} {stock_code} business segments customers industry competition risk filing"
+                ),
+            }
+        else:
+            queries = {
+                "financial_performance": (
+                    f"{stock_name} {stock_code} 年报 半年报 营收 净利润 现金流 ROE 资产负债率 业绩预告"
+                ),
+                "business_and_risk": (
+                    f"{stock_name} {stock_code} 主营业务 收入构成 应收账款 存货 商誉 行业竞争 经营风险"
+                ),
+            }
+
+        providers = [provider for provider in self._providers if provider.is_available]
+        if not providers:
+            return {
+                dimension: SearchResponse(
+                    query=query,
+                    results=[],
+                    provider="None",
+                    success=False,
+                    error_message="未配置可用搜索引擎",
+                )
+                for dimension, query in queries.items()
+            }
+
+        provider = providers[0]
+        limit = max(1, min(int(max_results_per_dimension or 3), 5))
+
+        def _search(dimension: str, query: str) -> tuple[str, SearchResponse]:
+            response = provider.search(query, max_results=limit, days=3650)
+            return dimension, self._normalize_and_limit_response(response, max_results=limit)
+
+        results: Dict[str, SearchResponse] = {}
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            futures = {
+                executor.submit(_search, dimension, query): dimension
+                for dimension, query in queries.items()
+            }
+            for future in as_completed(futures):
+                dimension = futures[future]
+                try:
+                    result_dimension, response = future.result()
+                    results[result_dimension] = response
+                except Exception as exc:
+                    results[dimension] = SearchResponse(
+                        query=queries[dimension],
+                        results=[],
+                        provider=provider.name,
+                        success=False,
+                        error_message=str(exc),
+                    )
+        return {dimension: results[dimension] for dimension in queries}
     
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
         """

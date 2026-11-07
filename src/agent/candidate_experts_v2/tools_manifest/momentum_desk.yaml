@@ -542,17 +542,17 @@ tools:
     failure_modes:
       - 仅支持 A 股；样本不足、本地 K 线不足时会低置信返回。
 
-  - tool: get_stock_info
+  - tool: get_stock_business_context
     priority: 35
     when_to_use: >-
       获取行业/板块归属。辅助判断板块背景。
     typical_args:
       stock_code: "{code}"
     returns_summary: >-
-      返回行业、概念、流通股本。
+      返回行业、概念板块和业务摘要。
     key_fields:
       - industry
-      - sector
+      - boards
     combo_hints:
       - 板块轮动背景下，行业信息帮助判断补涨空间。
     cost: cheap

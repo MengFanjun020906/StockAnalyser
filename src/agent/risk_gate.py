@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from src.schemas.agent_context import AccountContext, InvestorProfile, PositionContext
 from src.schemas.agent_signal import (
@@ -20,6 +20,20 @@ from src.schemas.agent_signal import (
 
 FAILED_DATA_QUALITY = {"failed", "insufficient"}
 ACTIVE_ACTIONS = OPEN_ACTIONS | EXIT_ACTIONS
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_position_cap_pct(value: Optional[float]) -> Optional[float]:
+    """Convert ratio form (0.20) to Risk Gate's percent form (20.0)."""
+    if value is None:
+        return None
+    return value * 100.0 if 0 <= value <= 1 else value
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,9 @@ class RiskGateInput:
     failed_tools: Sequence[str] = ()
     l3_confidence: Optional[float] = None
     current_total_exposure_pct: Optional[float] = None
+    composite_verdict: Optional[Dict[str, Any]] = None
+    composite_clamp_applied: bool = False
+    composite_pre_clamp_target_position_pct: Optional[float] = None
 
 
 class RiskGateEvaluator:
@@ -80,8 +97,61 @@ class RiskGateEvaluator:
         checks.extend(self._check_confidence(gate_input))
         checks.extend(self._check_data_quality(gate_input))
         checks.extend(self._check_cash_and_exposure(gate_input))
+        checks.extend(self._check_composite_verdict_ceiling(gate_input))
 
         return self._build_result(gate_input.plan.action, checks)
+
+    def _check_composite_verdict_ceiling(self, gate_input: RiskGateInput) -> List[RiskGateCheck]:
+        verdict = gate_input.composite_verdict
+        if not isinstance(verdict, dict):
+            return []
+        shadow_mode = bool(verdict.get("shadow_mode", True))
+        clamp_applied = bool(gate_input.composite_clamp_applied)
+        raw_cap = _optional_float(verdict.get("target_position_cap_pct"))
+        cap = _normalize_position_cap_pct(raw_cap)
+        final_target = gate_input.plan.target_position_pct
+        missed_clamp = (
+            not shadow_mode
+            and cap is not None
+            and final_target is not None
+            and final_target > cap
+        )
+        details = {
+            "verdict_status": verdict.get("verdict_status"),
+            "score": verdict.get("score"),
+            "scale_max": verdict.get("scale_max"),
+            "shadow_mode": shadow_mode,
+            "target_position_cap_pct": cap,
+            "target_position_cap_raw": raw_cap,
+            "target_position_cap_unit": "pct" if raw_cap is None or abs(raw_cap) > 1 else "ratio",
+            "pre_clamp_target_position_pct": gate_input.composite_pre_clamp_target_position_pct,
+            "final_target_position_pct": gate_input.plan.target_position_pct,
+            "clamp_applied": clamp_applied,
+        }
+        if shadow_mode:
+            message = "综合评分处于影子模式，仅记录仓位上限审计，未截断交易计划。"
+        elif missed_clamp:
+            return [
+                self._fail(
+                    "composite_verdict_ceiling",
+                    "交易计划超过综合评分仓位上限，且进入 Risk Gate 前未完成截断。",
+                    suggested_action="manual_review",
+                    details=details,
+                )
+            ]
+        elif clamp_applied:
+            message = "交易计划已在进入 Risk Gate 前按综合评分仓位上限完成截断。"
+        else:
+            message = "交易计划未触发综合评分仓位上限截断。"
+        return [
+            RiskGateCheck(
+                rule_id="composite_verdict_ceiling",
+                passed=True,
+                severity="info",
+                message=message,
+                details=details,
+            )
+        ]
 
     def _check_special_status(self, gate_input: RiskGateInput) -> List[RiskGateCheck]:
         quote = gate_input.quote

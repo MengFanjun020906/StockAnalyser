@@ -443,7 +443,7 @@ Planner 不直接假设存在 `get_tools_for_capability`。当前阶段只输出
 - `get_board_capital_flow` 是板块资金统一入口：`flow_sources` 保留 DC 行业/概念/地域、THS 行业、THS 概念的不同统计口径，不能把三套来源的排名和金额当同一来源直接相加。
 - StockAPI 增强工具按需调用，不属于资金面默认全量必查：`get_stockapi_hot_sectors` 用于热点板块/概念资金确认；`get_stockapi_sector_constituents` 和 `get_stockapi_sector_flow_history` 仅在已有 `bkCode` 后展开；`get_stockapi_limit_up_pool` 用于涨停/短线情绪；`get_stockapi_popularity_rank` 用于人气/关注度；`get_stockapi_hot_money_activity` 用于游资或龙虎榜验证。
 - `chip_distribution` -> `get_chip_distribution`
-- `fundamental_analysis` -> `get_stock_info`, `get_tushare_daily_basic`, `get_tushare_financial_indicators`, `get_tushare_financial_statements`
+- `fundamental_analysis` -> 使用 `get_stock_business_context` 获取公司与行业上下文，并优先使用结构化工具 `get_tushare_daily_basic`, `get_tushare_financial_indicators`, `get_tushare_financial_statements`, `get_tushare_forecast`, `get_tushare_express`；结构化证据不完整时再用 `search_stock_fundamentals` 补充公开网页资料。网页摘要不能覆盖公告/财报数值，必须保留来源并降低结论强度。`get_stock_info` 已废弃，不得调用。
 - `sector_industry` -> `get_market_indices`, `get_sector_rankings`, `get_board_capital_flow`
 - `regime_detection` -> `detect_market_regime`, `get_market_sentiment_snapshot`, `get_market_indices`, `get_sector_rankings`, `get_volume_analysis`, `scan_global_risk_events`
 - `symbol_regime_probability` -> `get_symbol_regime_probability`

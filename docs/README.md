@@ -4,6 +4,7 @@
 
 ## 常用入口
 
+- [仓库布局与命名规范](architecture/repository-layout.md)：顶层目录职责、`vendor/` 第三方仓库规则和命名约定。
 - [完整指南](full-guide.md)：安装、配置、运行、WebUI、数据源和排障。
 - [LLM 配置指南](LLM_CONFIG_GUIDE.md)：模型渠道、OpenAI-compatible 路由和常见问题。
 - [FAQ](FAQ.md)：常见使用问题。
@@ -18,5 +19,6 @@
 - `plans/`：方案、路线图、实施计划、调研和旧稿归档。
 - `deployment/`：部署、迁移、桌面端打包和云端 WebUI 指南。
 - `integrations/`：外部项目、Skill 或产品集成评估。
+- `reviews/`：历史项目评审与核验记录。
 - `bot/`：机器人配置图文材料。
 - `i18n/`：英文 / 繁中首页和英文索引。

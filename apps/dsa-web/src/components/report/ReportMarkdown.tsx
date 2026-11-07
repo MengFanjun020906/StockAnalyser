@@ -211,7 +211,7 @@ export const ReportMarkdown: React.FC<ReportMarkdownProps> = ({
             whitespace-pre-line break-words
           "
         >
-          <Markdown remarkPlugins={[remarkGfm]}>
+          <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>
             {content}
           </Markdown>
         </div>

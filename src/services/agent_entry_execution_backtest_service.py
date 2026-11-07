@@ -17,6 +17,8 @@ from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from src.config import get_config
+from src.agent.pricing.backtest import evaluate_price_plan_backtest
+from src.agent.pricing.repository import PricePlanRepository
 from src.repositories.stock_repo import StockRepository
 from src.storage import DatabaseManager
 
@@ -26,7 +28,8 @@ DEFAULT_MAX_HOLD_DAYS = 30
 A_SHARE_T_PLUS_ONE_RULE = "cn_t_plus_1"
 MISSING_SIGNAL_VALIDITY_LABEL = "AI 未给出有效期，默认 5 个交易日内未触发买入则失效"
 MAX_SYMBOLS_PER_TRACE = 4
-STRATEGY_NAMES = ("strict_ai_entry", "next_open_baseline", "atr_elastic_entry", "breakout_fallback_entry")
+LEGACY_STRATEGY_NAMES = ("strict_ai_entry", "next_open_baseline", "atr_elastic_entry", "breakout_fallback_entry")
+STRATEGY_NAMES = LEGACY_STRATEGY_NAMES + ("deterministic_price_plan",)
 DEFAULT_MINUTE_FREQUENCY = "5"
 DEFAULT_MINUTE_ADJUSTFLAG = "3"
 REJECT_ACTIONS = {"reject", "skip", "avoid"}
@@ -60,6 +63,7 @@ class AgentEntryExecutionBacktestService:
     ) -> None:
         self.db = db_manager or DatabaseManager.get_instance()
         self.stock_repo = stock_repo or StockRepository(self.db)
+        self.price_plans = PricePlanRepository(self.db)
 
     @staticmethod
     def default_trace_root() -> Path:
@@ -87,7 +91,7 @@ class AgentEntryExecutionBacktestService:
 
     def build_backtests_for_trace(self, *, trace_dir: Path) -> List[Dict[str, Any]]:
         plan_items = self.collect_trade_plans_for_trace(trace_dir=trace_dir)
-        rows: List[Dict[str, Any]] = []
+        rows = self._build_price_plan_backtests_for_trace(trace_dir)
         for item in plan_items:
             trade_plan = item["trade_plan"]
             summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
@@ -111,6 +115,83 @@ class AgentEntryExecutionBacktestService:
                     warnings=warnings,
                     price_data=price_data,
                 )
+            )
+        return rows
+
+    def _build_price_plan_backtests_for_trace(self, trace_dir: Path) -> List[Dict[str, Any]]:
+        trace_id = trace_dir.name
+        artifacts = self.price_plans.list_artifacts_by_trace(trace_id)
+        trace_risk_payload = _read_json(trace_dir / "risk_gate.json")
+        trace_trade_plan_result = (
+            trace_risk_payload.get("trade_plan_result")
+            if isinstance(trace_risk_payload, dict)
+            else None
+        )
+        trace_account_decision = (
+            trace_trade_plan_result.get("account_decision")
+            if isinstance(trace_trade_plan_result, dict)
+            else None
+        )
+        rows: List[Dict[str, Any]] = []
+        for artifact in artifacts:
+            rules = self.price_plans.get_market_rules(artifact.market_rules_snapshot_ref)
+            account_decision = (
+                trace_account_decision
+                if isinstance(trace_account_decision, dict)
+                and trace_trade_plan_result.get("price_plan", {}).get("plan_id") == artifact.plan_id
+                else {}
+            )
+            max_window = max(
+                (
+                    item.confirmation_valid_trading_days
+                    + item.order_valid_trading_days
+                    + DEFAULT_MAX_HOLD_DAYS
+                    for item in artifact.scenarios
+                ),
+                default=DEFAULT_MAX_HOLD_DAYS,
+            )
+            bars: List[Any] = []
+            code = artifact.symbol
+            for candidate in _stock_code_candidates(code):
+                bars = self.stock_repo.get_forward_bars(
+                    code=candidate,
+                    analysis_date=artifact.actual_as_of_session,
+                    eval_window_days=max_window,
+                )
+                if bars:
+                    code = candidate
+                    break
+            evaluation = evaluate_price_plan_backtest(
+                artifact,
+                bars,
+                market_rules=rules,
+                max_hold_trading_days=DEFAULT_MAX_HOLD_DAYS,
+                selected_scenario_id=account_decision.get("selected_scenario_id"),
+            )
+            rows.append(
+                {
+                    "schema_version": "agent_entry_execution_backtest.v2",
+                    "trace_id": trace_id,
+                    "trace_dir": str(trace_dir),
+                    "decision_date": artifact.actual_as_of_session.isoformat(),
+                    "ts_code": code,
+                    "name": artifact.symbol,
+                    "rank": None,
+                    "trade_plan": artifact.model_dump(mode="json"),
+                    "evaluation": evaluation,
+                    "strategies": {"deterministic_price_plan": evaluation},
+                    "warnings": [],
+                    "parse_status": "structured",
+                    "price_data": {
+                        "granularity": "daily",
+                        "source": "stock_daily",
+                        "code": code,
+                        "bar_count": len(bars),
+                        "first_bar_at": _value_to_iso(_bar_timestamp(bars[0])) if bars else None,
+                        "last_bar_at": _value_to_iso(_bar_timestamp(bars[-1])) if bars else None,
+                        "daily_bars": _aggregate_daily_bars(bars),
+                    },
+                }
             )
         return rows
 
@@ -364,6 +445,7 @@ class AgentEntryExecutionBacktestService:
                     "next_open_baseline": next_open,
                     "atr_elastic_entry": elastic,
                     "breakout_fallback_entry": breakout,
+                    "deterministic_price_plan": _legacy_price_plan_skip(),
                 }, validation_warnings, {
                     "granularity": "minute",
                     "source": "stock_minute_bars",
@@ -426,6 +508,7 @@ class AgentEntryExecutionBacktestService:
             "next_open_baseline": next_open,
             "atr_elastic_entry": elastic,
             "breakout_fallback_entry": breakout,
+            "deterministic_price_plan": _legacy_price_plan_skip(),
         }, validation_warnings, {
             "granularity": "daily",
             "source": "stock_daily",
@@ -461,6 +544,17 @@ def _build_row(
         "warnings": warnings,
         "parse_status": trade_plan.get("parse_status"),
         "price_data": price_data or {},
+    }
+
+
+def _legacy_price_plan_skip() -> Dict[str, Any]:
+    return {
+        "strategy": "deterministic_price_plan",
+        "evaluation_status": "skipped",
+        "outcome": None,
+        "scenario_evaluations": [],
+        "policy_evaluation": {},
+        "unevaluable_reason": "legacy_unstructured_trade_plan",
     }
 
 

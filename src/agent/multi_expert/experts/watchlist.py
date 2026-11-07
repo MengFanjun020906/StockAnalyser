@@ -145,7 +145,7 @@ def build_fundamental_expert_opinion(state: AgentState) -> ExpertOpinion:
         dimension="fundamental",
         labels=("fundamental",),
         positive_summary="基本面证据已覆盖公司信息或估值字段。",
-        missing_hint="get_stock_info",
+        missing_hint="get_stock_business_context/financial_indicators/financial_statements/forecast",
     )
 
 

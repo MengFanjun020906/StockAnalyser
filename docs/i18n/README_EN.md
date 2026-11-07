@@ -28,7 +28,7 @@ English | [简体中文](../../README.md) | [繁體中文](README_CHT.md)
 
 <div align="center">
   <a href="https://serpapi.com/baidu-search-api?utm_source=github_stockanalyser" target="_blank">
-    <img src="../../sources/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" height="160">
+    <img src="../assets/serpapi_banner_en.png" alt="Easily scrape real-time financial news data from search engines - SerpApi" height="160">
   </a>
 </div>
 <br>
@@ -205,7 +205,7 @@ Full environment variables, model routing, notification channels, data-source pr
 
 ## 🖥️ Web UI
 
-![FastAPI Web UI](../../sources/fastapi_server.png)
+![FastAPI Web UI](../assets/fastapi_server.png)
 
 The Web workspace supports settings, task monitoring, manual analysis, history reports, backtest, portfolio management, smart import, and light/dark themes.
 
@@ -246,7 +246,7 @@ See supported features and release notes in the [Changelog](../CHANGELOG.md). Su
 
 | Alipay | WeChat Pay | Xiaohongshu |
 | :---: | :---: | :---: |
-| <img src="../../sources/alipay.jpg" width="200" alt="Alipay"> | <img src="../../sources/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../../sources/xiaohongshu.png" width="200" alt="Xiaohongshu"> |
+| <img src="../assets/alipay.jpg" width="200" alt="Alipay"> | <img src="../assets/wechatpay.jpg" width="200" alt="WeChat Pay"> | <img src="../assets/xiaohongshu.png" width="200" alt="Xiaohongshu"> |
 
 ## 🤝 Contributing
 

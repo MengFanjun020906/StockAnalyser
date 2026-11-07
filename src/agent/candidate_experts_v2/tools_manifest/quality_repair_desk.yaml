@@ -4,27 +4,6 @@ description: >-
   寻找被市场错杀或尚未定价的基本面拐点机会。
 
 tools:
-  - tool: get_stock_info
-    priority: 5
-    when_to_use: >-
-      获取行业/板块归属、股本、上市日期。
-      判断公司所在行业是否处于景气周期，股本结构是否适合资金进入。
-    typical_args:
-      stock_code: "{code}"
-    returns_summary: >-
-      返回行业、概念、流通股本、上市日期等基础信息。
-    key_fields:
-      - industry
-      - sector
-      - list_date
-      - float_share
-    combo_hints:
-      - 行业景气 + 小市值 = 修复弹性大。
-      - 超大盘股修复周期长，优先中小盘。
-    cost: cheap
-    failure_modes:
-      - 少数标的信息缺失。
-
   - tool: get_stock_business_context
     priority: 6
     when_to_use: >-

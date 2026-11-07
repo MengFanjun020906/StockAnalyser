@@ -126,7 +126,11 @@ def _build_packets(run_id: str, cards: list[EvidenceCard], stock: StockRef | Non
         ("technical_expert", "technical", "analyze_trend/analyze_price_structure"),
         ("capital_chip_expert", "capital_chip", "get_capital_flow/get_chip_distribution"),
         ("news_sentiment_expert", "news_sentiment", "search_comprehensive_intel/sentiment_tools"),
-        ("fundamental_expert", "fundamental", "get_stock_info"),
+        (
+            "fundamental_expert",
+            "fundamental",
+            "get_stock_business_context/financial_indicators/financial_statements/forecast",
+        ),
         ("market_regime_expert", "market_regime", "detect_market_regime/get_sector_rankings"),
     ]
     return [

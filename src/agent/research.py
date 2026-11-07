@@ -48,7 +48,9 @@ class ResearchAgent:
     tool_names = [
         "search_stock_news",
         "search_comprehensive_intel",
-        "get_stock_info",
+        "get_stock_business_context",
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
         "get_realtime_quote",
         "get_daily_history",
         "get_sector_rankings",

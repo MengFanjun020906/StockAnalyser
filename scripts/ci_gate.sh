@@ -22,7 +22,7 @@ flake8_checks() {
     flake8_cmd=("$PYTHON_BIN" -m flake8)
   fi
   "${flake8_cmd[@]}" . \
-      --exclude=.git,.venv,venv,__pycache__,node_modules,static,openInvest,graphiti,Sequoia-X,alphasift \
+      --exclude=.git,.venv,venv,__pycache__,node_modules,static,vendor \
       --count --select=E9,F63,F7,F82 --show-source --statistics
 }
 
@@ -34,8 +34,7 @@ deterministic_checks() {
 
 offline_test_suite() {
   echo "==> backend-gate: offline test suite"
-  "$PYTHON_BIN" -m pytest -m "not network" \
-    --ignore=openInvest --ignore=graphiti --ignore=Sequoia-X --ignore=alphasift
+  "$PYTHON_BIN" -m pytest -m "not network" --ignore=vendor
 }
 
 run_all() {

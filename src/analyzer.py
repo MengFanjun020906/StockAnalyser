@@ -109,14 +109,6 @@ def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
     intel = intel if isinstance(intel, dict) else None
     if intel is None or "risk_alerts" not in intel:
         missing.append("dashboard.intelligence.risk_alerts")
-    if result.decision_type in ("buy", "hold"):
-        battle = dash.get("battle_plan")
-        battle = battle if isinstance(battle, dict) else {}
-        sp = battle.get("sniper_points")
-        sp = sp if isinstance(sp, dict) else {}
-        stop_loss = sp.get("stop_loss")
-        if stop_loss is None or (isinstance(stop_loss, str) and not stop_loss.strip()):
-            missing.append("dashboard.battle_plan.sniper_points.stop_loss")
     return len(missing) == 0, missing
 
 
@@ -145,14 +137,6 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
                 result.dashboard["intelligence"] = {}
             if "risk_alerts" not in result.dashboard["intelligence"]:
                 result.dashboard["intelligence"]["risk_alerts"] = []
-        elif field == "dashboard.battle_plan.sniper_points.stop_loss":
-            if not result.dashboard:
-                result.dashboard = {}
-            if "battle_plan" not in result.dashboard:
-                result.dashboard["battle_plan"] = {}
-            if "sniper_points" not in result.dashboard["battle_plan"]:
-                result.dashboard["battle_plan"]["sniper_points"] = {}
-            result.dashboard["battle_plan"]["sniper_points"]["stop_loss"] = placeholder
 
 
 # ---------- chip_structure fallback (Issue #589) ----------
@@ -832,10 +816,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "N/A（由确定性价格引擎后处理）",
+                "secondary_buy": "N/A（由确定性价格引擎后处理）",
+                "stop_loss": "N/A（由确定性价格引擎后处理）",
+                "take_profit": "N/A（由确定性价格引擎后处理）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -982,10 +966,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想入场位：XX元（满足主要技能触发条件）",
-                "secondary_buy": "次优入场位：XX元（更保守或确认后执行）",
-                "stop_loss": "止损位：XX元（失效条件或X%风险）",
-                "take_profit": "目标位：XX元（按阻力位/风险回报比制定）"
+                "ideal_buy": "N/A（由确定性价格引擎后处理）",
+                "secondary_buy": "N/A（由确定性价格引擎后处理）",
+                "stop_loss": "N/A（由确定性价格引擎后处理）",
+                "take_profit": "N/A（由确定性价格引擎后处理）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2068,7 +2052,7 @@ class GeminiAnalyzer:
 2. ❓ 当前入场位置与风险回报是否合理？若偏离过大，请明确说明等待条件
 3. ❓ 量能、波动与筹码结构是否支持当前结论？
 4. ❓ 消息面有无重大利空或与技能结论冲突的信息？
-5. ❓ 若结论成立，具体触发条件、止损位、观察点分别是什么？
+5. ❓ 若结论成立，定性触发条件、失效依据和观察点分别是什么？价格字段必须写 N/A，由确定性价格引擎后处理。
 """
         prompt += f"""
 
@@ -2076,7 +2060,7 @@ class GeminiAnalyzer:
 - **股票名称**：必须输出正确的中文全称（如"贵州茅台"而非"股票600519"）
 - **核心结论**：一句话说清该买/该卖/该等
 - **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
-- **具体狙击点位**：买入价、止损价、目标价（精确到分）
+- **确定性价格权限**：买入价、止损价、目标价统一写 N/A，不得自行生成；报告后处理阶段由确定性价格引擎提供唯一有效价格
 - **检查清单**：每项用 ✅/⚠️/❌ 标记
 - **消息面时间合规**：`latest_news`、`risk_alerts`、`positive_catalysts` 不得包含超出近{news_window_days}日或时间未知的信息
 - **技术面一致性**：严禁把“空头排列”和“多头排列”等互斥结论同时当作有效依据；若基本面/事件面与技术面冲突，必须明确写“事件先行、技术待确认”或“基本面偏多，但技术面尚未确认”
@@ -2214,8 +2198,6 @@ class GeminiAnalyzer:
                     lines.append("- dashboard.core_conclusion.one_sentence: one-line decision")
                 elif f == "dashboard.intelligence.risk_alerts":
                     lines.append("- dashboard.intelligence.risk_alerts: risk alert list (can be empty)")
-                elif f == "dashboard.battle_plan.sniper_points.stop_loss":
-                    lines.append("- dashboard.battle_plan.sniper_points.stop_loss: stop-loss level")
             return "\n".join(lines)
 
         lines = ["### 补全要求：请在上方分析基础上补充以下必填内容，并输出完整 JSON："]
@@ -2230,8 +2212,6 @@ class GeminiAnalyzer:
                 lines.append("- dashboard.core_conclusion.one_sentence: 一句话决策")
             elif f == "dashboard.intelligence.risk_alerts":
                 lines.append("- dashboard.intelligence.risk_alerts: 风险警报列表（可为空数组）")
-            elif f == "dashboard.battle_plan.sniper_points.stop_loss":
-                lines.append("- dashboard.battle_plan.sniper_points.stop_loss: 止损价")
         return "\n".join(lines)
 
     def _build_integrity_retry_prompt(

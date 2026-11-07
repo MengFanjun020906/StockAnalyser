@@ -46,3 +46,16 @@ Append one entry per run. Prune entries older than 30 days.
   "outcome": "fix-implemented-validated"
 }
 ```
+
+```json
+{
+  "run_id": "2026-07-25T21:38:53+08:00",
+  "pattern": "autonomous-kronos-a-share-daily-patterns",
+  "duration_s": 3900,
+  "items_found": 7,
+  "actions_taken": 12,
+  "escalations": 3,
+  "tokens_estimate": 410000,
+  "outcome": "fix-implemented-validated"
+}
+```

@@ -194,6 +194,136 @@ class StockMinuteBar(Base):
         }
 
 
+class JevEvaluation(Base):
+    """Immutable daily shadow observations; never orders or trading permissions."""
+
+    __tablename__ = "jev_evaluations"
+
+    id = Column(String(64), primary_key=True)
+    stock_code = Column(String(32), nullable=False, index=True)
+    market = Column(String(8), nullable=False)
+    as_of = Column(Date, nullable=False, index=True)
+    purpose = Column(String(16), nullable=False)
+    status = Column(String(32), nullable=False)
+    source = Column(String(32), nullable=False)
+    source_ref = Column(String(128), nullable=True, index=True)
+    payload_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class KronosModelRun(Base):
+    """One Kronos inference run for a daily A-share K-line window."""
+
+    __tablename__ = 'kronos_model_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(80), nullable=False, unique=True, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn', index=True)
+    frequency = Column(String(8), nullable=False, default='1d', index=True)
+    status = Column(String(32), nullable=False, default='ok', index=True)
+
+    model_name = Column(String(255))
+    tokenizer_name = Column(String(255))
+    device = Column(String(32))
+    max_context = Column(Integer)
+    lookback = Column(Integer)
+    pred_len = Column(Integer)
+    history_source = Column(String(80))
+
+    as_of = Column(String(32), index=True)
+    data_quality_json = Column(Text)
+    diagnostics_json = Column(Text)
+    started_at = Column(DateTime, default=datetime.now, index=True)
+    finished_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_kronos_runs_code_asof', 'code', 'as_of'),
+        Index('ix_kronos_runs_status_created', 'status', 'created_at'),
+    )
+
+
+class KronosSignal(Base):
+    """Kronos forecast summary and pattern-level signal for one stock/date."""
+
+    __tablename__ = 'kronos_signals'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(80), ForeignKey('kronos_model_runs.run_id'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn', index=True)
+    frequency = Column(String(8), nullable=False, default='1d')
+    as_of = Column(String(32), index=True)
+    bias = Column(String(32), index=True)
+    confidence = Column(Float)
+    expected_return_pct = Column(Float)
+    risk_reward = Column(Float)
+    pattern_count = Column(Integer, default=0)
+    signal_json = Column(Text)
+    forecast_summary_json = Column(Text)
+    source_chain_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_kronos_signals_code_asof_bias', 'code', 'as_of', 'bias'),
+    )
+
+
+class KronosForecastPoint(Base):
+    """One forecasted OHLCV point produced by Kronos."""
+
+    __tablename__ = 'kronos_forecast_points'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(80), ForeignKey('kronos_model_runs.run_id'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    horizon_index = Column(Integer, nullable=False)
+    forecast_time = Column(String(32), nullable=False, index=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Float)
+    amount = Column(Float)
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'horizon_index', name='uix_kronos_forecast_run_horizon'),
+        Index('ix_kronos_forecast_code_time', 'code', 'forecast_time'),
+    )
+
+
+class KronosPatternInstance(Base):
+    """Detected K-line pattern interval for chart annotation and seed evidence."""
+
+    __tablename__ = 'kronos_pattern_instances'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    pattern_id = Column(String(64), nullable=False, index=True)
+    run_id = Column(String(80), ForeignKey('kronos_model_runs.run_id'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    pattern_type = Column(String(48), nullable=False, index=True)
+    label = Column(String(80))
+    direction = Column(String(24), index=True)
+    confidence = Column(Float)
+    start_time = Column(String(32), nullable=False, index=True)
+    end_time = Column(String(32), nullable=False, index=True)
+    price_low = Column(Float)
+    price_high = Column(Float)
+    red_box_json = Column(Text)
+    summary = Column(Text)
+    evidence_json = Column(Text)
+    seed_gate_status = Column(String(32), default='backtest_pending', index=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'pattern_id', name='uix_kronos_pattern_run_pattern'),
+        Index('ix_kronos_patterns_code_type_end', 'code', 'pattern_type', 'end_time'),
+        Index('ix_kronos_patterns_gate_created', 'seed_gate_status', 'created_at'),
+    )
+
+
 class NewsIntel(Base):
     """
     新闻情报数据模型
@@ -1058,6 +1188,356 @@ class PortfolioDailySnapshot(Base):
     )
 
 
+class TradePlanArtifactRecord(Base):
+    """Immutable account-independent deterministic price plan."""
+
+    __tablename__ = 'trade_plan_artifacts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String(128), nullable=False, unique=True, index=True)
+    revision = Column(Integer, nullable=False, default=1)
+    supersedes_plan_id = Column(String(128), index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn', index=True)
+    timeframe = Column(String(8), nullable=False, default='1d')
+    requested_as_of = Column(Date, nullable=False, index=True)
+    actual_as_of_session = Column(Date, nullable=False, index=True)
+    generation_status = Column(String(24), nullable=False, index=True)
+    valid_until = Column(Date, index=True)
+    data_fingerprint = Column(String(80), nullable=False, index=True)
+    calculation_fingerprint = Column(String(80), nullable=False, unique=True, index=True)
+    plan_fingerprint = Column(String(80), nullable=False, unique=True, index=True)
+    algorithm_version = Column(String(64), nullable=False)
+    params_version = Column(String(64), nullable=False)
+    artifact_json = Column(Text, nullable=False)
+    trace_ref = Column(String(128), index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'revision', name='uix_trade_plan_symbol_revision'),
+        Index('ix_trade_plan_symbol_as_of', 'symbol', 'actual_as_of_session'),
+    )
+
+
+class TradePlanTraceLink(Base):
+    """Many-to-one trace association for an immutable price plan."""
+
+    __tablename__ = 'trade_plan_trace_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trace_ref = Column(String(128), nullable=False, index=True)
+    plan_id = Column(
+        String(128),
+        ForeignKey('trade_plan_artifacts.plan_id'),
+        nullable=False,
+        index=True,
+    )
+    linked_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('trace_ref', 'plan_id', name='uix_trade_plan_trace_link'),
+    )
+
+
+class PlanReviewArtifactRecord(Base):
+    """Immutable LLM review that can cite but never alter a price plan."""
+
+    __tablename__ = 'plan_review_artifacts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    review_id = Column(String(128), nullable=False, unique=True, index=True)
+    plan_id = Column(String(128), ForeignKey('trade_plan_artifacts.plan_id'), nullable=False, index=True)
+    scenario_id = Column(String(128), index=True)
+    evidence_bundle_fingerprint = Column(String(80), nullable=False, index=True)
+    prompt_version = Column(String(64), nullable=False)
+    model_ref = Column(String(128), nullable=False)
+    conclusion = Column(String(24), nullable=False, index=True)
+    review_status = Column(String(24), nullable=False, index=True)
+    review_fingerprint = Column(String(80), nullable=False, unique=True, index=True)
+    artifact_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+
+class AccountPlanDecisionRecord(Base):
+    """Account/risk-profile decision over an immutable plan."""
+
+    __tablename__ = 'account_plan_decisions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    decision_id = Column(String(128), nullable=False, unique=True, index=True)
+    plan_id = Column(String(128), ForeignKey('trade_plan_artifacts.plan_id'), nullable=False, index=True)
+    owner_id = Column(String(64), index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), index=True)
+    selected_scenario_id = Column(String(128), index=True)
+    risk_profile = Column(String(24), nullable=False, index=True)
+    execution_status = Column(String(32), nullable=False, index=True)
+    input_fingerprint = Column(String(80), nullable=False, index=True)
+    artifact_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+
+class PricePlanLifecycleEvent(Base):
+    """Append-only event stream for one price-plan scenario."""
+
+    __tablename__ = 'plan_lifecycle_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    plan_id = Column(String(128), ForeignKey('trade_plan_artifacts.plan_id'), nullable=False, index=True)
+    scenario_id = Column(String(128), nullable=False, index=True)
+    event_type = Column(String(32), nullable=False, index=True)
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    as_of = Column(DateTime, nullable=False, index=True)
+    dedupe_key = Column(String(192), nullable=False, unique=True, index=True)
+    payload_json = Column(Text)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_plan_lifecycle_event_scenario_time', 'plan_id', 'scenario_id', 'occurred_at'),
+    )
+
+
+class PricePlanLifecycleStateRecord(Base):
+    """Versioned materialized lifecycle state for one scenario."""
+
+    __tablename__ = 'plan_lifecycle_states'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String(128), ForeignKey('trade_plan_artifacts.plan_id'), nullable=False, index=True)
+    scenario_id = Column(String(128), nullable=False, index=True)
+    state_version = Column(Integer, nullable=False, default=1)
+    state = Column(String(24), nullable=False, default='waiting_touch', index=True)
+    first_touched_at = Column(DateTime)
+    confirmed_at = Column(DateTime)
+    invalidated_at = Column(DateTime)
+    expired_at = Column(DateTime)
+    last_evaluated_as_of = Column(Date, nullable=False, index=True)
+    last_event_id = Column(String(128), nullable=False, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('plan_id', 'scenario_id', name='uix_plan_lifecycle_state_scenario'),
+    )
+
+
+class MarketRuleSnapshotRecord(Base):
+    """Immutable versioned market-rule snapshot used by price planning."""
+
+    __tablename__ = 'market_rule_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(128), nullable=False, unique=True, index=True)
+    symbol = Column(String(16), index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    venue = Column(String(16), nullable=False, index=True)
+    board = Column(String(24), nullable=False, index=True)
+    snapshot_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_market_rule_symbol_date', 'symbol', 'trade_date'),
+    )
+
+
+class ChipDistributionSnapshotRecord(Base):
+    """Observed-at bounded chip snapshot for reproducible historical plans."""
+
+    __tablename__ = 'chip_distribution_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(128), nullable=False, unique=True, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    observed_at = Column(DateTime, nullable=False, index=True)
+    source = Column(String(64), nullable=False, index=True)
+    normalized_json = Column(Text, nullable=False)
+    raw_payload_json = Column(Text)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_chip_snapshot_symbol_date_observed', 'symbol', 'trade_date', 'observed_at'),
+    )
+
+
+class EntrySignal(Base):
+    """Current materialized state for one single-stock entry plan."""
+
+    __tablename__ = 'entry_signals'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(String(128), nullable=False, unique=True, index=True)
+    plan_id = Column(String(128), ForeignKey('trade_plan_artifacts.plan_id'), index=True)
+    scenario_id = Column(String(128), index=True)
+    owner_id = Column(String(64), index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(128))
+    market = Column(String(8), nullable=False, default='cn', index=True)
+    signal_type = Column(String(24), nullable=False, default='entry', index=True)
+    setup_type = Column(String(32), nullable=False, default='agent_entry')
+    direction = Column(String(8), nullable=False, default='long')
+    status = Column(String(24), nullable=False, default='active', index=True)
+    revision = Column(Integer, nullable=False, default=1)
+    entry_low = Column(Float)
+    entry_high = Column(Float)
+    stop_price = Column(Float)
+    trigger_rule_json = Column(Text)
+    invalidation_rules_json = Column(Text)
+    created_as_of = Column(DateTime, nullable=False, index=True)
+    last_checked_as_of = Column(DateTime, nullable=False, index=True)
+    valid_trading_days = Column(Integer, nullable=False, default=5)
+    valid_until = Column(Date, nullable=False, index=True)
+    evidence_quality = Column(String(24), nullable=False, default='ok')
+    source_trace_id = Column(String(128), index=True)
+    supersedes_signal_id = Column(String(128), index=True)
+    linked_watch_id = Column(String(128), index=True)
+    version = Column(Integer, nullable=False, default=1)
+    metadata_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index('ix_entry_signal_owner_symbol_status', 'owner_id', 'stock_code', 'market', 'status'),
+        Index('ix_entry_signal_status_valid_until', 'status', 'valid_until'),
+        Index('ix_entry_signal_account_symbol_status', 'account_id', 'stock_code', 'status'),
+        Index('ix_entry_signal_owner_plan', 'owner_id', 'plan_id'),
+    )
+
+
+class SignalLifecycleEvent(Base):
+    """Append-only lifecycle event for :class:`EntrySignal`."""
+
+    __tablename__ = 'signal_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    signal_id = Column(String(128), ForeignKey('entry_signals.signal_id'), nullable=False, index=True)
+    event_type = Column(String(32), nullable=False, index=True)
+    from_status = Column(String(24))
+    to_status = Column(String(24))
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    as_of = Column(DateTime, nullable=False, index=True)
+    source = Column(String(32), nullable=False)
+    source_trace_id = Column(String(128), index=True)
+    dedupe_key = Column(String(192), nullable=False, unique=True, index=True)
+    payload_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_signal_event_signal_occurred', 'signal_id', 'occurred_at', 'id'),
+    )
+
+
+class PositionWatch(Base):
+    """Current monitoring state for one continuous portfolio holding cycle."""
+
+    __tablename__ = 'position_watches'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    watch_id = Column(String(128), nullable=False, unique=True, index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    owner_id = Column(String(64), index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    stock_name = Column(String(128))
+    market = Column(String(8), nullable=False, default='cn', index=True)
+    position_cycle_id = Column(Integer, nullable=False, default=1)
+    status = Column(String(24), nullable=False, default='active', index=True)
+    quantity = Column(Float, nullable=False, default=0.0)
+    average_cost = Column(Float, nullable=False, default=0.0)
+    stop_price = Column(Float)
+    opened_at = Column(DateTime, nullable=False, index=True)
+    last_checked_as_of = Column(DateTime, nullable=False, index=True)
+    source_position_updated_at = Column(DateTime)
+    risk_level = Column(String(16), nullable=False, default='low', index=True)
+    current_action = Column(String(16), nullable=False, default='hold', index=True)
+    latest_score = Column(Integer)
+    latest_exit_warning_level = Column(Integer, nullable=False, default=0)
+    version = Column(Integer, nullable=False, default=1)
+    metadata_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'account_id',
+            'stock_code',
+            'market',
+            'position_cycle_id',
+            name='uix_position_watch_account_symbol_cycle',
+        ),
+        Index('ix_position_watch_account_status', 'account_id', 'status'),
+        Index('ix_position_watch_symbol_status', 'stock_code', 'market', 'status'),
+    )
+
+
+class PositionWatchEvent(Base):
+    """Append-only check and state-change event for a position watch."""
+
+    __tablename__ = 'position_watch_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    watch_id = Column(String(128), ForeignKey('position_watches.watch_id'), nullable=False, index=True)
+    event_type = Column(String(32), nullable=False, index=True)
+    from_status = Column(String(24))
+    to_status = Column(String(24))
+    occurred_at = Column(DateTime, nullable=False, index=True)
+    as_of = Column(DateTime, nullable=False, index=True)
+    source = Column(String(32), nullable=False)
+    source_trace_id = Column(String(128), index=True)
+    dedupe_key = Column(String(192), nullable=False, unique=True, index=True)
+    payload_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_position_watch_event_watch_occurred', 'watch_id', 'occurred_at', 'id'),
+    )
+
+
+class SignalSchedulerState(Base):
+    """Heartbeat and last-run projection for the separate schedule worker."""
+
+    __tablename__ = 'signal_scheduler_states'
+
+    market = Column(String(8), primary_key=True)
+    status = Column(String(24), nullable=False, default='idle', index=True)
+    heartbeat_at = Column(DateTime, nullable=False, index=True)
+    last_started_at = Column(DateTime)
+    last_success_at = Column(DateTime)
+    last_trading_date = Column(Date, index=True)
+    next_run_at = Column(DateTime)
+    watch_count = Column(Integer, nullable=False, default=0)
+    l1_count = Column(Integer, nullable=False, default=0)
+    error = Column(Text)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class SignalNotificationOutbox(Base):
+    """Durable delivery queue for state-change notifications."""
+
+    __tablename__ = 'signal_notification_outbox'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notification_id = Column(String(128), nullable=False, unique=True, index=True)
+    dedupe_key = Column(String(192), nullable=False, unique=True, index=True)
+    watch_id = Column(String(128), nullable=False, index=True)
+    state_version = Column(Integer, nullable=False)
+    action = Column(String(16), nullable=False)
+    channel = Column(String(32), nullable=False, default='all')
+    status = Column(String(16), nullable=False, default='pending', index=True)
+    payload_json = Column(Text)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=False, index=True)
+    last_error = Column(Text)
+    sent_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        Index('ix_signal_notification_status_next_attempt', 'status', 'next_attempt_at'),
+    )
+
+
 class PortfolioFxRate(Base):
     """Cached FX rates used for cross-currency portfolio conversion."""
 
@@ -1291,6 +1771,60 @@ class DatabaseManager:
         self._migrate_graphiti_outbox()
         self._migrate_news_event_sentinel()
         self._migrate_seed_pool_snapshot_unique_key()
+        self._migrate_trade_plan_schema()
+
+    def _migrate_trade_plan_schema(self) -> None:
+        """Create deterministic price-plan tables and legacy signal references."""
+        with self._engine.begin() as conn:
+            for table_name in (
+                'trade_plan_artifacts',
+                'trade_plan_trace_links',
+                'plan_review_artifacts',
+                'account_plan_decisions',
+                'plan_lifecycle_events',
+                'plan_lifecycle_states',
+                'market_rule_snapshots',
+                'chip_distribution_snapshots',
+            ):
+                Base.metadata.tables[table_name].create(bind=conn, checkfirst=True)
+
+            market_rule_table = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='market_rule_snapshots'"
+            ).fetchone()
+            if market_rule_table is not None:
+                self._add_sqlite_column_if_missing(
+                    conn,
+                    'market_rule_snapshots',
+                    'symbol',
+                    "ALTER TABLE market_rule_snapshots ADD COLUMN symbol VARCHAR(16)",
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_market_rule_symbol_date "
+                    "ON market_rule_snapshots (symbol, trade_date)"
+                )
+
+            entry_signal_table = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='entry_signals'"
+            ).fetchone()
+            if entry_signal_table is not None:
+                self._add_sqlite_column_if_missing(
+                    conn,
+                    'entry_signals',
+                    'plan_id',
+                    "ALTER TABLE entry_signals ADD COLUMN plan_id VARCHAR(128)",
+                )
+                self._add_sqlite_column_if_missing(
+                    conn,
+                    'entry_signals',
+                    'scenario_id',
+                    "ALTER TABLE entry_signals ADD COLUMN scenario_id VARCHAR(128)",
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_entry_signals_plan_id ON entry_signals (plan_id)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_entry_signals_scenario_id ON entry_signals (scenario_id)"
+                )
 
     def _migrate_news_event_sentinel(self) -> None:
         with self._engine.begin() as conn:

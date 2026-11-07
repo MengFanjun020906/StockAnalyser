@@ -30,6 +30,12 @@ _TOOL_DIMENSION = {
     "get_capital_flow": "capital_flow",
     "get_chip_distribution": "chip",
     "get_stock_info": "fundamental",
+    "get_tushare_daily_basic": "fundamental",
+    "get_tushare_financial_indicators": "fundamental",
+    "get_tushare_financial_statements": "fundamental",
+    "get_tushare_forecast": "fundamental",
+    "get_tushare_express": "fundamental",
+    "search_stock_fundamentals": "fundamental",
     "search_comprehensive_intel": "news_event",
     "detect_market_regime": "regime",
     "get_sector_rankings": "sector",
@@ -256,6 +262,7 @@ def _missing_fields_for(tool_name: str, raw: Dict[str, Any]) -> List[str]:
         "get_chip_distribution": ["profit_ratio", "avg_cost"],
         "get_stock_info": ["name"],
         "search_comprehensive_intel": ["report"],
+        "search_stock_fundamentals": ["materials"],
         "detect_market_regime": ["regime", "risk_level"],
     }.get(tool_name, [])
     return [field for field in required if raw.get(field) in (None, "", [], {})]
@@ -278,7 +285,15 @@ def _signals_for(tool_name: str, raw: Dict[str, Any]) -> List[EvidenceSignal]:
         return _capital_signals(raw)
     if tool_name == "get_chip_distribution":
         return _chip_signals(raw)
-    if tool_name == "get_stock_info":
+    if tool_name in {
+        "get_stock_info",
+        "get_tushare_daily_basic",
+        "get_tushare_financial_indicators",
+        "get_tushare_financial_statements",
+        "get_tushare_forecast",
+        "get_tushare_express",
+        "search_stock_fundamentals",
+    }:
         return _fundamental_signals(raw)
     if tool_name == "search_comprehensive_intel":
         return _news_signals(raw)

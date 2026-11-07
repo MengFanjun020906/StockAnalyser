@@ -41,7 +41,7 @@ MOMENTUM_DESK_TOOLS: tuple[str, ...] = (
     "get_tushare_moneyflow_ind_ths",
     "get_tushare_moneyflow_cnt_ths",
     "get_symbol_regime_probability",
-    "get_stock_info",
+    "get_stock_business_context",
 )
 
 # FeatureFlag/source kinds that signal trend-continuation eligibility.

@@ -10,7 +10,7 @@
 #   bash scripts/daily_run.sh --dry-run              # 只打印，不执行
 #
 # 执行顺序:
-#   1. update_sequoia_candidates.py   (baostock, 更新 stock_daily 个股日线 + 上证指数)
+#   1. update_sequoia_candidates.py   (tushare, 批量更新 stock_daily 个股日线 + 指数)
 #   2. update_fundamental_candidates.py (tushare, 更新财务快照, 可跳过)
 #   3. maintain_news_signals.py       (opt-in, 新闻卡片/事件/outcome/Graphiti repair)
 #   4. evaluate_seed_pool_quality.py  (opt-in, Seed Pool T+1 质量评估)
@@ -135,7 +135,7 @@ log "状态文件: $STATE_FILE"
 sep
 log "关键配置检查"
 info "TUSHARE_TOKEN        : $(masked "${TUSHARE_TOKEN:-}")"
-info "SEQUOIA_DB           : ${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db (默认)}"
+info "SEQUOIA_DB           : ${SEQUOIA_CANDIDATE_DB_PATH:-vendor/Sequoia-X/data/sequoia_v2.db (默认)}"
 info "FUNDAMENTAL_DB       : ${AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH:-(未配置)}"
 info "STOCK_LIST           : ${STOCK_LIST:-(未配置，使用默认)}"
 info "CANDIDATE_MODE       : ${AGENT_CANDIDATE_DISCOVERY_MODE:-(未配置)}"
@@ -143,7 +143,7 @@ info "NEWS_SIGNAL_DAILY    : ${NEWS_SIGNAL_DAILY_ENABLED:-false}"
 info "GRAPH_REPAIR_MODE    : ${NEWS_SIGNAL_GRAPH_REPAIR_MODE:-edges}"
 info "SEED_QUALITY_DAILY   : ${SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED:-false}"
 
-SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-Sequoia-X/data/sequoia_v2.db}"
+SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-vendor/Sequoia-X/data/sequoia_v2.db}"
 STEP1_TARGET_DATE=$("$PYTHON" - <<'PY' 2>/dev/null
 from scripts.update_sequoia_candidates import resolve_cn_resume_target_date
 
@@ -161,7 +161,7 @@ STEP1_KEY="step1_stock_daily_with_index_${STEP1_TARGET_DATE}"
 # Step 1: 更新 stock_daily 日线
 # ============================================================
 sep
-log ">>> [1/4] 更新 stock_daily 日线缓存 + 上证指数  (baostock)"
+log ">>> [1/4] 更新 stock_daily 日线缓存 + 指数  (tushare bulk daily + adj_factor)"
 
 if step_done "$STEP1_KEY"; then
     ok "已完成（跳过）  —  使用上次结果: $(db_stat "$SEQUOIA_DB")"
@@ -173,7 +173,7 @@ else
     if [ "$DRY_RUN" = true ]; then
         warn "dry-run: 跳过（不写入状态，重跑仍会执行）"
     else
-        if "$PYTHON" scripts/update_sequoia_candidates.py --trading-days 260; then
+        if "$PYTHON" scripts/update_sequoia_candidates.py --source tushare --trading-days 260; then
             ok "stock_daily 更新完成  (耗时: $(elapsed $((SECONDS - T1))))"
             info "更新后: $(db_stat "$SEQUOIA_DB")"
             mark_done "$STEP1_KEY"
@@ -202,7 +202,7 @@ else
     FUND_DB="${AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH:-}"
     if [ -n "$FUND_DB" ] && [ -f "$FUND_DB" ]; then
         FUND_ROWS=$(sqlite3 "$FUND_DB" \
-            "SELECT COUNT(DISTINCT ts_code) FROM fundamental_candidate_snapshot;" 2>/dev/null || echo "?")
+            "SELECT COUNT(DISTINCT code) FROM fundamental_candidate_snapshot;" 2>/dev/null || echo "?")
         info "当前快照: $FUND_ROWS 只股票"
     fi
     T2=$SECONDS

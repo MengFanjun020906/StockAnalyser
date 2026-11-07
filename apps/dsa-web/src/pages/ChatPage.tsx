@@ -873,7 +873,7 @@ const ChatPage: React.FC = () => {
                           </button>
                         </div>
                         <div className="chat-prose pr-20 sm:pr-24">
-                          <Markdown remarkPlugins={[remarkGfm]}>
+              <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>
                             {msg.content}
                           </Markdown>
                         </div>

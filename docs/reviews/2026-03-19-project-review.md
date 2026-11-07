@@ -357,7 +357,7 @@
 
 以下文件是本次核验中重点参考的依据：
 
-- `review.md` 原始内容
+- `docs/reviews/2026-03-19-project-review.md` 原始内容
 - `docs/CHANGELOG.md`
 - `src/config.py`
 - `src/core/config_registry.py`

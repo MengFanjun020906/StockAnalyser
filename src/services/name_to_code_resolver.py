@@ -12,6 +12,7 @@ from __future__ import annotations
 import difflib
 import logging
 import time
+from functools import lru_cache
 from typing import Dict, Optional, Set, Tuple
 
 from src.data.stock_mapping import STOCK_NAME_MAP
@@ -88,6 +89,32 @@ def _build_local_name_indexes(code_to_name: Dict[str, str]) -> Tuple[Dict[str, s
 _LOCAL_REVERSE_MAP, _LOCAL_AMBIGUOUS_NAMES = _build_local_name_indexes(STOCK_NAME_MAP)
 
 
+@lru_cache(maxsize=1)
+def _get_stock_index_name_to_code() -> Dict[str, str]:
+    """Return the generated frontend stock index as a unique name -> code map."""
+    try:
+        from src.data.stock_index_loader import get_stock_name_index_map
+
+        normalized_index = {
+            _normalize_code(code) or str(code).strip().upper(): name
+            for code, name in get_stock_name_index_map().items()
+        }
+        return _build_reverse_map_no_duplicates(normalized_index)
+    except Exception as exc:
+        logger.debug("[NameResolver] Generated stock index unavailable: %s", exc)
+        return {}
+
+
+def _resolve_embedded_unique_name(text: str, name_to_code: Dict[str, str]) -> Optional[str]:
+    """Resolve one unambiguous stock name embedded in free-form user text."""
+    matched_codes = {
+        code
+        for candidate_name, code in name_to_code.items()
+        if len(candidate_name) >= 3 and candidate_name in text
+    }
+    return next(iter(matched_codes)) if len(matched_codes) == 1 else None
+
+
 def _get_akshare_name_to_code() -> Optional[Dict[str, str]]:
     """Fetch A-share name->code from AkShare, with cache."""
     global _akshare_cache
@@ -135,17 +162,18 @@ def _is_single_char_typo(input_name: str, candidate_name: str) -> bool:
     return diff == 1
 
 
-def resolve_name_to_code(name: str) -> Optional[str]:
+def resolve_name_to_code(name: str, *, allow_network: bool = True) -> Optional[str]:
     """
     Resolve stock name to code.
 
     Strategy (in order):
     1. If input looks like a code (5-6 digits or 1-5 letters), return it normalized.
     2. Local STOCK_NAME_MAP reverse (exclude ambiguous names).
-    3. Pinyin match against local names.
-    4. AkShare online fallback (A-shares).
-    5. Fuzzy match (difflib).
-    6. Return None.
+    3. Generated local stock index, including one unique name embedded in text.
+    4. Pinyin match against local names.
+    5. Optional AkShare online fallback (A-shares).
+    6. Fuzzy match (difflib).
+    7. Return None.
 
     Args:
         name: Stock name or code string.
@@ -171,6 +199,17 @@ def resolve_name_to_code(name: str) -> Optional[str]:
         logger.debug(f"[NameResolver] 命中本地歧义名称，快速返回 None: {s}")
         return None
 
+    generated_reverse = _get_stock_index_name_to_code()
+    if s in generated_reverse:
+        return generated_reverse[s]
+
+    embedded_code = _resolve_embedded_unique_name(
+        s,
+        {**generated_reverse, **local_reverse},
+    )
+    if embedded_code:
+        return embedded_code
+
     # 3. Pinyin match (exact)
     try:
         from pypinyin import lazy_pinyin
@@ -191,14 +230,20 @@ def resolve_name_to_code(name: str) -> Optional[str]:
         logger.debug(f"[NameResolver] Skip CJK-only fallbacks for non-CJK input: {s}")
         return None
 
-    # 4. AkShare fallback
-    akshare_map = _get_akshare_name_to_code()
+    # 5. Optional AkShare fallback
+    akshare_map = _get_akshare_name_to_code() if allow_network else None
     if akshare_map and s in akshare_map:
         logger.debug(f"[NameResolver] 命中 AkShare 映射: {s} -> {akshare_map[s]}")
         return akshare_map[s]
 
-    # 5. Fuzzy match (local + akshare, local takes precedence)
-    all_name_to_code = dict(local_reverse)
+    if akshare_map:
+        embedded_code = _resolve_embedded_unique_name(s, akshare_map)
+        if embedded_code:
+            return embedded_code
+
+    # 6. Fuzzy match (generated/local/akshare, local takes precedence)
+    all_name_to_code = dict(generated_reverse)
+    all_name_to_code.update(local_reverse)
     if akshare_map:
         all_name_to_code.update(akshare_map)
     # Skip fuzzy matching for very short inputs (<=2 chars) to avoid false positives,

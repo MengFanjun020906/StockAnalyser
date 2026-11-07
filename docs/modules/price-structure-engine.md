@@ -104,7 +104,11 @@ SMC 部分基于最近摆动序列：
 - `analyze_trend`
 - `analyze_price_structure`
 - `get_capital_flow`
-- `get_stock_info`
+- `get_stock_business_context`
+- `get_tushare_daily_basic`
+- `get_tushare_financial_indicators`
+- `get_tushare_financial_statements`
+- `get_tushare_forecast`
 - `get_chip_distribution`
 - `search_comprehensive_intel`
 

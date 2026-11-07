@@ -896,14 +896,28 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
         }),
     ]
 
-    result = run_stock_selection_pipeline(
-        task="我现在有5w元，帮我选股",
-        agent_user_context=_context(),
-        tool_registry=_registry_with_candidates([{"code": "600001", "name": "测试一", "market": "cn", "source": "test"}]),
-        llm_adapter=adapter,
-        run_id="test-run",
-        orchestration_mode="legacy",
-    )
+    composite_payload = {
+        "schema_version": "stock-composite-shadow.v1",
+        "status": "ok",
+        "snapshot": {"symbol": "600001", "as_of": "2026-08-05"},
+        "composite_verdict": {
+            "score": None,
+            "scale_max": 20,
+            "verdict_status": "not_evaluable",
+            "shadow_mode": True,
+            "components": {"s4": {"score": None}, "chan": {"score": 5}},
+            "exit_warning": {"level": 0, "items": []},
+        },
+    }
+    with patch("src.agent.stock_selection.score_symbol_composite", return_value=composite_payload):
+        result = run_stock_selection_pipeline(
+            task="我现在有5w元，帮我选股",
+            agent_user_context=_context(),
+            tool_registry=_registry_with_candidates([{"code": "600001", "name": "测试一", "market": "cn", "source": "test"}]),
+            llm_adapter=adapter,
+            run_id="test-run",
+            orchestration_mode="legacy",
+        )
 
     assert result.success is True
     assert "选股分析报告：下周可关注候选" in result.final_markdown
@@ -926,6 +940,9 @@ def test_stock_selection_pipeline_runs_all_stages_with_summaries():
     assert result.final_report_json["market_regime"]["regime"] == "trending_up"
     assert result.final_report_json["orchestration_mode"] == "legacy"
     assert result.final_report_json["expert_state"] is None
+    assert result.context.stage_summary("deterministic_scoring")["target_count"] == 1
+    assert result.final_report_json["deterministic_scoring"]["full"]["results"][0]["composite_verdict"]["components"]["chan"]["score"] == 5
+    assert "确定性数学评分（影子模式）" in combined_markdown
     capital_flow_calls = [call for call in result.tool_calls_log if call["tool"] == "get_capital_flow"]
     assert capital_flow_calls
     assert all(call["success"] is False for call in capital_flow_calls)
@@ -989,6 +1006,28 @@ def test_stock_selection_resume_reuses_complete_candidate_discovery_artifact(tmp
         and event.get("payload", {}).get("stage") == "candidate_discovery"
         for event in events
     )
+
+
+def test_stock_selection_resume_loads_deterministic_scoring_artifact(tmp_path):
+    (tmp_path / "deterministic_scoring.json").write_text(
+        json.dumps(
+            {
+                "stage": "deterministic_scoring",
+                "status": "partial",
+                "summary": {"target_count": 1, "shadow_mode": True},
+                "full": {"results": [{"code": "600001", "status": "insufficient_data"}]},
+                "full_ref": "deterministic_scoring.json",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = stock_selection_module._load_stock_selection_resume_state(str(tmp_path))
+
+    assert "deterministic_scoring" in state["available_stages"]
+    assert "deterministic_scoring" in state["resumable_stages"]
+    assert state["stages"]["deterministic_scoring"]["summary"]["shadow_mode"] is True
 
 
 def test_stock_selection_prompts_use_compact_evidence_cards_not_raw_previews():

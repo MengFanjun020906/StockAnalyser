@@ -46,10 +46,12 @@ CAPABILITY_TOOL_MAP: Dict[CapabilityName, List[str]] = {
         "get_margin_trading_summary",
     ],
     "fundamental_analysis": [
-        "get_stock_info",
+        "get_stock_business_context",
         "get_tushare_daily_basic",
         "get_tushare_financial_indicators",
         "get_tushare_financial_statements",
+        "get_tushare_forecast",
+        "search_stock_fundamentals",
     ],
     "chip_distribution": ["get_chip_distribution"],
     "symbol_regime_probability": ["get_symbol_regime_probability"],

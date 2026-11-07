@@ -101,6 +101,12 @@ class AccountContext(BaseModel):
         description="Broker warning/liquidation reference ratio when available.",
     )
     cost_method: CostMethod = "fifo"
+    buy_commission_bps: Optional[float] = Field(None, ge=0)
+    sell_commission_bps: Optional[float] = Field(None, ge=0)
+    minimum_commission: Optional[float] = Field(None, ge=0)
+    transfer_fee_bps: Optional[float] = Field(None, ge=0)
+    stamp_duty_bps: Optional[float] = Field(None, ge=0)
+    cost_policy_version: Optional[str] = Field(None, max_length=64)
     notes: Optional[str] = Field(None, max_length=1000)
 
 

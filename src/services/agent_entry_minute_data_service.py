@@ -166,6 +166,57 @@ class AgentEntryMinuteDataService:
 
         return result
 
+    def ensure_symbol_day(
+        self,
+        symbol: str,
+        trading_date: date,
+        *,
+        frequency: str = DEFAULT_MINUTE_FREQUENCY,
+        adjustflag: str = DEFAULT_MINUTE_ADJUSTFLAG,
+    ) -> Dict[str, Any]:
+        """Fetch one bounded A-share minute window for lifecycle disambiguation.
+
+        This is intentionally separate from the trace backtest sync: a single
+        stock query may need only one conflict day, and must not scan reports or
+        fetch an unbounded history. Unsupported markets return a deterministic
+        skip result so callers can mark the path ambiguous.
+        """
+        normalized = _normalize_symbol(symbol)
+        if not _is_supported_baostock_stock(normalized):
+            return {"status": "unsupported", "symbol": normalized, "written_rows": 0}
+        normalized_frequency = _normalize_frequency(frequency)
+        try:
+            frame = self.baostock_fetcher.get_minute_k_data(
+                normalized,
+                trading_date.isoformat(),
+                trading_date.isoformat(),
+                frequency=normalized_frequency,
+                adjustflag=str(adjustflag or DEFAULT_MINUTE_ADJUSTFLAG),
+            )
+            records = _records_from_baostock_df(
+                frame,
+                fallback_symbol=normalized,
+                frequency=normalized_frequency,
+                adjustflag=str(adjustflag or DEFAULT_MINUTE_ADJUSTFLAG),
+            )
+            written = self.stock_repo.save_minute_bars(records, data_source="BaostockMinute")
+            return {
+                "status": "ok" if records else "empty",
+                "symbol": normalized,
+                "trading_date": trading_date.isoformat(),
+                "fetched_rows": len(records),
+                "written_rows": written,
+            }
+        except Exception as exc:
+            logger.warning("获取单日入场分钟线失败 %s %s: %s", normalized, trading_date, exc)
+            return {
+                "status": "failed",
+                "symbol": normalized,
+                "trading_date": trading_date.isoformat(),
+                "written_rows": 0,
+                "error": str(exc),
+            }
+
 
 def _build_symbol_ranges(plans: List[Dict[str, Any]], *, current_date: date) -> Dict[str, Dict[str, Any]]:
     ranges: Dict[str, Dict[str, Any]] = {}
