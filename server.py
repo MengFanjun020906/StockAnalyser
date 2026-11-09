@@ -36,7 +36,9 @@ setup_logging(
 )
 
 # 从 api.app 导入应用实例
-from api.app import app  # noqa: E402
+from api.app import create_app  # noqa: E402
+
+app = create_app(auto_worker=True)
 
 # 导出 app 供 uvicorn 使用
 __all__ = ['app']

@@ -1,12 +1,9 @@
 import type React from 'react';
-import { useEffect } from 'react';
 import { BrowserRouter as Router, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import HomePage from './pages/HomePage';
-import BacktestPage from './pages/BacktestPage';
+import BacktestCenterPage from './pages/BacktestCenterPage';
 import SettingsPage from './pages/SettingsPage';
 import LoginPage from './pages/LoginPage';
 import NotFoundPage from './pages/NotFoundPage';
-import ChatPage from './pages/ChatPage';
 import PortfolioPage from './pages/PortfolioPage';
 import AgentTracePage from './pages/AgentTracePage';
 import SignalPreviewPage from './pages/SignalPreviewPage';
@@ -15,19 +12,13 @@ import CandidatePoolPage from './pages/CandidatePoolPage';
 import SeedPoolQualityPage from './pages/SeedPoolQualityPage';
 import NewsSignalsPage from './pages/NewsSignalsPage';
 import KronosPage from './pages/KronosPage';
-import JevPage from './pages/JevPage';
 import { ApiErrorAlert, Shell } from './components/common';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
-import { useAgentChatStore } from './stores/agentChatStore';
 import './App.css';
 
 const AppContent: React.FC = () => {
   const location = useLocation();
   const { authEnabled, loggedIn, isLoading, loadError, refreshStatus } = useAuth();
-
-  useEffect(() => {
-    useAgentChatStore.getState().setCurrentRoute(location.pathname);
-  }, [location.pathname]);
 
   if (isLoading) {
     return (
@@ -69,8 +60,7 @@ const AppContent: React.FC = () => {
   return (
     <Routes>
       <Route element={<Shell />}>
-        <Route path="/" element={<HomePage />} />
-        <Route path="/chat" element={<ChatPage />} />
+        <Route path="/" element={<Navigate to="/agent-trace" replace />} />
         <Route path="/agent-trace" element={<AgentTracePage />} />
         <Route path="/agent-trace/:sessionId" element={<AgentTracePage />} />
         <Route path="/signal-preview" element={<SignalPreviewPage />} />
@@ -81,9 +71,8 @@ const AppContent: React.FC = () => {
         <Route path="/seed-pool-quality" element={<SeedPoolQualityPage />} />
         <Route path="/news-signals" element={<NewsSignalsPage />} />
         <Route path="/kronos" element={<KronosPage />} />
-        <Route path="/jev" element={<JevPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
-        <Route path="/backtest" element={<BacktestPage />} />
+        <Route path="/backtest" element={<BacktestCenterPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>

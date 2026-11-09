@@ -9,7 +9,6 @@ Fixes #1066 – eliminates 45+ redundant HTTP requests per stock in Agent mode.
 from __future__ import annotations
 
 import contextvars
-from contextlib import contextmanager
 import logging
 import os
 import sqlite3
@@ -38,28 +37,6 @@ _CACHE_STALE_GRACE_DAYS = 4
 _frozen_target_date: contextvars.ContextVar[Optional[date]] = contextvars.ContextVar(
     "_frozen_target_date", default=None,
 )
-_captured_history: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("captured_history", default=None)
-
-
-@contextmanager
-def capture_history_reads(*, enabled: bool = True):
-    """Retain the daily inputs actually read by one Trace and its copied contexts."""
-    snapshots = {}
-    token = _captured_history.set(snapshots if enabled else None)
-    try:
-        yield snapshots
-    finally:
-        _captured_history.reset(token)
-
-
-def _observed_history(stock_code: str, frame: pd.DataFrame, source: str):
-    snapshots = _captured_history.get()
-    if snapshots is not None:
-        _, symbol = _history_code_candidates(stock_code)
-        snapshots[symbol] = (frame.tail(90).copy(deep=True), source)
-    return frame, source
-
-
 def set_frozen_target_date(d: date) -> contextvars.Token:
     return _frozen_target_date.set(d)
 
@@ -351,7 +328,7 @@ def load_history_df(
                 "load_history_df(%s): %d bars from DB (requested %d, latest=%s, effective_end=%s)",
                 stock_code, len(df), days, latest_date, effective_end,
             )
-            return _observed_history(stock_code, df, "db_cache")
+            return df, "db_cache"
     except Exception as e:
         logger.debug("load_history_df(%s): DB read failed: %s", stock_code, e)
 
@@ -378,7 +355,7 @@ def load_history_df(
                     "load_history_df(%s): %d bars from Sequoia DB (requested %d, latest=%s, effective_end=%s)",
                     stock_code, len(df), days, latest_date, effective_end,
                 )
-                return _observed_history(stock_code, df, "sequoia_stock_daily")
+                return df, "sequoia_stock_daily"
     except Exception as e:
         logger.debug("load_history_df(%s): Sequoia fallback failed: %s", stock_code, e)
 
@@ -390,7 +367,7 @@ def load_history_df(
         manager = _get_fetcher_manager()
         df, source = manager.get_daily_data(stock_code, days=days)
         if df is not None and not df.empty:
-            return _observed_history(stock_code, df, source)
+            return df, source
     except Exception as e:
         logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
 

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from src.config import get_config
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
@@ -71,32 +71,6 @@ class TraceIntentResolution(TypedDict, total=False):
     classifier_intent: Optional[ReportIntent]
     classifier_error: Optional[str]
 
-class ChatRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
-    message: str
-    session_id: Optional[str] = None
-    skills: Optional[List[str]] = Field(
-        default=None,
-        validation_alias=AliasChoices("skills", "strategies"),
-    )
-    context: Optional[Dict[str, Any]] = None  # Previous analysis context for data reuse
-
-    @property
-    def effective_skills(self) -> Optional[List[str]]:
-        """Return skill ids from the unified request shape."""
-        return self.skills
-
-class ChatResponse(BaseModel):
-    success: bool
-    content: str
-    session_id: str
-    error: Optional[str] = None
-    price_plan: Optional[Dict[str, Any]] = None
-    trade_plan_result: Optional[Dict[str, Any]] = None
-    risk_gate: Optional[Dict[str, Any]] = None
-
-
 class AgentTraceRunRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=20000)
     session_id: Optional[str] = None
@@ -150,22 +124,6 @@ class AgentTraceRunResponse(BaseModel):
     judge_sanity: Optional[Dict[str, Any]] = None
     artifact_dir: Optional[str] = None
     runtime_config: Optional[Dict[str, Any]] = None
-    jev_review: Optional[Dict[str, Any]] = None
-
-class SkillInfo(BaseModel):
-    id: str
-    name: str
-    description: str
-
-class SkillsResponse(BaseModel):
-    skills: List[SkillInfo]
-    default_skill_id: str = ""
-
-
-class StrategiesResponse(BaseModel):
-    strategies: List[SkillInfo]
-    default_strategy_id: str = ""
-
 
 class AgentModelDeployment(BaseModel):
     deployment_id: str
@@ -199,200 +157,6 @@ async def get_agent_models():
 async def get_agent_runtime_config():
     """Return non-sensitive Agent runtime switches for frontend diagnostics."""
     return AgentRuntimeConfigResponse(runtime_config=_build_agent_runtime_config(get_config()))
-
-
-def _build_skills_response(config) -> SkillsResponse:
-    from src.agent.factory import get_skill_manager
-    from src.agent.skills.defaults import get_primary_default_skill_id
-
-    skill_manager = get_skill_manager(config)
-    available_skills = sorted(
-        [
-            skill
-            for skill in skill_manager.list_skills()
-            if getattr(skill, "user_invocable", True)
-        ],
-        key=lambda skill: (
-            int(getattr(skill, "default_priority", 100)),
-            skill.display_name,
-            skill.name,
-        ),
-    )
-    skills = [
-        SkillInfo(id=skill.name, name=skill.display_name, description=skill.description)
-        for skill in available_skills
-    ]
-    return SkillsResponse(
-        skills=skills,
-        default_skill_id=get_primary_default_skill_id(available_skills),
-    )
-
-
-@router.get("/skills", response_model=SkillsResponse)
-async def get_skills():
-    """
-    Get available agent strategy skills.
-    """
-    return _build_skills_response(get_config())
-
-
-@router.get("/strategies", response_model=StrategiesResponse, include_in_schema=False)
-async def get_strategies():
-    """Compatibility alias for legacy clients."""
-    payload = _build_skills_response(get_config())
-    return StrategiesResponse(
-        strategies=payload.skills,
-        default_strategy_id=payload.default_skill_id,
-    )
-
-@router.post("/chat", response_model=ChatResponse)
-async def agent_chat(request: ChatRequest):
-    """
-    Chat with the AI Agent.
-    """
-    config = get_config()
-    
-    if not config.is_agent_available():
-        raise HTTPException(status_code=400, detail="Agent mode is not enabled")
-        
-    session_id = request.session_id or str(uuid.uuid4())
-    
-    try:
-        skills = request.effective_skills
-        executor = _build_executor(config, skills or None)
-
-        # Pass explicit skills into context for the orchestrator.
-        # Direct assignment so caller-provided skills always take precedence
-        # over any stale value carried in the context dict.
-        ctx = dict(request.context or {})
-        if skills is not None:
-            ctx["skills"] = skills
-
-        await asyncio.to_thread(
-            _prepare_signal_lifecycle_context,
-            message=request.message,
-            context=ctx,
-        )
-
-        # Offload the blocking call to a thread to avoid blocking the event loop.
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: executor.chat(message=request.message, session_id=session_id,
-                                  context=ctx),
-        )
-
-        await asyncio.to_thread(
-            _ensure_single_stock_price_plan,
-            message=request.message,
-            session_id=session_id,
-            result=result,
-            context=ctx,
-        )
-
-        await asyncio.to_thread(
-            _capture_signal_lifecycle,
-            message=request.message,
-            session_id=session_id,
-            result=result,
-            context=ctx,
-        )
-
-        return ChatResponse(
-            success=result.success,
-            content=result.content,
-            session_id=session_id,
-            error=result.error,
-            price_plan=getattr(result, "price_plan", None),
-            trade_plan_result=getattr(result, "trade_plan_result", None),
-            risk_gate=getattr(result, "deterministic_risk_gate", None),
-        )
-            
-    except Exception as e:
-        logger.error(f"Agent chat API failed: {e}")
-        logger.exception("Agent chat error details:")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class SessionItem(BaseModel):
-    session_id: str
-    title: str
-    message_count: int
-    created_at: Optional[str] = None
-    last_active: Optional[str] = None
-
-class SessionsResponse(BaseModel):
-    sessions: List[SessionItem]
-
-class SessionMessagesResponse(BaseModel):
-    session_id: str
-    messages: List[Dict[str, Any]]
-
-
-@router.get("/chat/sessions", response_model=SessionsResponse)
-async def list_chat_sessions(limit: int = 50, user_id: Optional[str] = None):
-    """获取聊天会话列表
-
-    Args:
-        limit: Maximum number of sessions to return.
-        user_id: Optional platform-prefixed user identifier for session
-            isolation.  When provided, only sessions whose session_id
-            starts with this prefix are returned.  The value must
-            include the platform prefix, e.g. ``telegram_12345``,
-            ``feishu_ou_abc``.
-    """
-    from src.storage import get_db
-    sessions = get_db().get_chat_sessions(
-        limit=limit,
-        session_prefix=user_id,
-        extra_session_ids=[user_id] if user_id else None,
-    )
-    return SessionsResponse(sessions=sessions)
-
-
-@router.get("/chat/sessions/{session_id}", response_model=SessionMessagesResponse)
-async def get_chat_session_messages(session_id: str, limit: int = 100):
-    """获取单个会话的完整消息"""
-    from src.storage import get_db
-    messages = get_db().get_conversation_messages(session_id, limit=limit)
-    return SessionMessagesResponse(session_id=session_id, messages=messages)
-
-
-@router.delete("/chat/sessions/{session_id}")
-async def delete_chat_session(session_id: str):
-    """删除指定会话"""
-    from src.storage import get_db
-    count = get_db().delete_conversation_session(session_id)
-    return {"deleted": count}
-
-
-class SendChatRequest(BaseModel):
-    """Request body for sending chat content to notification channels."""
-
-    content: str = Field(..., min_length=1, max_length=50000)
-    title: Optional[str] = None
-
-
-@router.post("/chat/send")
-async def send_chat_to_notification(request: SendChatRequest):
-    """
-    Send chat session content to configured notification channels.
-    Uses run_in_executor to avoid blocking the event loop.
-    """
-    from src.notification import NotificationService
-
-    loop = asyncio.get_running_loop()
-    success = await loop.run_in_executor(
-        None,
-        lambda: NotificationService().send(request.content),
-    )
-    if not success:
-        return {
-            "success": False,
-            "error": "no_channels",
-            "message": "未配置通知渠道，请先在设置中配置",
-        }
-    return {"success": True}
 
 
 def _build_executor(config, skills: Optional[List[str]] = None):
@@ -1554,7 +1318,6 @@ def _trace_history_item_from_artifact(session_id: str, path: Path) -> Dict[str, 
         "judge_sanity": judge_sanity,
         "artifact_dir": str(path),
         "runtime_config": None,
-        "jev_review": _read_trace_jev(path, session_id),
     }
     message = str(request_payload.get("message") or "")
     stock_code = str(target_conflict["expected_symbol"] if target_conflict else request_payload.get("stock_code") or "")
@@ -1636,31 +1399,6 @@ async def get_agent_trace_session(session_id: str):
             detail={"error": "not_found", "message": f"未找到 Trace session {normalized} 的落盘记录"},
         )
     return _trace_history_item_from_artifact(normalized, artifact_dir)
-
-
-def _read_trace_jev(path: Path, session_id: str, *, outcomes: bool = False) -> dict:
-    try:
-        conflict = _stored_trace_target_conflict(path)
-        if conflict:
-            return {"status": "unavailable", "reason": "target_symbol_mismatch", "shadow_mode": True,
-                    "session_id": session_id, "shared_snapshot": False}
-        from src.services.jev_trace_service import JevTraceService
-
-        return JevTraceService().read(path, session_id, outcomes=outcomes)
-    except Exception:
-        logger.warning("Jev Trace review read unavailable for %s", session_id)
-        return {"status": "unavailable", "reason": "review_read_error", "shadow_mode": True}
-
-
-@router.get("/trace/sessions/{session_id}/jev")
-def get_trace_jev_review(session_id: str):
-    normalized = session_id.strip()
-    if not normalized.startswith("trace-"):
-        normalized = f"trace-{normalized}"
-    artifact_dir = _find_trace_artifact_dir(normalized)
-    if artifact_dir is None:
-        raise HTTPException(status_code=404, detail="Trace session not found")
-    return _read_trace_jev(artifact_dir, normalized, outcomes=True)
 
 
 def _write_trace_json(path: Path, payload: Any) -> None:
@@ -3627,7 +3365,6 @@ def _capture_signal_lifecycle(
     context: Optional[Dict[str, Any]] = None,
     composite_payload: Optional[Dict[str, Any]] = None,
     risk_gate_payload: Optional[Dict[str, Any]] = None,
-    capture_jev: bool = True,
 ) -> None:
     try:
         from src.services.signal_lifecycle_service import SignalLifecycleService
@@ -3648,42 +3385,6 @@ def _capture_signal_lifecycle(
     except Exception as exc:
         logger.warning("Signal lifecycle capture skipped: %s", exc, exc_info=True)
 
-    if not capture_jev:
-        return
-    try:
-        from src.services.jev_evaluation_service import JevEvaluationService
-
-        jev_context = context or {}
-        user_context = _coerce_trace_agent_user_context(jev_context)
-        primary_symbol = user_context.report.primary_symbol if user_context else None
-        symbol = str(primary_symbol or jev_context.get("stock_code") or _infer_stock_code_from_message(message) or "")
-        JevEvaluationService().capture_agent_result(
-            stock_code=symbol, session_id=session_id, result=result,
-            context=jev_context, risk_gate_payload=risk_gate_payload,
-        )
-    except Exception:
-        logger.warning("Jev shadow capture unavailable; analysis result preserved")
-
-
-def _prepare_trace_jev_review(writer: TraceArtifactWriter, *, result: Any, context: dict,
-                              risk_gate: dict | None, histories: dict,
-                              background_tasks: BackgroundTasks | None) -> dict:
-    try:
-        from src.services.jev_trace_service import JevTraceService
-
-        user = _coerce_trace_agent_user_context(context)
-        symbol = str((user.report.primary_symbol if user else None) or context.get("stock_code") or "")
-        service = JevTraceService()
-        review = service.prepare(path=writer.path, session_id=writer.session_id, symbol=symbol,
-                                 result=result, context=context, risk_gate=risk_gate, histories=histories)
-        if review["status"] == "pending" and background_tasks is not None:
-            background_tasks.add_task(service.finish, writer.path, review)
-        _safe_artifact_event(writer, {"type": "jev_review_ready", "session_id": writer.session_id,
-                                      "status": review["status"], "capture_id": review["capture_id"]})
-        return review
-    except Exception:
-        logger.warning("Jev Trace review preparation failed for %s", writer.session_id)
-        return {"status": "error", "reason": "shadow_prepare_error", "shadow_mode": True}
 
 
 def _ensure_single_stock_price_plan(
@@ -3847,23 +3548,20 @@ async def run_agent_trace(request: AgentTraceRunRequest, background_tasks: Backg
         events.append(event_payload)
 
     def run_sync():
-        from src.services.history_loader import capture_history_reads
-
         executor = _build_executor(config, skills or None)
-        with capture_history_reads(enabled=bool(getattr(config, "jev_enabled", False))) as histories:
-            with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
-                result = executor.chat(
-                    message=request.message,
-                    session_id=session_id,
-                    progress_callback=progress_callback,
-                    context=context,
-                )
-            _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
-            return result, histories
+        with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+            result = executor.chat(
+                message=request.message,
+                session_id=session_id,
+                progress_callback=progress_callback,
+                context=context,
+            )
+        _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
+        return result
 
     try:
         loop = asyncio.get_running_loop()
-        result, histories = await loop.run_in_executor(None, run_sync)
+        result = await loop.run_in_executor(None, run_sync)
     except Exception as exc:
         logger.error("Agent trace run failed: %s", exc, exc_info=True)
         _safe_artifact_finalize(artifact_writer, error=str(exc), context=context, request=request)
@@ -3889,11 +3587,6 @@ async def run_agent_trace(request: AgentTraceRunRequest, background_tasks: Backg
         context=context,
         composite_payload=composite_verdict,
         risk_gate_payload=risk_gate,
-        capture_jev=False,
-    )
-    jev_review = await asyncio.to_thread(
-        _prepare_trace_jev_review, artifact_writer, result=result, context=context,
-        risk_gate=risk_gate, histories=histories, background_tasks=background_tasks,
     )
     llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
     judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
@@ -3926,7 +3619,6 @@ async def run_agent_trace(request: AgentTraceRunRequest, background_tasks: Backg
         judge_sanity=judge_sanity,
         artifact_dir=str(artifact_writer.path),
         runtime_config=_build_agent_runtime_config(config),
-        jev_review=jev_review,
     )
 
 
@@ -4004,17 +3696,14 @@ async def stream_agent_trace(request: AgentTraceRunRequest, background_tasks: Ba
                 "runtime_config": _build_agent_runtime_config(config),
             })
             executor = _build_executor(config, skills or None)
-            from src.services.history_loader import capture_history_reads
-
-            with capture_history_reads(enabled=bool(getattr(config, "jev_enabled", False))) as histories:
-                with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
-                    result = executor.chat(
-                        message=request.message,
-                        session_id=session_id,
-                        progress_callback=progress_callback,
-                        context=context,
-                    )
-                _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
+            with llm_telemetry_scope(trace_id=session_id, artifact_dir=str(artifact_writer.path)):
+                result = executor.chat(
+                    message=request.message,
+                    session_id=session_id,
+                    progress_callback=progress_callback,
+                    context=context,
+                )
+            _safe_artifact_finalize(artifact_writer, result=result, context=context, request=request)
             normalized_tool_calls = _normalize_tool_calls_status(result.tool_calls_log)
             composite_verdict = _read_trace_json_file(artifact_writer.path / "composite_verdict.json", None)
             risk_gate = _read_trace_json_file(artifact_writer.path / "risk_gate.json", None)
@@ -4025,11 +3714,6 @@ async def stream_agent_trace(request: AgentTraceRunRequest, background_tasks: Ba
                 context=context,
                 composite_payload=composite_verdict,
                 risk_gate_payload=risk_gate,
-                capture_jev=False,
-            )
-            jev_review = _prepare_trace_jev_review(
-                artifact_writer, result=result, context=context, risk_gate=risk_gate,
-                histories=histories, background_tasks=background_tasks,
             )
             llm_telemetry = _read_trace_json_file(artifact_writer.path / "llm_telemetry.json", None) or _build_llm_telemetry_summary(artifact_writer.path)
             judge_sanity = _read_trace_json_file(artifact_writer.path / "judge_sanity.json", None) or _build_judge_sanity_summary(getattr(result, "stock_selection", None))
@@ -4062,7 +3746,6 @@ async def stream_agent_trace(request: AgentTraceRunRequest, background_tasks: Ba
                 "judge_sanity": judge_sanity,
                 "artifact_dir": str(artifact_writer.path),
                 "runtime_config": _build_agent_runtime_config(config),
-                "jev_review": jev_review,
             })
         except Exception as exc:
             logger.error("Agent trace stream failed: %s", exc, exc_info=True)
@@ -4196,120 +3879,3 @@ async def agent_research(request: ResearchRequest):
         logger.error("Agent research API failed: %s", e)
         logger.exception("Agent research error details:")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/chat/stream")
-async def agent_chat_stream(request: ChatRequest):
-    """
-    Chat with the AI Agent, streaming progress via SSE.
-    Each SSE event is a JSON object with a 'type' field:
-      - thinking: AI is deciding next action
-      - tool_start: a tool call has begun
-      - tool_done: a tool call finished
-      - generating: final answer being generated
-      - done: analysis complete, contains 'content' and 'success'
-      - error: error occurred, contains 'message'
-    """
-    config = get_config()
-    if not config.is_agent_available():
-        raise HTTPException(status_code=400, detail="Agent mode is not enabled")
-
-    session_id = request.session_id or str(uuid.uuid4())
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-
-    # Pass explicit skills into context for the orchestrator.
-    # Direct assignment so caller-provided skills always take precedence.
-    skills = request.effective_skills
-    stream_ctx = dict(request.context or {})
-    if skills is not None:
-        stream_ctx["skills"] = skills
-
-    def progress_callback(event: dict):
-        event = _normalize_tool_event_status(dict(event))
-        # Enrich tool events with display names
-        if event.get("type") in ("tool_start", "tool_done"):
-            tool = event.get("tool", "")
-            event["display_name"] = TOOL_DISPLAY_NAMES.get(tool, tool)
-        asyncio.run_coroutine_threadsafe(queue.put(event), loop)
-
-    def run_sync():
-        try:
-            _prepare_signal_lifecycle_context(message=request.message, context=stream_ctx)
-            executor = _build_executor(config, skills or None)
-            result = executor.chat(
-                message=request.message,
-                session_id=session_id,
-                progress_callback=progress_callback,
-                context=stream_ctx,
-            )
-            _ensure_single_stock_price_plan(
-                message=request.message,
-                session_id=session_id,
-                result=result,
-                context=stream_ctx,
-            )
-            _capture_signal_lifecycle(
-                message=request.message,
-                session_id=session_id,
-                result=result,
-                context=stream_ctx,
-            )
-            asyncio.run_coroutine_threadsafe(
-                queue.put({
-                    "type": "done",
-                    "success": result.success,
-                    "content": result.content,
-                    "error": result.error,
-                    "total_steps": result.total_steps,
-                    "total_tokens": result.total_tokens,
-                    "provider": result.provider,
-                    "model": result.model,
-                    "tool_calls": result.tool_calls_log,
-                    "session_id": session_id,
-                    "price_plan": getattr(result, "price_plan", None),
-                    "trade_plan_result": getattr(result, "trade_plan_result", None),
-                    "risk_gate": getattr(result, "deterministic_risk_gate", None),
-                }),
-                loop,
-            )
-        except Exception as exc:
-            logger.error(f"Agent stream error: {exc}")
-            asyncio.run_coroutine_threadsafe(
-                queue.put({"type": "error", "message": str(exc)}),
-                loop,
-            )
-
-    async def event_generator():
-        # Start executor in a thread so we don't block the event loop
-        fut = loop.run_in_executor(None, run_sync)
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=300.0)
-                except asyncio.TimeoutError:
-                    yield "data: " + json.dumps({"type": "error", "message": "分析超时"}, ensure_ascii=False, allow_nan=False) + "\n\n"
-                    break
-                yield "data: " + json.dumps(_sanitize_json_payload(event), ensure_ascii=False, allow_nan=False) + "\n\n"
-                if event.get("type") in ("done", "error"):
-                    break
-        finally:
-            try:
-                await asyncio.wait_for(fut, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError:
-                # Cleanup taking longer than 5s is treated as an expected timeout; no warning.
-                logger.debug("agent executor cleanup timed out after 5s for session %s", session_id)
-            except Exception as exc:
-                logger.warning("agent executor cleanup error (ignored): %s", exc, exc_info=True)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )

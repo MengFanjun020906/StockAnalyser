@@ -24,6 +24,7 @@ StockAnalyser/
 | 目录 | 职责 | 约束 |
 | --- | --- | --- |
 | `src/` | 主流程、服务、仓储、Schema、报告 | 业务逻辑唯一落点，不向 `vendor/` 写代码 |
+| `src/backtest/` | 组合回测内核、快照、账本、指标、worker、API 服务 | 纯内核不访问网络/LLM/Portfolio 真账本；实验产物写入 `data/backtest_runs/` |
 | `api/` | FastAPI 路由与请求/响应 Schema | 与 `src/` 通过服务层交互 |
 | `bot/` | 机器人接入 | 不复制业务实现 |
 | `data_provider/` | 多数据源适配与 fallback | 单源失败不影响主流程 |
@@ -33,7 +34,7 @@ StockAnalyser/
 | `docs/` | 架构、模块、部署、示例、素材 | 只放文档与静态素材 |
 | `scripts/` | 本地开发、安装、构建、数据维护脚本 | 不承载长期运行的服务逻辑 |
 | `vendor/` | 第三方仓库 | 只读引用，升级需单独评审 |
-| `data/` | SQLite、Trace、回测数据 | 不提交；备份/迁移单独处理 |
+| `data/` | SQLite、Trace、回测数据、`backtest_runs/` 实验快照/账本 | 不提交；备份/迁移单独处理 |
 | `logs/` | 运行日志 | 不提交；旧日志按月归档 |
 | `reports/` | 生成的报告产物 | 不提交；旧报告按年归档 |
 

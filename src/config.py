@@ -778,13 +778,6 @@ class Config:
     graphiti_outbox_job_timeout_seconds: int = 120
     graphiti_selection_search_timeout_seconds: float = 12.0
 
-    # === Jev daily shadow evaluations ===
-    jev_enabled: bool = False
-    jev_api_key: str = field(default="", repr=False)
-    jev_base_url: str = "https://api.typesafe.ai/v1"
-    jev_model: str = "jev-latest"
-    jev_timeout_seconds: float = 15.0
-
     # === Kronos K线形态配置 ===
     kronos_enabled: bool = False
     kronos_repo_path: str = "vendor/Kronos"
@@ -968,6 +961,14 @@ class Config:
     backtest_min_age_days: int = 14
     backtest_engine_version: str = "v1"
     backtest_neutral_band_pct: float = 2.0
+    # Portfolio backtest (P0): empty runs dir resolves to <database dir>/backtest_runs
+    backtest_runs_dir: str = ""
+    backtest_worker_concurrency: int = 4
+    backtest_worker_poll_seconds: float = 1.0
+    backtest_worker_lease_seconds: int = 180
+    backtest_data_job_workers: int = 2
+    backtest_max_date_range_days: int = 3650
+    backtest_max_plans: int = 2000
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
@@ -1731,14 +1732,6 @@ class Config:
                 minimum=1.0,
                 maximum=60.0,
             ),
-            jev_enabled=parse_env_bool(os.getenv('JEV_ENABLED'), False),
-            jev_api_key=(os.getenv('JEV_API_KEY') or os.getenv('TYPESAFE_API_KEY') or os.getenv('TYPESAFE_AI_API_KEY') or '').strip(),
-            jev_base_url=os.getenv('JEV_BASE_URL', 'https://api.typesafe.ai/v1').strip().rstrip('/'),
-            jev_model=os.getenv('JEV_MODEL', 'jev-latest').strip() or 'jev-latest',
-            jev_timeout_seconds=parse_env_float(
-                os.getenv('JEV_TIMEOUT_SECONDS'), 15.0,
-                field_name='JEV_TIMEOUT_SECONDS', minimum=1.0, maximum=60.0,
-            ),
             kronos_enabled=parse_env_bool(os.getenv('KRONOS_ENABLED'), False),
             kronos_repo_path=os.getenv('KRONOS_REPO_PATH', 'vendor/Kronos').strip() or 'vendor/Kronos',
             kronos_tokenizer_path=(
@@ -2068,6 +2061,43 @@ class Config:
                 2.0,
                 field_name='BACKTEST_NEUTRAL_BAND_PCT',
                 minimum=0.0,
+            ),
+            backtest_runs_dir=os.getenv('BACKTEST_RUNS_DIR', ''),
+            backtest_worker_concurrency=parse_env_int(
+                os.getenv('BACKTEST_WORKER_CONCURRENCY'),
+                4,
+                field_name='BACKTEST_WORKER_CONCURRENCY',
+                minimum=1,
+            ),
+            backtest_worker_poll_seconds=parse_env_float(
+                os.getenv('BACKTEST_WORKER_POLL_SECONDS'),
+                1.0,
+                field_name='BACKTEST_WORKER_POLL_SECONDS',
+                minimum=0.1,
+            ),
+            backtest_worker_lease_seconds=parse_env_int(
+                os.getenv('BACKTEST_WORKER_LEASE_SECONDS'),
+                180,
+                field_name='BACKTEST_WORKER_LEASE_SECONDS',
+                minimum=30,
+            ),
+            backtest_data_job_workers=parse_env_int(
+                os.getenv('BACKTEST_DATA_JOB_WORKERS'),
+                2,
+                field_name='BACKTEST_DATA_JOB_WORKERS',
+                minimum=1,
+            ),
+            backtest_max_date_range_days=parse_env_int(
+                os.getenv('BACKTEST_MAX_DATE_RANGE_DAYS'),
+                3650,
+                field_name='BACKTEST_MAX_DATE_RANGE_DAYS',
+                minimum=30,
+            ),
+            backtest_max_plans=parse_env_int(
+                os.getenv('BACKTEST_MAX_PLANS'),
+                2000,
+                field_name='BACKTEST_MAX_PLANS',
+                minimum=1,
             ),
             log_dir=os.getenv('LOG_DIR', './logs'),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),

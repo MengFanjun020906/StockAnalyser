@@ -2,6 +2,8 @@
 
 本文说明 `watchlist_scan` 选股链路的当前实现语义。更底层的实施细节、类名和历史迁移记录见 [选股链路重构实施方案](./选股链路重构-实施方案.md)。
 
+> 最后核对：2026-11-09（对齐 `dev` 分支 commit `32a4121`）。红线否决门目前只有模块和单测、未接入主链路，详见实施方案 §2.2。
+
 ## 1. 设计目标
 
 选股链路解决的是两个容易混淆的问题：
@@ -31,8 +33,10 @@
   -> SeedFactPacket
   -> 四席位并行
   -> 聚合与名额分配
+  -> balanced_candidate_evidence
   -> candidate_screening
   -> single_stock_deep_dive
+  -> deterministic_scoring
   -> meta_orchestrator
   -> pricing_agent
   -> portfolio_allocation

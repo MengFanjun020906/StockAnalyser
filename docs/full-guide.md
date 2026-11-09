@@ -1086,8 +1086,6 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 ### 功能特性
 
 - 📝 **配置管理** - 查看/修改自选股列表
-- 🚀 **快速分析** - 通过 API 接口触发分析
-- 📊 **实时进度** - 分析任务状态实时更新，支持多任务并行；普通分析链路在进入 LLM 阶段后会优先尝试 LiteLLM 流式生成，并通过任务 SSE 回灌更细粒度的 `message/progress`
 - 📈 **回测验证** - 评估历史分析准确率，查询方向胜率与模拟收益
 - 🔗 **API 文档** - 访问 `/docs` 查看 Swagger UI
 
@@ -1095,11 +1093,6 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `/api/v1/analysis/analyze` | POST | 触发股票分析 |
-| `/api/v1/analysis/tasks` | GET | 查询任务列表 |
-| `/api/v1/analysis/tasks/stream` | GET (SSE) | 订阅任务实时状态流 |
-| `/api/v1/analysis/status/{task_id}` | GET | 查询任务状态 |
-| `/api/v1/history` | GET | 查询分析历史 |
 | `/api/v1/usage/summary?period=today|month|all` | GET | 按调用类型与模型维度汇总 LLM 调用次数和 Token 用量 |
 | `/api/v1/backtest/run` | POST | 触发回测 |
 | `/api/v1/backtest/results` | GET | 查询回测结果（分页） |
@@ -1110,25 +1103,12 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/health` | GET | 健康检查 |
 | `/docs` | GET | API Swagger 文档 |
 
-> 说明：`POST /api/v1/analysis/analyze` 在 `async_mode=false` 时仅支持单只股票；批量 `stock_codes` 需使用 `async_mode=true`。异步 `202` 响应对单股返回 `task_id`，对批量返回 `accepted` / `duplicates` 汇总结构。
-
-> 进度流说明：`GET /api/v1/analysis/tasks/stream` 除 `task_created / task_started / task_completed / task_failed` 外，新增 `task_progress` 事件。普通分析链路会在“行情准备 / 新闻检索 / 上下文整理 / LLM 生成 / 报告保存”等阶段持续更新 `progress` 与 `message`。LiteLLM 流式返回仅在服务端累积完整文本，最终 JSON 解析成功后才会持久化历史报告；若流式在首个 chunk 前不可用，会自动回退到原非流式调用；若已产生部分 chunk 后失败，系统先尝试同模型非流式重试，失败后再按既有主模型->备用模型顺序继续尝试。  
-> 如果任务进度回调异常，主链路不会中断，系统会提升告警为 warning 级别并在服务端日志中输出完整异常，便于排查 SSE 推送断点。
->  
-> 说明：该特性属于运行时 SSE 与回退链路细节，优先记录于完整指南（`full-guide*.md`），不在 `README.md` 中展开详细行为分支。
+> 说明：Web 首页与问股页面已移除，因此 `/api/v1/analysis/*`、`/api/v1/history/*`、`/api/v1/agent/chat*` 和 `/api/v1/agent/skills` 接口不再提供。股票分析与报告生成仍可通过 CLI、定时任务或 Bot 使用；Agent 链路仍可通过 `POST /api/v1/agent/trace/run` 和 `POST /api/v1/agent/trace/stream` 触发。
 
 **调用示例**：
 ```bash
 # 健康检查
 curl http://127.0.0.1:8000/api/health
-
-# 触发分析（A股）
-curl -X POST http://127.0.0.1:8000/api/v1/analysis/analyze \
-  -H 'Content-Type: application/json' \
-  -d '{"stock_code": "600519"}'
-
-# 查询任务状态
-curl http://127.0.0.1:8000/api/v1/analysis/status/<task_id>
 
 # 查询今日 LLM 用量
 curl "http://127.0.0.1:8000/api/v1/usage/summary?period=today"
@@ -1201,7 +1181,7 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 
 ## Agent 工具数据缓存与持久化
 
-- `get_daily_history` 会先尝试复用本地 `stock_daily` 日线缓存；缓存新鲜且至少覆盖首页默认的 30 条记录时，不再重复请求外部数据源。
+- `get_daily_history` 会先尝试复用本地 `stock_daily` 日线缓存；缓存新鲜且至少覆盖报告默认的 30 条记录时，不再重复请求外部数据源。
 - 当 Agent 请求的天数多于本地缓存记录数时，工具会返回实际可用记录，并通过 `partial_cache=true`、`requested_days`、`actual_records` 标明这是部分缓存命中。
 - 缓存缺失或过期时，工具仍会按原逻辑从数据源获取日线数据；获取成功后会 best-effort 写回 `stock_daily`，保存失败不会阻断 Agent 回复。
 - `search_stock_news` 按 7、14、30 天逐级扩展检索：结果必须在标题、摘要或链接中直接出现公司名或证券代码，行情、F10、公告目录等静态入口不算新闻；有可核验发布日期的相关新闻即返回，只有无日期候选时返回 `date_unverified/partial`，不会伪装成“0 条新闻”；各窗口原始数、无关过滤数、静态入口过滤数、过期过滤数与错误写入 `window_attempts`。已核验和日期待核验候选都会 best-effort 写入 `news_intel`，后者保持 `published_date=null`，不能作为近期消息强证据。`search_comprehensive_intel` 继续按自身维度口径持久化。
@@ -1260,8 +1240,8 @@ A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是
 - 页面运行按钮默认走 `POST /api/v1/agent/trace/stream` SSE：上下文、Planner、thinking、工具开始、工具完成、最终完成/失败会实时追加到页面，避免长时间运行时前端黑箱等待。
 - 页面支持选择持仓账户、报告意图、风险偏好、持有周期、单票上限、总权益仓位上限、最大回撤、默认止损和用户画像备注；顶部 `Context In Use` 会直接展示本次注入的账户、目标持仓、成本、仓位、浮盈亏和画像摘要，避免只能翻 JSON 判断是否用到了真实持仓。
 - 修改历史问题时，如果正文中唯一明确的股票代码与配置中的旧代码不同，页面会省略旧代码并使用问题中的标的；直接 API 请求仍携带冲突代码时，普通和流式接口均在取数前返回 `422 / trace_target_conflict`。代码别名会先标准化，多标的比较不按单股冲突处理。
-- 已保存的 Trace 若问题标的与原配置/上下文标的不一致，读取时将报告标为 `target_mismatch`，隔离错误价格、评分、风控、裁决及 Jev 对照，原始 artifact 保留；Jev 轮询不会恢复错标的结果。此类 Trace 不允许续跑复用旧证据（`409 / resume_trace_target_conflict`），需按正确标的重新运行。
-- 页面会把最近 10 次 Trace 的轻量摘要保存在当前浏览器的 localStorage，完整记录按 session 从后端读取，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常聊天历史。
+- 已保存的 Trace 若问题标的与原配置/上下文标的不一致，读取时将报告标为 `target_mismatch`，隔离错误价格、评分、风控和裁决，原始 artifact 保留。此类 Trace 不允许续跑复用旧证据（`409 / resume_trace_target_conflict`），需按正确标的重新运行。
+- 页面会把最近 10 次 Trace 的轻量摘要保存在当前浏览器的 localStorage，完整记录按 session 从后端读取，可在 `Trace History` 中回看；后端仍会清理 `trace-*` 临时会话，避免污染正常会话历史。
 - 每次 Trace 同时会在后端写入本地调试产物目录 `data/agent_traces/<timestamp>-<session_id>/`，包含 `request.json`、`context.json`、`planner.json`、`events.ndjson`、`tool_calls.json`、`evidence_ledger.json`、`report_quality.json`、`debate.json`、`composite_verdict.json`、`risk_gate.json`、`final.md`、`todo.md` 和 `summary.json`；当 `watchlist_scan` 使用阶段化选股流水线时，还会写入 `stock_selection.json`、`selection_context.json`、`final_report.json` 以及各阶段 JSON 产物，便于复盘候选发现、初筛、深度分析、组合配置、反方审查和 Judge 裁决。选股链路还会落盘 `candidate_evidence.json` 和 `candidate_evidence.md`，按策略、消息、资金、基本面四类各最多 2 只候选保存统一证据包，供后续规划和排障复用；候选级取证并行执行，若同一股票在多个维度重复出现，则以前序维度为准跳过重复项并继续向后补位。页面状态栏会展示本次 `Artifact` 路径。该目录在 `/data/` 下，默认不会提交到 Git。
 - planning prompt 包含独立的 `Execute Protocol`：要求执行器把工具结果落入 Evidence Ledger，记录失败降级、停止条件和最终输出审计门槛；`planner.json` 和 `todo.md` 会记录主/辅维度、初始假设、工具预期结果、下游使用方式、失败降级、停止条件和 replan 策略，`todo.md` 初始写入计划，执行结束后会补充工具成功/失败、参数、结果预览和 Execute 复核状态。
 - planning_execute 工具证据形成后会进入对抗式 Debate：主观点 Agent、强制反方 Agent 和 Judge Agent 共用同一份 Evidence Bundle；Judge 使用关闭推理的紧凑结构化协议，只接收四维证据摘要、真实工具引用和数学场景，必须分别输出技术、资金、基本面和消息面对价格计划的绝对结论。四维意见只允许保持或降低执行权限，不能修改数学价格。Trace 记录 Judge 的结束原因、正文字符数、推理字符数和 completion tokens，避免“消耗 token 但无正文”被误报为普通 JSON 解析失败。

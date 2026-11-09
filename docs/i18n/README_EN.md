@@ -46,7 +46,7 @@ English | [简体中文](../../README.md) | [繁體中文](README_CHT.md)
 | Import | Smart Import & Autocomplete | Image, CSV/Excel, and clipboard import; search by code, name, pinyin, and aliases |
 | History | Report Management | Full Markdown reports, rerun analysis, history browsing, and batch management |
 | Backtest | AI Backtest Validation | Validate historical analysis with directional accuracy and simulated return views |
-| Agent Q&A | Strategy Chat | Multi-turn strategy chat with 11 built-in strategies across Web/Bot/API |
+| Agent Q&A | Strategy Chat | Multi-turn strategy chat with 11 built-in strategies through the Bot and Agent Trace API |
 | Notifications | Multi-channel Push | WeChat Work, Feishu, Telegram, Discord, Slack, Email, and more |
 | Automation | Scheduled Runs | GitHub Actions, Docker, local scheduler, and FastAPI service mode |
 
@@ -218,11 +218,11 @@ Visit `http://127.0.0.1:8000`. Authentication, smart import, autocomplete, repor
 
 ## 🤖 Agent Strategy Chat
 
-After configuring any available AI API key, the Web `/chat` page can use strategy chat. Set `AGENT_MODE=false` only if you want to disable it explicitly.
+After configuring any available AI API key, the bot `/chat` command can use multi-turn strategy chat. The Web chat page and its API have been removed; use the Bot or `POST /api/v1/agent/trace/run` for Agent workflows. Set `AGENT_MODE=false` only if you want to disable Agent mode explicitly.
 
 - Built-in strategies include moving-average crossovers, Chan theory, Elliott wave, bull trend, and more
 - Calls realtime quotes, K-line data, technical indicators, news, and risk context
-- Supports follow-up questions, session export, notification sending, and background execution
+- Supports multi-turn follow-up questions through the bot
 - Supports custom strategy files and experimental multi-agent orchestration
 
 > Agent parameters, `skill` naming compatibility, multi-agent mode, and budget guards are covered in the [Full Guide](../full-guide_EN.md#local-webui-management-interface) and [LLM Config Guide](../LLM_CONFIG_GUIDE_EN.md).

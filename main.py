@@ -632,7 +632,7 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     def run_server():
         level_name = (config.log_level or "INFO").lower()
         uvicorn.run(
-            "api.app:app",
+            "server:app",
             host=host,
             port=port,
             log_level=level_name,
@@ -814,7 +814,7 @@ def main() -> int:
     if args.serve_only:
         logger.info("模式: 仅 Web 服务")
         logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
-        logger.info("通过 /api/v1/analysis/analyze 接口触发分析")
+        logger.info("通过 /agent-trace 页面运行业务分析链路")
         logger.info(f"API 文档: http://{args.host}:{args.port}/docs")
         logger.info("按 Ctrl+C 退出...")
         try:
