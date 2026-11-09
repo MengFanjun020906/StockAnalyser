@@ -17,7 +17,6 @@ export * from './Drawer';
 export * from './ScrollArea';
 export * from './ApiErrorAlert';
 export * from './Collapsible';
-export * from './ScoreGauge';
 export * from './JsonViewer';
 export * from './Select';
 export * from './Badge';

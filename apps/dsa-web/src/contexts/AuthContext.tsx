@@ -2,7 +2,6 @@ import type React from 'react';
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
 import { authApi } from '../api/auth';
-import { useStockPoolStore } from '../stores';
 
 type AuthContextValue = {
   authEnabled: boolean;
@@ -57,9 +56,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setPasswordSet(status.passwordSet ?? false);
       setPasswordChangeable(status.passwordChangeable ?? false);
       setSetupState(status.setupState);
-      if (status.authEnabled && !status.loggedIn) {
-        useStockPoolStore.getState().resetDashboardState();
-      }
     } catch (err) {
       setLoadError(getParsedApiError(err));
       setAuthEnabled(false);
@@ -67,7 +63,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setPasswordSet(false);
       setPasswordChangeable(false);
       setSetupState('no_password');
-      useStockPoolStore.getState().resetDashboardState();
     } finally {
       setIsLoading(false);
     }

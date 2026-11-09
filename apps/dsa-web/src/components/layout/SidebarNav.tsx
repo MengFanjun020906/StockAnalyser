@@ -1,12 +1,10 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { Activity, BarChart3, BriefcaseBusiness, ChartCandlestick, Crosshair, Gauge, Home, LogOut, MessageSquareQuote, Newspaper, Route, Settings2 } from 'lucide-react';
+import { Activity, BarChart3, BriefcaseBusiness, ChartCandlestick, Crosshair, LogOut, Newspaper, Route, Settings2 } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
-import { useAgentChatStore } from '../../stores/agentChatStore';
 import { cn } from '../../utils/cn';
 import { ConfirmDialog } from '../common/ConfirmDialog';
-import { StatusDot } from '../common/StatusDot';
 import { ThemeToggle } from '../theme/ThemeToggle';
 
 type SidebarNavProps = {
@@ -20,17 +18,13 @@ type NavItem = {
   to: string;
   icon: React.ComponentType<{ className?: string }>;
   exact?: boolean;
-  badge?: 'completion';
 };
 
 const NAV_ITEMS: NavItem[] = [
-  { key: 'home', label: '首页', to: '/', icon: Home, exact: true },
-  { key: 'chat', label: '问股', to: '/chat', icon: MessageSquareQuote, badge: 'completion' },
   { key: 'agent-trace', label: '链路', to: '/agent-trace', icon: Route },
   { key: 'news-signals', label: '消息', to: '/news-signals', icon: Newspaper },
   { key: 'kronos', label: 'K线', to: '/kronos', icon: ChartCandlestick },
   { key: 'signal-preview', label: '信号', to: '/signal-preview', icon: Activity },
-  { key: 'jev', label: 'Jev', to: '/jev', icon: Gauge },
   { key: 'agent-entry-execution-backtests', label: '入场', to: '/agent-entry-execution-backtests', icon: Crosshair },
   { key: 'seed-pool-quality', label: '质量', to: '/seed-pool-quality', icon: ChartCandlestick },
   { key: 'portfolio', label: '持仓', to: '/portfolio', icon: BriefcaseBusiness },
@@ -40,7 +34,6 @@ const NAV_ITEMS: NavItem[] = [
 
 export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNavigate }) => {
   const { authEnabled, logout } = useAuth();
-  const completionBadge = useAgentChatStore((state) => state.completionBadge);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
 
   return (
@@ -55,7 +48,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
       </div>
 
       <nav className="flex flex-1 flex-col gap-1.5" aria-label="主导航">
-        {NAV_ITEMS.map(({ key, label, to, icon: Icon, exact, badge }) => (
+        {NAV_ITEMS.map(({ key, label, to, icon: Icon, exact }) => (
           <NavLink
             key={key}
             to={to}
@@ -86,17 +79,6 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ collapsed = false, onNav
                 )}
                 <Icon className={cn('ml-1 h-5 w-5 shrink-0', isActive ? 'text-[var(--nav-icon-active)]' : 'text-current')} />
                 {!collapsed ? <span className="truncate">{label}</span> : null}
-                {badge === 'completion' && completionBadge ? (
-                  <StatusDot
-                    tone="info"
-                    data-testid="chat-completion-badge"
-                    className={cn(
-                      'absolute right-3 border-2 border-background shadow-[0_0_10px_var(--nav-indicator-shadow)]',
-                      collapsed ? 'right-2 top-2' : ''
-                    )}
-                    aria-label="问股有新消息"
-                  />
-                ) : null}
               </>
             )}
           </NavLink>

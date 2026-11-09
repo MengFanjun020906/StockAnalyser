@@ -9,13 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [文档] 按当前代码对齐 `docs/architecture/选股链路重构-实施方案.md` 与 `docs/architecture/stock-selection-pipeline.md`：修正四席位数量、深挖上限（默认 4、上限 5）、席位超时（300s）、seed fact 超时（30s）等数值；标注红线否决门仅实现未接线、席位名额/回填表未接入 Config、`theme_catalyst` 缺专属 playbook；补充 `balanced_candidate_evidence`、`deterministic_scoring`、断点续跑和真实 trace 事件清单。
+
+- [新功能] 回测结果页新增“上证超额”指标：策略区间收益减上证指数区间收益，正数表示跑赢；benchmark 接口同时返回 `strategy_return_pct`、`shanghai_return_pct`、`excess_vs_shanghai_pct` 和各指数收益。
+
+- [改进] P3 入场模型改为 `adaptive`（20 日高点突破 + MA20 回踩），订单有效期默认 15 个交易日；选股前增加一手成本/一手风险/目标仓位过滤，避免选出无法执行的高价款。
+
+- [新功能] P3 新增 `confirmation_mode`：默认 `auto_accept`，选股后直接生成确定性计划并交给资金/风险硬门槛，适合观察纯 AI 选股结果；保留 `llm` 逐只确认模式，结果标 `auto_accept_selection`。
+
+- [新功能] 回测权益图新增多指数对比曲线：上证指数、创业板指、科创50、沪深300，按初始权益归一化；新增 `/runs/{run_id}/benchmarks`，首次用 Tushare `index_daily`，本地 Sequoia 兜底，并缓存 `benchmarks.json`。
+
+- [改进] Web 回测中心下线 P0 创建入口，默认并仅展示 P3 历史 Agent 研究；P0 的 API、PlanAdapter、已有 run 详情/结果保留兼容，避免旧数据不可读。
+
+- [新功能] `server:app` / `python main.py --serve` 启动时自动拉起进程内 standard + research 回测 worker；Web 点击“创建实验”后 run 入队即自动执行，不再要求手工启动 `--kind research` worker。CLI worker 仍可并行扩容，lease 保证同一 run 只执行一次。
+
+- [新功能] P3 新增 `universe_mode=auto_local_coverage`：从 Sequoia 全市场日线库自动发现候选，按成交额/历史 bar 预筛后交给选股 Agent，不再要求手写标的池；保留 `explicit` 受控模式。
+- [改进] P3 接入 `vendor/Sequoia-X/data/sequoia_v2.db`（约 5,599 标的、2025-10-14 至 2026-11-06），将 `legacy_hfq_bridge` OHLC 按成交额/成交量回推到现金价格尺度并标 `research_price_basis_rebased` / `daily_basis_unverified`；P3 默认 `min_history_bars=40`。
+- [改进] P3 预检展示实际候选代码、数据源、覆盖区间和价格基准；auto 模式额外标 `local_coverage_universe`，明确不是严格 PIT 全市场。
+
+- [新功能] 新增 P3 历史 Agent 研究首版：显式标的池、月度决策、as-of 日线快照、选股 Agent、单股确认 Agent、确定性研究计划、LLM 调用预算与 per-run 输出缓存；计划在回测过程中生成，不再要求历史执行计划输入。
+- [新功能] 新增 `historical_agent_research` 独立研究队列与 `--kind research` worker；标准回测 worker 不领取 P3 run，P3 结果固定标记 `survivor_bias`、`model_knowledge_leakage_risk`、`llm_nondeterminism`、`research_not_production`。
+- [改进] P3 预检只检查 universe/历史行情/决策日/LLM 可用性/调用预算/工具缺口，不再出现 `no_included_plans`；预检面板展示研究标的、决策次数、预计调用、模型和工具缺口。
+- [改进] Web 回测中心新增“P3 历史 Agent 研究”表单与结果摘要，展示选股/确认决策、LLM 调用/缓存次数和研究标签；P0 回放仍保留。
+- [测试] 新增 P3 选股→确认→执行垂直切片、预算中断、研究预检、API/worker 契约测试，使用 fake LLM 离线运行。
+
+- [新功能] 新增 P0 组合回测内核（`src/backtest/`）：不可变实验快照、as-of 数据视图、结构化价格计划适配、单一逻辑时钟、资金预留、T+1、批次持仓、部分成交、费用/滑点、权益与指标、手算金标准与防前视校验；不写入 Portfolio 真账本。
+- [新功能] 新增 per-run 独立 SQLite 快照/账本 + 中央 run 元数据、持久队列、多进程 worker、租约/心跳、取消、中断恢复与 fingerprint 结果复用；相同数据/配置不会重复执行成功实验。
+- [新功能] 新增 `/api/v1/backtest/runs` 创建/列表/详情/净值/订单/成交/已平仓/持仓/输入/诊断/取消/重跑/CSV/JSON 导出，以及预检、分钟线同步 job 和候选计划/风险档位/费用策略资源。
+- [新功能] Web 回测中心新增“组合实验”视图：新建实验、风险档位预览、严格 5 分钟/日线显式降级、预检覆盖、进度/取消、净值回撤图、订单/成交/持仓/输入排除原因与导出；旧“历史分析诊断”保留为独立 tab。
+- [改进] 新增 `source_pipeline`（`selection_confirmed` / `single_stock`）与冻结的 `RiskPolicy` 档位（保守 10/40、平衡 20/80、激进 40/100，含最大持仓、最低现金、单笔风险预算、选股 Top N）；选股到单股确认必须有显式 `selection_links` 父链，缺失进入排除清单。
+- [修复] 统一 API 请求校验错误序列化，Pydantic 校验上下文中的 `ValueError` 不再导致 500，返回可读的 422 错误。
+- [文档] 新增组合回测使用说明（`docs/backtest/portfolio-backtest.md`）与 API 规格（`docs/api/backtest-runs.md`），同步 `.env.example` 的 `BACKTEST_RUNS_DIR`、worker 并发/租约/数据 job 配置。
+- [测试] 新增资金竞争/费用手算/T+1/防前视/涨跌停/部分成交/公司行为/指标 null 语义/计划适配/确定性重放/worker 租约/API 契约测试，默认离线运行。
+
+- [文档] 新增 Agent 回测系统设计与执行规格，明确已有方案组合回放、资金账本、5 分钟撮合、数据快照、防前视、历史策略/Agent 研究阶段及验收测试，并关联模拟盘与旧入场诊断方案；该规格的 P0 已由后续组合回测实现。
+
 - [改进] 选股候选发现席位支持按股票有界并发（AGENT_DESK_ROW_CONCURRENCY，默认 3），在保持逐股证据、输出顺序和超时/熔断语义的前提下，减少多股票 desk 的串行 LLM 等待。
+- [改进] 移除 Web 首页（股票分析/历史报告）与问股页面及其导航、路由和专属前端模块；根路径改为进入 `/agent-trace`，并删除仅首页使用的 `/api/v1/analysis/*`、`/api/v1/history/*` 与仅问股使用的 `/api/v1/agent/chat*`、`/api/v1/agent/skills` 接口；分析主流程、定时任务、Bot `/chat` 与 Agent 核心保持不变。
+- [改进] 彻底移除 Jev 日线影子评估：删除 `/jev` 页面与 API、Jev 服务/仓储、配置项与环境变量示例、数据表模型、持仓盯盘中的 Jev 评估，以及 Agent Trace 中的 Jev 复核；数据库既有数据不做删除。
 - [chore] 顶层目录整理：Kronos / Sequoia-X / alphasift / graphiti / openInvest 统一迁入 `vendor/`，品牌素材 `sources/` 迁入 `docs/assets/`，`review.md` 归档到 `docs/reviews/`；同步更新默认路径、Dockerfile、CI 排除项、安装脚本、`.env.example` 和相关文档。
 - [改进] 保留 `data/`、`logs/`、`reports/` 运行目录边界，旧日志与旧报告按时间归档，清理本地缓存和临时文件；docs 中带空格的文件名统一为 kebab-case。
 - [文档] 新增仓库布局与命名规范，说明顶层目录职责、第三方仓库只读边界、运行产物归档方式和文件命名约定。
-- [修复] Agent Trace 修改历史问题后不再携带冲突的旧股票代码；API 在取数前拦截单股目标冲突，并只读隔离已保存的错标的价格、评分、风控、裁决和 Jev 对照，禁止续跑复用污染证据。
-- [新功能] 接入 TypeSafe Jev 日线影子评估，覆盖 A 股、港股、美股的 1/3/5 交易日方向、已有买点方案复核与持仓风险；新增评估页面、不可覆盖的记录及后续收盘价观察，保留现有价格和风控权限。
-- [改进] 将 Jev 影子复核融入 Agent Trace：复用本轮冻结日线与证据，原报告先返回，后台追加流程节点、1/3/5 日判断与原动作分歧对照，支持轻量历史恢复和只读后续观察，并修复手机端长路径及工具标题溢出。
+- [修复] Agent Trace 修改历史问题后不再携带冲突的旧股票代码；API 在取数前拦截单股目标冲突，并只读隔离已保存的错标的价格、评分、风控和裁决，禁止续跑复用污染证据。
 - [修复] Sequoia Tushare 全市场快照缺少已有标的时，改用单股历史交集补齐复权桥接，避免 `daily_run.sh` 因单个股票 overlap 缺失中断。
 - [修复] Tushare SDK 遇到 HTTP 401 返回无列空表时改由 HTTP 客户端恢复真实凭证错误，财务快照更新明确提示 Token 无效或过期；`daily_run.sh` 的当前快照统计改用实际 `code` 字段。
 - [改进] 信号预览改为列表与图表上下排列，图表获得完整横向空间；ECharts 悬浮提示改为紧凑的日期/指标/数值行布局并限制宽度，移动端直接展示标的列表。

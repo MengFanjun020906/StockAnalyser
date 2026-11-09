@@ -15,12 +15,10 @@ from api.v1.endpoints import (
     agent,
     agent_entry_execution_backtests,
     agent_verdict_reviews,
-    analysis,
     auth,
     backtest,
+    backtest_runs,
     candidate_pool,
-    history,
-    jev,
     kronos,
     news_signals,
     portfolio,
@@ -33,8 +31,6 @@ from api.v1.endpoints import (
 
 # 创建 v1 版本主路由
 router = APIRouter(prefix="/api/v1")
-
-router.include_router(jev.router, prefix="/jev", tags=["Jev"])
 
 router.include_router(
     auth.router,
@@ -91,18 +87,6 @@ router.include_router(
 )
 
 router.include_router(
-    analysis.router,
-    prefix="/analysis",
-    tags=["Analysis"]
-)
-
-router.include_router(
-    history.router,
-    prefix="/history",
-    tags=["History"]
-)
-
-router.include_router(
     stocks.router,
     prefix="/stocks",
     tags=["Stocks"]
@@ -112,6 +96,12 @@ router.include_router(
     backtest.router,
     prefix="/backtest",
     tags=["Backtest"]
+)
+
+router.include_router(
+    backtest_runs.router,
+    prefix="/backtest",
+    tags=["BacktestRuns"]
 )
 
 router.include_router(

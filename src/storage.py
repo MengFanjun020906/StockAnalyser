@@ -194,23 +194,6 @@ class StockMinuteBar(Base):
         }
 
 
-class JevEvaluation(Base):
-    """Immutable daily shadow observations; never orders or trading permissions."""
-
-    __tablename__ = "jev_evaluations"
-
-    id = Column(String(64), primary_key=True)
-    stock_code = Column(String(32), nullable=False, index=True)
-    market = Column(String(8), nullable=False)
-    as_of = Column(Date, nullable=False, index=True)
-    purpose = Column(String(16), nullable=False)
-    status = Column(String(32), nullable=False)
-    source = Column(String(32), nullable=False)
-    source_ref = Column(String(128), nullable=True, index=True)
-    payload_json = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-
-
 class KronosModelRun(Base):
     """One Kronos inference run for a daily A-share K-line window."""
 
@@ -903,6 +886,148 @@ class BacktestSummary(Base):
             name='uix_backtest_summary_scope_code_window_version',
         ),
     )
+
+
+class BacktestRunRecord(Base):
+    """Central metadata for one portfolio backtest experiment attempt.
+
+    Detailed orders/fills/ledger stay in an immutable per-run SQLite file.  This
+    table is intentionally small so the API can list/claim runs without opening
+    every experiment ledger.
+    """
+
+    __tablename__ = 'backtest_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    mode = Column(String(32), nullable=False, index=True)
+    status = Column(String(24), nullable=False, index=True)
+    source_pipeline = Column(String(32), default='single_stock', index=True)
+    risk_profile = Column(String(24), default='balanced')
+    worker_kind = Column(String(16), default='standard', index=True)
+    attempt = Column(Integer, nullable=False, default=1)
+    request_fingerprint = Column(String(80), nullable=False, index=True)
+    experiment_fingerprint = Column(String(80), index=True)
+    reused_from_run_id = Column(String(64), index=True)
+    config_json = Column(Text, nullable=False)
+    engine_version = Column(String(64), nullable=False)
+    git_revision = Column(String(64))
+    git_dirty = Column(Boolean, default=False)
+    plan_hashes_json = Column(Text)
+    manifest_json = Column(Text)
+    metrics_json = Column(Text)
+    summary_json = Column(Text)
+    quality_flags_json = Column(Text)
+    counts_json = Column(Text)
+    result_dir = Column(String(512))
+    data_quality = Column(String(24), default='partial')
+    progress = Column(Float, default=0.0)
+    phase = Column(String(64), default='')
+    error_code = Column(String(64))
+    error_message = Column(Text)
+    cancel_requested = Column(Boolean, default=False, nullable=False)
+    lease_owner = Column(String(128), index=True)
+    lease_expires_at = Column(DateTime, index=True)
+    heartbeat_at = Column(DateTime)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint('request_fingerprint', 'attempt', name='uix_backtest_run_fingerprint_attempt'),
+        Index('ix_backtest_run_status_created', 'status', 'created_at'),
+        Index('ix_backtest_run_lease', 'status', 'lease_expires_at'),
+    )
+
+
+class BacktestRunInputRecord(Base):
+    """Included/excluded plan inputs for one experiment run."""
+
+    __tablename__ = 'backtest_run_inputs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    input_id = Column(String(128), nullable=False)
+    source_type = Column(String(32), nullable=False)
+    source_id = Column(String(128), nullable=False, index=True)
+    plan_id = Column(String(128), index=True)
+    revision = Column(Integer)
+    scenario_id = Column(String(128), index=True)
+    decision_id = Column(String(128), index=True)
+    trace_refs_json = Column(Text)
+    symbol = Column(String(16), index=True)
+    available_at = Column(DateTime)
+    valid_from = Column(Date)
+    included = Column(Boolean, nullable=False, default=False, index=True)
+    exclusion_reason = Column(String(128), index=True)
+    quality_flags_json = Column(Text)
+    payload_hash = Column(String(80))
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'input_id', name='uix_backtest_run_input'),
+        Index('ix_backtest_run_input_included', 'run_id', 'included'),
+    )
+
+
+class BacktestDataJobRecord(Base):
+    """Persisted precheck / minute-bar sync job for the backtest UI."""
+
+    __tablename__ = 'backtest_data_jobs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(64), nullable=False, unique=True, index=True)
+    job_type = Column(String(32), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default='queued', index=True)
+    request_json = Column(Text, nullable=False)
+    result_json = Column(Text)
+    progress = Column(Float, default=0.0)
+    error_code = Column(String(64))
+    error_message = Column(Text)
+    lease_owner = Column(String(128))
+    lease_expires_at = Column(DateTime)
+    heartbeat_at = Column(DateTime)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+
+    __table_args__ = (
+        Index('ix_backtest_data_job_status_created', 'status', 'created_at'),
+    )
+
+
+class BacktestCorporateActionRecord(Base):
+    """Versioned corporate-action input used to freeze experiment snapshots.
+
+    Rows are market data, not Portfolio ledger rows.  The backtest engine never
+    reads or writes PortfolioAccount/PortfolioCashLedger.
+    """
+
+    __tablename__ = 'backtest_corporate_actions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    ex_date = Column(Date, nullable=False, index=True)
+    action_type = Column(String(32), nullable=False, index=True)
+    cash_per_share = Column(Float, default=0.0)
+    stock_ratio = Column(Float, default=0.0)
+    split_ratio = Column(Float, default=1.0)
+    version = Column(String(64), nullable=False, index=True)
+    source = Column(String(64), default='manual')
+    verified = Column(Boolean, default=False)
+    payload_json = Column(Text)
+    created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol', 'ex_date', 'action_type', 'version',
+            name='uix_backtest_corporate_action',
+        ),
+        Index('ix_backtest_corporate_action_symbol_date', 'symbol', 'ex_date'),
+    )
+
 
 
 class SelectionSeedPoolSnapshot(Base):
@@ -1772,6 +1897,42 @@ class DatabaseManager:
         self._migrate_news_event_sentinel()
         self._migrate_seed_pool_snapshot_unique_key()
         self._migrate_trade_plan_schema()
+        self._migrate_backtest_run_schema()
+
+    def _migrate_backtest_run_schema(self) -> None:
+        """Add portfolio-backtest columns for databases created before P3."""
+        with self._engine.begin() as conn:
+            table = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='backtest_runs'"
+            ).fetchone()
+            if table is None:
+                return
+            self._add_sqlite_column_if_missing(
+                conn,
+                'backtest_runs',
+                'source_pipeline',
+                "ALTER TABLE backtest_runs ADD COLUMN source_pipeline VARCHAR(32) DEFAULT 'single_stock'",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                'backtest_runs',
+                'risk_profile',
+                "ALTER TABLE backtest_runs ADD COLUMN risk_profile VARCHAR(24) DEFAULT 'balanced'",
+            )
+            self._add_sqlite_column_if_missing(
+                conn,
+                'backtest_runs',
+                'worker_kind',
+                "ALTER TABLE backtest_runs ADD COLUMN worker_kind VARCHAR(16) DEFAULT 'standard'",
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_backtest_runs_source_pipeline "
+                "ON backtest_runs (source_pipeline)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_backtest_runs_worker_kind "
+                "ON backtest_runs (worker_kind)"
+            )
 
     def _migrate_trade_plan_schema(self) -> None:
         """Create deterministic price-plan tables and legacy signal references."""

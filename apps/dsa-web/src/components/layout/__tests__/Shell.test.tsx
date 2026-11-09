@@ -13,11 +13,6 @@ vi.mock('../../../contexts/AuthContext', () => ({
   }),
 }));
 
-vi.mock('../../../stores/agentChatStore', () => ({
-  useAgentChatStore: (selector: (state: { completionBadge: boolean }) => unknown) =>
-    selector({ completionBadge: true }),
-}));
-
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
@@ -35,9 +30,9 @@ beforeAll(() => {
 });
 
 describe('Shell', () => {
-  it.skip('renders navigation, theme toggle and completion badge', () => {
+  it.skip('renders navigation and theme toggle', () => {
     render(
-      <MemoryRouter initialEntries={['/chat']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <ThemeProvider>
           <Shell>
             <div>page content</div>
@@ -47,8 +42,7 @@ describe('Shell', () => {
     );
 
     expect(screen.getAllByRole('button', { name: '切换主题' }).length).toBeGreaterThan(0);
-    expect(screen.getByRole('link', { name: '问股' })).toBeInTheDocument();
-    expect(screen.getByTestId('chat-completion-badge')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '链路' })).toBeInTheDocument();
     const logoutButton = screen.getByRole('button', { name: '退出' });
     expect(logoutButton).toBeInTheDocument();
     expect(logoutButton).toHaveClass('cursor-pointer');
@@ -56,7 +50,7 @@ describe('Shell', () => {
 
   it.skip('opens the theme menu from the sidebar toggle', async () => {
     render(
-      <MemoryRouter initialEntries={['/chat']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <ThemeProvider>
           <Shell>
             <div>page content</div>
@@ -72,7 +66,7 @@ describe('Shell', () => {
 
   it('shows a confirmation dialog before logout', async () => {
     render(
-      <MemoryRouter initialEntries={['/chat']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <ThemeProvider>
           <Shell>
             <div>page content</div>

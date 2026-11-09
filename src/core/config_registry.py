@@ -915,36 +915,6 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min": 0, "max": 2},
         "display_order": 66,
     },
-    "JEV_ENABLED": {
-        "title": "Jev Shadow Evaluation", "description": "Evaluate CN/HK/US daily entry and holding risk for 1/3/5 sessions. Shadow only; never changes trading decisions.",
-        "category": "ai_model", "data_type": "boolean", "ui_control": "switch",
-        "is_sensitive": False, "is_required": False, "is_editable": True,
-        "default_value": "false", "options": [], "validation": {}, "display_order": 90,
-    },
-    "JEV_API_KEY": {
-        "title": "Jev API Key", "description": "TypeSafe System One credential. Falls back to TYPESAFE_API_KEY or TYPESAFE_AI_API_KEY when empty.",
-        "category": "ai_model", "data_type": "string", "ui_control": "password",
-        "is_sensitive": True, "is_required": False, "is_editable": True,
-        "default_value": "", "options": [], "validation": {}, "display_order": 91,
-    },
-    "JEV_BASE_URL": {
-        "title": "Jev API Base URL", "description": "HTTPS base URL for the TypeSafe System One API, without /systemone.",
-        "category": "ai_model", "data_type": "string", "ui_control": "text",
-        "is_sensitive": False, "is_required": False, "is_editable": True,
-        "default_value": "https://api.typesafe.ai/v1", "options": [], "validation": {}, "display_order": 92,
-    },
-    "JEV_MODEL": {
-        "title": "Jev Model", "description": "TypeSafe evaluation model or alias. Each observation also stores the resolved response model.",
-        "category": "ai_model", "data_type": "string", "ui_control": "text",
-        "is_sensitive": False, "is_required": False, "is_editable": True,
-        "default_value": "jev-latest", "options": [], "validation": {}, "display_order": 93,
-    },
-    "JEV_TIMEOUT_SECONDS": {
-        "title": "Jev Request Timeout", "description": "HTTP timeout in seconds. Rate limit/overload responses retry once after one second.",
-        "category": "ai_model", "data_type": "float", "ui_control": "number",
-        "is_sensitive": False, "is_required": False, "is_editable": True,
-        "default_value": "15", "options": [], "validation": {"min": 1, "max": 60}, "display_order": 94,
-    },
     "KRONOS_ENABLED": {
         "title": "Enable Kronos",
         "description": "Enable Kronos daily A-share K-line forecast inference. Disabled by default; enabling may download HuggingFace weights at first use.",

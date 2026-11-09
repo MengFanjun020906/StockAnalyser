@@ -8,8 +8,6 @@ const mockThemeToggle = vi.fn(({ collapsed }: { collapsed?: boolean }) => (
   <button type="button">{collapsed ? '切换主题(折叠)' : '切换主题'}</button>
 ));
 
-const completionBadgeState = { value: true };
-
 vi.mock('../../../contexts/AuthContext', () => ({
   useAuth: () => ({
     authEnabled: true,
@@ -17,41 +15,26 @@ vi.mock('../../../contexts/AuthContext', () => ({
   }),
 }));
 
-vi.mock('../../../stores/agentChatStore', () => ({
-  useAgentChatStore: (selector: (state: { completionBadge: boolean }) => unknown) =>
-    selector({ completionBadge: completionBadgeState.value }),
-}));
-
 vi.mock('../../theme/ThemeToggle', () => ({
   ThemeToggle: (props: { collapsed?: boolean }) => mockThemeToggle(props),
 }));
 
 describe('SidebarNav', () => {
-  it('shows the shared completion badge only when chat completion is pending', () => {
-    completionBadgeState.value = true;
-
-    const { rerender } = render(
-      <MemoryRouter initialEntries={['/chat']}>
+  it('does not render the removed home, chat, or Jev entries', () => {
+    render(
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav />
       </MemoryRouter>,
     );
 
-    expect(screen.getByTestId('chat-completion-badge')).toBeInTheDocument();
-    expect(screen.getByLabelText('问股有新消息')).toBeInTheDocument();
-
-    completionBadgeState.value = false;
-    rerender(
-      <MemoryRouter initialEntries={['/chat']}>
-        <SidebarNav />
-      </MemoryRouter>,
-    );
-
-    expect(screen.queryByTestId('chat-completion-badge')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '首页' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '问股' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Jev' })).not.toBeInTheDocument();
   });
 
   it('renders the collapsed theme toggle variant when the sidebar is collapsed', () => {
     render(
-      <MemoryRouter initialEntries={['/']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav collapsed />
       </MemoryRouter>,
     );
@@ -64,7 +47,7 @@ describe('SidebarNav', () => {
 
   it('renders the developer trace navigation item', () => {
     render(
-      <MemoryRouter initialEntries={['/']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav />
       </MemoryRouter>,
     );
@@ -74,7 +57,7 @@ describe('SidebarNav', () => {
 
   it('renders the Kronos K-line navigation item', () => {
     render(
-      <MemoryRouter initialEntries={['/']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav />
       </MemoryRouter>,
     );
@@ -84,7 +67,7 @@ describe('SidebarNav', () => {
 
   it('links the signal navigation item to the preview page', () => {
     render(
-      <MemoryRouter initialEntries={['/']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav />
       </MemoryRouter>,
     );
@@ -95,7 +78,7 @@ describe('SidebarNav', () => {
 
   it('replaces the candidate-pool navigation item with entry backtests', () => {
     render(
-      <MemoryRouter initialEntries={['/']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav />
       </MemoryRouter>,
     );
@@ -106,7 +89,7 @@ describe('SidebarNav', () => {
 
   it('opens the logout confirmation and confirms logout', async () => {
     render(
-      <MemoryRouter initialEntries={['/chat']}>
+      <MemoryRouter initialEntries={['/agent-trace']}>
         <SidebarNav />
       </MemoryRouter>,
     );

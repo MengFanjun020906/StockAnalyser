@@ -58,8 +58,6 @@ def mismatched_trace(tmp_path):
                            "risk_gate": {"allowed_action": "open"}},
         "debate.json": {"enabled": True, "success": True, "judge_decision": {"final_action": "open"}},
         "tool_calls.json": [{"tool": "analyze_trend", "success": True, "arguments": {"stock_code": "002475"}}],
-        "jev.json": {"status": "ok", "session_id": "trace-mismatch", "shadow_mode": True,
-                     "evaluation": {"stock_code": "600519", "status": "ok"}},
     }
     for name, data in files.items():
         (tmp_path / name).write_text(json.dumps(data), encoding="utf-8")
@@ -70,7 +68,7 @@ def mismatched_trace(tmp_path):
     return tmp_path
 
 
-def test_history_quarantines_wrong_security_price_decision_and_jev_without_mutating_files(mismatched_trace):
+def test_history_quarantines_wrong_security_price_and_decision_without_mutating_files(mismatched_trace):
     before = {path.name: path.read_bytes() for path in mismatched_trace.iterdir()}
     result = agent._trace_history_item_from_artifact("trace-mismatch", mismatched_trace)["result"]
     assert result["success"] is False
@@ -81,18 +79,7 @@ def test_history_quarantines_wrong_security_price_decision_and_jev_without_mutat
     assert result["composite_verdict"]["error_code"] == "target_symbol_mismatch"
     assert result["debate"]["success"] is False
     assert not result["debate"].get("judge_decision")
-    assert result["jev_review"]["status"] == "unavailable"
-    assert not result["jev_review"].get("evaluation")
     assert {path.name: path.read_bytes() for path in mismatched_trace.iterdir()} == before
-
-
-def test_jev_poll_does_not_restore_quarantined_result(mismatched_trace):
-    with patch.object(agent, "_find_trace_artifact_dir", return_value=mismatched_trace), \
-            patch("src.services.jev_trace_service.JevTraceService") as service:
-        review = agent.get_trace_jev_review("trace-mismatch")
-    assert review["status"] == "unavailable"
-    assert review["reason"] == "target_symbol_mismatch"
-    service.assert_not_called()
 
 
 def test_mismatched_trace_cannot_be_resumed_with_its_old_evidence(mismatched_trace):

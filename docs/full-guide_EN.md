@@ -919,8 +919,6 @@ FastAPI provides RESTful API service for configuration management and triggering
 ### Features
 
 - **Configuration Management** - View/modify watchlist
-- **Quick Analysis** - Trigger analysis via API
-- **Real-time Progress** - Analysis task status updates in real-time, supports parallel tasks; the regular stock-analysis path now prefers LiteLLM streaming during the LLM stage and pushes finer-grained `message/progress` updates through task SSE
 - **Backtest Validation** - Evaluate historical analysis accuracy, query direction win rate and simulated returns
 - **API Documentation** - Visit `/docs` for Swagger UI
 
@@ -928,11 +926,6 @@ FastAPI provides RESTful API service for configuration management and triggering
 
 | Endpoint | Method | Description |
 |------|------|------|
-| `/api/v1/analysis/analyze` | POST | Trigger stock analysis |
-| `/api/v1/analysis/tasks` | GET | Query task list |
-| `/api/v1/analysis/tasks/stream` | GET (SSE) | Subscribe to realtime task updates |
-| `/api/v1/analysis/status/{task_id}` | GET | Query task status |
-| `/api/v1/history` | GET | Query analysis history |
 | `/api/v1/usage/summary?period=today|month|all` | GET | Query LLM call counts and token usage grouped by call type and model |
 | `/api/v1/backtest/run` | POST | Trigger backtest |
 | `/api/v1/backtest/results` | GET | Query backtest results (paginated) |
@@ -941,25 +934,12 @@ FastAPI provides RESTful API service for configuration management and triggering
 | `/api/health` | GET | Health check |
 | `/docs` | GET | API Swagger documentation |
 
-> Note: `POST /api/v1/analysis/analyze` supports only one stock when `async_mode=false`; batch `stock_codes` requires `async_mode=true`. The async `202` response returns a single `task_id` for one stock, or an `accepted` / `duplicates` summary for batch requests.
-
-> Progress-stream note: `GET /api/v1/analysis/tasks/stream` now emits `task_progress` in addition to `task_created / task_started / task_completed / task_failed`. The regular analysis path updates `progress` and `message` across quote preparation, news retrieval, context assembly, LLM generation, and report persistence. Streaming chunks are accumulated only on the server side; history is persisted only after the final JSON parses successfully. If streaming is unavailable before the first chunk, the system falls back to the previous non-stream request. If a stream fails after partial output has already arrived, the system first retries non-stream for the same model, then continues through existing fallback models in the original order (primary + fallback list).
-> If a progress callback fails, the analysis flow continues, and the exception is now logged at warning level to help troubleshoot SSE delivery gaps.
-
-> Note: This behavior is documented in the full guide (`full-guide*.md`) because it is detailed runtime SSE/fallback behavior and is therefore kept out of the README.
+> Note: the Web home page and strategy-chat page have been removed, so `/api/v1/analysis/*`, `/api/v1/history/*`, `/api/v1/agent/chat*`, and `/api/v1/agent/skills` are no longer available. Stock analysis and report generation remain available through the CLI, scheduled jobs, and the bot; Agent traces remain available through `POST /api/v1/agent/trace/run` and `POST /api/v1/agent/trace/stream`.
 
 **Usage examples**:
 ```bash
 # Health check
 curl http://127.0.0.1:8000/api/health
-
-# Trigger analysis (A-shares)
-curl -X POST http://127.0.0.1:8000/api/v1/analysis/analyze \
-  -H 'Content-Type: application/json' \
-  -d '{"stock_code": "600519"}'
-
-# Query task status
-curl http://127.0.0.1:8000/api/v1/analysis/status/<task_id>
 
 # Query today's LLM usage
 curl "http://127.0.0.1:8000/api/v1/usage/summary?period=today"
@@ -1036,7 +1016,7 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 
 ## Agent Tool Data Cache And Persistence
 
-- `get_daily_history` first tries to reuse local `stock_daily` daily-bar cache; when the cache is fresh and contains at least the dashboard default of 30 records, it avoids another external data-source request.
+- `get_daily_history` first tries to reuse local `stock_daily` daily-bar cache; when the cache is fresh and contains at least the report default of 30 records, it avoids another external data-source request.
 - If Agent asks for more days than the local cache contains, the tool returns the available records and marks the response with `partial_cache=true`, `requested_days`, and `actual_records`.
 - When the cache is missing or stale, the tool keeps the original data-source fetch path; successful fetches are written back to `stock_daily` on a best-effort basis, and write failures do not block the Agent response.
 - `search_stock_news` expands through 7-, 14-, and 30-day windows. Results must directly mention the company name or ticker in their title, snippet, or URL; quote, F10, and announcement-directory landing pages do not count as news. It returns dated matches as verified recent news; undated matches are returned as `date_unverified/partial` instead of being presented as zero news. Per-window raw, irrelevant, static-page, stale, and error counts are retained in `window_attempts`. Verified and undated candidates are persisted to `news_intel` on a best-effort basis, with undated rows keeping `published_date=null`. `search_comprehensive_intel` keeps its dimension-specific persistence behavior.
@@ -1051,8 +1031,8 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 - The Run button uses the `POST /api/v1/agent/trace/stream` SSE endpoint by default. Context, Planner, thinking updates, tool start, tool completion, and final done/error events are appended live so long-running traces are no longer a black-box wait.
 - It supports selecting a portfolio account, report intent, risk preference, trading horizon, single-position limit, total equity exposure limit, maximum drawdown, default stop loss, and investor notes. The top `Context In Use` block shows the injected account, target position, cost, weight, unrealized PnL, and profile summary so developers can confirm whether the real portfolio context was used without digging through raw JSON.
 - When an edited question contains one explicit security different from the saved stock field, the page omits that stale field and uses the question's target. Direct requests that still contain conflicting symbols return `422 / trace_target_conflict` before fetching data on both normal and streaming endpoints. Aliases are normalized; multiple-security comparisons are not treated as single-stock conflicts.
-- Historical traces whose question conflicts with the stored stock or context are marked `target_mismatch` at read time. Their report, prices, scores, risk decision, debate, and Jev comparison are quarantined without rewriting artifacts; Jev polling cannot restore them. Resuming these traces is rejected with `409 / resume_trace_target_conflict` to prevent evidence reuse. Start a fresh analysis for the intended security.
-- Lightweight summaries of the latest 10 traces are saved in the current browser's localStorage. Full records are loaded from the backend by session and can be reopened from `Trace History`; the backend still deletes temporary `trace-*` sessions so normal chat history stays clean.
+- Historical traces whose question conflicts with the stored stock or context are marked `target_mismatch` at read time. Their report, prices, scores, risk decision, and debate are quarantined without rewriting artifacts. Resuming these traces is rejected with `409 / resume_trace_target_conflict` to prevent evidence reuse. Start a fresh analysis for the intended security.
+- Lightweight summaries of the latest 10 traces are saved in the current browser's localStorage. Full records are loaded from the backend by session and can be reopened from `Trace History`; the backend still deletes temporary `trace-*` sessions so normal conversation history stays clean.
 - Each trace also writes local backend artifacts under `data/agent_traces/<timestamp>-<session_id>/`, including `request.json`, `context.json`, `planner.json`, `events.ndjson`, `tool_calls.json`, `evidence_ledger.json`, `report_quality.json`, `debate.json`, `composite_verdict.json`, `risk_gate.json`, `final.md`, `todo.md`, and `summary.json`. When `watchlist_scan` uses the staged stock-selection pipeline, the trace also writes `stock_selection.json`, `selection_context.json`, `final_report.json`, and per-stage JSON artifacts for candidate discovery, screening, deep dives, allocation, adversarial review, and Judge decisions. Stock selection also writes `candidate_evidence.json` and `candidate_evidence.md`, a balanced evidence packet with up to 2 strategy, 2 news, 2 capital, and 2 fundamental candidates for downstream planning and troubleshooting reuse. Candidate-level evidence collection runs in parallel; duplicate stocks across dimensions keep the earlier bucket assignment, skip the duplicate, and continue filling from later candidates. The page status bar shows the current `Artifact` path. The directory lives under `/data/` and is ignored by Git by default.
 - The planning prompt includes a dedicated `Execute Protocol`: the executor must turn tool results into an Evidence Ledger, record failure downgrade paths, stop conditions, and final-output audit gates. `planner.json` and `todo.md` now record main/supporting dimensions, initial hypotheses, expected tool results, downstream use, failure fallbacks, stop conditions, and the replan policy. `todo.md` is written with the initial plan and rewritten at the end with tool success/failure status, arguments, result previews, and execute-review state.
 - After planning_execute evidence is available, the runtime enters an adversarial Debate stage: the Primary Thesis Agent, forced-opposition Agent, and Judge Agent share the same Evidence Bundle. The Judge uses a compact structured protocol with thinking disabled and receives only four-dimensional evidence summaries, verified tool references, and mathematical scenarios. It must emit absolute technical, capital-flow, fundamental, and news/event verdicts against the deterministic price plan. These verdicts may preserve or reduce execution authority but never alter mathematical prices. Trace diagnostics record finish reason, visible content size, reasoning size, and completion tokens so reasoning-only exhaustion cannot be mislabeled as a generic JSON parse failure.

@@ -148,17 +148,6 @@ class PositionWatchSchedulerService:
                 "risk_gate": evaluation.get("risk_gate"),
                 "data_window": evaluation.get("data_window"),
             }
-            if get_config().jev_enabled:
-                try:
-                    from src.services.jev_evaluation_service import JevEvaluationService
-
-                    payload["jev_evaluation"] = JevEvaluationService().evaluate(
-                        position["stock_code"], as_of=as_of, source="position_watch",
-                        source_ref=f"account:{position['account_id']}", position=position,
-                    )
-                except Exception:
-                    logger.warning("Jev position shadow unavailable for %s", position["stock_code"])
-                    payload["jev_evaluation"] = {"status": "error", "reason": "shadow_capture_error"}
             should_notify = self._should_notify(previous, position=position, current_action=evaluation["action"], current_risk=evaluation["risk_level"])
             notification = self._notification_payload(
                 position=position,

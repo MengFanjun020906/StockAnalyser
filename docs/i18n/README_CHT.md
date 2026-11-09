@@ -46,7 +46,7 @@
 | 匯入 | 智能匯入與補全 | 支援圖片、CSV/Excel、剪貼簿匯入，自選股輸入支援代碼/名稱/拼音/別名補全 |
 | 歷史 | 報告管理 | 支援歷史報告查看、完整 Markdown 報告、重新分析與批量管理 |
 | 回測 | AI 回測驗證 | 對歷史分析進行事後驗證，查看方向準確率和模擬收益 |
-| Agent 問股 | 策略對話 | 多輪策略問答，支援均線金叉/纏論/波浪等 11 種內建策略，Web/Bot/API 全鏈路 |
+| Agent 問股 | 策略對話 | 多輪策略問答，支援均線金叉/纏論/波浪等 11 種內建策略，Bot 與 Agent Trace API 鏈路 |
 | 推送 | 多渠道通知 | 支援企業微信、飛書、Telegram、Discord、Slack、郵件等主流渠道 |
 | 自動化 | 定時運行 | 支援 GitHub Actions、Docker、本地定時任務和 FastAPI 服務模式 |
 
@@ -218,11 +218,11 @@ python main.py --webui-only
 
 ## 🤖 Agent 策略問股
 
-配置任意可用 AI API Key 後，Web `/chat` 頁面即可使用策略問股；如需顯式關閉可設定 `AGENT_MODE=false`。
+配置任意可用 AI API Key 後，Bot `/chat` 指令即可使用多輪策略問答；Web 問股頁面及其 API 已移除，Agent 工作流請使用 Bot 或 `POST /api/v1/agent/trace/run`。如需顯式關閉可設定 `AGENT_MODE=false`。
 
 - 支援均線金叉、纏論、波浪理論、多頭趨勢等內建策略
 - 支援即時行情、K 線、技術指標、新聞和風險資訊調用
-- 支援多輪追問、會話匯出、發送到通知渠道和後台執行
+- 支援透過 Bot 進行多輪追問
 - 支援自訂策略文件與多 Agent 編排（實驗性）
 
 > Agent 具體參數、`skill` 命名兼容、多 Agent 模式和預算護欄見 [完整指南](../full-guide.md#本地-webui-管理界面) 與 [LLM 配置指南](../LLM_CONFIG_GUIDE.md)。

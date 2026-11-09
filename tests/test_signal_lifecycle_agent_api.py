@@ -140,13 +140,11 @@ def _structured_price_plan(symbol: str, *, trace_ref: str | None = None) -> Trad
 @pytest.mark.parametrize(
     "endpoint",
     [
-        "/api/v1/agent/chat",
-        "/api/v1/agent/chat/stream",
         "/api/v1/agent/trace/run",
         "/api/v1/agent/trace/stream",
     ],
 )
-def test_single_stock_chat_trade_plan_is_visible_in_signal_preview(endpoint: str) -> None:
+def test_single_stock_trace_trade_plan_is_visible_in_signal_preview(endpoint: str) -> None:
     _reset_auth_globals()
     with tempfile.TemporaryDirectory() as temp_dir:
         data_dir = Path(temp_dir)
@@ -205,19 +203,10 @@ def test_single_stock_chat_trade_plan_is_visible_in_signal_preview(endpoint: str
             request_payload = {
                 "message": "分析 600519 是否适合买入",
                 "session_id": "chat-signal-001",
-                "context": {
-                    "stock_code": "600519",
-                    "stock_name": "贵州茅台",
-                    "market": "cn",
-                    "as_of": "2026-08-11T15:00:00",
-                },
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "inject_portfolio_context": False,
             }
-            if "/trace/" in endpoint:
-                request_payload.update({
-                    "stock_code": "600519",
-                    "stock_name": "贵州茅台",
-                    "inject_portfolio_context": False,
-                })
 
             with (
                 patch("api.v1.endpoints.agent._build_executor", return_value=executor),
@@ -250,7 +239,7 @@ def test_single_stock_chat_trade_plan_is_visible_in_signal_preview(endpoint: str
             assert signals[0]["plan_id"] == "plan-600519-20260811"
             assert signals[0]["metadata"]["current_action"] == "wait"
             assert signals[0]["metadata"]["trigger_action"] == "open"
-            expected_session = "trace-chat-signal-001" if "/trace/" in endpoint else "chat-signal-001"
+            expected_session = "trace-chat-signal-001"
             assert signals[0]["source_trace_id"] == expected_session
         finally:
             DatabaseManager.reset_instance()

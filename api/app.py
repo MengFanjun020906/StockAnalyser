@@ -119,14 +119,56 @@ from src.services.system_config_service import SystemConfigService
 async def app_lifespan(app: FastAPI):
     """Initialize and release shared services for the app lifecycle."""
     app.state.system_config_service = SystemConfigService()
+    from src.backtest.data_service import BacktestDataService
+    from src.backtest.service import BacktestRunService
+
+    app.state.backtest_run_service = BacktestRunService()
+    app.state.backtest_data_service = BacktestDataService(
+        run_service=app.state.backtest_run_service,
+    )
+    try:
+        app.state.backtest_data_service.repo.reap_data_jobs()
+    except Exception:
+        logger.warning("failed to reap interrupted backtest data jobs", exc_info=True)
+    auto_worker = None
+    if getattr(app.state, "auto_backtest_worker_enabled", False):
+        try:
+            from src.backtest.auto_worker import AutoBacktestWorker
+
+            auto_worker = AutoBacktestWorker(
+                service=app.state.backtest_run_service,
+                research_llm_adapter=getattr(
+                    app.state.backtest_run_service, "research_llm_adapter", None
+                ),
+            )
+            auto_worker.start()
+            app.state.backtest_auto_worker = auto_worker
+        except Exception:
+            logger.warning("failed to start auto backtest workers", exc_info=True)
+            auto_worker = None
     try:
         yield
     finally:
-        if hasattr(app.state, "system_config_service"):
-            delattr(app.state, "system_config_service")
+        if auto_worker is not None:
+            try:
+                auto_worker.stop()
+            except Exception:
+                logger.warning("failed to stop auto backtest workers", exc_info=True)
+        try:
+            app.state.backtest_data_service.shutdown()
+        except Exception:
+            pass
+        for attr in (
+            "backtest_auto_worker",
+            "backtest_data_service",
+            "backtest_run_service",
+            "system_config_service",
+        ):
+            if hasattr(app.state, attr):
+                delattr(app.state, attr)
 
 
-def create_app(static_dir: Optional[Path] = None) -> FastAPI:
+def create_app(static_dir: Optional[Path] = None, auto_worker: bool = False) -> FastAPI:
     """
     创建并配置 FastAPI 应用实例
     
@@ -155,7 +197,10 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
         version="1.0.0",
         lifespan=app_lifespan,
     )
-    
+    # CLI/server entrypoints opt in explicitly; tests and library imports keep
+    # the API process free of background workers.
+    app.state.auto_backtest_worker_enabled = bool(auto_worker)
+
     # ============================================================
     # CORS 配置
     # ============================================================

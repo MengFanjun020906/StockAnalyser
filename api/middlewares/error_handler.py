@@ -21,6 +21,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 logger = logging.getLogger(__name__)
 
 
+def _json_safe(value):
+    """Convert Pydantic validation context (which may contain ValueError) to JSON."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 class ErrorHandlerMiddleware(BaseHTTPMiddleware):
     """
     全局异常处理中间件
@@ -106,7 +117,7 @@ def add_error_handlers(app) -> None:
             content={
                 "error": "validation_error",
                 "message": "请求参数验证失败",
-                "detail": exc.errors()
+                "detail": [_json_safe(item) for item in exc.errors()],
             }
         )
     
