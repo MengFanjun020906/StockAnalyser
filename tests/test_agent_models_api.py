@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1563,6 +1564,34 @@ class TraceArtifactWriterSeedPoolTestCase(unittest.TestCase):
         self.assertEqual(seed_gate["candidate_source"], "llm_expert_committee")
         self.assertEqual(seed_facts["packets"][0]["facts"]["analyze_trend"]["status"], "ok")
         self.assertNotIn("data", seed_facts["packets"][0]["facts"]["analyze_trend"])
+
+
+class AgentTraceSessionListTestCase(unittest.TestCase):
+    def test_lists_recent_trace_artifacts_for_history_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "20261109-101500-trace-older"
+            newer = root / "20261110-213710-trace-newer"
+            for path in (older, newer):
+                path.mkdir()
+                (path / "summary.json").write_text(json.dumps({"success": True, "total_steps": 3, "total_tokens": 120}))
+                (path / "request.json").write_text(json.dumps({"message": "分析 600519", "stock_code": "600519"}))
+            invalid = root / "not-a-trace-dir"
+            invalid.mkdir()
+            (invalid / "summary.json").write_text(json.dumps({"success": True}))
+
+            os.utime(older, (1_700_000_000, 1_700_000_000))
+            os.utime(newer, (1_800_000_000, 1_800_000_000))
+
+            with patch.object(agent, "_trace_artifact_root", return_value=root):
+                payload = asyncio.run(agent.list_agent_trace_sessions(limit=10))
+
+        sessions = payload["sessions"]
+        self.assertEqual([item["id"] for item in sessions], ["trace-newer", "trace-older"])
+        self.assertEqual(sessions[0]["stockCode"], "600519")
+        self.assertEqual(sessions[0]["status"], "success")
+        self.assertEqual(sessions[0]["result"]["total_steps"], 3)
+        self.assertTrue(sessions[0]["result"]["artifact_dir"].endswith("20261110-213710-trace-newer"))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ import {
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams } from 'react-router-dom';
-import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
+import { agentApi, type AgentTraceHistoryItemResponse, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
 import { portfolioApi } from '../api/portfolio';
 import { CandidateDecisionTable, type CandidateDecisionRow, type CandidateDecisionTone } from '../components/candidates/CandidateDecisionTable';
 import { TraceStepNav, type TraceNavStep } from '../components/agent/TraceStepNav';
@@ -464,6 +464,33 @@ const persistTraceHistory = (items: TraceHistoryItem[], next: TraceHistoryItem):
   const merged = [compactNext, ...items.map(compactTraceHistoryItem).filter((item) => item.id !== compactNext.id)].slice(0, TRACE_HISTORY_LIMIT);
   saveTraceHistory(merged);
   return merged;
+};
+
+const traceHistoryTimestamp = (item: TraceHistoryItem): number => {
+  const timestamp = new Date(item.createdAt).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const toTraceHistoryItem = (item: AgentTraceHistoryItemResponse): TraceHistoryItem => ({
+  ...item,
+  accountId: item.accountId ?? undefined,
+});
+
+const mergeTraceHistory = (
+  localItems: TraceHistoryItem[],
+  serverItems: AgentTraceHistoryItemResponse[],
+): TraceHistoryItem[] => {
+  const byId = new Map<string, TraceHistoryItem>();
+  // Server artifacts win over the browser index so stale localStorage entries
+  // cannot hide a run that still exists on disk.
+  [...serverItems.map(toTraceHistoryItem), ...localItems].forEach((item) => {
+    if (!item.id || byId.has(item.id)) return;
+    byId.set(item.id, item);
+  });
+  return [...byId.values()]
+    .sort((a, b) => traceHistoryTimestamp(b) - traceHistoryTimestamp(a))
+    .slice(0, TRACE_HISTORY_LIMIT)
+    .map(compactTraceHistoryItem);
 };
 
 const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
@@ -2127,6 +2154,21 @@ const AgentTracePage: React.FC = () => {
   useEffect(() => {
     document.title = 'Agent Trace';
     setHistoryItems(loadTraceHistory());
+    let alive = true;
+    agentApi.listTraceSessions(TRACE_HISTORY_LIMIT)
+      .then((response) => {
+        if (!alive) return;
+        const serverItems = Array.isArray(response?.sessions) ? response.sessions : [];
+        setHistoryItems((items) => {
+          const merged = mergeTraceHistory(items, serverItems);
+          saveTraceHistory(merged);
+          return merged;
+        });
+      })
+      .catch(() => {
+        // Server history is a recovery path; keep the local index if it is unavailable.
+      });
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {

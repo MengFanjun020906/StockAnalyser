@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getRuntimeConfig: vi.fn(),
   getTraceSession: vi.fn(),
+  listTraceSessions: vi.fn(),
   runTrace: vi.fn(),
   traceStream: vi.fn(),
 }));
@@ -15,6 +16,7 @@ vi.mock('../../api/agent', () => ({
   agentApi: {
     getRuntimeConfig: mocks.getRuntimeConfig,
     getTraceSession: mocks.getTraceSession,
+    listTraceSessions: mocks.listTraceSessions,
     runTrace: mocks.runTrace,
     traceStream: mocks.traceStream,
   },
@@ -42,10 +44,12 @@ describe('AgentTracePage', () => {
     mocks.getAccounts.mockReset();
     mocks.getRuntimeConfig.mockReset();
     mocks.getTraceSession.mockReset();
+    mocks.listTraceSessions.mockReset();
     mocks.runTrace.mockReset();
     mocks.traceStream.mockReset();
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
     mocks.getTraceSession.mockRejectedValue(new Error('not found'));
+    mocks.listTraceSessions.mockResolvedValue({ sessions: [] });
   });
 
   it('runs a trace and renders planner, events, tools, and final output', async () => {
@@ -447,6 +451,59 @@ describe('AgentTracePage', () => {
     expect(await screen.findByText('expert_graph')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
+  });
+
+  it('recovers history from server artifacts when browser storage is empty', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.listTraceSessions.mockResolvedValue({
+      sessions: [{
+        id: 'trace-server',
+        createdAt: '2026-11-10T13:37:10.000Z',
+        message: '分析 600519',
+        stockCode: '600519',
+        status: 'success',
+        result: {
+          success: true,
+          session_id: 'trace-server',
+          content: '',
+          total_steps: 2,
+          total_tokens: 10,
+          provider: 'deepseek',
+          model: 'deepseek-chat',
+          mode: 'planning_execute',
+          events: [],
+          tool_calls: [],
+          artifact_dir: '/tmp/agent_traces/20261110-213710-trace-server',
+        },
+      }],
+    });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-server',
+      createdAt: '2026-11-10T13:37:10.000Z',
+      message: '分析 600519',
+      stockCode: '600519',
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-server',
+        content: '服务端历史报告',
+        total_steps: 2,
+        total_tokens: 10,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        mode: 'planning_execute',
+        events: [],
+        tool_calls: [],
+        artifact_dir: '/tmp/agent_traces/20261110-213710-trace-server',
+      },
+    });
+
+    renderPage();
+
+    const historyButton = await screen.findByRole('button', { name: /600519/ });
+    expect(window.localStorage.getItem('dsa.agentTrace.history.v1')).toContain('trace-server');
+    fireEvent.click(historyButton);
+    expect(await screen.findByText('服务端历史报告')).toBeInTheDocument();
   });
 
   it('continues a local history trace from the history row button', async () => {
