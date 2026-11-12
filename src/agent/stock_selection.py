@@ -4199,6 +4199,8 @@ def _meta_regime_adjustment(market: Dict[str, Any]) -> str:
     regime = str(market.get("regime") or "unknown")
     if regime == "trending_up":
         return "大盘偏强,可保留动量延续剧本,但仍需回踩确认和追高约束。"
+    if regime == "bull_volatile":
+        return "大盘偏强但波动放大,可保留动量延续剧本,但必须降低首仓、等待承接确认并收紧失效条件。"
     if regime in {"range_bound", "high_volatility"}:
         return "震荡或高波动环境,高位突破需按诱多风险处理,提高回撤确认要求。"
     if regime in {"risk_off", "panic", "trending_down"}:
@@ -4815,6 +4817,8 @@ def _summarize_market_regime(regime: Dict[str, Any]) -> Dict[str, Any]:
         "volatility_bucket": regime.get("volatility_bucket"),
         "sentiment_state": regime.get("sentiment_state"),
         "wyckoff_phase": regime.get("wyckoff_phase"),
+        "trend_direction": regime.get("trend_direction"),
+        "vol_direction": regime.get("vol_direction"),
         "risk_multiplier": regime.get("risk_multiplier"),
         "strategy_hints": list(regime.get("strategy_hints") or [])[:5],
         "data_quality": regime.get("data_quality"),
@@ -4884,12 +4888,18 @@ def _apply_market_regime_constraints(
     regime_name = str(regime.get("regime") or "").strip().lower()
     risk_level = str(regime.get("risk_level") or "").strip().lower()
     volatility = str(regime.get("volatility_bucket") or "").strip().lower()
+    trend_direction = str(regime.get("trend_direction") or "").strip().lower()
+    trend_up = trend_direction == "up" or regime_name in {"trending_up", "bull_volatile"}
     restrictive = (
         regime_name in {"risk_off", "panic"}
         or risk_level in {"high", "extreme"}
-        or volatility == "extreme"
+        or (volatility == "extreme" and not trend_up)
     )
-    high_vol = restrictive or volatility in {"high_vol", "extreme"} or risk_level == "medium_high"
+    high_vol = (
+        restrictive
+        or volatility in {"elevated", "high_vol", "extreme"}
+        or risk_level == "medium_high"
+    )
     if not high_vol:
         return allocation_payload
 
@@ -4917,7 +4927,8 @@ def _apply_market_regime_constraints(
             plan["initial_amount"] = 0
             plan["reason"] = f"{plan.get('reason') or ''}；{rule}".strip("；")
         elif high_vol and action == "open":
-            capped = min(pct_num, 5.0)
+            cap_pct = 15.0 if trend_up else 5.0
+            capped = min(pct_num, cap_pct)
             plan["initial_position_pct"] = capped
             if isinstance(plan.get("initial_amount"), (int, float)) and pct_num > 0:
                 plan["initial_amount"] = plan["initial_amount"] * capped / pct_num
@@ -4953,6 +4964,12 @@ def _apply_market_regime_constraints(
 def _market_regime_rule_text(regime: Dict[str, Any]) -> str:
     regime_name = regime.get("regime") or "unknown"
     volatility = regime.get("volatility_bucket") or "unknown"
+    trend_direction = str(regime.get("trend_direction") or "").strip().lower()
+    if trend_direction == "up" or str(regime_name).strip().lower() in {"trending_up", "bull_volatile"}:
+        return (
+            f"市场状态约束：regime={regime_name}, volatility={volatility}，"
+            "降低首仓并等待承接确认，不把波动单独作为开仓否决理由"
+        )
     return f"市场状态约束：regime={regime_name}, volatility={volatility}，降低主动开仓和追高权重"
 
 
@@ -7515,6 +7532,7 @@ def _translate_machine_tokens(text: str) -> str:
         "latest_trading_day": "最近有效交易日",
         "unknown": "未知",
         "high_volatility": "高波动",
+        "bull_volatile": "高波动上涨",
         "range_bound": "震荡市",
         "uptrend": "上行趋势",
         "downtrend": "下行趋势",
@@ -7535,6 +7553,7 @@ def _market_regime_label(value: Any) -> str:
     raw = str(value or "").strip()
     labels = {
         "high_volatility": "高波动",
+        "bull_volatile": "高波动上涨",
         "range_bound": "震荡市",
         "uptrend": "上行趋势",
         "downtrend": "下行趋势",

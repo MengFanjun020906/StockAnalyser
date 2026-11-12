@@ -67,7 +67,7 @@ def market_coefficient(market_regime: Optional[Any]) -> Optional[float]:
         return None
     regime = _value(market_regime, "regime")
     bucket = _value(market_regime, "volatility_bucket")
-    if regime == "trending_up":
+    if regime in {"trending_up", "bull_volatile"}:
         return 1.0 if bucket in LOW_VOLATILITY_BUCKETS else 0.8
     return REGIME_COEFFICIENTS.get(regime or "unknown")
 

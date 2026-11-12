@@ -2738,8 +2738,8 @@ def _handle_detect_market_regime(
             prev_payload = previous.get("payload") or previous
             payload["status"] = "stale_fallback"
             payload["regime"] = prev_regime
-            for key in ("volatility_bucket", "atr_percentile", "wyckoff_phase",
-                        "sentiment_score", "composite_score", "position_guidance"):
+            for key in ("volatility_bucket", "atr_percentile", "wyckoff_phase", "trend_direction",
+                        "vol_direction", "sentiment_score", "composite_score", "position_guidance"):
                 if key in prev_payload and (key not in payload or payload.get(key) is None):
                     payload[key] = prev_payload[key]
             payload["stale_source"] = "persisted_state"
@@ -2770,8 +2770,9 @@ detect_market_regime_tool = ToolDefinition(
     description=(
         "Detect China A-share market regime using empirical ATR percentile, damped volatility "
         "bucket, A-share sentiment/liquidity substitutes, Wyckoff phase, and persisted "
-        "confirmation state. Use as the default pre-check for entry, position review, and "
-        "watchlist selection."
+        "confirmation state. Trend direction and volatility direction are reported separately "
+        "so high-volatility uptrends are not treated as risk-off. Use as the default pre-check "
+        "for entry, position review, and watchlist selection."
     ),
     parameters=[
         ToolParameter(

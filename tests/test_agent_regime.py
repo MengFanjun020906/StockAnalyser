@@ -73,7 +73,7 @@ def test_regime_confirmation_requires_consecutive_bars_before_switching():
     assert state.regime == MarketRegime.RANGE_BOUND
 
 
-def test_high_volatility_uptrend_keeps_directional_regime():
+def test_high_volatility_uptrend_is_bull_volatile_not_risk_off():
     bars = _bars(220, drift=0.35, vol=0.5)
     widened = []
     for idx, bar in enumerate(bars):
@@ -95,8 +95,37 @@ def test_high_volatility_uptrend_keeps_directional_regime():
     state = detect_market_regime(widened)
 
     assert state.volatility_bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}
-    assert state.regime == MarketRegime.TRENDING_UP
-    assert any("波动不是开仓否决项" in item for item in state.strategy_hints)
+    assert state.trend_direction == "up"
+    assert state.regime == MarketRegime.BULL_VOLATILE
+    assert state.risk_level == "medium"
+    assert state.risk_multiplier <= 1.2
+    assert any("波动用于降仓" in item for item in state.strategy_hints)
+
+
+def test_extreme_volatility_downtrend_remains_high_risk():
+    bars = _bars(220, drift=-0.35, vol=0.5)
+    widened = []
+    for idx, bar in enumerate(bars):
+        if idx < len(bars) - 30:
+            widened.append(bar)
+            continue
+        widened.append(
+            MarketBar(
+                date=bar.date,
+                open=bar.open,
+                high=bar.close + 10.0,
+                low=max(1.0, bar.close - 10.0),
+                close=bar.close,
+                volume=bar.volume * 1.5,
+                amount=bar.amount,
+            )
+        )
+
+    state = detect_market_regime(widened)
+
+    assert state.trend_direction == "down"
+    assert state.regime in {MarketRegime.TRENDING_DOWN, MarketRegime.RISK_OFF, MarketRegime.PANIC}
+    assert state.risk_level == "high"
 
 
 def test_sentiment_and_wyckoff_are_structured():

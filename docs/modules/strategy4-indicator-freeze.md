@@ -239,6 +239,7 @@ else:
 | --- | --- | ---: |
 | `trending_up` | `VolatilityBucket` ∈ {`very_low`, `low`, `normal`} | `1.00` |
 | `trending_up` | 其他波动档 | `0.80` |
+| `bull_volatile` | — | `0.80` |
 | `range_bound` | — | `0.60` |
 | `event_driven` | — | `0.50` |
 | `high_volatility` | — | `0.40` |

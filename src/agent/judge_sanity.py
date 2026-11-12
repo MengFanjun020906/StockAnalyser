@@ -165,7 +165,13 @@ def _is_risk_defense_regime(market_regime: Optional[Dict[str, Any]]) -> bool:
     regime = str(market_regime.get("regime") or "").strip().lower()
     risk = str(market_regime.get("risk_level") or "").strip().lower()
     volatility = str(market_regime.get("volatility_bucket") or "").strip().lower()
-    return regime in {"risk_off", "panic"} or risk in {"high", "extreme"} or volatility == "extreme"
+    trend_direction = str(market_regime.get("trend_direction") or "").strip().lower()
+    trend_up = trend_direction == "up" or regime in {"trending_up", "bull_volatile"}
+    return (
+        regime in {"risk_off", "panic"}
+        or risk in {"high", "extreme"}
+        or (volatility == "extreme" and not trend_up)
+    )
 
 
 def _downgrade_summary(

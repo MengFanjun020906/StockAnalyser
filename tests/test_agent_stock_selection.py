@@ -3030,3 +3030,63 @@ def test_stock_selection_pipeline_exits_when_candidate_mode_is_not_thesis_desk()
     assert discovery["full"]["required_candidate_discovery_mode"] == "thesis_desk_committee"
     assert result.tool_calls_log == []
     adapter.call_text.assert_not_called()
+
+
+def test_market_regime_constraints_allow_bull_volatile_open_with_higher_cap():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(market_regime={
+        "regime": "bull_volatile",
+        "risk_level": "medium",
+        "volatility_bucket": "extreme",
+        "trend_direction": "up",
+    })
+    payload = {
+        "summary": {},
+        "full": {
+            "positions_plan": [{
+                "code": "600001",
+                "action": "open",
+                "initial_position_pct": 20.0,
+                "initial_amount": 20000.0,
+            }],
+            "risk_controls": [],
+        },
+    }
+
+    result = stock_selection_module._apply_market_regime_constraints(ctx, payload)
+    plan = result["full"]["positions_plan"][0]
+
+    assert plan["action"] == "open"
+    assert plan["initial_position_pct"] == 15.0
+    assert plan["initial_amount"] == 15000.0
+
+
+def test_market_regime_constraints_keep_five_percent_cap_without_uptrend():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(market_regime={
+        "regime": "high_volatility",
+        "risk_level": "medium_high",
+        "volatility_bucket": "high_vol",
+        "trend_direction": "flat",
+    })
+    payload = {
+        "summary": {},
+        "full": {
+            "positions_plan": [{
+                "code": "600001",
+                "action": "open",
+                "initial_position_pct": 20.0,
+                "initial_amount": 20000.0,
+            }],
+            "risk_controls": [],
+        },
+    }
+
+    result = stock_selection_module._apply_market_regime_constraints(ctx, payload)
+    plan = result["full"]["positions_plan"][0]
+
+    assert plan["action"] == "open"
+    assert plan["initial_position_pct"] == 5.0
+    assert plan["initial_amount"] == 5000.0

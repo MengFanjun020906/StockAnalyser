@@ -22,6 +22,8 @@ def build_market_regime_expert_opinion(state: AgentState) -> ExpertOpinion:
     regime_name = str(regime.get("regime") or "unknown")
     risk_level = str(regime.get("risk_level") or "unknown")
     volatility = str(regime.get("volatility_bucket") or "unknown")
+    trend_direction = str(regime.get("trend_direction") or "unknown")
+    trend_up = trend_direction == "up" or regime_name in {"trending_up", "bull_volatile"}
     hints = _as_text_list(regime.get("strategy_hints"))[:4]
     data_quality = str(regime.get("data_quality") or "")
 
@@ -29,7 +31,11 @@ def build_market_regime_expert_opinion(state: AgentState) -> ExpertOpinion:
     confidence = 0.55
     risks: List[str] = []
     action = "selectively_open"
-    if regime_name in {"risk_off", "panic"} or risk_level in {"high", "extreme", "critical"} or volatility == "extreme":
+    if (
+        regime_name in {"risk_off", "panic"}
+        or risk_level in {"high", "extreme", "critical"}
+        or (volatility == "extreme" and not trend_up)
+    ):
         verdict = "caution"
         confidence = 0.8
         risks.append("市场状态限制主动开仓或追高。")

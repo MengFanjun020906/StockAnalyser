@@ -28,6 +28,7 @@ class VolatilityBucket(str, Enum):
 
 class MarketRegime(str, Enum):
     TRENDING_UP = "trending_up"
+    BULL_VOLATILE = "bull_volatile"
     TRENDING_DOWN = "trending_down"
     RANGE_BOUND = "range_bound"
     HIGH_VOLATILITY = "high_volatility"
@@ -132,6 +133,8 @@ class RegimeState:
     sentiment_score: Optional[float]
     sentiment_components: Dict[str, Any]
     wyckoff_phase: WyckoffPhase
+    trend_direction: str
+    vol_direction: str
     risk_level: str
     risk_multiplier: float
     strategy_hints: List[str]
@@ -153,6 +156,8 @@ class RegimeState:
             "sentiment_score": self.sentiment_score,
             "sentiment_components": self.sentiment_components,
             "wyckoff_phase": self.wyckoff_phase.value,
+            "trend_direction": self.trend_direction,
+            "vol_direction": self.vol_direction,
             "risk_level": self.risk_level,
             "risk_multiplier": self.risk_multiplier,
             "strategy_hints": self.strategy_hints,
@@ -230,12 +235,14 @@ def detect_market_regime(
     evidence.extend(wyckoff_evidence)
 
     trend = _trend_metrics(bars)
+    trend_direction = _trend_direction(trend, wyckoff_phase)
+    vol_direction = _vol_direction(atr_values)
+    evidence.append(f"趋势方向={trend_direction}，波动方向={vol_direction}。")
     raw_regime = _classify_regime(
         trend=trend,
+        trend_direction=trend_direction,
         bucket=bucket,
         sentiment_state=sentiment_state,
-        sentiment_score=sentiment_score,
-        wyckoff_phase=wyckoff_phase,
     )
     regime, confirmation = _apply_regime_confirmation(
         raw_regime=raw_regime,
@@ -252,9 +259,16 @@ def detect_market_regime(
 
     conflicts.extend(_detect_conflicts(bucket, sentiment_state, wyckoff_phase, trend))
     meta = _VOL_BUCKET_META.get(bucket, _VOL_BUCKET_META[VolatilityBucket.UNKNOWN])
-    strategy_hints = list(meta["strategy_hints"])
+    if trend_direction == "up" and bucket in {
+        VolatilityBucket.ELEVATED,
+        VolatilityBucket.HIGH_VOL,
+        VolatilityBucket.EXTREME,
+    }:
+        strategy_hints = ["趋势向上且波动抬升：降低首仓、放宽止损，但不用波动单独否决方向。"]
+    else:
+        strategy_hints = list(meta["strategy_hints"])
     strategy_hints.extend(_regime_strategy_hints(regime, bucket, wyckoff_phase, sentiment_state))
-    risk_level = _risk_level(regime, bucket, sentiment_state)
+    risk_level = _risk_level(regime, bucket, sentiment_state, trend_direction)
     data_quality = _data_quality(len(bars), sentiment_payload)
 
     return RegimeState(
@@ -269,8 +283,10 @@ def detect_market_regime(
         sentiment_score=round(sentiment_score, 4) if sentiment_score is not None else None,
         sentiment_components=sentiment_payload,
         wyckoff_phase=wyckoff_phase,
+        trend_direction=trend_direction,
+        vol_direction=vol_direction,
         risk_level=risk_level,
-        risk_multiplier=float(meta["risk_multiplier"]),
+        risk_multiplier=_risk_multiplier(bucket, trend_direction),
         strategy_hints=strategy_hints,
         evidence=evidence,
         conflicts=conflicts,
@@ -292,6 +308,8 @@ def _unknown_state(market: str, bars: Sequence[MarketBar], reason: str) -> Regim
         sentiment_score=None,
         sentiment_components={},
         wyckoff_phase=WyckoffPhase.UNKNOWN,
+        trend_direction="unknown",
+        vol_direction="unknown",
         risk_level="unknown",
         risk_multiplier=1.0,
         strategy_hints=["数据不足，保守采用监控/等待。"],
@@ -469,28 +487,52 @@ def _trend_metrics(bars: Sequence[MarketBar]) -> Dict[str, Any]:
     }
 
 
+def _trend_direction(trend: Dict[str, Any], wyckoff_phase: WyckoffPhase) -> str:
+    if wyckoff_phase == WyckoffPhase.MARKUP or (
+        trend.get("above_ma20") and trend.get("above_ma60") and trend.get("ret20", 0.0) > 0.03
+    ):
+        return "up"
+    if wyckoff_phase == WyckoffPhase.MARKDOWN or (
+        not trend.get("above_ma20") and not trend.get("above_ma60") and trend.get("ret20", 0.0) < -0.03
+    ):
+        return "down"
+    return "flat"
+
+
+def _vol_direction(atr_values: Sequence[float], window: int = 5) -> str:
+    if len(atr_values) < window + 1:
+        return "unknown"
+    baseline = mean(atr_values[-window - 1 : -1])
+    if baseline <= 0:
+        return "unknown"
+    ratio = atr_values[-1] / baseline
+    if ratio > 1.15:
+        return "expanding"
+    if ratio < 0.85:
+        return "compressing"
+    return "stable"
+
+
 def _classify_regime(
     *,
     trend: Dict[str, Any],
+    trend_direction: str,
     bucket: VolatilityBucket,
     sentiment_state: SentimentState,
-    sentiment_score: Optional[float],
-    wyckoff_phase: WyckoffPhase,
 ) -> MarketRegime:
     if bucket == VolatilityBucket.EXTREME and trend.get("ret20", 0.0) < -0.06:
         return MarketRegime.PANIC
     if (
         bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}
         and sentiment_state in {SentimentState.FEAR, SentimentState.EXTREME_FEAR}
+        and trend_direction != "up"
     ):
         return MarketRegime.RISK_OFF
-    if wyckoff_phase == WyckoffPhase.MARKUP or (
-        trend.get("above_ma20") and trend.get("above_ma60") and trend.get("ret20", 0.0) > 0.03
-    ):
+    if trend_direction == "up":
+        if bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
+            return MarketRegime.BULL_VOLATILE
         return MarketRegime.TRENDING_UP
-    if wyckoff_phase == WyckoffPhase.MARKDOWN or (
-        not trend.get("above_ma20") and not trend.get("above_ma60") and trend.get("ret20", 0.0) < -0.03
-    ):
+    if trend_direction == "down":
         return MarketRegime.TRENDING_DOWN
     if bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
         return MarketRegime.HIGH_VOLATILITY
@@ -566,6 +608,9 @@ def _regime_strategy_hints(
         hints.append("risk_off 下优先降低风险暴露，开仓需等待市场确认。")
     elif regime == MarketRegime.PANIC:
         hints.append("panic 下禁止追涨杀跌，优先处理止损和流动性。")
+    elif regime == MarketRegime.BULL_VOLATILE:
+        hints.append("强势高波动环境：允许顺势参与，但必须降低首仓、等待承接确认，并保留明确失效条件。")
+        hints.append("高波动上涨中，波动用于降仓和放宽止损，不作为方向否决项。")
     elif regime == MarketRegime.TRENDING_UP:
         hints.append("趋势向上时可接受回踩确认后的顺势策略。")
         if bucket in {VolatilityBucket.ELEVATED, VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
@@ -585,12 +630,36 @@ def _regime_strategy_hints(
     return hints
 
 
-def _risk_level(regime: MarketRegime, bucket: VolatilityBucket, sentiment_state: SentimentState) -> str:
-    if regime in {MarketRegime.PANIC, MarketRegime.RISK_OFF} or bucket == VolatilityBucket.EXTREME:
+def _risk_multiplier(bucket: VolatilityBucket, trend_direction: str) -> float:
+    meta = _VOL_BUCKET_META.get(bucket, _VOL_BUCKET_META[VolatilityBucket.UNKNOWN])
+    if trend_direction == "up":
+        directional = {
+            VolatilityBucket.ELEVATED: 1.0,
+            VolatilityBucket.HIGH_VOL: 1.1,
+            VolatilityBucket.EXTREME: 1.2,
+        }
+        if bucket in directional:
+            return directional[bucket]
+    return float(meta["risk_multiplier"])
+
+
+def _risk_level(
+    regime: MarketRegime,
+    bucket: VolatilityBucket,
+    sentiment_state: SentimentState,
+    trend_direction: str,
+) -> str:
+    if regime in {MarketRegime.PANIC, MarketRegime.RISK_OFF}:
+        return "high"
+    if sentiment_state in {SentimentState.EXTREME_GREED, SentimentState.EXTREME_FEAR}:
+        return "medium_high"
+    if regime == MarketRegime.BULL_VOLATILE:
+        return "medium"
+    if trend_direction == "up":
+        return "medium"
+    if bucket == VolatilityBucket.EXTREME:
         return "high"
     if bucket in {VolatilityBucket.ELEVATED, VolatilityBucket.HIGH_VOL}:
-        return "medium_high"
-    if sentiment_state in {SentimentState.EXTREME_GREED, SentimentState.EXTREME_FEAR}:
         return "medium_high"
     if regime == MarketRegime.UNKNOWN:
         return "unknown"

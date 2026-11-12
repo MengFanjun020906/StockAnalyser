@@ -107,6 +107,25 @@ def test_risk_defense_wait_with_no_position_keeps_audit_check():
     assert any(check["rule_id"] == "risk_defense_already_wait" for check in checks)
 
 
+def test_bull_volatile_extreme_volatility_does_not_downgrade_active_judge():
+    sanitized = apply_judge_sanity(
+        _judge("open"),
+        allocation_payload=_allocation(),
+        market_regime={
+            "regime": "bull_volatile",
+            "risk_level": "medium",
+            "volatility_bucket": "extreme",
+            "trend_direction": "up",
+        },
+    )
+
+    assert sanitized["summary"]["final_action"] == "open"
+    assert not any(
+        check["rule_id"] == "risk_defense_downgrade"
+        for check in sanitized["full"].get("sanity_checks") or []
+    )
+
+
 def test_wait_is_not_upgraded_or_mutated_without_checks():
     payload = _judge("wait")
     original = deepcopy(payload)
