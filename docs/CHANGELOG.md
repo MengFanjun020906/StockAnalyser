@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [修复] Agent Trace 历史不再只依赖浏览器 `localStorage`：新增 `GET /api/v1/agent/trace/sessions` 从本地 artifact 目录恢复最近会话，页面加载时与本地索引合并并按时间排序，避免切换访问端口（如 `5173` → `8000`）、清理缓存或换浏览器后历史记录消失。
+
+- [改进] `./start_all.sh` 默认只启动后端 `8000`，由后端同时提供 Web 页面与 API，并在启动前复用 `prepare_webui_frontend_assets()` 自动检查/构建前端静态产物；Vite `5173` 改为 `START_WEB=true` 显式开启的热更新选项，避免每次启动同时占用两个访问入口。
+
+- [改进] 信号预览页给评分条每个指标加释义 tooltip（策略 4 的分项与阈值、缠论加减分、量比/波动率/近 10 日/金叉口径），鼠标悬停或键盘聚焦即可查看。
+
+- [修复] 信号预览页评分条区分正式分与临时分：正式分被阻塞（如本周周线未收盘）时展示后端 `provisional_score` 并标记“临时”，同时给出阻塞原因中文说明，不再出现“综合评分 -- / 20 但缠论 0 / 10”的迷惑组合。
+
+- [修复] 信号预览页图表降噪：同一价位只画一条止损/目标线、观察场景不再画不可执行的止损目标、事件点按「类型+日期」去重并补中文文案、价格带与中枢不再往 K 线上写标签（价格区间移到页面图例，中枢改为描边方框 + 图例色块）；修正 `null` 止损被画成 0 元线、右侧价格轴刻度与标签被裁切、成交量单位显示为“50000万”的问题。
+
+- [改进] 信号预览页桌面改双栏（列表 + 详情），选中标的写入 `?mode=&id=`，刷新或分享不再跳回第一只；窄屏图表默认窗口收到 60 根、指标与固定判决改双列；顺带修复侧边栏品牌名溢出遮挡标题、刷新按钮图标被按钮内边距挤扁。
+
+- [改进] `detect_market_regime` 解耦趋势方向与波动方向：新增 `trend_direction`、`vol_direction` 和 `bull_volatile` regime；趋势向上时高波动只降仓、不否决，组合配置、Judge、市场专家和 prompts 同步调整。
+
 - [文档] 按当前代码对齐 `docs/architecture/选股链路重构-实施方案.md` 与 `docs/architecture/stock-selection-pipeline.md`：修正四席位数量、深挖上限（默认 4、上限 5）、席位超时（300s）、seed fact 超时（30s）等数值；标注红线否决门仅实现未接线、席位名额/回填表未接入 Config、`theme_catalyst` 缺专属 playbook；补充 `balanced_candidate_evidence`、`deterministic_scoring`、断点续跑和真实 trace 事件清单。
 
 - [新功能] 回测结果页新增“上证超额”指标：策略区间收益减上证指数区间收益，正数表示跑赢；benchmark 接口同时返回 `strategy_return_pct`、`shanghai_return_pct`、`excess_vs_shanghai_pct` 和各指数收益。

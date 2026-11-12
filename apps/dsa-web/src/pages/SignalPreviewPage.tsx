@@ -1,7 +1,8 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
-import { Activity, AlertTriangle, CalendarClock, CandlestickChart, ChevronRight, Database, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Activity, AlertTriangle, CalendarClock, CandlestickChart, ChevronRight, Database, Info, RefreshCw, ShieldCheck } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import {
   signalPreviewApi,
   type EntrySignal,
@@ -13,7 +14,7 @@ import {
 } from '../api/signalPreview';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
-import { ApiErrorAlert, Badge, EmptyState } from '../components/common';
+import { ApiErrorAlert, Badge, EmptyState, Tooltip } from '../components/common';
 import { cn } from '../utils/cn';
 import { buildSignalPreviewChartOption } from './signalPreviewChartOption';
 import { entryCurrentAction, entryDisplayState, entryPlanMode, entryTriggerAction } from './signalPreviewPresentation';
@@ -137,6 +138,13 @@ const PERMISSION_TEXT: Record<string, string> = {
   not_evaluable: '暂不可评估',
 };
 
+const FORMALIZATION_REASON_TEXT: Record<string, string> = {
+  S4_WEEKLY_BAR_UNCONFIRMED: '本周周线尚未收盘，策略 4 与综合分当前为临时分；日线指标与已确认的缠论信号仍然有效。',
+  S4_FEATURES_INCOMPLETE: '策略 4 必需特征不完整，综合分暂不成立。',
+  S4_NOT_IMPLEMENTED: '策略 4 指标尚未实现，综合分暂不成立。',
+  CHAN_EVIDENCE_INSUFFICIENT: '缠论结构证据不足，缠论分暂不计入。',
+};
+
 const ACTION_TEXT: Record<string, string> = {
   none: '无',
   hold: '持有',
@@ -154,11 +162,31 @@ const SOURCE_TEXT: Record<string, string> = {
   local_db: '本地数据库',
   LocalDB: '本地数据库',
   Baostock: 'Baostock',
+  TushareFetcher: 'Tushare',
+  Akshare: 'Akshare',
   quote_provider: '行情源',
   lazy_reconcile: '信号补算',
   single_stock_query: '单股分析',
   portfolio_scheduler: '持仓定时任务',
   deterministic_price_plan: '确定性价格计划',
+};
+
+const ZONE_ROLE_TEXT: Record<string, string> = {
+  primary: '主入场区',
+  secondary: '次入场区',
+  observation: '观察区',
+};
+
+const ZONE_SWATCH: Record<string, string> = {
+  primary: 'border-sky-400 bg-sky-400/40',
+  secondary: 'border-teal-300 bg-teal-400/35',
+  observation: 'border-slate-300 bg-slate-400/25',
+};
+
+const ENTRY_ZONE_TEXT: Record<string, string> = {
+  ideal: '理想入场',
+  secondary: '次优入场',
+  entry: '计划入场',
 };
 
 const SCENARIO_ROLE_TEXT: Record<string, string> = {
@@ -168,6 +196,7 @@ const SCENARIO_ROLE_TEXT: Record<string, string> = {
 };
 
 const SETUP_TEXT: Record<string, string> = {
+  agent_entry: '智能体入场',
   chan_first_buy: '缠论一买',
   chan_second_buy: '缠论二买',
   chan_third_buy: '缠论三买',
@@ -204,7 +233,12 @@ const SignalChart: React.FC<{ detail: SignalPreviewDetail | null }> = ({ detail 
   useEffect(() => {
     if (!ref.current || !detail?.chart.bars.length) return undefined;
     const chart = echarts.init(ref.current);
-    chart.setOption(buildSignalPreviewChartOption(detail), { notMerge: true });
+    // 窄屏塞不下 180 根 K 线，默认窗口收到 60 根，同时隐藏价格线标签。
+    const compact = ref.current.getBoundingClientRect().width < 520;
+    chart.setOption(
+      buildSignalPreviewChartOption(detail, { compact, visibleBars: compact ? 60 : 180 }),
+      { notMerge: true },
+    );
     let resizeFrame = 0;
     const resize = () => {
       window.cancelAnimationFrame(resizeFrame);
@@ -237,11 +271,11 @@ const SignalChart: React.FC<{ detail: SignalPreviewDetail | null }> = ({ detail 
         title="暂无本地 K 线"
         description="当前标的在本地数据库中没有可展示的日线数据。"
         icon={<CandlestickChart className="h-7 w-7" />}
-        className="min-h-[560px]"
+        className="min-h-[420px]"
       />
     );
   }
-  return <div ref={ref} data-testid="signal-preview-chart" className="h-[650px] min-h-[520px] w-full min-w-0 max-w-full overflow-hidden [&>div]:!w-full [&_canvas]:!w-full xl:h-[720px]" />;
+  return <div ref={ref} data-testid="signal-preview-chart" className="h-[420px] min-h-[360px] w-full min-w-0 max-w-full overflow-hidden [&>div]:!w-full [&_canvas]:!w-full sm:h-[560px] xl:h-[680px]" />;
 };
 
 const ModeTabs: React.FC<{ mode: PreviewMode; data: SignalPreviewList | null; onChange: (mode: PreviewMode) => void }> = ({ mode, data, onChange }) => (
@@ -277,16 +311,8 @@ type SubjectListProps = {
 const SubjectList: React.FC<SubjectListProps> = ({ mode, data, selectedId, onSelect }) => {
   const legacySignals = (data?.entrySignals ?? []).filter((item) => !item.planId);
   const rows = mode === 'entry' ? [...(data?.pricePlans ?? []), ...legacySignals] : data?.positionWatches ?? [];
-  if (!rows.length) {
-    return (
-      <EmptyState
-        title={mode === 'entry' ? '暂无个股信号' : '暂无持仓监控'}
-        description={mode === 'entry' ? '单股分析会保存确定性价格计划；没有正式买点的观察区也会显示。' : '独立定时进程完成首次持仓扫描后显示。'}
-        icon={<Database className="h-6 w-6" />}
-        className="min-h-[240px] px-4"
-      />
-    );
-  }
+  // 列表为空时不再渲染第二个空态，右侧主区域已有一次统一说明。
+  if (!rows.length) return null;
   return (
     <div className="divide-y divide-border/60 border-y border-border/60">
       {rows.map((row) => {
@@ -330,46 +356,105 @@ const SubjectList: React.FC<SubjectListProps> = ({ mode, data, selectedId, onSel
   );
 };
 
+const S4_HINT = (
+  <span className="block">
+    <span className="block font-semibold text-foreground">策略 4 · strategy4.v1（满分 10）</span>
+    <span className="mt-1 block">区域 2：EMA13 指导线 &gt; MA57，且 MA57 上升</span>
+    <span className="block">多周期共振 2：日线多/强、周线多/强四项中 ≥ 3 项</span>
+    <span className="block">量比 2：当日成交量 ÷ 5 日均量 ≥ 1.2</span>
+    <span className="block">波动率 2：ATR14 ÷ MA20 ≤ 6%</span>
+    <span className="block">近 10 日 1：涨幅 ≤ 9%（防追高）</span>
+    <span className="block">金叉 1：当日 DIF 上穿 DEA，且其余条件全部满足</span>
+    <span className="mt-1 block text-secondary-text/80">每项满足阈值才得分；周线未收盘时只出临时分。</span>
+  </span>
+);
+
+const METRIC_HINTS: Record<string, React.ReactNode> = {
+  '综合评分': '策略 4 分 + 缠论分，满分 20。正式分被阻塞时（如本周周线未收盘）这里显示后端临时分。',
+  '策略 4': S4_HINT,
+  '缠论': '按已触发信号加减：一买 +5、二买 +4、三买 +2、底钝化 +2、周线确认 +1；顶背驰 -3、顶钝化 -2，上下限 0–10 分。未收盘的周线信号暂不计分。',
+  '多周期共振': '日线多头、日线强势、周线多头、周线强势四项中满足的数量；≥ 3 项才拿满策略 4 的共振分。',
+  '量比': '当日成交量 ÷ 5 日均量。≥ 1.2 记满策略 4 的量比分。',
+  '波动率': 'ATR14 ÷ MA20 × 100。≤ 6% 记满策略 4 的波动率分。',
+  '近 10 日': '最近 10 个交易日涨幅。≤ 9% 记满 1 分（防止追高）。',
+  '金叉 / 全满足': '金叉：当日 DIF 上穿 DEA。全满足：区域、共振、量比、波动率、近 10 日五项条件同时达标。',
+};
+
+type MetricItem = { label: string; value: string; tag?: string; hint?: React.ReactNode };
+
 const MetricsStrip: React.FC<{ detail: SignalPreviewDetail }> = ({ detail }) => {
   const composite = detail.chart.composite;
   const verdict = composite?.compositeVerdict;
   const s4 = composite?.snapshot?.s4;
-  const metrics = [
-    ['综合评分', verdict?.score == null ? '-- / 20' : `${verdict.score} / ${verdict.scaleMax ?? 20}`],
-    ['策略 4', verdict?.components?.s4?.score == null ? '-- / 10' : `${verdict.components.s4.score} / 10`],
-    ['缠论', verdict?.components?.chan?.score == null ? '-- / 10' : `${verdict.components.chan.score} / 10`],
-    ['多周期共振', s4?.resonanceCount == null ? '--' : `${s4.resonanceCount} / 4`],
-    ['量比', fmt(s4?.volumeRatio5D)],
-    ['波动率', fmtPct(s4?.volatilityPct)],
-    ['近 10 日', fmtPct(s4?.gain10dPct)],
-    ['金叉 / all_ok', `${s4?.goldenCrossToday === true ? '是' : s4?.goldenCrossToday === false ? '否' : '--'} / ${s4?.allOk === true ? '是' : s4?.allOk === false ? '否' : '--'}`],
+  const scaleMax = verdict?.scaleMax ?? 20;
+  const s4Score = verdict?.components?.s4?.score;
+  const s4Provisional = s4Score == null ? verdict?.components?.s4?.provisionalScore ?? null : null;
+  const chanScore = verdict?.components?.chan?.score;
+  // 正式分被阻塞（例如周线未收盘）时，后端会给出临时分；不显示会让整条指标看起来像坏了。
+  const provisional = verdict?.score == null ? verdict?.provisionalScore ?? null : null;
+  const metrics: MetricItem[] = [
+    {
+      label: '综合评分',
+      value: verdict?.score != null ? `${verdict.score} / ${scaleMax}` : provisional != null ? `${provisional} / ${scaleMax}` : `-- / ${scaleMax}`,
+      tag: provisional != null ? '临时' : undefined,
+      hint: METRIC_HINTS['综合评分'],
+    },
+    {
+      label: '策略 4',
+      value: s4Score != null ? `${s4Score} / 10` : s4Provisional != null ? `${s4Provisional} / 10` : '-- / 10',
+      tag: s4Provisional != null ? '临时' : undefined,
+      hint: METRIC_HINTS['策略 4'],
+    },
+    { label: '缠论', hint: METRIC_HINTS['缠论'], value: chanScore == null ? '-- / 10' : `${chanScore} / 10` },
+    { label: '多周期共振', hint: METRIC_HINTS['多周期共振'], value: s4?.resonanceCount == null ? '--' : `${s4.resonanceCount} / 4` },
+    { label: '量比', hint: METRIC_HINTS['量比'], value: fmt(s4?.volumeRatio5D) },
+    { label: '波动率', hint: METRIC_HINTS['波动率'], value: fmtPct(s4?.volatilityPct) },
+    { label: '近 10 日', hint: METRIC_HINTS['近 10 日'], value: fmtPct(s4?.gain10dPct) },
+    { label: '金叉 / 全满足', hint: METRIC_HINTS['金叉 / 全满足'], value: `${s4?.goldenCrossToday === true ? '是' : s4?.goldenCrossToday === false ? '否' : '--'} / ${s4?.allOk === true ? '是' : s4?.allOk === false ? '否' : '--'}` },
   ];
   return (
-    <div className="grid border-y border-border/70 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-8">
-      {metrics.map(([label, value], index) => (
-        <div key={label} className={cn('min-h-[70px] px-3 py-3', index > 0 ? 'border-t border-border/50 sm:border-l sm:border-t-0' : '')}>
-          <div className="text-[11px] font-medium text-secondary-text">{label}</div>
-          <div className="mt-1 text-sm font-semibold tabular-nums text-foreground">{value}</div>
+    <div className="grid grid-cols-2 gap-px border-y border-border/70 bg-border/50 sm:grid-cols-4 2xl:grid-cols-8">
+      {metrics.map((metric) => (
+        <div key={metric.label} className="min-h-[62px] bg-background px-3 py-2.5">
+          <div className="flex items-center gap-1 text-[11px] font-medium text-secondary-text">
+            {metric.label}
+            {metric.hint ? (
+              <Tooltip content={metric.hint} focusable className="-m-1 p-1">
+                <Info className="h-3 w-3 shrink-0 text-secondary-text/60" aria-hidden />
+              </Tooltip>
+            ) : null}
+          </div>
+          <div className="mt-1 flex items-baseline gap-1.5">
+            <span className="text-sm font-semibold tabular-nums text-foreground">{metric.value}</span>
+            {metric.tag ? <span className="rounded bg-warning/15 px-1 py-0.5 text-[10px] font-medium text-warning">{metric.tag}</span> : null}
+          </div>
         </div>
       ))}
     </div>
   );
 };
 
-const SchedulerStatus: React.FC<{ data: SignalPreviewList | null }> = ({ data }) => (
-  <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border/60 pt-3 text-xs text-secondary-text">
-    <span className="inline-flex items-center gap-1.5 font-medium text-foreground"><CalendarClock className="h-3.5 w-3.5" />定时扫描</span>
-    {(['cn', 'hk', 'us'] as const).map((market) => {
-      const state = data?.scheduler.find((item) => item.market === market);
-      return (
-        <span key={market} className="inline-flex items-center gap-1.5">
-          <span className={cn('h-2 w-2 rounded-full', state?.online ? 'bg-success' : 'bg-secondary-text/40')} />
-          {market.toUpperCase()} {state?.status === 'failed' ? '失败' : state?.lastSuccessAt ? shortDate(state.lastSuccessAt) : '待首轮'}
+const SchedulerStatus: React.FC<{ data: SignalPreviewList | null }> = ({ data }) => {
+  const states = data?.scheduler ?? [];
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border/60 pt-3 text-xs text-secondary-text">
+      <span className="inline-flex items-center gap-1.5 font-medium text-foreground"><CalendarClock className="h-3.5 w-3.5" />定时扫描</span>
+      {states.length === 0 ? (
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-2 w-2 rounded-full bg-secondary-text/40" />暂无运行记录
         </span>
-      );
-    })}
-  </div>
-);
+      ) : (['cn', 'hk', 'us'] as const).map((market) => {
+        const state = states.find((item) => item.market === market);
+        return (
+          <span key={market} className="inline-flex items-center gap-1.5">
+            <span className={cn('h-2 w-2 rounded-full', state?.online ? 'bg-success' : 'bg-secondary-text/40')} />
+            {market.toUpperCase()} {state?.status === 'failed' ? '失败' : state?.lastSuccessAt ? shortDate(state.lastSuccessAt) : '待首轮'}
+          </span>
+        );
+      })}
+    </div>
+  );
+};
 
 const EvaluationPanel: React.FC<{ evaluation: SignalEvaluationSummary | null }> = ({ evaluation }) => {
   if (!evaluation) return null;
@@ -442,7 +527,8 @@ const EvaluationPanel: React.FC<{ evaluation: SignalEvaluationSummary | null }> 
 };
 
 const SignalPreviewPage: React.FC = () => {
-  const [mode, setMode] = useState<PreviewMode>('entry');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [mode, setMode] = useState<PreviewMode>(searchParams.get('mode') === 'position' ? 'position' : 'entry');
   const [data, setData] = useState<SignalPreviewList | null>(null);
   const [evaluation, setEvaluation] = useState<SignalEvaluationSummary | null>(null);
   const [detail, setDetail] = useState<SignalPreviewDetail | null>(null);
@@ -450,15 +536,16 @@ const SignalPreviewPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState<ParsedApiError | null>(null);
+  const detailRef = useRef<HTMLElement | null>(null);
 
   const legacyEntrySignals = useMemo(
     () => (data?.entrySignals ?? []).filter((item) => !item.planId),
     [data],
   );
   const ids = useMemo(
-    () => mode === 'entry'
+    () => (mode === 'entry'
       ? [...(data?.pricePlans ?? []).map((item) => item.planId), ...legacyEntrySignals.map((item) => item.signalId)]
-      : (data?.positionWatches ?? []).map((item) => item.watchId),
+      : (data?.positionWatches ?? []).map((item) => item.watchId)),
     [data, legacyEntrySignals, mode],
   );
 
@@ -511,11 +598,31 @@ const SignalPreviewPage: React.FC = () => {
       setDetail(null);
       return;
     }
-    if (!selectedId || !ids.includes(selectedId)) setSelectedId(ids[0]);
-  }, [ids, selectedId]);
+    if (selectedId && ids.includes(selectedId)) return;
+    const fromUrl = searchParams.get('id');
+    if (fromUrl && ids.includes(fromUrl)) {
+      setSelectedId(fromUrl);
+      return;
+    }
+    setSelectedId(ids[0]);
+  }, [ids, searchParams, selectedId]);
   useEffect(() => {
     if (selectedId) void loadDetail(selectedId);
   }, [loadDetail, selectedId]);
+  // 选中标的写回地址栏，刷新或分享链接不会跳回第一只票。
+  useEffect(() => {
+    // 列表还没回来时不要动 URL，否则刷新会把 ?id= 擦掉。
+    if (!data) return;
+    if (!selectedId && ids.length) return;
+    const urlMode = searchParams.get('mode') ?? 'entry';
+    const urlId = searchParams.get('id') ?? '';
+    if (urlMode === mode && urlId === (selectedId ?? '')) return;
+    const next = new URLSearchParams(searchParams);
+    next.set('mode', mode);
+    if (selectedId) next.set('id', selectedId);
+    else next.delete('id');
+    setSearchParams(next, { replace: true });
+  }, [data, ids.length, mode, searchParams, selectedId, setSearchParams]);
 
   const subject = detail?.subject;
   const verdict = detail?.chart.composite?.compositeVerdict;
@@ -529,10 +636,60 @@ const SignalPreviewPage: React.FC = () => {
   const entryActionSummary = detail?.kind === 'entry_signal'
     ? `${ACTION_TEXT[entryCurrentAction(subject as EntrySignal)] || '--'} / ${ACTION_TEXT[entryTriggerAction(subject as EntrySignal)] || '--'}`
     : '--';
-  const hasPriceZones = Boolean(
-    detail?.pricePlan?.scenarios?.length
-    || (detail?.kind === 'entry_signal' && ((subject as EntrySignal | undefined)?.entryLow != null || (subject as EntrySignal | undefined)?.triggerRule?.zones?.length)),
-  );
+
+  const formalizationNotes = verdict?.verdictStatus === 'evaluable'
+    ? []
+    : (verdict?.formalizationReasonCodes ?? []).map((code) => FORMALIZATION_REASON_TEXT[code] || code);
+  const scoreBadge = verdict?.verdictStatus === 'evaluable'
+    ? { label: '评分完整', variant: 'success' as const }
+    : verdict?.score == null && verdict?.provisionalScore != null
+      ? { label: '临时评分', variant: 'warning' as const }
+      : { label: '评分不完整', variant: 'warning' as const };
+
+  const zoneLegend = useMemo<Array<{ key: string; tone: string; label: string; range: string }>>(() => {
+    if (!detail) return [];
+    if (detail.kind === 'price_plan') {
+      return (detail.pricePlan?.scenarios ?? []).map((scenario) => ({
+        key: scenario.scenarioId,
+        tone: scenario.role,
+        label: ZONE_ROLE_TEXT[scenario.role] || scenario.role,
+        range: `${fmt(scenario.entryLow)}–${fmt(scenario.entryHigh)}`,
+      }));
+    }
+    if (detail.kind === 'entry_signal') {
+      const signal = detail.subject as EntrySignal;
+      const zones = signal.triggerRule?.zones ?? [];
+      if (zones.length) {
+        return zones.map((zone, index) => ({
+          key: `${zone.label}-${index}`,
+          tone: index === 0 ? 'primary' : 'secondary',
+          label: ENTRY_ZONE_TEXT[zone.label] || zone.label,
+          range: `${fmt(zone.low)}–${fmt(zone.high)}`,
+        }));
+      }
+      if (signal.entryLow != null || signal.entryHigh != null) {
+        return [{
+          key: 'entry',
+          tone: 'primary',
+          label: '计划入场区',
+          range: `${fmt(signal.entryLow)}–${fmt(signal.entryHigh)}`,
+        }];
+      }
+    }
+    return [];
+  }, [detail]);
+
+  const groupedZoneLegend = useMemo(() => {
+    const grouped = new Map<string, { key: string; tone: string; label: string; ranges: string[] }>();
+    zoneLegend.forEach((zone) => {
+      const existing = grouped.get(zone.label);
+      if (existing) existing.ranges.push(zone.range);
+      else grouped.set(zone.label, { key: zone.label, tone: zone.tone, label: zone.label, ranges: [zone.range] });
+    });
+    return [...grouped.values()];
+  }, [zoneLegend]);
+
+  const hasPriceLines = Boolean(detail?.pricePlan?.scenarios?.some((scenario) => scenario.role !== 'observation'));
 
   const handleRefresh = async () => {
     await loadList();
@@ -540,7 +697,23 @@ const SignalPreviewPage: React.FC = () => {
     if (selectedId) await loadDetail(selectedId, true);
   };
 
-  const listContent = <SubjectList mode={mode} data={data} selectedId={selectedId} onSelect={setSelectedId} />;
+  const handleModeChange = (next: PreviewMode) => {
+    setMode(next);
+    setSelectedId(null);
+    setDetail(null);
+  };
+
+  const handleSelect = useCallback((id: string) => {
+    setSelectedId(id);
+    // 单栏（<xl）时详情在列表下方，点选后直接滚到图，省一次手动下滑。
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 1279px)').matches) {
+      window.requestAnimationFrame(() => {
+        detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  }, []);
+
+  const listContent = <SubjectList mode={mode} data={data} selectedId={selectedId} onSelect={handleSelect} />;
 
   return (
     <div className="w-full px-3 pb-8 pt-4 md:px-5 xl:px-7">
@@ -553,37 +726,39 @@ const SignalPreviewPage: React.FC = () => {
           <SchedulerStatus data={data} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <ModeTabs mode={mode} data={data} onChange={(next) => { setMode(next); setSelectedId(null); setDetail(null); }} />
-          <button type="button" className="btn-secondary inline-flex h-10 w-10 items-center justify-center" onClick={() => void handleRefresh()} disabled={loading || detailLoading} aria-label="刷新信号预览" title="刷新">
-            <RefreshCw className={cn('h-4 w-4', loading || detailLoading ? 'animate-spin' : '')} />
+          <ModeTabs mode={mode} data={data} onChange={handleModeChange} />
+          <button type="button" className="btn-secondary inline-flex h-10 w-10 items-center justify-center !p-0" onClick={() => void handleRefresh()} disabled={loading || detailLoading} aria-label="刷新信号预览">
+            <RefreshCw className={cn('h-4 w-4 shrink-0', loading || detailLoading ? 'animate-spin' : '')} />
           </button>
         </div>
       </header>
 
       {error ? <div className="mb-4"><ApiErrorAlert error={error} /></div> : null}
 
-      <div className="space-y-4">
-        <section className="border-y border-border/70 bg-card/20">
+      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)] xl:items-start">
+        <section className="border-y border-border/70 bg-card/20 xl:sticky xl:top-4 xl:z-10">
           <div className="flex items-center justify-between px-3 py-3 text-xs text-secondary-text">
             <span className="font-medium text-foreground">{mode === 'entry' ? '个股计划' : '持仓监控'}</span>
             <span>{mode === 'entry' ? '按最近更新排序' : '按风险等级排序'} · {ids.length} 项</span>
           </div>
-          <div className="max-h-[300px] overflow-y-auto border-t border-border/60">
-            {listContent}
-          </div>
+          {ids.length ? (
+            <div className="max-h-[300px] overflow-y-auto border-t border-border/60 xl:max-h-[calc(100vh-9rem)]">
+              {listContent}
+            </div>
+          ) : null}
         </section>
 
-        <section className="min-w-0">
+        <section ref={detailRef} className="min-w-0 scroll-mt-4">
           {!detail && !detailLoading ? (
             <EmptyState
               title={ids.length ? '请选择一个标的' : mode === 'entry' ? '暂无可展示信号' : '暂无可展示持仓'}
               description={mode === 'entry' ? '单股分析产生的入场、等待与观察区间会出现在这里。' : '首次定时持仓扫描完成后会出现在这里。'}
               icon={<Activity className="h-7 w-7" />}
-              className="min-h-[620px]"
+              className="min-h-[280px] xl:min-h-[520px]"
             />
           ) : null}
           {detailLoading ? (
-            <div className="flex min-h-[620px] items-center justify-center text-sm text-secondary-text">
+            <div className="flex min-h-[280px] items-center justify-center text-sm text-secondary-text xl:min-h-[520px]">
               <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> 正在读取本地历史与指标
             </div>
           ) : null}
@@ -605,26 +780,45 @@ const SignalPreviewPage: React.FC = () => {
                 </div>
                 <div className="flex flex-wrap items-center gap-2 text-xs">
                   <span className="inline-flex items-center gap-1 text-secondary-text"><Database className="h-3.5 w-3.5" />{(detail.chart.dataWindow?.sources || []).map((source) => SOURCE_TEXT[source] || source).join(' / ') || '本地数据库'}</span>
-                  <Badge variant={verdict?.verdictStatus === 'evaluable' ? 'success' : 'warning'}>{verdict?.verdictStatus === 'evaluable' ? '评分完整' : '评分不完整'}</Badge>
+                  <Badge variant={scoreBadge.variant}>{scoreBadge.label}</Badge>
                 </div>
               </div>
 
               <MetricsStrip detail={detail} />
-              {hasPriceZones ? (
+              {formalizationNotes.length ? (
+                <div className="flex items-start gap-2 border-b border-border/70 bg-warning/[0.06] px-3 py-2 text-xs text-warning">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{formalizationNotes.join('；')}</span>
+                </div>
+              ) : null}
+              {zoneLegend.length ? (
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-border/70 px-3 py-2 text-xs text-secondary-text">
                   <span className="font-medium text-foreground">价格区间</span>
-                  <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 border border-sky-400 bg-sky-400/40" />主入场区</span>
-                  <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 border border-teal-300 bg-teal-400/35" />次入场区</span>
-                  <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-2.5 border border-slate-300 bg-slate-400/25" />观察区</span>
-                  <span className="text-secondary-text/75">区域是模型价格带，圆点/三角是事件与缠论结构点</span>
+                  {groupedZoneLegend.map((zone) => (
+                    <span key={zone.key} className="inline-flex items-center gap-1.5">
+                      <span className={cn('h-2.5 w-2.5 border', ZONE_SWATCH[zone.tone] || ZONE_SWATCH.observation)} />
+                      {zone.label}
+                      <span className="tabular-nums text-foreground/80">{zone.ranges.join('、')}</span>
+                    </span>
+                  ))}
+                  {hasPriceLines ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="h-0 w-4 border-t border-dashed border-red-500" />止损
+                      <span className="ml-1 h-0 w-4 border-t border-dotted border-sky-500" />目标
+                    </span>
+                  ) : null}
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 border border-amber-500/75 bg-amber-500/10" />缠论中枢
+                  </span>
+                  <span className="text-secondary-text/75">圆点/三角为事件与结构点，悬停可看详情</span>
                 </div>
               ) : null}
               <div className="border-b border-border/70 bg-card/35"><SignalChart detail={detail} /></div>
 
-              <div className="grid gap-5 pt-5 xl:grid-cols-[minmax(0,1fr)_340px]">
+              <div className="grid gap-5 pt-5 xl:grid-cols-[minmax(0,1fr)_300px]">
                 <div>
                   <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground"><ShieldCheck className="h-4 w-4 text-cyan" />固定判决</div>
-                  <dl className="grid border-y border-border/60 text-sm sm:grid-cols-2 xl:grid-cols-3">
+                  <dl className="grid grid-cols-2 gap-px border-y border-border/60 bg-border/40 text-sm xl:grid-cols-3">
                     {[
                       ['信号等级', VERDICT_TEXT[verdict?.signalLevel || ''] || verdict?.signalLevel || '--'],
                       ['入场权限', PERMISSION_TEXT[verdict?.entryPermission || ''] || verdict?.entryPermission || '--'],
@@ -633,16 +827,23 @@ const SignalPreviewPage: React.FC = () => {
                       ['评审权限', accountDecision?.reviewPermission ? REVIEW_PERMISSION_TEXT[accountDecision.reviewPermission] || accountDecision.reviewPermission : '--'],
                       ['风险偏好 / 仓位上限', accountDecision ? `${RISK_PROFILE_TEXT[accountDecision.riskProfile || ''] || accountDecision.riskProfile || '--'} / ${accountDecision.targetPositionPct == null ? '--' : `${fmt(accountDecision.targetPositionPct)}%`}` : '--'],
                       ['计划数量 / 账户净盈亏比', accountDecision ? `${accountDecision.plannedQuantity == null ? '--' : `${accountDecision.plannedQuantity} 股`} / ${accountDecision.accountNetRr1 == null ? '--' : `${fmt(accountDecision.accountNetRr1)}:1`}` : '--'],
-                      ['选中场景', accountDecision?.selectedScenarioId || '--'],
+                      ['选中场景', (() => {
+                        const selectedScenario = detail.pricePlan?.scenarios.find((scenario) => scenario.scenarioId === accountDecision?.selectedScenarioId);
+                        return selectedScenario
+                          ? `${ZONE_ROLE_TEXT[selectedScenario.role] || '场景'} ${fmt(selectedScenario.entryLow)}–${fmt(selectedScenario.entryHigh)}`
+                          : '--';
+                      })()],
                       ['数据更新', detail.chart.dataWindow?.end || '--'],
                       ['证据缺失', (verdict?.missingFeatures || []).join(', ') || '无'],
                       ['限制原因', accountDecision?.reasonCodes?.map((code) => PLAN_REASON_TEXT[code] || code).join('；') || verdict?.exitWarning?.items?.join(', ') || '无'],
-                    ].map(([label, value], index) => (
-                      <div key={label} className={cn('min-h-[66px] px-3 py-3', index > 0 ? 'border-t border-border/50 sm:border-l sm:border-t-0' : '')}>
+                    ].map(([label, value]) => (
+                      <div key={label} className="min-h-[60px] bg-background px-3 py-3">
                         <dt className="text-xs text-secondary-text">{label}</dt>
                         <dd className="mt-1 break-words font-medium text-foreground">{value}</dd>
                       </div>
                     ))}
+                    {/* 11 项在 2/3 列下都会空出一格，用同色占位避免露出分隔底色。 */}
+                    <div aria-hidden className="bg-background" />
                   </dl>
                 </div>
                 <div>

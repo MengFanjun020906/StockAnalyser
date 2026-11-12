@@ -17,7 +17,7 @@ describe('signalPreviewChartOption', () => {
     expect(series.some((item) => item.name === 'MACD')).toBe(true);
     expect(series.some((item) => String(item.name).startsWith('缠论笔'))).toBe(true);
     expect(candle.markArea.data).toHaveLength(2);
-    expect(candle.markLine.data[0].name).toBe('止损');
+    expect(candle.markLine.data[0].name).toBe('止损 9.00');
     expect(candle.markPoint.data[0].name).toBe('触价');
     expect(candle.markPoint.data.some((item) => item.name === '一买')).toBe(true);
   });
@@ -111,13 +111,15 @@ describe('signalPreviewChartOption', () => {
     const primaryArea = candle.markArea.data.find((area) => area[0].name === '主入场区');
     expect(primaryArea?.[0]).toMatchObject({
       yAxis: 10,
-      label: { show: true, formatter: '主入场区' },
-      itemStyle: { borderWidth: 2 },
+      itemStyle: { borderWidth: 1 },
     });
+    expect(primaryArea?.[0].label).toBeUndefined();
     expect(primaryArea?.[0].xAxis).toBeUndefined();
-    expect(candle.markLine.data.some((line) => line.name === '主场景止损' && line.yAxis === 9)).toBe(true);
-    expect(candle.markLine.data.some((line) => line.name === '主场景目标一' && line.yAxis === 12)).toBe(true);
-    expect(candle.markLine.data.some((line) => line.name === '主场景目标二' && line.yAxis === 13)).toBe(true);
+    expect(candle.markLine.data.some((line) => line.name === '主止损 9.00' && line.yAxis === 9)).toBe(true);
+    expect(candle.markLine.data.some((line) => line.name === '主目标一 12.00' && line.yAxis === 12)).toBe(true);
+    expect(candle.markLine.data.some((line) => line.name === '主目标二 13.00' && line.yAxis === 13)).toBe(true);
+    // 观察场景没有可执行的止损/目标，不再画线。
+    expect(candle.markLine.data.some((line) => line.yAxis === 7.5)).toBe(false);
   });
 
   it('keeps axis tooltip content compact and aligned by row', () => {
@@ -141,6 +143,83 @@ describe('signalPreviewChartOption', () => {
     expect(html).toContain('justify-content:space-between');
     expect(tooltip.extraCssText).toContain('max-width:240px');
     expect(tooltip.padding).toEqual([7, 9]);
+  });
+
+  it('deduplicates identical target prices and skips observation-only lines', () => {
+    const detail = makeDetail();
+    detail.kind = 'price_plan';
+    detail.subject = {
+      planId: 'plan-1', stockCode: '600519', market: 'cn', generationStatus: 'generated',
+      revision: 1, actualAsOfSession: '2026-08-02', scenarioCount: 3, reasonCodes: [],
+    };
+    detail.pricePlan = {
+      planId: 'plan-1', generationStatus: 'generated', actualAsOfSession: '2026-08-02', reasonCodes: [],
+      scenarios: [
+        { scenarioId: 's1', role: 'primary', entryLow: 10, entryHigh: 11, stopLoss: 9, target1: 12, target2: 13, sourceFamilies: [], scenarioReasonCodes: [] },
+        { scenarioId: 's2', role: 'secondary', entryLow: 9.5, entryHigh: 10.5, stopLoss: 8.5, target1: 12, target2: 13, sourceFamilies: [], scenarioReasonCodes: [] },
+        { scenarioId: 's3', role: 'observation', entryLow: 8, entryHigh: 8.5, stopLoss: null, target1: 12, target2: null, sourceFamilies: [], scenarioReasonCodes: [] },
+      ],
+    };
+
+    const option = buildSignalPreviewChartOption(detail);
+    const candle = (option.series as Array<Record<string, unknown>>).find((item) => item.type === 'candlestick') as {
+      markLine: { data: Array<{ name: string; yAxis: number }> };
+    };
+
+    expect(candle.markLine.data.filter((line) => line.yAxis === 12)).toHaveLength(1);
+    expect(candle.markLine.data.filter((line) => line.yAxis === 13)).toHaveLength(1);
+    expect(candle.markLine.data.some((line) => line.name === '次止损 8.50')).toBe(true);
+    expect(candle.markLine.data).toHaveLength(4);
+  });
+
+  it('does not draw a zero-price stop when the stop is missing', () => {
+    const detail = makeDetail();
+    (detail.subject as { stopPrice: number | null }).stopPrice = null;
+
+    const option = buildSignalPreviewChartOption(detail);
+    const candle = (option.series as Array<Record<string, unknown>>).find((item) => item.type === 'candlestick') as {
+      markLine: { data: Array<{ yAxis: number }> };
+    };
+
+    expect(candle.markLine.data).toHaveLength(0);
+  });
+
+  it('deduplicates repeated lifecycle events and keeps chart labels Chinese', () => {
+    const detail = makeDetail();
+    detail.chart.structure = { ...detail.chart.structure, pens: [], signals: [] };
+    const base = detail.events[0];
+    detail.events = [
+      { ...base, eventId: 'e1', eventType: 'plan_created', occurredAt: '2026-08-02T00:00:00' },
+      { ...base, eventId: 'e2', eventType: 'plan_created', occurredAt: '2026-08-02T00:00:00' },
+      { ...base, eventId: 'e3', eventType: 'touched', occurredAt: '2026-08-03T00:00:00' },
+      { ...base, eventId: 'e4', eventType: 'unknown_event', occurredAt: '2026-08-04T00:00:00' },
+    ];
+
+    const option = buildSignalPreviewChartOption(detail);
+    const candle = (option.series as Array<Record<string, unknown>>).find((item) => item.type === 'candlestick') as {
+      markPoint: { data: Array<{ name: string }> };
+    };
+
+    expect(candle.markPoint.data.map((point) => point.name)).toEqual(['价格计划创建', '进入区间', '信号事件']);
+  });
+
+  it('shortens the default window and hides price labels on compact layouts', () => {
+    const detail = makeDetail();
+    detail.chart.bars = Array.from({ length: 120 }, (_, index) => ({
+      ...detail.chart.bars[0],
+      date: `2026-${String(Math.floor(index / 28) + 1).padStart(2, '0')}-${String((index % 28) + 1).padStart(2, '0')}`,
+    }));
+
+    const compact = buildSignalPreviewChartOption(detail, { compact: true, visibleBars: 60 });
+    const wide = buildSignalPreviewChartOption(detail);
+    const zoom = (option: typeof compact) => (option.dataZoom as Array<{ startValue: number }>)[0].startValue;
+    const candle = (compact.series as Array<Record<string, unknown>>).find((item) => item.type === 'candlestick') as {
+      markLine: { data: Array<{ label: { show: boolean } }> };
+    };
+
+    expect(zoom(compact)).toBe(60);
+    expect(zoom(wide)).toBe(0);
+    expect(candle.markLine.data[0].label.show).toBe(false);
   });
 });
 
