@@ -1078,7 +1078,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 
 | 命令 | 说明 |
 |------|------|
-| `./start_all.sh` | 本地开发一键启动 Neo4j、FastAPI 后端与 Vite 前端，默认 Neo4j `7687`/`7474`、后端 `8000`、前端 `5173`；如需跳过 Neo4j，可设置 `START_NEO4J=false` |
+| `./start_all.sh` | 本地开发一键启动 Neo4j 与 FastAPI 后端，默认 Neo4j `7687`/`7474`、后端 `8000`；后端同时提供 Web 页面与 API，启动前会自动检查并构建前端静态产物；如需跳过 Neo4j，可设置 `START_NEO4J=false`；如需 Vite 热更新，可设置 `START_WEB=true` 额外启动 `5173` |
 | `./stop_all.sh` | 停止 `start_all.sh` 启动的本地后端、前端与 Neo4j 容器；如需保留 Neo4j 运行，可设置 `STOP_NEO4J=false` |
 | `python main.py --serve` | 启动 API 服务 + 执行一次完整分析 |
 | `python main.py --serve-only` | 仅启动 API 服务，手动触发分析 |

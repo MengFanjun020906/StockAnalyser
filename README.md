@@ -122,9 +122,9 @@ cp .env.example .env
 
 启动后访问：
 
-- Web: `http://127.0.0.1:5173`
-- Agent Trace: `http://127.0.0.1:5173/agent-trace`
-- 后端 API: `http://127.0.0.1:8000`
+- Web: `http://127.0.0.1:8000`（后端同时提供页面与 API）
+- Agent Trace: `http://127.0.0.1:8000/agent-trace`
+- 后端 API: `http://127.0.0.1:8000/docs`
 - Neo4j Browser: `http://127.0.0.1:7474/browser/`
 
 停止服务：
@@ -137,6 +137,12 @@ cp .env.example .env
 
 ```bash
 python main.py --serve-only
+```
+
+如需前端热更新，可额外启动 Vite（页面走 `http://127.0.0.1:5173`，API 代理到 8000）：
+
+```bash
+START_WEB=true ./start_all.sh
 ```
 
 ## 最小配置

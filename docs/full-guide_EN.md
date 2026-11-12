@@ -911,7 +911,7 @@ FastAPI provides RESTful API service for configuration management and triggering
 
 | Command | Description |
 |------|------|
-| `./start_all.sh` | Start local Neo4j, FastAPI backend, and Vite frontend for development, defaulting to Neo4j `7687`/`7474`, backend `8000`, and frontend `5173`; set `START_NEO4J=false` to skip Neo4j |
+| `./start_all.sh` | Start local Neo4j and the FastAPI backend, defaulting to Neo4j `7687`/`7474` and backend `8000`; the backend serves both the Web UI and the API, and frontend assets are checked/built automatically before startup; set `START_NEO4J=false` to skip Neo4j, or `START_WEB=true` to also run Vite on `5173` for hot reload |
 | `./stop_all.sh` | Stop the local backend, frontend, and Neo4j container started by `start_all.sh`; set `STOP_NEO4J=false` to keep Neo4j running |
 | `python main.py --serve` | Start API service + run full analysis once |
 | `python main.py --serve-only` | Start API service only, manually trigger analysis |
