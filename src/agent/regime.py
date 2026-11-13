@@ -135,6 +135,7 @@ class RegimeState:
     wyckoff_phase: WyckoffPhase
     trend_direction: str
     vol_direction: str
+    breadth_confirmed: Optional[bool]
     risk_level: str
     risk_multiplier: float
     strategy_hints: List[str]
@@ -158,6 +159,7 @@ class RegimeState:
             "wyckoff_phase": self.wyckoff_phase.value,
             "trend_direction": self.trend_direction,
             "vol_direction": self.vol_direction,
+            "breadth_confirmed": self.breadth_confirmed,
             "risk_level": self.risk_level,
             "risk_multiplier": self.risk_multiplier,
             "strategy_hints": self.strategy_hints,
@@ -230,6 +232,30 @@ def detect_market_regime(
     sentiment_state, sentiment_score, sentiment_payload = _compose_sentiment(sentiment)
     if sentiment_state != SentimentState.UNKNOWN and sentiment_score is not None:
         evidence.append(f"A股情绪合成分数={sentiment_score:.2f}，状态={sentiment_state.value}。")
+    breadth_stats = (sentiment_payload.get("raw") or {}).get("market_stats") or {}
+    breadth_ratio = None
+    if breadth_stats:
+        breadth_ratio = breadth_stats.get("advance_ratio")
+        evidence.append(
+            "全市场宽度：上涨 {up} 家 / 下跌 {down} 家，上涨占比 {ratio:.1%}；"
+            "涨停 {limit_up} 家 / 跌停 {limit_down} 家。".format(
+                up=breadth_stats.get("up_count", 0),
+                down=breadth_stats.get("down_count", 0),
+                ratio=float(breadth_ratio or 0.0),
+                limit_up=breadth_stats.get("limit_up_count", 0),
+                limit_down=breadth_stats.get("limit_down_count", 0),
+            )
+        )
+        if breadth_stats.get("high_low_ratio") is not None:
+            evidence.append(
+                "全市场新高/新低：20 日新高 {high} 家 / 新低 {low} 家，新高占比 {ratio:.1%}。".format(
+                    high=breadth_stats.get("high20", 0),
+                    low=breadth_stats.get("low20", 0),
+                    ratio=float(breadth_stats.get("high_low_ratio") or 0.0),
+                )
+            )
+
+    breadth_confirmed = None if breadth_ratio is None else float(breadth_ratio) >= 0.35
 
     wyckoff_phase, wyckoff_evidence = _detect_wyckoff_phase(bars[-wyckoff_window:])
     evidence.extend(wyckoff_evidence)
@@ -238,18 +264,21 @@ def detect_market_regime(
     trend_direction = _trend_direction(trend, wyckoff_phase)
     vol_direction = _vol_direction(atr_values)
     evidence.append(f"趋势方向={trend_direction}，波动方向={vol_direction}。")
+    if trend_direction == "up" and breadth_ratio is not None and float(breadth_ratio) < 0.35:
+        conflicts.append("指数趋势向上，但全市场上涨占比不足 35%，宽度未确认，按结构性行情处理。")
     raw_regime = _classify_regime(
         trend=trend,
         trend_direction=trend_direction,
         bucket=bucket,
         sentiment_state=sentiment_state,
+        breadth_confirmed=breadth_confirmed,
     )
     regime, confirmation = _apply_regime_confirmation(
         raw_regime=raw_regime,
         previous_regime=previous_regime,
         pending_regime=pending_regime,
         pending_count=pending_count,
-        confirmation_bars=max(1, int(confirmation_bars)),
+        confirmation_bars=_required_confirmation_bars(raw_regime, confirmation_bars),
     )
 
     if regime != raw_regime:
@@ -285,6 +314,7 @@ def detect_market_regime(
         wyckoff_phase=wyckoff_phase,
         trend_direction=trend_direction,
         vol_direction=vol_direction,
+        breadth_confirmed=breadth_confirmed,
         risk_level=risk_level,
         risk_multiplier=_risk_multiplier(bucket, trend_direction),
         strategy_hints=strategy_hints,
@@ -310,6 +340,7 @@ def _unknown_state(market: str, bars: Sequence[MarketBar], reason: str) -> Regim
         wyckoff_phase=WyckoffPhase.UNKNOWN,
         trend_direction="unknown",
         vol_direction="unknown",
+        breadth_confirmed=None,
         risk_level="unknown",
         risk_multiplier=1.0,
         strategy_hints=["数据不足，保守采用监控/等待。"],
@@ -519,6 +550,7 @@ def _classify_regime(
     trend_direction: str,
     bucket: VolatilityBucket,
     sentiment_state: SentimentState,
+    breadth_confirmed: Optional[bool] = None,
 ) -> MarketRegime:
     if bucket == VolatilityBucket.EXTREME and trend.get("ret20", 0.0) < -0.06:
         return MarketRegime.PANIC
@@ -530,6 +562,8 @@ def _classify_regime(
         return MarketRegime.RISK_OFF
     if trend_direction == "up":
         if bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
+            if breadth_confirmed is False:
+                return MarketRegime.HIGH_VOLATILITY
             return MarketRegime.BULL_VOLATILE
         return MarketRegime.TRENDING_UP
     if trend_direction == "down":
@@ -537,6 +571,18 @@ def _classify_regime(
     if bucket in {VolatilityBucket.HIGH_VOL, VolatilityBucket.EXTREME}:
         return MarketRegime.HIGH_VOLATILITY
     return MarketRegime.RANGE_BOUND
+
+
+def _required_confirmation_bars(raw_regime: MarketRegime, base_bars: int) -> int:
+    """A 股急跌慢涨：防御切换更快，进攻切换更慢。"""
+    base = max(1, int(base_bars))
+    if raw_regime in {MarketRegime.PANIC, MarketRegime.RISK_OFF}:
+        return 1
+    if raw_regime == MarketRegime.TRENDING_DOWN:
+        return max(1, base - 1)
+    if raw_regime in {MarketRegime.TRENDING_UP, MarketRegime.BULL_VOLATILE}:
+        return base + 1
+    return base
 
 
 def _apply_regime_confirmation(

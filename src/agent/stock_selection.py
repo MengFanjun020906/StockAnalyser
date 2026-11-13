@@ -4890,6 +4890,8 @@ def _apply_market_regime_constraints(
     volatility = str(regime.get("volatility_bucket") or "").strip().lower()
     trend_direction = str(regime.get("trend_direction") or "").strip().lower()
     trend_up = trend_direction == "up" or regime_name in {"trending_up", "bull_volatile"}
+    breadth_confirmed = regime.get("breadth_confirmed")
+    breadth_ok = breadth_confirmed is not False
     restrictive = (
         regime_name in {"risk_off", "panic"}
         or risk_level in {"high", "extreme"}
@@ -4927,7 +4929,7 @@ def _apply_market_regime_constraints(
             plan["initial_amount"] = 0
             plan["reason"] = f"{plan.get('reason') or ''}；{rule}".strip("；")
         elif high_vol and action == "open":
-            cap_pct = 15.0 if trend_up else 5.0
+            cap_pct = 15.0 if trend_up and breadth_ok else 5.0
             capped = min(pct_num, cap_pct)
             plan["initial_position_pct"] = capped
             if isinstance(plan.get("initial_amount"), (int, float)) and pct_num > 0:
@@ -4964,13 +4966,19 @@ def _apply_market_regime_constraints(
 def _market_regime_rule_text(regime: Dict[str, Any]) -> str:
     regime_name = regime.get("regime") or "unknown"
     volatility = regime.get("volatility_bucket") or "unknown"
+    regime_label = _market_regime_label(regime_name)
+    volatility_label = _volatility_label(volatility)
     trend_direction = str(regime.get("trend_direction") or "").strip().lower()
-    if trend_direction == "up" or str(regime_name).strip().lower() in {"trending_up", "bull_volatile"}:
+    breadth_confirmed = regime.get("breadth_confirmed")
+    if (
+        (trend_direction == "up" or str(regime_name).strip().lower() in {"trending_up", "bull_volatile"})
+        and breadth_confirmed is not False
+    ):
         return (
-            f"市场状态约束：regime={regime_name}, volatility={volatility}，"
+            f"市场状态约束：{regime_label}，波动 {volatility_label}，"
             "降低首仓并等待承接确认，不把波动单独作为开仓否决理由"
         )
-    return f"市场状态约束：regime={regime_name}, volatility={volatility}，降低主动开仓和追高权重"
+    return f"市场状态约束：{regime_label}，波动 {volatility_label}，降低主动开仓和追高权重"
 
 
 def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
@@ -7555,6 +7563,8 @@ def _market_regime_label(value: Any) -> str:
         "high_volatility": "高波动",
         "bull_volatile": "高波动上涨",
         "range_bound": "震荡市",
+        "trending_up": "上行趋势",
+        "trending_down": "下行趋势",
         "uptrend": "上行趋势",
         "downtrend": "下行趋势",
         "bull": "牛市",
@@ -7562,6 +7572,7 @@ def _market_regime_label(value: Any) -> str:
         "neutral": "中性",
         "panic": "恐慌",
         "risk_off": "避险",
+        "unknown": "未知",
     }
     return labels.get(raw, raw or "-")
 
@@ -7571,9 +7582,13 @@ def _volatility_label(value: Any) -> str:
     labels = {
         "extreme": "极端",
         "high": "高",
+        "high_vol": "高波动",
         "medium": "中",
-        "low": "低",
+        "elevated": "抬升",
         "normal": "正常",
+        "low": "低",
+        "very_low": "极低",
+        "unknown": "未知",
     }
     return labels.get(raw, raw or "-")
 

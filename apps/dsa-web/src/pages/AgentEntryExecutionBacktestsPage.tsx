@@ -493,7 +493,7 @@ const EntryBacktestTable: React.FC<{ rows: EntryExecutionBacktestRow[]; strategy
               <th className="w-[96px] px-4 py-3 text-right">收益</th>
               <th className="w-[190px] px-4 py-3 text-left">退出</th>
               <th className="w-[380px] px-4 py-3 text-left">交互日K</th>
-              <th className="w-[140px] px-4 py-3 text-left">Trace</th>
+              <th className="w-[140px] px-4 py-3 text-left">追踪</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border/50">

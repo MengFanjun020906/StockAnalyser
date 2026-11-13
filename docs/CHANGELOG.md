@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [改进] Agent Trace 与胜率复盘页的英文展示统一中文化：市场状态枚举（regime、波动档、情绪、趋势/波动方向等）、工具名、流水线阶段、动作、`OK/FAIL`、`step`、评测状态以及页面标题/分区标签均改为中文，工具参数等原始 JSON 明细保持技术原样。
+
+- [改进] `detect_market_regime` 的状态确认改为非对称：`panic` / `risk_off` 当日生效，`trending_down` 缩短一天，`trending_up` / `bull_volatile` 延长一天，贴合 A 股急跌慢涨。
+
+- [改进] `detect_market_regime` 的市场宽度分量改为优先使用全市场涨跌家数（含涨停/跌停净比和 20 日新高/新低家数），拿不到时回退指数宽度；宽度明细写入 `evidence`，指数上涨但上涨占比低于 35% 时输出 `breadth_confirmed=false`，`bull_volatile` 降为 `high_volatility`，首仓上限回落至 5%。
+
 - [修复] Agent Trace 历史不再只依赖浏览器 `localStorage`：新增 `GET /api/v1/agent/trace/sessions` 从本地 artifact 目录恢复最近会话，页面加载时与本地索引合并并按时间排序，避免切换访问端口（如 `5173` → `8000`）、清理缓存或换浏览器后历史记录消失。
 
 - [改进] `./start_all.sh` 默认只启动后端 `8000`，由后端同时提供 Web 页面与 API，并在启动前复用 `prepare_webui_frontend_assets()` 自动检查/构建前端静态产物；Vite `5173` 改为 `START_WEB=true` 显式开启的热更新选项，避免每次启动同时占用两个访问入口。

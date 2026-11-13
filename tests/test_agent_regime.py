@@ -221,10 +221,137 @@ def test_detect_market_regime_uses_full_auxiliary_component_timeout():
     timeouts_by_name = {name: timeout for name, timeout in calls}
     assert timeouts_by_name["market_history"] == 25.0
     assert timeouts_by_name["market_indices"] == 25.0
+    assert timeouts_by_name["market_stats"] == 25.0
     assert timeouts_by_name["sector_rankings"] == 25.0
     assert timeouts_by_name["market_flow"] == 25.0
     assert timeouts_by_name["northbound"] == 25.0
     assert timeouts_by_name["margin"] == 25.0
+
+
+def test_detect_market_regime_uses_full_market_breadth():
+    history_rows = [
+        {
+            "date": bar.date.isoformat(),
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "amount": bar.amount,
+        }
+        for bar in _bars(180, drift=0.4, vol=1.2)
+    ]
+    stats = {
+        "up_count": 4200,
+        "down_count": 800,
+        "flat_count": 100,
+        "limit_up_count": 90,
+        "limit_down_count": 5,
+    }
+
+    with patch("src.agent.tools.market_tools._load_market_history", return_value=(history_rows, "unit")), \
+         patch("src.agent.tools.market_tools._handle_get_market_indices", return_value={"indices": [{"change_pct": -1.0}]}), \
+         patch("src.agent.tools.market_tools._fetch_market_stats", return_value=stats), \
+         patch("src.agent.tools.market_tools._handle_get_sector_rankings", return_value={"top_sectors": [], "bottom_sectors": []}), \
+         patch("src.agent.tools.data_tools._handle_get_market_capital_flow", return_value={}), \
+         patch("src.agent.tools.data_tools._handle_get_northbound_capital_flow", return_value={}), \
+         patch("src.agent.tools.data_tools._handle_get_margin_trading_summary", return_value={}), \
+         patch("src.storage.get_db", side_effect=RuntimeError("db unavailable")):
+        result = _handle_detect_market_regime(persist=False)
+
+    breadth = result["sentiment_components"]["raw"]["market_stats"]
+    assert breadth["advance_ratio"] > 0.8
+    assert breadth["score"] > 0.5
+    assert result["sentiment_components"]["components"]["market_breadth"] == breadth["score"]
+    assert any("全市场宽度" in item for item in result["evidence"])
+
+
+def test_detect_market_regime_flags_breadth_divergence():
+    history_rows = [
+        {
+            "date": bar.date.isoformat(),
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "amount": bar.amount,
+        }
+        for bar in _bars(180, drift=0.4, vol=1.2)
+    ]
+
+    with patch("src.agent.tools.market_tools._load_market_history", return_value=(history_rows, "unit")), \
+         patch("src.agent.tools.market_tools._handle_get_market_indices", return_value={"indices": [{"change_pct": 1.2}]}), \
+         patch("src.agent.tools.market_tools._fetch_market_stats", return_value={"up_count": 900, "down_count": 3800}), \
+         patch("src.agent.tools.market_tools._handle_get_sector_rankings", return_value={"top_sectors": [], "bottom_sectors": []}), \
+         patch("src.agent.tools.data_tools._handle_get_market_capital_flow", return_value={}), \
+         patch("src.agent.tools.data_tools._handle_get_northbound_capital_flow", return_value={}), \
+         patch("src.agent.tools.data_tools._handle_get_margin_trading_summary", return_value={}), \
+         patch("src.storage.get_db", side_effect=RuntimeError("db unavailable")):
+        result = _handle_detect_market_regime(persist=False)
+
+    assert result["trend_direction"] == "up"
+    assert any("宽度未确认" in item for item in result["conflicts"])
+
+
+def test_classify_regime_downgrades_bull_volatile_without_breadth():
+    from src.agent.regime import (
+        MarketRegime,
+        SentimentState,
+        VolatilityBucket,
+        _classify_regime,
+    )
+
+    kwargs = {
+        "trend": {"ret20": 0.05},
+        "trend_direction": "up",
+        "bucket": VolatilityBucket.HIGH_VOL,
+        "sentiment_state": SentimentState.NEUTRAL,
+    }
+    assert _classify_regime(**kwargs, breadth_confirmed=False) == MarketRegime.HIGH_VOLATILITY
+    assert _classify_regime(**kwargs, breadth_confirmed=None) == MarketRegime.BULL_VOLATILE
+    assert _classify_regime(**kwargs, breadth_confirmed=True) == MarketRegime.BULL_VOLATILE
+
+
+def test_derive_market_breadth_detail_includes_high_low():
+    from src.agent.tools.market_tools import _derive_market_breadth_detail
+
+    detail = _derive_market_breadth_detail({
+        "up_count": 2000,
+        "down_count": 2000,
+        "limit_up_count": 0,
+        "limit_down_count": 0,
+        "high_low": {"high20": 100, "low20": 300},
+    })
+
+    assert detail["high_low_ratio"] == 0.25
+    assert round(detail["score"], 4) == -0.1
+
+
+def test_confirmation_bars_are_asymmetric():
+    from src.agent.regime import MarketRegime, _required_confirmation_bars
+
+    assert _required_confirmation_bars(MarketRegime.PANIC, 3) == 1
+    assert _required_confirmation_bars(MarketRegime.RISK_OFF, 3) == 1
+    assert _required_confirmation_bars(MarketRegime.TRENDING_DOWN, 3) == 2
+    assert _required_confirmation_bars(MarketRegime.TRENDING_UP, 3) == 4
+    assert _required_confirmation_bars(MarketRegime.BULL_VOLATILE, 3) == 4
+    assert _required_confirmation_bars(MarketRegime.RANGE_BOUND, 3) == 3
+
+
+def test_panic_switch_takes_effect_immediately():
+    from src.agent.regime import MarketRegime, _apply_regime_confirmation
+
+    regime, payload = _apply_regime_confirmation(
+        raw_regime=MarketRegime.PANIC,
+        previous_regime=MarketRegime.TRENDING_UP.value,
+        pending_regime=None,
+        pending_count=0,
+        confirmation_bars=1,
+    )
+
+    assert regime == MarketRegime.PANIC
+    assert payload["state"] == "switched"
 
 
 def test_default_tool_registry_contains_detect_market_regime():
@@ -271,6 +398,7 @@ def test_detect_market_regime_tool_uses_persisted_state_and_context():
 
     with patch("src.agent.tools.market_tools._load_market_history", return_value=(history_rows, "unit")), \
          patch("src.agent.tools.market_tools._handle_get_market_indices", return_value={"indices": [{"change_pct": 1.0}]}), \
+         patch("src.agent.tools.market_tools._fetch_market_stats", return_value={}), \
          patch("src.agent.tools.market_tools._handle_get_sector_rankings", return_value={"top_sectors": [], "bottom_sectors": []}), \
          patch("src.agent.tools.data_tools._handle_get_market_capital_flow", return_value={"market_flow": {"main_net_inflow": 100.0}}), \
          patch("src.agent.tools.data_tools._handle_get_northbound_capital_flow", return_value={"history": [{"net_inflow": 10.0}]}), \

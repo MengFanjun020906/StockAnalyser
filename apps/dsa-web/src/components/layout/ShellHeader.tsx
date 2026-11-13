@@ -21,7 +21,7 @@ export const ShellHeader: React.FC<ShellHeaderProps> = ({
   onOpenMobileNav,
 }) => {
   const location = useLocation();
-  const current = TITLES[location.pathname] ?? { title: 'StockAnalyser', description: 'Web workspace' };
+  const current = TITLES[location.pathname] ?? { title: 'StockAnalyser', description: 'Web 工作台' };
 
   return (
     <header className="sticky top-0 z-30 border-b border-border/60 bg-background/84 backdrop-blur-xl">

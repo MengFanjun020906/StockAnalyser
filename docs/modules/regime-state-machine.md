@@ -34,6 +34,7 @@
   "wyckoff_phase": "accumulation | distribution | markup | markdown | range | unknown",
   "trend_direction": "up | flat | down | unknown",
   "vol_direction": "expanding | stable | compressing | unknown",
+  "breadth_confirmed": true,
   "risk_level": "medium | medium_high | high | unknown",
   "risk_multiplier": 1.0,
   "strategy_hints": [],
@@ -88,7 +89,7 @@
 | 原始维度 | A 股替代项 | 当前来源 |
 | --- | --- | --- |
 | Funding Rate | 两融余额变化 | `get_margin_trading_summary` |
-| Long/Short Ratio | 指数宽度 | `get_market_indices` |
+| Long/Short Ratio | 全市场涨跌家数 + 20 日新高/新低家数（回退指数宽度） | `stock_market_activity_legu`、`stock_a_high_low_statistics`，失败时回退 `get_market_stats` / `get_market_indices` |
 | Fear & Greed | 预留 | 后续可接自建 A 股情绪指数 |
 | OI / Flow | 北向资金、市场主力净流入 | `get_northbound_capital_flow`、`get_market_capital_flow` |
 
@@ -113,6 +114,10 @@ market_flow_z:         0.16
 | 其他 | `neutral` |
 
 缺失分量不会被编造，只会降低 `data_quality`。
+
+`market_breadth` 优先使用全市场涨跌家数：`上涨占比 = up_count / (up_count + down_count)`，映射到 `[-1, 1]`。若同时拿到 20 日新高/新低家数，则按 `涨跌 0.6 / 涨停跌停 0.2 / 新高新低 0.2` 合成；拿不到新高新低时退回 `0.7 / 0.3`。再拿不到全市场统计时，才退回按指数涨跌家数计算。宽度明细会写入 `sentiment_components.raw.market_stats` 和 `evidence`。
+
+当指数趋势向上但全市场上涨占比低于 35% 时，`breadth_confirmed=false`，`regime` 从 `bull_volatile` 降为 `high_volatility`，并在 `conflicts` 中标记“宽度未确认，按结构性行情处理”。数据缺失时 `breadth_confirmed=null`，保持原有分类，不因缺数据误降档。
 
 ## 6. Wyckoff 相位识别
 
@@ -149,7 +154,8 @@ Wyckoff 不直接决定买卖，但会影响最终 `regime` 和风险提示。�
 
 - `extreme` 波动且近 20 日明显下跌 -> `panic`。
 - 高波动叠加恐惧情绪，且趋势方向不是向上 -> `risk_off`。
-- 趋势向上且波动为 `high_vol` / `extreme` -> `bull_volatile`。
+- 趋势向上且波动为 `high_vol` / `extreme`，且宽度确认 -> `bull_volatile`。
+- 趋势向上但全市场宽度未确认（上涨占比 < 35%）-> `high_volatility`。
 - 趋势向上且波动为 `elevated` 及以下 -> `trending_up`。
 - Wyckoff 为 `markdown` 或均线/收益走弱 -> `trending_down`。
 - 高波动但方向不明 -> `high_volatility`。
@@ -171,7 +177,8 @@ Wyckoff 不直接决定买卖，但会影响最终 `regime` 和风险提示。�
 | --- | --- | --- | --- | --- |
 | `up` | `very_low` / `low` / `normal` | `trending_up` | `medium` | 正常 |
 | `up` | `elevated` | `trending_up` | `medium` | 首仓上限 15%，承接确认 |
-| `up` | `high_vol` / `extreme` | `bull_volatile` | `medium` | 首仓上限 15%，承接确认 |
+| `up` | `high_vol` / `extreme` + 宽度确认 | `bull_volatile` | `medium` | 首仓上限 15%，承接确认 |
+| `up` | `high_vol` / `extreme` + 宽度未确认 | `high_volatility` | `medium_high` | 首仓上限 5% |
 | `flat` | `elevated` / `high_vol` | `high_volatility` | `medium_high` | 首仓上限 5% |
 | `flat` | `extreme` | `high_volatility` | `high` | 等待或防守 |
 | `down` | `high_vol` | `trending_down` | `medium_high` | 首仓上限 5%，优先防守 |
@@ -183,7 +190,14 @@ Wyckoff 不直接决定买卖，但会影响最终 `regime` 和风险提示。�
 
 ## 8. 状态确认
 
-Regime 切换需要连续确认，默认 `confirmation_bars=3`。
+Regime 切换需要连续确认，默认 `confirmation_bars=3`，但按 A 股“急跌慢涨”做非对称处理：
+
+| 目标 regime | 实际确认天数（base=3） | 说明 |
+| --- | --- | --- |
+| `panic` / `risk_off` | 1 | 风控优先，当日生效 |
+| `trending_down` | 2 | 下跌确认更快 |
+| `trending_up` / `bull_volatile` | 4 | 上涨确认更慢，避免假突破 |
+| `range_bound` / `high_volatility` | 3 | 保持默认 |
 
 如果上次状态是 `range_bound`，本次原始状态变成 `trending_up`：
 
@@ -194,11 +208,11 @@ Regime 切换需要连续确认，默认 `confirmation_bars=3`。
   "previous_regime": "range_bound",
   "pending_regime": "trending_up",
   "pending_count": 1,
-  "required": 3
+  "required": 4
 }
 ```
 
-只有连续满足 3 次后才切换为新 regime。这样可以减少震荡行情中的频繁翻转。
+只有连续满足对应天数后才切换为新 regime。这样可以减少震荡行情中的频繁翻转，同时保证下跌和恐慌不会因为确认过慢而漏掉。
 
 ## 9. SQLite 持久化
 
@@ -242,7 +256,7 @@ Regime 切换需要连续确认，默认 `confirmation_bars=3`。
 
 当前限制：
 
-- 市场代理默认仍走现有日线加载链路，后续应优先使用 Tushare `index_daily` 明确拉沪深300指数；暂未接入全市场涨跌家数和多指数宽度。
+- 市场代理默认仍走现有日线加载链路，后续应优先使用 Tushare `index_daily` 明确拉沪深300指数；已接入全市场涨跌家数和 20 日新高/新低家数，尚未接入多指数宽度和逐股“站上 20 日均线占比”（逐股遍历全市场日线成本过高，当前用新高/新低家数代理）。
 - Fear & Greed 为预留位，当前没有自建 A 股情绪指数。
 - 股指期货 OI、基差、ETF 期权 PCR/OI 尚未接入。
 - 情绪合成分量不足时会返回 `data_quality=limited`，不会编造缺失数据。

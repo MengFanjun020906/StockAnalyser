@@ -3062,6 +3062,38 @@ def test_market_regime_constraints_allow_bull_volatile_open_with_higher_cap():
     assert plan["initial_amount"] == 15000.0
 
 
+def test_market_regime_constraints_cap_uptrend_without_breadth():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(market_regime={
+        "regime": "bull_volatile",
+        "risk_level": "medium",
+        "volatility_bucket": "extreme",
+        "trend_direction": "up",
+        "breadth_confirmed": False,
+    })
+    payload = {
+        "summary": {},
+        "full": {
+            "positions_plan": [{
+                "code": "600001",
+                "action": "open",
+                "initial_position_pct": 20.0,
+                "initial_amount": 20000.0,
+            }],
+            "risk_controls": [],
+        },
+    }
+
+    result = stock_selection_module._apply_market_regime_constraints(ctx, payload)
+    plan = result["full"]["positions_plan"][0]
+
+    assert plan["action"] == "open"
+    assert plan["initial_position_pct"] == 5.0
+    assert plan["initial_amount"] == 5000.0
+    assert "降低主动开仓" in plan["reason"]
+
+
 def test_market_regime_constraints_keep_five_percent_cap_without_uptrend():
     from types import SimpleNamespace
 
