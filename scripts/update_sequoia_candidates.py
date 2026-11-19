@@ -23,6 +23,15 @@ kept for callers that still select ``--source baostock``.
 Tushare completion metadata is advanced only after an unfiltered full-market
 snapshot succeeds.  Partial smoke runs and index-only refreshes therefore
 cannot make a later daily run skip missing stock data.
+
+Publish-lag fallback
+--------------------
+The target date comes from the A-share trading calendar, not the natural date.
+Tushare publishes ``index_daily`` well after the 15:00 close, so the calendar
+target may still be missing during an evening run.  When the newest published
+session is older than the target, the update falls back to that newest session
+instead of failing, records it as the completion date, and leaves the remaining
+days for the next resume instead of blocking the whole daily pipeline.
 """
 
 from __future__ import annotations
@@ -695,12 +704,20 @@ def _run_tushare_update(args: argparse.Namespace, db_path: str, end: date) -> in
     if not available_dates:
         print("Tushare returned no completed trading dates", file=sys.stderr)
         return 3
-    if available_dates[-1] != end_text:
+
+    # The calendar target is the latest *session* that has closed, but Tushare
+    # publishes index_daily well after the 15:00 close.  Treating an unpublished
+    # target as a hard failure makes every same-evening daily run fail even
+    # though the prior session is fully available.  Fall back to the newest
+    # published session and let the completion marker record what was actually
+    # written; the next run resumes from there once the target bar is published.
+    effective_end_text = available_dates[-1]
+    if effective_end_text != end_text:
         print(
-            f"Tushare index data is not ready for target date {end_text}; latest={available_dates[-1]}",
-            file=sys.stderr,
+            f"[WARN] Tushare index data is not ready for target date {end_text}; "
+            f"updating to latest available date {effective_end_text} instead",
+            flush=True,
         )
-        return 3
 
     force_rolling_refresh = args.no_incremental or args.no_resume or not resume_date
     if force_rolling_refresh:
@@ -914,6 +931,9 @@ def _run_tushare_update(args: argparse.Namespace, db_path: str, end: date) -> in
             )
 
     final_date = available_dates[-1]
+    if resume_date and final_date < resume_date:
+        # A stale upstream response must never move the completion marker backwards.
+        final_date = resume_date
     mark_complete = not args.index_only and not selected_symbols and args.limit_symbols <= 0
     written_rows = _save_tushare_batch(
         db_path,
@@ -927,6 +947,7 @@ def _run_tushare_update(args: argparse.Namespace, db_path: str, end: date) -> in
     total_rows, symbol_count, min_date, max_date = db_summary(db_path)
     print(
         f"Done. source=tushare written_rows={written_rows} scales={len(scales)} "
+        f"completed_date={final_date} "
         f"pruned_by_date={deleted_by_date} pruned_by_symbol={deleted_by_symbol} cutoff={cutoff} "
         f"db_rows={total_rows} symbols={symbol_count} date_range={min_date}..{max_date}",
         flush=True,

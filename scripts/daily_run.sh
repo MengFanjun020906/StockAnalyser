@@ -17,8 +17,10 @@
 #
 # 续跑机制:
 #   每天在 .cache/ 下生成一个状态文件 daily_run_YYYYMMDD.state。
-#   Sequoia 日线步骤按最新已完成交易日写入标记，避免盘中运行更新到上一交易日后
-#   阻止收盘后补齐当日行情；其他步骤按自然日写入标记。
+#   Sequoia 日线步骤按实际写入的已完成交易日写入标记，避免盘中运行更新到上一交易日后
+#   阻止收盘后补齐当日行情；当 Tushare 尚未发布日历目标日行情时，脚本会回退到最新
+#   已发布交易日，此时按回退后的日期写标记，当天稍后重跑仍会继续尝试补齐目标日。
+#   其他步骤按自然日写入标记。
 #   每步成功完成后写入标记；中断重跑时自动跳过已完成步骤。
 #   --reset 可强制清除状态重头跑。
 
@@ -176,7 +178,17 @@ else
         if "$PYTHON" scripts/update_sequoia_candidates.py --source tushare --trading-days 260; then
             ok "stock_daily 更新完成  (耗时: $(elapsed $((SECONDS - T1))))"
             info "更新后: $(db_stat "$SEQUOIA_DB")"
-            mark_done "$STEP1_KEY"
+            STEP1_DONE_DATE=$(sqlite3 "$SEQUOIA_DB" \
+                "SELECT value FROM stock_daily_metadata WHERE key='last_completed_date';" 2>/dev/null || true)
+            STEP1_DONE_KEY_DATE="${STEP1_DONE_DATE//-/}"
+            if [ -n "$STEP1_DONE_KEY_DATE" ] && [ "$STEP1_DONE_KEY_DATE" != "$STEP1_TARGET_DATE" ]; then
+                # 目标交易日行情尚未发布：脚本已回退更新到最新可用日。
+                # 按实际写入日写标记，使当天稍后重跑仍会尝试补齐日历目标日。
+                mark_done "step1_stock_daily_with_index_${STEP1_DONE_KEY_DATE}"
+                warn "Tushare 尚未发布 ${STEP1_TARGET_DATE} 的行情，已更新到 ${STEP1_DONE_KEY_DATE}；稍后重跑会继续补齐"
+            else
+                mark_done "$STEP1_KEY"
+            fi
         else
             warn "stock_daily 更新脚本失败，已有 $(db_stat "$SEQUOIA_DB") 仍可用"
             warn "step1 未标记完成，下次续跑会重试"

@@ -297,7 +297,7 @@ def test_update_sequoia_candidates_tushare_targeted_bridge_recovers_missing_mark
     assert close == 110.0
 
 
-def test_update_sequoia_candidates_tushare_does_not_complete_before_target_date(tmp_path):
+def test_update_sequoia_candidates_tushare_falls_back_when_target_not_published(tmp_path, capsys):
     db_path = tmp_path / "sequoia_v2.db"
     init_db(str(db_path))
     upsert_rows(
@@ -351,7 +351,89 @@ def test_update_sequoia_candidates_tushare_does_not_complete_before_target_date(
         "data_provider.tushare_client.query_tushare_api",
         side_effect=fake_tushare_query,
     ):
-        assert main() == 3
+        assert main() == 0
+
+    with sqlite3.connect(db_path) as conn:
+        completion_date = conn.execute(
+            "SELECT value FROM stock_daily_metadata WHERE key = 'last_completed_date'"
+        ).fetchone()[0]
+
+    # The unpublished target (2026-01-03) degrades to the newest published session.
+    assert completion_date == "2026-01-02"
+    output = capsys.readouterr().out
+    assert "is not ready for target date 2026-01-03" in output
+    assert "updating to latest available date 2026-01-02" in output
+
+
+def test_update_sequoia_candidates_tushare_fallback_writes_latest_available_session(tmp_path):
+    db_path = tmp_path / "sequoia_v2.db"
+    init_db(str(db_path))
+    upsert_rows(
+        str(db_path),
+        [
+            ("600001", "2026-11-16", 90, 110, 80, 100, 1_000, 10_000),
+            (BENCHMARK_INDEX_SYMBOL, "2026-11-16", 3000, 3050, 2950, 3020, 10_000, 20_000),
+            (REGIME_INDEX_SYMBOL, "2026-11-16", 4000, 4050, 3950, 4020, 10_000, 20_000),
+        ],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO stock_daily_metadata(key, value) VALUES(?, ?)",
+            [("active_source", "tushare"), ("last_completed_date", "2026-11-16")],
+        )
+        conn.commit()
+
+    def stock_row(code, trade_date, close):
+        return {
+            "ts_code": code,
+            "trade_date": trade_date,
+            "open": close - 0.5,
+            "high": close + 0.5,
+            "low": close - 1,
+            "close": close,
+            "vol": 10,
+            "amount": 20,
+        }
+
+    def fake_tushare_query(api_name, params=None, fields="", timeout=30):
+        params = params or {}
+        if api_name == "index_daily":
+            return pd.DataFrame(
+                [
+                    stock_row(params["ts_code"], "20261117", 3120),
+                    stock_row(params["ts_code"], "20261116", 3020),
+                ]
+            )
+        trade_date = params["trade_date"]
+        closes = {"20261116": 10, "20261117": 11}
+        if api_name == "daily":
+            return pd.DataFrame([stock_row("600001.SH", trade_date, closes[trade_date])])
+        if api_name == "adj_factor":
+            return pd.DataFrame(
+                [{"ts_code": "600001.SH", "trade_date": trade_date, "adj_factor": 2.0}]
+            )
+        raise AssertionError(f"unexpected Tushare API: {api_name}")
+
+    argv = ["update_sequoia_candidates.py", "--source", "tushare", "--db-path", str(db_path)]
+    with patch.object(sys, "argv", argv), patch.dict("os.environ", {"TUSHARE_TOKEN": "test-token"}), patch(
+        "scripts.update_sequoia_candidates.resolve_cn_resume_target_date",
+        return_value=date(2026, 11, 18),
+    ), patch(
+        "data_provider.tushare_client.query_tushare_api",
+        side_effect=fake_tushare_query,
+    ):
+        assert main() == 0
+
+    with sqlite3.connect(db_path) as conn:
+        close = conn.execute(
+            "SELECT close FROM stock_daily WHERE symbol = '600001' AND date = '2026-11-17'"
+        ).fetchone()[0]
+        completion_date = conn.execute(
+            "SELECT value FROM stock_daily_metadata WHERE key = 'last_completed_date'"
+        ).fetchone()[0]
+
+    assert close == 110.0
+    assert completion_date == "2026-11-17"
 
 
 def test_update_sequoia_candidates_tushare_rejects_partial_market_snapshot(tmp_path):
@@ -558,6 +640,31 @@ def test_update_sequoia_candidates_resume_target_uses_effective_cn_trading_date(
         create=True,
     ):
         assert resolve_cn_resume_target_date(current_time) == date(2026, 6, 12)
+
+
+def test_update_sequoia_candidates_target_uses_current_session_after_close():
+    class _FakeCalendar:
+        def is_session(self, check_date):
+            return True
+
+        def date_to_session(self, check_date, direction="previous"):
+            return pd.Timestamp(check_date)
+
+        def session_close(self, session):
+            # 15:00 Asia/Shanghai expressed in UTC.
+            return pd.Timestamp(datetime(2026, 11, 18, 7, 0, tzinfo=ZoneInfo("UTC")))
+
+        def previous_session(self, session):
+            return session - pd.Timedelta(days=1)
+
+    current_time = datetime(2026, 11, 18, 18, 42, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with patch("src.core.trading_calendar._XCALS_AVAILABLE", True), patch(
+        "src.core.trading_calendar.xcals",
+        SimpleNamespace(get_calendar=lambda _ex: _FakeCalendar()),
+        create=True,
+    ):
+        assert resolve_cn_resume_target_date(current_time) == date(2026, 11, 18)
 
 
 def test_update_sequoia_candidates_detects_baostock_session_expired_errors():

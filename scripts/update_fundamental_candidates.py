@@ -121,7 +121,18 @@ def main() -> int:
         print("sample_errors=" + " | ".join(errors[:5]), file=sys.stderr)
     if interrupted:
         return 130
-    return 0 if written else 1
+    if written:
+        return 0
+    if errors:
+        return 1
+    # All pending codes returned no fina_indicator rows.  This is expected for a
+    # newly listed stock that has not disclosed a report yet, so it must not
+    # fail the daily pipeline on its own.
+    print(
+        "no fina_indicator rows for pending codes; reports likely not disclosed yet (non-fatal)",
+        file=sys.stderr,
+    )
+    return 0
 
 
 class ProgressReporter:
