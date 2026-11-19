@@ -1,0 +1,57 @@
+# 板块资金流观察（仅展示，不参与排序/入选/desk 打分）
+# 参数全部集中在此，业务函数不硬编码。
+version: 1
+
+# 窗口：最近 N 个完整交易日（按交易日，不按日历日）
+window_days: 5
+
+# 单日快照最多抓取多少个板块的逐日资金流（含候选映射到的全部板块）
+# 0 = 全量行业板块（当前约 496 个，以 catalog_size 为准），保证截面分位是 complete；
+# 正数 = 截断到该数量（映射板块优先），截断时记 percentile_universe=partial
+universe_limit: 0
+
+# 并发与重试。取值依据（2026-11-18 实测 30 板块样本）：
+#   c=4  p50 139ms / p95 220ms，全量折算约 21s
+#   c=8  p50 229ms / p95 351ms，全量折算约 16s，瞬时约 31 req/s
+#   c=12 p50 190ms / p95 245ms，全量折算约 9s，瞬时约 52 req/s（限流风险抬升）
+# 选 8：留出约 1.6 倍余量给重试，同时不把并发压到东财接口的瞬时阈值。
+concurrency: 8
+# 单个板块失败重试次数；退避 retry_backoff_s * (attempt+1)，失败只降级不抛错
+retry: 1
+retry_backoff_s: 0.5
+request_timeout_s: 20
+
+# 是否启用「成分股反查」兜底（成本高，默认关闭；代码精确匹配命中率 100% 时不需要）
+constituent_fallback: false
+constituent_max_boards: 40
+
+# 复合分权重（沿用设计首版，不在此处调参）
+weights:
+  net_inflow_sum: 0.32
+  main_inflow_pct_avg: 0.20
+  positive_inflow_days: 0.18
+  latest_net_inflow: 0.12
+  inflow_acceleration: 0.10
+  large_order_positive_days: 0.08
+
+# 过热惩罚：sector_return_window 超过 start_pct 后按 slope 扣分，最多扣 cap
+overheat:
+  start_pct: 8.0
+  slope: 30.0
+  cap: 0.18
+
+# state 阈值（仅用于展示）
+state_thresholds:
+  persistent_score: 0.65
+  persistent_positive_days: 4
+  net_inflow_score: 0.45
+  neutral_score_low: 0.30
+  neutral_score_high: 0.45
+  outflow_positive_days_max: 1
+
+# 快照落库
+snapshot:
+  cache_subdir: factor_eval_cache
+  max_lag_days: 3
+  # 失败板块单独重试的冷却时间（分钟）；冷却内命中缓存直接返回，不整批重跑
+  error_retry_cooldown_minutes: 10

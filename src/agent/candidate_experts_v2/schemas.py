@@ -96,6 +96,8 @@ class FeatureRow(BaseModel):
     flags: List[FeatureFlag] = Field(default_factory=list)
     fact_sheet: Optional["FactSheet"] = None
     seed_fact: Optional["SeedFactPacket"] = None
+    # 主题归属画像(含 unrelated/unknown),用于回访/反证;缺失时保持 None
+    theme_profile: Optional[Dict[str, Any]] = None
     recall_sources: List[str] = Field(default_factory=list)
     coarse_kept: bool = True
     coarse_drop_reason: str = ""
@@ -134,7 +136,62 @@ class SeedItem(BaseModel):
     priority_score: float = 0.0
     freshness: str = "unknown"
     context_hint: str = ""
+    # 主题归属画像(始终写入,含 unrelated/unknown),旧字段语义不变
+    theme_profile: Optional[Dict[str, Any]] = None
     extras: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SectorFlowFact(BaseModel):
+    """板块资金流观察值(仅展示,不参与排序/desk 打分)。
+
+    由 ``sector_flow.attach_sector_flow`` 在候选确定后统一填充: 同一交易日只构建
+    一次板块快照, 个股按 ``bk_code`` O(1) 查询。``usage`` 固定为 ``observation``、
+    ``display_only=True``, 守卫测试禁止 aggregator / experts 读取
+    ``score`` / ``state``。缺失一律用 ``None`` 表达, 不用 0 代替。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # 身份与映射
+    bk_code: Optional[str] = None
+    bk_name_raw: Optional[str] = None
+    industry_key: Optional[str] = None
+    mapping_method: Literal["code", "alias", "constituent", "unmapped"] = "unmapped"
+    mapping_confidence: Literal["high", "medium", "low", "none"] = "none"
+    candidate_boards: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # 口径
+    as_of_date: Optional[str] = None
+    window_days: int = 5
+    sample_days: int = 0
+    unit: Literal["yuan", "wan_yuan"] = "yuan"
+
+    # 原始事实
+    net_inflow_sum: Optional[float] = None
+    main_inflow_pct_avg: Optional[float] = None
+    positive_inflow_days: Optional[int] = None
+    latest_net_inflow: Optional[float] = None
+    inflow_acceleration: Optional[float] = None
+    large_order_positive_days: Optional[int] = None
+    sector_return_window: Optional[float] = None
+    return_source: Optional[str] = None
+
+    # 派生(仅观察)
+    composite: Optional[float] = None
+    overheat_penalty: Optional[float] = None
+    overheat_status: Literal["ok", "missing"] = "missing"
+    score: Optional[float] = None
+    state: Literal["persistent_inflow", "net_inflow", "neutral", "outflow", "unknown"] = "unknown"
+    score_partial: bool = False
+
+    # 质量与来源
+    status: Literal["ok", "partial", "missing"] = "missing"
+    missing_reason: Optional[str] = None
+    quality_notes: List[str] = Field(default_factory=list)
+    source_chain: List[str] = Field(default_factory=list)
+    computed_at: str = ""
+    usage: Literal["observation"] = "observation"
+    display_only: bool = True
 
 
 class FactSheet(BaseModel):
@@ -165,11 +222,17 @@ class FactSheet(BaseModel):
     avg_turnover_20: Optional[float] = None
     liquidity_ok: bool = True
     hard_risk_flags: List[str] = Field(default_factory=list)  # st/delist/suspended/...
+    # 红线判定依据: 每条 {flag, status: hit/clear/unknown, source, as_of, detail}
+    hard_risk_evidence: List[Dict[str, Any]] = Field(default_factory=list)
+    # 无数据可判的 flag(明确标未知, 不默认放行)
+    hard_risk_unknown: List[str] = Field(default_factory=list)
     # 板块/题材(共享上下文,替代独立题材席)
     sector_name: str = ""
     sector_strength: Literal["strong", "neutral", "weak", "unknown"] = "unknown"
     sector_rank_pct: Optional[float] = None
     leader_already_up: Optional[bool] = None  # 板块龙头是否已涨(补涨判断用)
+    # 板块资金流观察块: 仅展示, 默认 None, 不进入 desk LLM 事实包/排序
+    sector_flow: Optional[SectorFlowFact] = None
     freshness: str = "unknown"
     warnings: List[str] = Field(default_factory=list)
 
@@ -209,6 +272,7 @@ class SeedFactPacket(BaseModel):
     market: str = "cn"
     recall_sources: List[str] = Field(default_factory=list)
     flags: List[Dict[str, Any]] = Field(default_factory=list)
+    theme_profile: Optional[Dict[str, Any]] = None
     fact_sheet: Dict[str, Any] = Field(default_factory=dict)
     business_context: Dict[str, Any] = Field(default_factory=dict)
     facts: Dict[str, SeedFactToolResult] = Field(default_factory=dict)
@@ -226,13 +290,34 @@ class EvidenceItem(BaseModel):
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
 
+CounterEvidenceType = Literal[
+    "theme_mismatch",
+    "missing_market_data",
+    "overextended_price",
+    "weak_technical_confirmation",
+    "negative_event_dominant",
+    "extreme_valuation",
+]
+
+
 class RiskNote(BaseModel):
-    """Structured risk note attached to a candidate."""
+    """Structured risk note attached to a candidate.
+
+    ``type`` stays a free string because thesis desks may emit their own risk
+    labels; deterministic counter-evidence uses :data:`CounterEvidenceType`.
+    ``severity`` / ``source`` / ``as_of`` / ``reason`` make every note auditable
+    (where it came from, when, and why it was judged that way).
+    """
 
     model_config = ConfigDict(extra="allow")
 
     type: str
     summary: str = ""
+    severity: float = Field(default=0.0, ge=0.0, le=1.0)
+    source: str = ""
+    as_of: str = ""
+    reason: str = ""
+    metrics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ExpertCandidateV2(BaseModel):

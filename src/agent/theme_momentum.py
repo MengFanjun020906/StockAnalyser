@@ -189,7 +189,12 @@ def classify_seed_theme_profile(seed: Any, snapshot: Optional[Dict[str, Any]]) -
     membership_confidence = 0.0
     if matched.aliases:
         membership_confidence += 0.45
-    if source in {"sector_theme", "news_theme_daily"}:
+    # sector_theme 来源本身即"主题板块成分股",算主题证据;news_theme_daily
+    # 只在日报主题/相关板块/关键词命中目标主题别名时才算,避免"来自新闻池"
+    # 被误当成"贴靠主线主题"(例如航运、低空经济日报)。
+    if source == "sector_theme":
+        membership_confidence += 0.25
+    elif source == "news_theme_daily" and matched.aliases:
         membership_confidence += 0.25
     if source in {"hot_rank", "limit_up_pool", "capital_flow_anomaly", "dragon_tiger"} and matched.aliases:
         membership_confidence += 0.15
@@ -199,8 +204,20 @@ def classify_seed_theme_profile(seed: Any, snapshot: Optional[Dict[str, Any]]) -
         membership_confidence += 0.05
     membership_confidence = _clamp(membership_confidence)
 
-    role = "unrelated" if membership_confidence < 0.25 else "follower"
-    if membership_confidence >= 0.25:
+    # 三态主题归属:matched / unrelated_confirmed / unclassified。
+    # unclassified 只表示"证据不足",不能当成"与主题无关"。
+    confirmation = _theme_confirmation_evidence(metrics)
+    if matched.aliases:
+        theme_status = "matched"
+        # 命中别名时不保留"他主题"确认块,避免同时出现 matched 与 explicit_other_theme。
+        confirmation = None
+    elif confirmation is not None:
+        theme_status = "unrelated_confirmed"
+    else:
+        theme_status = "unclassified"
+
+    if theme_status == "matched":
+        role = "follower"
         if source == "sector_theme" and "leader" in source_label:
             role = "core_leader" if (rank is None or rank <= 3) else "core_midcap"
         elif source == "sector_theme":
@@ -216,8 +233,14 @@ def classify_seed_theme_profile(seed: Any, snapshot: Optional[Dict[str, Any]]) -
             role = "core_midcap" if (net_inflow or 0) > 0 and priority >= 76 else "follower"
         elif source == "news_theme_daily":
             role = "follower"
+    elif theme_status == "unrelated_confirmed":
+        role = "unrelated"
+    else:
+        role = "unknown"
 
-    if (bomb_num or 0) >= 2 or (regime == "climax_extension" and role == "follower"):
+    if theme_status == "matched" and (
+        (bomb_num or 0) >= 2 or (regime == "climax_extension" and role == "follower")
+    ):
         role = "exhaustion_candidate" if (bomb_num or 0) >= 2 else "late_chaser"
     if regime == "theme_risk_off" and role not in {"unrelated", "unknown"}:
         role = "exhaustion_candidate"
@@ -247,12 +270,41 @@ def classify_seed_theme_profile(seed: Any, snapshot: Optional[Dict[str, Any]]) -
                 "membership_confidence": round(membership_confidence, 4),
             }
         ],
+        "theme_status": theme_status,
+        "theme_confirmation": confirmation or {},
         "stock_role": role,
         "momentum_setup": setup,
         "overbought_interpretation": interpretation,
         "chase_permission": permission,
-        "evidence": _profile_evidence(seed, matched, role, setup, strength=strength, net_inflow=net_inflow),
+        "evidence": _profile_evidence(
+            seed,
+            matched,
+            role,
+            setup,
+            strength=strength,
+            net_inflow=net_inflow,
+            theme_status=theme_status,
+            confirmation=confirmation,
+        ),
         "risk_flags": risk_flags,
+        # FAC-05: display-only provenance; does not participate in role/confidence.
+        "theme_attribution": _build_theme_attribution(
+            seed,
+            aliases=aliases,
+            theme=theme,
+            theme_name=str(
+                snapshot.get("theme_name")
+                or THEME_UNIVERSES["ai_compute_chain"]["display_name"]
+            ),
+            regime=regime,
+            metrics=metrics,
+            matched=matched,
+            membership_confidence=membership_confidence,
+            role=role,
+            setup=setup,
+            theme_status=theme_status,
+            confirmation=confirmation,
+        ),
     }
 
 
@@ -265,11 +317,20 @@ def apply_theme_profile_to_seed(seed: Any, snapshot: Optional[Dict[str, Any]]) -
         extras = {}
         seed.extras = extras
     extras["theme_profile"] = profile
+    # 显式字段:无论 stock_role 是 unrelated/unknown 都落盘,供快照回放与反证使用。
+    if isinstance(seed, dict):
+        seed["theme_profile"] = profile
+    else:
+        try:
+            seed.theme_profile = profile
+        except Exception:
+            pass
     metrics = extras.setdefault("metrics", {})
     if isinstance(metrics, dict):
         metrics.update(
             {
                 "theme_regime": profile.get("theme_regime"),
+                "theme_status": profile.get("theme_status"),
                 "stock_role": profile.get("stock_role"),
                 "momentum_setup": profile.get("momentum_setup"),
                 "overbought_interpretation": profile.get("overbought_interpretation"),
@@ -532,6 +593,154 @@ def _match_aliases(text: str, aliases: Sequence[str]) -> _MatchedText:
     return _MatchedText(text=text, aliases=found[:8])
 
 
+# 主题归属三态里的"正证据"白名单/黑名单。
+# 只有 exclusion_rule 或 explicit_other_theme 才能把"没查到主题"升级为
+# unrelated_confirmed;其余一律 unclassified(证据不足),不能当成"与主题无关"。
+_GENERIC_THEME_LABELS = {
+    "",
+    "其他",
+    "其它",
+    "综合",
+    "综合类",
+    "A股",
+    "沪深A股",
+    "全市场",
+    "大盘",
+    "市场",
+    "个股",
+    "股票",
+    "热点",
+    "异动",
+    "强势",
+    "涨停",
+    "连板",
+    "概念",
+    "板块",
+    "行业",
+    # 交易属性/指数成分等非主题标签:不能作为"明确他主题"的正证据。
+    "融资融券",
+    "沪股通",
+    "深股通",
+    "港股通",
+    "MSCI",
+    "MSCI中国",
+    "标准普尔",
+    "富时罗素",
+    "转债标的",
+    "预盈预增",
+    "预亏预减",
+    "机构重仓",
+    "基金重仓",
+    "QFII重仓",
+    "社保重仓",
+    "券商重仓",
+    "保险重仓",
+    "养老金",
+    "高送转",
+    "次新股",
+    "壳资源",
+    "股权激励",
+    "回购增持",
+    "破净股",
+    "低价股",
+    "小盘股",
+    "中盘股",
+    "大盘股",
+    "上证50",
+    "沪深300",
+    "中证500",
+    "中证1000",
+    "创业板综",
+    "科创50",
+    "unknown",
+    "other",
+}
+
+_EXCLUSION_THEME_RELATIONS = {
+    "opposite",
+    "excluded",
+    "exclude",
+    "exclusion",
+    "against",
+    "faded",
+    "fade",
+    "outdated",
+}
+
+_EXPLICIT_THEME_LABEL_KEYS: Tuple[str, ...] = (
+    "theme",
+    "bk_name",
+    "bkName",
+    "plate_name",
+    "industry",
+    "related_boards",
+    "concepts",
+    "concept",
+)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _explicit_theme_labels(metrics: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return concrete non-generic theme/board/industry labels from metrics."""
+
+    generic = {_normalize_text(item) for item in _GENERIC_THEME_LABELS}
+    labels: List[Dict[str, str]] = []
+    seen: set = set()
+    for key in _EXPLICIT_THEME_LABEL_KEYS:
+        value = metrics.get(key)
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in values:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            normalized = _normalize_text(text)
+            if normalized in generic or normalized in seen:
+                continue
+            seen.add(normalized)
+            labels.append({"field": f"metrics.{key}", "value": text[:40]})
+    return labels[:8]
+
+
+def _theme_confirmation_evidence(metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return positive evidence that a seed belongs to *another* theme.
+
+    ``None`` means "evidence insufficient" and must never be read as
+    "unrelated". Only two shapes confirm a mismatch:
+
+    - ``exclusion_rule``: explicit opposite / excluded / faded signal.
+    - ``explicit_other_theme``: a concrete non-generic theme/board/industry
+      label that exists while no target-theme alias matched.
+    """
+
+    relation = str(metrics.get("theme_relation") or "").strip().lower()
+    if relation in _EXCLUSION_THEME_RELATIONS or _truthy(metrics.get("theme_excluded")):
+        return {
+            "evidence_kind": "exclusion_rule",
+            "severity": 0.85,
+            "labels": [],
+            "rule": (
+                f"theme_relation={relation or 'unknown'}, "
+                f"theme_excluded={metrics.get('theme_excluded')}"
+            ),
+        }
+    labels = _explicit_theme_labels(metrics)
+    if labels:
+        return {
+            "evidence_kind": "explicit_other_theme",
+            "severity": 0.7,
+            "labels": labels,
+            "rule": "存在明确他主题/板块/行业标签，且未命中目标主题别名",
+        }
+    return None
+
+
 def _row_text(row: Dict[str, Any]) -> str:
     parts: List[str] = []
     for key in (
@@ -541,6 +750,11 @@ def _row_text(row: Dict[str, Any]) -> str:
         "industry",
         "concepts",
         "concept",
+        # 来源主题字段:盘前日报的 theme / related_boards / matched_keywords 必须
+        # 参与主题匹配,否则"日报主题是航运"也会被当成目标主题来源。
+        "theme",
+        "related_boards",
+        "matched_keywords",
         "stock_reason",
         "plate_reason",
         "reason",
@@ -572,15 +786,431 @@ def _seed_text(seed: Any, metrics: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _profile_evidence(seed: Any, match: _MatchedText, role: str, setup: str, *, strength: Optional[float], net_inflow: Optional[float]) -> List[str]:
+def _profile_evidence(
+    seed: Any,
+    match: _MatchedText,
+    role: str,
+    setup: str,
+    *,
+    strength: Optional[float],
+    net_inflow: Optional[float],
+    theme_status: str = "",
+    confirmation: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     evidence = [f"来源={getattr(seed, 'source', '')}，角色={role}，setup={setup}。"]
     if match.aliases:
         evidence.append(f"主题别名命中：{', '.join(match.aliases)}。")
+    if theme_status == "unrelated_confirmed":
+        kind = str((confirmation or {}).get("evidence_kind") or "unknown")
+        labels = [
+            str(item.get("value"))
+            for item in (confirmation or {}).get("labels") or []
+            if isinstance(item, dict) and item.get("value")
+        ]
+        label_text = "、".join(labels[:4]) or str((confirmation or {}).get("rule") or "")
+        evidence.append(f"确认他主题（{kind}）：{label_text}；未命中目标主题别名。")
+    elif theme_status == "unclassified":
+        evidence.append("主题证据不足：未命中主题别名，也没有明确他主题/排除证据（不判为无关）。")
     if strength is not None:
         evidence.append(f"主题/板块强度={strength:.2f}。")
     if net_inflow is not None:
         evidence.append(f"资金净流入={net_inflow:.0f}。")
     return evidence
+
+
+# FAC-05: 主题来源分解。以下字段与 ``_row_text`` 保持一致,保证归因展示与
+# 原判定读取同一批文本;新增内容只做审计,不参与 stock_role / 置信度计算。
+_ROW_TEXT_KEYS: Tuple[str, ...] = (
+    "bk_name",
+    "bkName",
+    "plate_name",
+    "industry",
+    "concepts",
+    "concept",
+    "theme",
+    "related_boards",
+    "matched_keywords",
+    "stock_reason",
+    "plate_reason",
+    "reason",
+    "rank_reason",
+    "name",
+    "ts_name",
+    "hint",
+)
+
+_CAPITAL_SOURCES = {
+    "capital_flow_anomaly",
+    "dragon_tiger",
+    "margin_financing",
+    "block_trade",
+}
+
+_ROLE_RULES: Dict[str, str] = {
+    "sector_theme": "热点板块来源：source_label 含 leader 且 rank<=3 → core_leader；rank<=6 或净流入>0 → core_midcap；否则 follower",
+    "limit_up_pool": "涨停池来源：连板>=2 或 priority>=84 → high_beta_leader；climax_extension 下 → late_chaser；否则 follower",
+    "hot_rank": "热榜来源：rank<=5 → high_beta_leader；否则 follower",
+    "news_theme_daily": "盘前日报来源：日报主题/相关板块/关键词命中主题别名后才 +0.25 并固定 follower；未命中不赠主题权重",
+}
+
+_THEME_STATUS_RULE = (
+    "别名命中 → matched；无命中但有 exclusion_rule / explicit_other_theme 正证据 → "
+    "unrelated_confirmed；其余 → unclassified（证据不足，只记录，不否决）"
+)
+
+
+def _theme_text_fields(seed: Any, metrics: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Enumerate the exact text fields consumed by the theme classifier."""
+
+    fields: List[Dict[str, str]] = []
+
+    def _push(field: str, value: Any) -> None:
+        if value in (None, "", []):
+            return
+        if isinstance(value, list):
+            text = " ".join(str(item) for item in value)
+        else:
+            text = str(value)
+        text = text.strip()
+        if text:
+            fields.append({"field": field, "text": text})
+
+    _push("name", getattr(seed, "name", None))
+    _push("hint", getattr(seed, "hint", None))
+    _push("context_hint", getattr(seed, "context_hint", None))
+    for key in _ROW_TEXT_KEYS:
+        _push(f"metrics.{key}", metrics.get(key))
+    for idx, signal in enumerate(getattr(seed, "trigger_signals", None) or []):
+        if not isinstance(signal, dict):
+            continue
+        _push(f"trigger_signals[{idx}].label", signal.get("label"))
+        _push(f"trigger_signals[{idx}].value", signal.get("value"))
+    return fields
+
+
+def _compact_detail(values: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in values.items()
+        if value not in (None, "", [])
+    }
+
+
+def _structured_theme_sources(
+    seed: Any,
+    metrics: Dict[str, Any],
+    *,
+    freshness: str,
+) -> List[Dict[str, Any]]:
+    """Extract concrete provenance records (news / card / sector / rank / limit-up)."""
+
+    source = str(getattr(seed, "source", "") or "unknown")
+    as_of = str(freshness or "unknown")
+    out: List[Dict[str, Any]] = []
+
+    if source == "news_theme_daily":
+        out.append(
+            {
+                "source_type": "news_theme",
+                "source_id": str(metrics.get("source_url") or metrics.get("source_title") or source),
+                "label": str(metrics.get("theme") or getattr(seed, "name", "") or source),
+                "as_of": as_of,
+                "detail": _compact_detail(
+                    {
+                        "theme": metrics.get("theme"),
+                        "source_title": metrics.get("source_title"),
+                        "source_url": metrics.get("source_url"),
+                        "evidence_section": metrics.get("evidence_section"),
+                        "matched_keywords": metrics.get("matched_keywords"),
+                        "related_boards": metrics.get("related_boards"),
+                        "polarity": metrics.get("polarity"),
+                        "directness": metrics.get("directness"),
+                        "mapping_role": metrics.get("mapping_role"),
+                        "rank": metrics.get("rank"),
+                    }
+                ),
+            }
+        )
+    elif source == "sector_theme":
+        out.append(
+            {
+                "source_type": "leading_sector",
+                "source_id": str(
+                    metrics.get("bk_code")
+                    or metrics.get("bk_name")
+                    or getattr(seed, "code", "")
+                    or source
+                ),
+                "label": str(metrics.get("bk_name") or getattr(seed, "name", "") or source),
+                "as_of": as_of,
+                "detail": _compact_detail(
+                    {
+                        "bk_code": metrics.get("bk_code"),
+                        "bk_name": metrics.get("bk_name"),
+                        "rank": metrics.get("rank"),
+                        "strength": metrics.get("strength"),
+                        "net_inflow": metrics.get("net_inflow"),
+                        "inflow_days": metrics.get("inflow_days"),
+                        "change_ratio": metrics.get("change_ratio"),
+                        "source_label": metrics.get("source_label"),
+                    }
+                ),
+            }
+        )
+    elif source == "hot_rank":
+        out.append(
+            {
+                "source_type": "hot_rank",
+                "source_id": str(getattr(seed, "code", "") or source),
+                "label": str(getattr(seed, "name", "") or source),
+                "as_of": as_of,
+                "detail": _compact_detail(
+                    {
+                        "rank": metrics.get("rank"),
+                        "rank_reason": metrics.get("rank_reason"),
+                        "source_label": metrics.get("source_label"),
+                    }
+                ),
+            }
+        )
+    elif source == "limit_up_pool":
+        out.append(
+            {
+                "source_type": "limit_up_pool",
+                "source_id": str(getattr(seed, "code", "") or source),
+                "label": str(getattr(seed, "name", "") or source),
+                "as_of": as_of,
+                "detail": _compact_detail(
+                    {
+                        "limit_up_streak": metrics.get("limit_up_streak"),
+                        "bomb_num": metrics.get("bomb_num") or metrics.get("open_times"),
+                        "reason": metrics.get("reason") or metrics.get("stock_reason"),
+                    }
+                ),
+            }
+        )
+    elif source in _CAPITAL_SOURCES:
+        out.append(
+            {
+                "source_type": "capital_flow",
+                "source_id": str(getattr(seed, "code", "") or source),
+                "label": str(getattr(seed, "name", "") or source),
+                "as_of": as_of,
+                "detail": _compact_detail(
+                    {
+                        "net_inflow": metrics.get("net_inflow"),
+                        "rank": metrics.get("rank"),
+                        "source_label": metrics.get("source_label"),
+                    }
+                ),
+            }
+        )
+
+    for idx, signal in enumerate(getattr(seed, "trigger_signals", None) or []):
+        if not isinstance(signal, dict):
+            continue
+        if str(signal.get("signal_type") or "").strip() != "news_signal_card":
+            continue
+        value = signal.get("value") if isinstance(signal.get("value"), dict) else {}
+        out.append(
+            {
+                "source_type": "news_card",
+                "source_id": str(value.get("card_id") or f"trigger_signals[{idx}]"),
+                "label": str(value.get("summary_short") or signal.get("label") or "新闻信号卡")[:120],
+                "as_of": str(value.get("signal_date") or as_of),
+                "detail": _compact_detail(
+                    {
+                        "primary_industries": value.get("primary_industries"),
+                        "company_rationale": value.get("company_rationale"),
+                        "company_direction": value.get("company_direction"),
+                        "signal_score": value.get("signal_score"),
+                        "mapping_confidence": value.get("mapping_confidence"),
+                        "evidence_grade": value.get("evidence_grade"),
+                        "gate_result": value.get("gate_result"),
+                    }
+                ),
+            }
+        )
+    return out
+
+
+def _build_theme_attribution(
+    seed: Any,
+    *,
+    aliases: Sequence[str],
+    theme: str,
+    theme_name: str,
+    regime: str,
+    metrics: Dict[str, Any],
+    matched: _MatchedText,
+    membership_confidence: float,
+    role: str,
+    setup: str,
+    theme_status: str = "",
+    confirmation: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the display-only theme attribution block (FAC-05).
+
+    It replays the same text fields / weights used by the role decision so a
+    reviewer can answer "why this theme" or "why unrelated" without changing
+    any classification output.
+    """
+
+    source = str(getattr(seed, "source", "") or "unknown")
+    freshness = str(getattr(seed, "freshness", "") or "unknown")
+    fields = _theme_text_fields(seed, metrics)
+    field_hits: List[Dict[str, Any]] = []
+    hit_aliases: set = set()
+    for field in fields:
+        field_match = _match_aliases(field["text"], aliases)
+        if not field_match.aliases:
+            continue
+        hit_aliases.update(field_match.aliases)
+        field_hits.append(
+            {
+                "source_type": "seed_text",
+                "source_id": field["field"],
+                "label": field["field"],
+                "as_of": freshness,
+                "matched_aliases": field_match.aliases,
+                "detail": {"excerpt": field["text"][:120]},
+            }
+        )
+
+    rank = _to_float(metrics.get("rank"))
+    net_inflow = _to_float(metrics.get("net_inflow"))
+    top_rank = rank is not None and rank <= 5
+    positive_inflow = net_inflow is not None and net_inflow > 0
+    heat_with_alias = (
+        source in {"hot_rank", "limit_up_pool", "capital_flow_anomaly", "dragon_tiger"}
+        and bool(matched.aliases)
+    )
+    source_theme_weight = source == "sector_theme" or (
+        source == "news_theme_daily" and bool(matched.aliases)
+    )
+    contributions = [
+        {
+            "factor": "alias_match",
+            "weight": 0.45 if matched.aliases else 0.0,
+            "hit": bool(matched.aliases),
+        },
+        {
+            "factor": "source_theme_priority",
+            "weight": 0.25 if source_theme_weight else 0.0,
+            "hit": source_theme_weight,
+            "detail": (
+                "sector_theme 来源即主题板块成分"
+                if source == "sector_theme"
+                else "news_theme_daily 需来源主题命中别名才计权重"
+            ),
+        },
+        {
+            "factor": "heat_source_with_alias",
+            "weight": 0.15 if heat_with_alias else 0.0,
+            "hit": heat_with_alias,
+        },
+        {
+            "factor": "top_rank",
+            "weight": 0.10 if top_rank else 0.0,
+            "hit": top_rank,
+        },
+        {
+            "factor": "positive_net_inflow",
+            "weight": 0.05 if positive_inflow else 0.0,
+            "hit": positive_inflow,
+        },
+    ]
+
+    decision = theme_status or (
+        "unrelated_confirmed" if role == "unrelated" else ("unclassified" if role == "unknown" else "matched")
+    )
+    confirmation = confirmation if isinstance(confirmation, dict) else {}
+    missing_reason = ""
+    if decision == "unclassified":
+        if hit_aliases:
+            missing_reason = (
+                f"membership_confidence={membership_confidence:.2f}；"
+                f"虽命中别名 {', '.join(sorted(hit_aliases))}，但来源 {source} 与排名/资金未形成足够权重；"
+                "证据不足，不等于与主题无关"
+            )
+        else:
+            missing_reason = (
+                f"membership_confidence={membership_confidence:.2f}；"
+                f"检查 {len(fields)} 个文本字段未命中主题别名，来源 {source} 不提供主题权重，"
+                "且无他主题/排除证据（证据不足，不等于与主题无关）"
+            )
+    elif decision == "unrelated_confirmed":
+        kind = str(confirmation.get("evidence_kind") or "unknown")
+        labels = [
+            str(item.get("value"))
+            for item in confirmation.get("labels") or []
+            if isinstance(item, dict) and item.get("value")
+        ]
+        if kind == "exclusion_rule":
+            missing_reason = f"排除规则命中：{confirmation.get('rule') or 'unknown'}；未命中目标主题别名"
+        else:
+            missing_reason = (
+                f"明确他主题标签：{'、'.join(labels[:4]) or 'unknown'}；未命中目标主题别名"
+            )
+
+    sources: List[Dict[str, Any]] = [
+        {
+            "source_type": "seed_source",
+            "source_id": source,
+            "label": source,
+            "as_of": freshness,
+            "matched_aliases": sorted(hit_aliases),
+            "detail": _compact_detail(
+                {
+                    "priority_score": getattr(seed, "priority_score", None),
+                    "rank": metrics.get("rank"),
+                    "source_label": metrics.get("source_label"),
+                    "theme": metrics.get("theme"),
+                    "related_boards": metrics.get("related_boards"),
+                    "hint": str(getattr(seed, "hint", "") or "")[:120],
+                }
+            ),
+        }
+    ]
+    sources.extend(_structured_theme_sources(seed, metrics, freshness=freshness))
+    sources.extend(field_hits[:6])
+
+    role_rule = _ROLE_RULES.get(source, f"来源 {source} 不在主题权重表内")
+    if role in {"late_chaser", "exhaustion_candidate"}:
+        role_rule += "；开板/高潮/退潮规则覆盖角色"
+    elif role in {"core_leader", "core_midcap", "high_beta_leader"}:
+        role_rule += "；命中核心角色规则"
+    elif role == "follower":
+        role_rule += "；落入 follower"
+    elif role == "unrelated":
+        role_rule = "存在他主题/排除正证据 → unrelated_confirmed"
+    elif role == "unknown":
+        role_rule = "无主题别名且无正证据 → unclassified（只记录，不否决）"
+
+    return {
+        "theme": theme,
+        "theme_name": theme_name,
+        "decision": decision,
+        "theme_status": decision,
+        "confirmation": confirmation,
+        "stock_role": role,
+        "theme_regime": regime,
+        "membership_confidence": round(membership_confidence, 4),
+        "rule": {
+            "membership_threshold": 0.25,
+            "theme_status_rule": _THEME_STATUS_RULE,
+            "role_rule": role_rule,
+            "momentum_setup": setup,
+        },
+        "contributions": contributions,
+        "sources": sources[:12],
+        "fields_checked": [field["field"] for field in fields],
+        "missing_reason": missing_reason,
+        "as_of": freshness,
+        "display_only": True,
+        "affects_ranking": False,
+        "affects_theme_decision": False,
+    }
 
 
 def _rank_score(matches: Sequence[Tuple[Dict[str, Any], _MatchedText]]) -> float:

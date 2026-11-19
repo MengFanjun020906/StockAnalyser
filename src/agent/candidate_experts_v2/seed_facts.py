@@ -244,6 +244,9 @@ def _compact_fact_sheet(value: Any) -> Dict[str, Any]:
         "sector_strength",
         "freshness",
         "warnings",
+        "hard_risk_flags",
+        "hard_risk_evidence",
+        "hard_risk_unknown",
     )
     return {
         key: fs.get(key)
@@ -1105,6 +1108,11 @@ def _empty_packet(row: FeatureRow, tools: Sequence[str]) -> SeedFactPacket:
             for flag in row.flags
         ],
         fact_sheet=_fact_sheet_to_dict(row.fact_sheet),
+        theme_profile=(
+            dict(row.theme_profile)
+            if isinstance(getattr(row, "theme_profile", None), dict)
+            else None
+        ),
         facts={tool_name: SeedFactToolResult(status="missing") for tool_name in tools},
     )
 

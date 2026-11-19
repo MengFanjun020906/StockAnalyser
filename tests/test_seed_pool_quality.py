@@ -985,5 +985,87 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.assertEqual(quality["items"][0]["name"], "深天马Ａ")
 
 
+def test_seed_snapshot_persists_theme_profile_for_unrelated():
+    from src.services.seed_pool_quality_service import _seed_fact_packet_to_seed_item
+
+    packet = {
+        "code": "600001",
+        "name": "测试标的",
+        "market": "cn",
+        "fact_sheet": {"freshness": "2026-11-16"},
+        "flags": [],
+        "recall_sources": ["daily_screener"],
+        "theme_profile": {
+            "theme_status": "unrelated_confirmed",
+            "stock_role": "unrelated",
+            "theme_regime": "unknown",
+            "theme_confidence": 0.0,
+            "evidence": ["来源=daily_screener，角色=unrelated"],
+            "evidence_source": "seed.theme_profile",
+            "theme_confirmation": {
+                "evidence_kind": "explicit_other_theme",
+                "severity": 0.7,
+                "labels": [{"field": "metrics.concepts", "value": "银行"}],
+            },
+            "theme_attribution": {
+                "decision": "unrelated_confirmed",
+                "missing_reason": "明确他主题标签：银行；未命中目标主题别名",
+                "sources": [{"source_type": "seed_source", "source_id": "daily_screener", "as_of": "2026-11-16"}],
+                "display_only": True,
+                "affects_ranking": False,
+            },
+        },
+    }
+    item = _seed_fact_packet_to_seed_item(packet, preview_by_code={}, candidate_by_code={})
+    assert item["theme_status"] == "unrelated_confirmed"
+    assert item["stock_role"] == "unrelated"
+    assert item["theme_regime"] == "unknown"
+    assert item["theme_profile_source"] == "seed_fact_packet.theme_profile"
+    assert item["theme_profile_missing_reason"] == ""
+    assert item["theme_profile"]["evidence"] == ["来源=daily_screener，角色=unrelated"]
+    assert item["theme_attribution"]["decision"] == "unrelated_confirmed"
+    assert item["theme_attribution"]["sources"][0]["source_id"] == "daily_screener"
+
+
+def test_seed_snapshot_derives_theme_role_from_flag_metrics_when_packet_lacks_profile():
+    from src.services.seed_pool_quality_service import _seed_fact_packet_to_seed_item
+
+    packet = {
+        "code": "600002",
+        "name": "测试标的2",
+        "market": "cn",
+        "fact_sheet": {"freshness": "2026-11-16"},
+        "flags": [
+            {
+                "detector": "daily_screener",
+                "kind": "pattern",
+                "metrics": {"stock_role": "follower", "theme_regime": "theme_active"},
+            }
+        ],
+        "recall_sources": ["daily_screener"],
+    }
+    item = _seed_fact_packet_to_seed_item(packet, preview_by_code={}, candidate_by_code={})
+    assert item["stock_role"] == "follower"
+    assert item["theme_profile_source"] == "seed_fact_packet.flags.metrics"
+    assert item["theme_profile"]["derived_from_metrics"]
+
+
+def test_seed_snapshot_marks_missing_theme_profile_explicitly():
+    from src.services.seed_pool_quality_service import _seed_fact_packet_to_seed_item
+
+    packet = {
+        "code": "600003",
+        "name": "测试标的3",
+        "market": "cn",
+        "fact_sheet": {"freshness": "2026-11-16"},
+        "flags": [],
+        "recall_sources": ["daily_screener"],
+    }
+    item = _seed_fact_packet_to_seed_item(packet, preview_by_code={}, candidate_by_code={})
+    assert item["stock_role"] is None
+    assert item["theme_profile_source"] == "missing"
+    assert "theme_profile" in item["theme_profile_missing_reason"]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -579,6 +579,34 @@ type CandidateReasonDimension = {
   detail: string;
 };
 
+type SectorFlowDisplay = {
+  status?: string;
+  state?: string;
+  score?: number;
+  scorePartial?: boolean;
+  asOfDate?: string;
+  bkCode?: string;
+  bkName?: string;
+  industryKey?: string;
+  mappingMethod?: string;
+  mappingConfidence?: string;
+  windowDays?: number;
+  sampleDays?: number;
+  unit?: string;
+  netInflowSum?: number;
+  mainInflowPctAvg?: number;
+  positiveInflowDays?: number;
+  latestNetInflow?: number;
+  inflowAcceleration?: number;
+  largeOrderPositiveDays?: number;
+  sectorReturnWindow?: number;
+  composite?: number;
+  overheatPenalty?: number;
+  overheatStatus?: string;
+  missingReason?: string;
+  qualityNotes?: string[];
+};
+
 type DisplayCandidate = {
   code: string;
   name: string;
@@ -605,6 +633,7 @@ type DisplayCandidate = {
   desks: string[];
   multiDeskConviction: boolean;
   conflictFlags: string[];
+  sectorFlow?: SectorFlowDisplay;
 };
 
 type CandidateDimensionGroup = {
@@ -1291,6 +1320,50 @@ const normalizeReasonDimensions = (item: Record<string, unknown>): CandidateReas
   return result.slice(0, 5);
 };
 
+const normalizeSectorFlow = (value: unknown): SectorFlowDisplay | undefined => {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  // NOTE: 0 是合法值（例如净流入 0、过热惩罚 0），这里不使用 `||` 兜底。
+  const numeric = (key: string): number | undefined => {
+    const raw = record[key];
+    if (raw == null || raw === '') return undefined;
+    const parsed = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  const text = (key: string): string | undefined => {
+    const raw = record[key];
+    return raw == null || raw === '' ? undefined : String(raw);
+  };
+  const flags = toStringList(record.qualityNotes ?? record.quality_notes);
+  return {
+    status: text('status'),
+    state: text('state'),
+    score: numeric('score'),
+    scorePartial: Boolean(record.scorePartial ?? record.score_partial),
+    asOfDate: text('asOfDate') ?? text('as_of_date'),
+    bkCode: text('bkCode') ?? text('bk_code'),
+    bkName: text('bkName') ?? text('bk_nameRaw') ?? text('bk_name_raw'),
+    industryKey: text('industryKey') ?? text('industry_key'),
+    mappingMethod: text('mappingMethod') ?? text('mapping_method'),
+    mappingConfidence: text('mappingConfidence') ?? text('mapping_confidence'),
+    windowDays: numeric('windowDays') ?? numeric('window_days'),
+    sampleDays: numeric('sampleDays') ?? numeric('sample_days'),
+    unit: text('unit'),
+    netInflowSum: numeric('netInflowSum') ?? numeric('net_inflow_sum'),
+    mainInflowPctAvg: numeric('mainInflowPctAvg') ?? numeric('main_inflow_pct_avg'),
+    positiveInflowDays: numeric('positiveInflowDays') ?? numeric('positive_inflow_days'),
+    latestNetInflow: numeric('latestNetInflow') ?? numeric('latest_net_inflow'),
+    inflowAcceleration: numeric('inflowAcceleration') ?? numeric('inflow_acceleration'),
+    largeOrderPositiveDays: numeric('largeOrderPositiveDays') ?? numeric('large_order_positive_days'),
+    sectorReturnWindow: numeric('sectorReturnWindow') ?? numeric('sector_return_window'),
+    composite: numeric('composite'),
+    overheatPenalty: numeric('overheatPenalty') ?? numeric('overheat_penalty'),
+    overheatStatus: text('overheatStatus') ?? text('overheat_status'),
+    missingReason: text('missingReason') ?? text('missing_reason'),
+    qualityNotes: flags,
+  };
+};
+
 const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | null => {
   const code = String(item.code || item.stock_code || item.symbol || '').trim();
   if (!code) return null;
@@ -1329,6 +1402,7 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
     desks: toStringList(item.desks),
     multiDeskConviction: Boolean(item.multi_desk_conviction),
     conflictFlags: toStringList(item.conflict_flags),
+    sectorFlow: normalizeSectorFlow(item.sector_flow),
   };
 };
 
@@ -1357,6 +1431,7 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     current.latestDate = current.latestDate || candidate.latestDate;
     current.metrics = { ...candidate.metrics, ...current.metrics };
     current.lifecycleStatus = current.lifecycleStatus || candidate.lifecycleStatus;
+    current.sectorFlow = current.sectorFlow ?? candidate.sectorFlow;
     current.consensusBonus = Math.max(current.consensusBonus ?? 0, candidate.consensusBonus ?? 0) || current.consensusBonus || candidate.consensusBonus;
     current.mixedEvidence = current.mixedEvidence || candidate.mixedEvidence;
     current.reasonDimensions = [...current.reasonDimensions];
@@ -1833,6 +1908,69 @@ const candidateMetricHighlights = (candidate: DisplayCandidate): string[] => (
   [...fundamentalMetricBadges(candidate), ...technicalMetricBadges(candidate)].slice(0, 10)
 );
 
+const SECTOR_FLOW_STATE_LABELS: Record<string, string> = {
+  persistent_inflow: '持续流入',
+  net_inflow: '净流入',
+  neutral: '中性',
+  outflow: '流出',
+  unknown: '未知',
+};
+
+const SECTOR_FLOW_MISSING_LABELS: Record<string, string> = {
+  no_bk_code: '无行业板块代码',
+  unmapped_industry: '行业板块未映射',
+  insufficient_history: '板块资金流历史不足 2 天',
+  provider_failed: '板块资金流数据源失败',
+  date_mismatch: '板块快照日期不匹配',
+};
+
+const formatSectorAmountYi = (value: number): string => `${(value / 100000000).toFixed(2)}亿`;
+
+const sectorFlowHighlights = (sectorFlow?: SectorFlowDisplay): string[] => {
+  if (!sectorFlow || sectorFlow.status === 'missing') return [];
+  const items: string[] = [];
+  if (typeof sectorFlow.netInflowSum === 'number') items.push(`板块5日净流入 ${formatSectorAmountYi(sectorFlow.netInflowSum)}`);
+  if (typeof sectorFlow.positiveInflowDays === 'number') {
+    items.push(`正流入 ${sectorFlow.positiveInflowDays}/${sectorFlow.windowDays ?? 5} 天`);
+  }
+  if (typeof sectorFlow.inflowAcceleration === 'number') {
+    items.push(`加速度 ${formatSectorAmountYi(sectorFlow.inflowAcceleration)}`);
+  }
+  if (typeof sectorFlow.sectorReturnWindow === 'number') {
+    items.push(`板块5日涨幅 ${sectorFlow.sectorReturnWindow.toFixed(2)}%`);
+  }
+  if (typeof sectorFlow.overheatPenalty === 'number' && sectorFlow.overheatPenalty > 0) {
+    items.push(`过热惩罚 -${sectorFlow.overheatPenalty.toFixed(2)}`);
+  }
+  if (sectorFlow.asOfDate) items.push(`板块数据 ${sectorFlow.asOfDate}`);
+  return items.slice(0, 4);
+};
+
+const sectorFlowBadge = (sectorFlow?: SectorFlowDisplay): { label: string; tone: CandidateDecisionTone } | null => {
+  if (!sectorFlow) return null;
+  if (sectorFlow.status === 'missing') {
+    return { label: '板块资金流:数据不足', tone: 'warning' };
+  }
+  const stateLabel = SECTOR_FLOW_STATE_LABELS[sectorFlow.state || 'unknown'] || '未知';
+  const partial = sectorFlow.scorePartial || sectorFlow.status === 'partial';
+  return {
+    label: `板块:${stateLabel}${partial ? '(部分)' : ''}`,
+    tone: sectorFlow.state === 'outflow' ? 'warning' : 'info',
+  };
+};
+
+const sectorFlowRiskFlags = (sectorFlow?: SectorFlowDisplay): string[] => {
+  if (!sectorFlow) return [];
+  const flags: string[] = [];
+  if (sectorFlow.status === 'missing') {
+    const reason = sectorFlow.missingReason || '';
+    flags.push(`板块资金流数据不足：${SECTOR_FLOW_MISSING_LABELS[reason] || reason || '未知原因'}`);
+  } else if (sectorFlow.scorePartial || sectorFlow.status === 'partial') {
+    flags.push(`板块资金流仅 ${sectorFlow.sampleDays ?? 0}/${sectorFlow.windowDays ?? 5} 天，分数按可用天数重归一`);
+  }
+  return flags;
+};
+
 const candidateDecisionRank = (actionKey: string): number => {
   if (['buy', 'open', 'add', 'conditional_buy', 'deep_dive'].includes(actionKey)) return 0;
   if (['monitor', 'wait'].includes(actionKey)) return 1;
@@ -1867,6 +2005,7 @@ const toTraceCandidateDecisionRows = (
       const scoreNote = screeningScore != null
         ? 'candidate_screening 阶段的取证分；seed pool 召回分只保留为来源诊断。'
         : undefined;
+      const sectorBadge = sectorFlowBadge(candidate.sectorFlow);
       const evidence = [
         ...(screening ? [{
           label: `初筛：${displayCandidateAction(String(screening.screening_result || action.key)).label}`,
@@ -1878,6 +2017,13 @@ const toTraceCandidateDecisionRows = (
           detail: displayReasonText(entry.detail),
           tone: candidateEvidenceTone(entry.dimension),
         })),
+        ...(candidate.sectorFlow ? [{
+          label: '板块资金流（仅观察，不构成建议）',
+          detail: candidate.sectorFlow.status === 'missing'
+            ? `数据不足：${SECTOR_FLOW_MISSING_LABELS[candidate.sectorFlow.missingReason || ''] || candidate.sectorFlow.missingReason || '未知原因'}`
+            : `${candidate.sectorFlow.bkName || candidate.sectorFlow.industryKey || '板块'} ${SECTOR_FLOW_STATE_LABELS[candidate.sectorFlow.state || 'unknown'] || '未知'}（${candidate.sectorFlow.asOfDate || '日期未知'}）`,
+          tone: 'default' as CandidateDecisionTone,
+        }] : []),
       ];
       return {
         id: candidate.code,
@@ -1905,11 +2051,13 @@ const toTraceCandidateDecisionRows = (
             : []),
           ...(candidate.consensusBonus != null && candidate.consensusBonus > 0 ? [{ label: `共振 +${formatMetricValue(candidate.consensusBonus)}`, tone: 'success' as CandidateDecisionTone }] : []),
           ...(candidate.mixedEvidence ? [{ label: '存在反证', tone: 'warning' as CandidateDecisionTone }] : []),
+          ...(sectorBadge ? [sectorBadge] : []),
         ],
         evidence,
-        metricHighlights: candidateMetricHighlights(candidate),
+        metricHighlights: [...sectorFlowHighlights(candidate.sectorFlow), ...candidateMetricHighlights(candidate)].slice(0, 10),
         riskFlags: [
           ...(candidate.mixedEvidence ? ['存在反证，需要后续取证确认'] : []),
+          ...sectorFlowRiskFlags(candidate.sectorFlow),
           ...candidate.reasonDimensions
             .filter((entry) => entry.detail.includes('超买') || entry.detail.includes('追高') || entry.dimension === 'fallback')
             .map((entry) => displayReasonText(entry.detail)),

@@ -740,6 +740,8 @@ def _fact_sheet_to_dict(fs: FactSheet) -> Dict[str, Any]:
         "rsi14": fs.rsi14,
         "liquidity_ok": fs.liquidity_ok,
         "hard_risk_flags": fs.hard_risk_flags,
+        "hard_risk_evidence": fs.hard_risk_evidence,
+        "hard_risk_unknown": fs.hard_risk_unknown,
         "sector_name": fs.sector_name,
         "sector_strength": fs.sector_strength,
         "leader_already_up": fs.leader_already_up,

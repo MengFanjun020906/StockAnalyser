@@ -523,6 +523,11 @@ def _seed_fact_packet_to_seed_item(
             "recall_sources": recall_sources,
             "fact_sheet_freshness": fact_sheet.get("freshness"),
         }
+    theme_profile, theme_profile_source, theme_profile_missing_reason = _resolve_theme_profile(
+        packet=packet,
+        preview=preview,
+        flags=flags,
+    )
     return {
         "code": code,
         "name": packet.get("name") or preview.get("name") or candidate.get("name") or candidate.get("stock_name") or code,
@@ -533,8 +538,74 @@ def _seed_fact_packet_to_seed_item(
         "catalyst_tags": _seed_fact_catalyst_tags(flags=flags, trigger_signals=trigger_signals),
         "entry_reason": hint,
         "freshness": preview.get("freshness") or fact_sheet.get("freshness") or packet.get("freshness") or "",
+        # 新增字段:全部候选都写入 stock_role(含 unrelated/unknown)及判定依据;
+        # 缺失时显式留空并给出原因,不默认成 unrelated。
+        "theme_profile": theme_profile,
+        "theme_status": (theme_profile or {}).get("theme_status"),
+        "stock_role": (theme_profile or {}).get("stock_role"),
+        "theme_regime": (theme_profile or {}).get("theme_regime"),
+        "theme_profile_source": theme_profile_source,
+        "theme_profile_missing_reason": theme_profile_missing_reason,
+        # FAC-05: 主题归属来源分解(哪条新闻/卡片/板块/文本字段/时间/规则),只读审计。
+        "theme_attribution": (theme_profile or {}).get("theme_attribution"),
         "raw_seed_fact_packet": packet,
     }
+
+
+def _resolve_theme_profile(
+    *,
+    packet: Dict[str, Any],
+    preview: Dict[str, Any],
+    flags: Sequence[Dict[str, Any]],
+) -> tuple:
+    """Resolve the persisted theme profile for one seed snapshot item.
+
+    Priority: seed fact packet (authoritative, covers all seeds) → preview →
+    FeatureFlag.metrics fallback (older snapshots / degraded packets). Returns
+    ``(profile, source, missing_reason)`` and never invents ``unrelated``.
+    """
+    packet_profile = packet.get("theme_profile") if isinstance(packet.get("theme_profile"), dict) else None
+    if packet_profile:
+        profile = dict(packet_profile)
+        profile.setdefault("evidence_source", "seed_fact_packet.theme_profile")
+        return profile, "seed_fact_packet.theme_profile", ""
+
+    preview_profile = preview.get("theme_profile") if isinstance(preview.get("theme_profile"), dict) else None
+    if preview_profile:
+        profile = dict(preview_profile)
+        profile.setdefault("evidence_source", "seed_pool_summary.preview.theme_profile")
+        return profile, "seed_pool_summary.preview.theme_profile", ""
+
+    for flag in flags:
+        metrics = flag.get("metrics") if isinstance(flag.get("metrics"), dict) else {}
+        role = str(metrics.get("stock_role") or "").strip()
+        if not role:
+            continue
+        detector = str(flag.get("detector") or "unknown")
+        # 旧 FeatureFlag 只有 stock_role:非 unrelated/unknown 视为 matched,
+        # unrelated/unknown 只能算 unclassified(证据不足),不能当作确认无关。
+        theme_status = "matched" if role not in {"unrelated", "unknown"} else "unclassified"
+        return (
+            {
+                "theme": metrics.get("theme") or "ai_compute_chain",
+                "theme_regime": metrics.get("theme_regime") or "unknown",
+                "theme_status": theme_status,
+                "stock_role": role,
+                "theme_confidence": metrics.get("theme_confidence"),
+                "momentum_setup": metrics.get("momentum_setup"),
+                "overbought_interpretation": metrics.get("overbought_interpretation"),
+                "chase_permission": metrics.get("chase_permission"),
+                "evidence": [
+                    f"来源={detector}，stock_role={role}（由 FeatureFlag.metrics 还原，缺少 membership 明细）"
+                ],
+                "evidence_source": "seed_fact_packet.flags.metrics",
+                "derived_from_metrics": True,
+            },
+            "seed_fact_packet.flags.metrics",
+            "",
+        )
+
+    return None, "missing", "snapshot 未包含 theme_profile，且 FeatureFlag.metrics 无 stock_role"
 
 
 def _seed_fact_catalyst_tags(*, flags: Sequence[Dict[str, Any]], trigger_signals: Sequence[Dict[str, Any]]) -> List[str]:

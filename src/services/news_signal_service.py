@@ -1059,6 +1059,141 @@ class NewsSignalService:
             "skipped": skipped,
         }
 
+    def counter_evidence_for_codes(
+        self,
+        codes: Iterable[str],
+        *,
+        signal_date: str = "",
+        lookback_days: int = 7,
+        limit: int = 300,
+    ) -> Dict[str, Any]:
+        """Read persisted news cards for already-seeded stocks as counter-evidence.
+
+        Unlike :meth:`seed_evidence_for_codes`, this path deliberately **does not**
+        apply the entry gates (benefit-only, score>=50, high mapping confidence).
+        It is read-only evidence for FAC-02 and never creates seeds, so it cannot
+        lower the candidate-entry threshold. A successful query with no matching
+        card is reported as ``queried_no_match`` rather than ``unavailable``.
+        """
+        requested_codes = {
+            _normalize_stock_code(code)
+            for code in codes
+            if _normalize_stock_code(code)
+        }
+        if not requested_codes:
+            return {
+                "status": "ok",
+                "requested_codes": 0,
+                "matched_codes": 0,
+                "items_by_code": {},
+                "skipped": {},
+            }
+
+        try:
+            target_date = _parse_datetime(signal_date).date() if _parse_datetime(signal_date) else date.today()
+        except Exception:
+            target_date = date.today()
+        cutoff_date = target_date - timedelta(days=max(1, int(lookback_days or 1)))
+
+        try:
+            cards = self.repo.list_cards(
+                signal_date=None,
+                status="active",
+                limit=max(1, min(int(limit or 300), 1000)),
+            )
+        except Exception as exc:
+            logger.warning("news counter-evidence query failed: %s", exc)
+            return {
+                "status": "unavailable",
+                "error": f"{type(exc).__name__}: {exc}",
+                "requested_codes": len(requested_codes),
+                "matched_codes": 0,
+                "items_by_code": {},
+                "skipped": {},
+            }
+
+        items_by_code: Dict[str, List[Dict[str, Any]]] = {}
+        skipped: Dict[str, int] = {}
+
+        def _skip(reason: str) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+
+        for card in cards:
+            signal_day = _parse_datetime(card.get("signal_date"))
+            if signal_day is None:
+                _skip("missing_signal_date")
+                continue
+            if signal_day.date() < cutoff_date or signal_day.date() > target_date:
+                _skip("outside_lookback")
+                continue
+            if str(card.get("status") or "").strip().lower() != "active":
+                _skip("inactive")
+                continue
+
+            tone = str(card.get("news_tone") or "").strip().lower()
+            mapping_confidence = _float_or_none(card.get("mapping_confidence")) or 0.0
+            signal_score = _float_or_none(card.get("adjusted_signal_score"))
+            if signal_score is None:
+                signal_score = _float_or_none(card.get("signal_score")) or 0.0
+
+            for company in card.get("company_impacts") or []:
+                if not isinstance(company, dict):
+                    continue
+                code = _normalize_stock_code(company.get("symbol") or company.get("code"))
+                if code not in requested_codes:
+                    continue
+                direction = str(company.get("direction") or "").strip().lower()
+                company_confidence = _float_or_none(company.get("confidence")) or 0.0
+                confidence = max(mapping_confidence, company_confidence)
+                negative, positive, neutral = _counter_sentiment_scores(
+                    tone=tone,
+                    direction=direction,
+                    confidence=confidence,
+                    signal_score=signal_score,
+                )
+                if negative <= 0.0 and positive <= 0.0 and neutral <= 0.0:
+                    _skip("no_sentiment_signal")
+                    continue
+                items_by_code.setdefault(code, []).append(
+                    {
+                        "card_id": card.get("card_id"),
+                        "summary_short": card.get("summary_short"),
+                        "signal_date": card.get("signal_date"),
+                        "news_tone": tone,
+                        "company_direction": direction,
+                        "signal_score": signal_score,
+                        "mapping_confidence": mapping_confidence,
+                        "company_confidence": company_confidence,
+                        "company_rationale": company.get("rationale"),
+                        "evidence_grade": card.get("evidence_grade"),
+                        "negative_score": negative,
+                        "positive_score": positive,
+                        "neutral_score": neutral,
+                        "usage": "counter_evidence_only",
+                    }
+                )
+
+        for items in items_by_code.values():
+            items.sort(
+                key=lambda item: (
+                    float(item.get("negative_score") or 0.0),
+                    float(item.get("signal_score") or 0.0),
+                ),
+                reverse=True,
+            )
+            del items[3:]
+
+        return {
+            "status": "ok",
+            "signal_date": target_date.isoformat(),
+            "lookback_days": max(1, int(lookback_days or 1)),
+            "requested_codes": len(requested_codes),
+            "matched_codes": len(items_by_code),
+            "attached_cards": sum(len(items) for items in items_by_code.values()),
+            "items_by_code": items_by_code,
+            "skipped": skipped,
+        }
+
     def add_feedback(self, *, card_id: str, feedback_type: str, note: str = "", payload: Optional[Dict[str, Any]] = None, user_id: str = "") -> Dict[str, Any]:
         feedback = self.repo.add_feedback(
             card_id=card_id,
@@ -4124,6 +4259,56 @@ def _float_or_none(value: Any) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _counter_sentiment_scores(
+    *,
+    tone: str,
+    direction: str,
+    confidence: float,
+    signal_score: float,
+) -> Tuple[float, float, float]:
+    """Map a persisted card to counter-evidence-only sentiment scores.
+
+    This is intentionally separate from the seed-entry gates. It returns
+    ``(negative, positive, neutral)`` in 0-1 and never mutates card state.
+    """
+    tone = str(tone or "").strip().lower()
+    direction = str(direction or "").strip().lower()
+    confidence = max(0.0, min(1.0, float(confidence or 0.0)))
+    score_weight = 0.8 + 0.2 * max(0.0, min(1.0, float(signal_score or 0.0) / 100.0))
+
+    negative = 0.0
+    positive = 0.0
+    neutral = 0.0
+    if direction == "harm":
+        negative = 0.75 + 0.15 * confidence
+        if tone == "negative":
+            negative += 0.1
+    elif direction == "benefit":
+        positive = 0.6 + 0.3 * confidence
+        if tone == "negative":
+            positive *= 0.4
+            negative = max(negative, 0.3 + 0.2 * confidence)
+        elif tone == "neutral":
+            positive *= 0.7
+    elif tone == "negative":
+        negative = 0.55 + 0.25 * confidence
+    elif tone == "positive":
+        positive = 0.4 + 0.2 * confidence
+
+    if tone == "neutral":
+        neutral = 0.5
+    elif tone == "mixed":
+        neutral = 0.5
+        positive = max(positive, 0.2)
+        negative = max(negative, 0.2)
+
+    return (
+        round(min(1.0, negative * score_weight), 3),
+        round(min(1.0, positive * score_weight), 3),
+        round(min(1.0, neutral * score_weight), 3),
+    )
 
 
 def _collect_graph_edges(

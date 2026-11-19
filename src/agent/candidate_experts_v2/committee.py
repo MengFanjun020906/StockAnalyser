@@ -284,6 +284,105 @@ def _attach_news_signal_card_evidence(
         )
 
 
+def _attach_news_counter_evidence(
+    seeds_by_source: Dict[str, List[SeedItem]],
+    *,
+    signal_date: str,
+) -> Dict[str, Any]:
+    """Attach read-only negative/positive news sentiment to already-seeded stocks.
+
+    The seed-entry gates (benefit-only, score>=50) are untouched: negative or
+    low-score cards never create seeds. This step only reads persisted cards for
+    codes that already entered through other sources, so FAC-02 can distinguish
+    ``queried_no_match`` from ``unavailable`` without lowering the entry bar.
+    """
+    codes = sorted(
+        {
+            _news_signal_evidence_code(seed.code)
+            for bucket in seeds_by_source.values()
+            for seed in bucket
+            if _news_signal_evidence_code(seed.code)
+        }
+    )
+    if not codes:
+        return _source_diagnostic("news_counter_evidence", "empty", count=0)
+
+    reference_date = _format_stockapi_date(signal_date)
+    try:
+        from src.services.news_signal_service import NewsSignalService
+
+        result = NewsSignalService().counter_evidence_for_codes(
+            codes,
+            signal_date=reference_date,
+            lookback_days=7,
+        )
+        status = str(result.get("status") or "unavailable")
+        items_by_code = result.get("items_by_code") if isinstance(result.get("items_by_code"), dict) else {}
+        matched_codes: set[str] = set()
+        attached = 0
+
+        for bucket in seeds_by_source.values():
+            for seed in bucket:
+                metrics = seed.extras.get("metrics") if isinstance(seed.extras, dict) else None
+                if not isinstance(metrics, dict):
+                    metrics = {}
+                    seed.extras["metrics"] = metrics
+                if status != "ok":
+                    metrics["news_sentiment_status"] = "unavailable"
+                    metrics["news_sentiment_reason"] = str(result.get("error") or "query_unavailable")
+                    continue
+                lookup_code = _news_signal_evidence_code(seed.code)
+                items = items_by_code.get(lookup_code) or items_by_code.get(str(seed.code or "")) or []
+                if not items:
+                    # Query succeeded; no persisted card for this code = genuine no match.
+                    metrics["news_sentiment_status"] = "queried_no_match"
+                    metrics["news_sentiment_as_of"] = reference_date
+                    continue
+                metrics["news_sentiment_status"] = "ok"
+                metrics["negative_score"] = max(float(item.get("negative_score") or 0.0) for item in items)
+                metrics["positive_score"] = max(float(item.get("positive_score") or 0.0) for item in items)
+                metrics["neutral_score"] = max(float(item.get("neutral_score") or 0.0) for item in items)
+                metrics["news_counter_evidence"] = items[:3]
+                metrics["news_sentiment_as_of"] = max(
+                    str(item.get("signal_date") or reference_date) for item in items
+                )
+                matched_codes.add(lookup_code)
+                attached += 1
+
+        final_status = "ok" if status != "ok" else ("ok" if attached else "queried_no_match")
+        return _source_diagnostic(
+            "news_counter_evidence",
+            final_status,
+            count=attached,
+            error=str(result.get("error") or ""),
+            detail={
+                "signal_date": reference_date,
+                "lookback_days": result.get("lookback_days", 7),
+                "requested_codes": len(codes),
+                "matched_seed_codes": len(matched_codes),
+                "skipped": result.get("skipped") if isinstance(result, dict) else {},
+                "mode": "counter_evidence_only_no_seed",
+            },
+        )
+    except Exception as exc:
+        logger.warning("news counter-evidence attachment failed: %s", exc)
+        for bucket in seeds_by_source.values():
+            for seed in bucket:
+                metrics = seed.extras.get("metrics") if isinstance(seed.extras, dict) else None
+                if not isinstance(metrics, dict):
+                    metrics = {}
+                    seed.extras["metrics"] = metrics
+                metrics["news_sentiment_status"] = "unavailable"
+                metrics["news_sentiment_reason"] = f"{type(exc).__name__}: {exc}"
+        return _source_diagnostic(
+            "news_counter_evidence",
+            "failed",
+            count=0,
+            error=f"{type(exc).__name__}: {exc}",
+            detail={"signal_date": reference_date},
+        )
+
+
 def _attach_knowledge_graph_evidence(
     seeds_by_source: Dict[str, List[SeedItem]],
     graph_evidence: Optional[Dict[str, Any]],
@@ -343,7 +442,11 @@ def _seed_pool_summary(seeds: Sequence[SeedItem], *, total_limit: int) -> Dict[s
     stock_role_counts: Dict[str, int] = {}
     for seed in seeds:
         source_counts[seed.source] = source_counts.get(seed.source, 0) + 1
-        theme_profile = seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None
+        theme_profile = (
+            seed.theme_profile
+            if isinstance(getattr(seed, "theme_profile", None), dict)
+            else (seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None)
+        )
         if isinstance(theme_profile, dict):
             theme_regime = str(theme_profile.get("theme_regime") or "").strip()
             stock_role = str(theme_profile.get("stock_role") or "").strip()
@@ -636,7 +739,11 @@ def _coerce_llm_callable(llm_adapter: Any) -> LLMCallable:
                         call_id=str(tc.get("id") or ""),
                     )
                 )
-            return LLMTurn(tool_calls=tool_calls, text=str(raw.get("content") or ""))
+            return LLMTurn(
+                tool_calls=tool_calls,
+                text=str(raw.get("content") or ""),
+                finish_reason=str(raw.get("finish_reason") or ""),
+            )
         return LLMTurn(tool_calls=[], text=str(raw))
 
     return _call
@@ -1437,6 +1544,13 @@ def _passes_hard_exclusion(seed: SeedItem) -> Tuple[bool, str]:
     code = str(seed.code or "").strip()
     if not re.fullmatch(r"\d{6}", code):
         return False, "invalid_a_share_code"
+    if str(seed.market or "cn").strip().lower() == "cn":
+        from src.agent.candidate_experts_v2.instruments import A_SHARE, classify_instrument
+
+        instrument_type, _label = classify_instrument(code)
+        if instrument_type != A_SHARE:
+            # 可转债 / ETF / 基金 / 债券 / 回购 / B 股 不进入 A 股 seed pool。
+            return False, f"non_stock_instrument:{instrument_type}"
     from dataclasses import replace as _dc_replace
     from src.agent.candidate_experts.filters import evaluate_hard_exclusion, resolve_candidate_exclusion_policy
     item_dict: Dict[str, Any] = {"code": code, "name": str(seed.name or "").strip(), "source": seed.source}
@@ -1727,6 +1841,16 @@ def _build_seed_pool_result(
             str(news_signal_diagnostic.get("status") or "unknown"),
             freshness=_format_stockapi_date(today),
             error=str(news_signal_diagnostic.get("error") or ""),
+        )
+        news_counter_diagnostic = _attach_news_counter_evidence(
+            seeds_by_source,
+            signal_date=today or "",
+        )
+        diagnostics.append(news_counter_diagnostic)
+        source_quality["news_counter_evidence"] = _source_quality(
+            str(news_counter_diagnostic.get("status") or "unknown"),
+            freshness=_format_stockapi_date(today),
+            error=str(news_counter_diagnostic.get("error") or ""),
         )
         graph_diagnostic = _attach_knowledge_graph_evidence(seeds_by_source, graph_evidence)
         diagnostics.append(graph_diagnostic)
@@ -2115,6 +2239,14 @@ def _build_seed_pool_result(
                 priority_score=72.0 + max(0.0, min(20.0, (limit_per_source - (_safe_float(rank) or limit_per_source)) * 1.2)),
                 freshness=str(result.get("date") or "stockapi_latest"),
                 context_hint="热榜在线来源，只代表关注度异常，不直接代表方向。",
+                # 保留来源自带的概念/行业标签,供主题归属做"明确他主题"正证据。
+                extras={
+                    "metrics": {
+                        "concepts": item.get("concepts"),
+                        "industry": item.get("industry"),
+                        "plate_name": item.get("plate_name"),
+                    }
+                },
             ))
         status = str(result.get("status") or ("ok" if items else "empty")).lower()
         diagnostic = _source_diagnostic(
@@ -2515,6 +2647,16 @@ def _build_seed_pool_result(
         str(news_signal_diagnostic.get("status") or "unknown"),
         freshness=_format_stockapi_date(today or trade_date),
         error=str(news_signal_diagnostic.get("error") or ""),
+    )
+    news_counter_diagnostic = _attach_news_counter_evidence(
+        seeds_by_source,
+        signal_date=today or trade_date,
+    )
+    diagnostics.append(news_counter_diagnostic)
+    source_quality["news_counter_evidence"] = _source_quality(
+        str(news_counter_diagnostic.get("status") or "unknown"),
+        freshness=_format_stockapi_date(today or trade_date),
+        error=str(news_counter_diagnostic.get("error") or ""),
     )
     graph_diagnostic = _attach_knowledge_graph_evidence(seeds_by_source, graph_evidence)
     diagnostics.append(graph_diagnostic)
@@ -3411,7 +3553,11 @@ def _seed_to_candidate_payload(seed: SeedItem) -> Dict[str, Any]:
         })
     recall_sources = seed.extras.get("recall_sources") if isinstance(seed.extras, dict) else None
     metrics = dict(seed.extras.get("metrics", {}) if isinstance(seed.extras, dict) else {})
-    theme_profile = seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None
+    theme_profile = (
+        seed.theme_profile
+        if isinstance(getattr(seed, "theme_profile", None), dict)
+        else (seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None)
+    )
     source_diagnostics = dict(metrics.get("source_diagnostics") or {})
     source_diagnostics.update({
         "source": seed.source,
@@ -3587,6 +3733,14 @@ def run_committee_discovery(
     seed_fact_tool_timeout_seconds: float = 30.0,
     per_seed_timeout_budget_s: Optional[float] = None,
     desk_row_concurrency: int = 3,
+    momentum_gain5d_gate_enabled: bool = False,
+    veto_gate_enabled: bool = False,
+    veto_enforce_liquidity: bool = False,
+    veto_violent_outflow_threshold: Optional[float] = None,
+    veto_breakdown_accel_threshold: Optional[float] = None,
+    sector_flow_enabled: bool = False,
+    sector_flow_cache_dir: Optional[str] = None,
+    counter_evidence_veto_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Run the LLM expert committee and return a discover-compatible payload.
 
@@ -3612,6 +3766,18 @@ def run_committee_discovery(
             diagnostics and quality metadata. Prefer this over prebuilt_seeds.
         enable_seed_gate: Whether to run the no-tool LLM noise gate before
             dimension experts. Gate failure falls back to deterministic seeds.
+        momentum_gain5d_gate_enabled: Legacy A/B switch. When False (default),
+            ``gain_5d`` is a FactSheet fact and does not gate momentum-desk entry.
+        veto_gate_enabled: Wire the deterministic red-line veto before desks.
+            Default False keeps the pre-wiring candidate flow unchanged.
+        veto_enforce_liquidity: Treat ``liquidity_ok is False`` as a red line
+            when the veto gate is enabled. Default False matches the conservative
+            ``veto_gate`` contract (liquidity never vetoes by default).
+        veto_violent_outflow_threshold / veto_breakdown_accel_threshold: Optional
+            FactSheet soft red-line thresholds; ``None`` keeps them inert.
+        counter_evidence_veto_enabled: When True, candidates whose typed
+            counter-evidence is ``veto_eligible`` are removed after allocation.
+            Default False = record-only (facts enter payload, ranking untouched).
     """
 
     started = time.time()
@@ -3689,6 +3855,14 @@ def run_committee_discovery(
             seed_fact_tool_timeout_seconds=seed_fact_tool_timeout_seconds,
             per_seed_timeout_budget_s=per_seed_timeout_budget_s,
             desk_row_concurrency=desk_row_concurrency,
+            momentum_gain5d_gate_enabled=momentum_gain5d_gate_enabled,
+            veto_gate_enabled=veto_gate_enabled,
+            veto_enforce_liquidity=veto_enforce_liquidity,
+            veto_violent_outflow_threshold=veto_violent_outflow_threshold,
+            veto_breakdown_accel_threshold=veto_breakdown_accel_threshold,
+            sector_flow_enabled=sector_flow_enabled,
+            sector_flow_cache_dir=sector_flow_cache_dir,
+            counter_evidence_veto_enabled=counter_evidence_veto_enabled,
         )
         # Merge thesis result into payload while preserving seed-pool diagnostics.
         # Empty desk output is a hard candidate-discovery failure, not permission
@@ -3829,6 +4003,14 @@ def run_thesis_desk_committee(
     seed_fact_tool_timeout_seconds: float = 30.0,
     per_seed_timeout_budget_s: Optional[float] = None,
     desk_row_concurrency: int = 3,
+    momentum_gain5d_gate_enabled: bool = False,
+    veto_gate_enabled: bool = False,
+    veto_enforce_liquidity: bool = False,
+    veto_violent_outflow_threshold: Optional[float] = None,
+    veto_breakdown_accel_threshold: Optional[float] = None,
+    sector_flow_enabled: bool = False,
+    sector_flow_cache_dir: Optional[str] = None,
+    counter_evidence_veto_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
 
@@ -3880,12 +4062,20 @@ def run_thesis_desk_committee(
             today=today,
             coarse_cap=coarse_cap,
             prebuilt_pool=build_result,
+            violent_outflow_threshold=veto_violent_outflow_threshold,
+            breakdown_accel_threshold=veto_breakdown_accel_threshold,
+            hard_risk_allow_online=True,
         )
         rows: List[FeatureRow] = recall_result.rows
         payload["recall_diagnostics"] = recall_result.diagnostics
         payload["recall_sources"] = recall_result.sources
         payload["recall_total_in"] = recall_result.total_in
         payload["recall_total_kept"] = recall_result.total_kept
+
+        from src.agent.candidate_experts_v2.hard_risk import summarize_hard_risk
+
+        hard_risk_summary = summarize_hard_risk([row.fact_sheet for row in rows])
+        payload["hard_risk_summary"] = hard_risk_summary
     except Exception as exc:
         tb = traceback.format_exc()
         logger.warning("thesis_desk_committee: recall failed: %s\n%s", exc, tb)
@@ -3933,6 +4123,48 @@ def run_thesis_desk_committee(
         }
     )
 
+    # ── Step 2.5: deterministic red-line veto (default off) ──────────────
+    vetoed_rows: List[Dict[str, Any]] = []
+    if veto_gate_enabled:
+        from src.agent.candidate_experts_v2.veto_gate import apply_veto
+
+        rows, vetoed_rows = apply_veto(
+            rows,
+            enabled=True,
+            enforce_liquidity=veto_enforce_liquidity,
+        )
+        payload["recall_total_after_veto"] = len(rows)
+        payload["discovery_steps"].append(
+            {
+                "source": "veto_gate",
+                "status": "ok",
+                "dimension": "pre_desk_veto",
+                "enabled": True,
+                "enforce_liquidity": bool(veto_enforce_liquidity),
+                "vetoed": len(vetoed_rows),
+                "kept": len(rows),
+            }
+        )
+        payload["veto"] = {
+            "enabled": True,
+            "enforce_liquidity": bool(veto_enforce_liquidity),
+            "vetoed_count": len(vetoed_rows),
+            "vetoed": vetoed_rows,
+        }
+        if not rows:
+            logger.warning("thesis_desk_committee: all candidates vetoed")
+            payload["status"] = "failed"
+            payload["error"] = "all candidates vetoed"
+            payload["thesis_desk_committee_elapsed_ms"] = int((time.time() - started) * 1000)
+            return payload
+    else:
+        payload["veto"] = {
+            "enabled": False,
+            "enforce_liquidity": bool(veto_enforce_liquidity),
+            "vetoed_count": 0,
+            "vetoed": [],
+        }
+
     # ── Step 3: run desks in parallel ────────────────────────────────────
     try:
         llm_callable = _coerce_llm_callable(llm_adapter)
@@ -3963,6 +4195,7 @@ def run_thesis_desk_committee(
             llm=llm_callable,
             prompt_variables=prompt_variables,
             fallback_supplement_n=desk_fallback_supplement_n,
+            gain_5d_gate_enabled=momentum_gain5d_gate_enabled,
         )
         quality_repair_desk = QualityRepairDeskExpert(
             tool_registry=tool_registry,
@@ -4177,8 +4410,22 @@ def run_thesis_desk_committee(
         payload["thesis_desk_committee_elapsed_ms"] = int((time.time() - started) * 1000)
         return payload
 
+    # ── Step 3.5: sector-flow observation (display only, never re-ranks) ─
+    # Attached AFTER allocate_slots so it can never influence order or picks.
+    sector_flow_summary: Dict[str, Any] = {"enabled": False}
+    if sector_flow_enabled and final_candidates:
+        from src.agent.candidate_experts_v2.sector_flow import attach_sector_flow
+
+        sector_flow_summary = attach_sector_flow(
+            final_candidates,
+            as_of_date=_format_stockapi_date(today) if today else None,
+            enabled=True,
+            cache_dir=sector_flow_cache_dir or None,
+        )
+
     # ── Step 4: convert to payload-compatible candidate dicts ────────────
     candidate_dicts: List[Dict[str, Any]] = []
+    rows_by_code: Dict[str, Any] = {str(row.code): row for row in rows}
     for ac in final_candidates:
         all_evidence = [
             {"tool": ev.tool, "summary": ev.summary, "metrics": ev.metrics}
@@ -4209,14 +4456,83 @@ def run_thesis_desk_committee(
                 desk: [{"tool": ev.tool, "summary": ev.summary} for ev in evs]
                 for desk, evs in ac.evidence_by_desk.items()
             },
-            "risks": [{"type": r.type, "summary": r.summary} for r in ac.risks],
+            "risks": [
+                {
+                    "type": r.type,
+                    "summary": r.summary,
+                    "severity": r.severity,
+                    "source": r.source,
+                    "as_of": r.as_of,
+                    "reason": r.reason or r.summary,
+                }
+                for r in ac.risks
+            ],
             "candidate_source": "thesis_desk_committee",
             "valid_until": "next_trading_day",
         }
+        if sector_flow_enabled:
+            from src.agent.candidate_experts_v2.sector_flow import serialize_for_display
+
+            sector_flow = serialize_for_display(
+                getattr(getattr(ac, "fact_sheet", None), "sector_flow", None)
+            )
+            if sector_flow:
+                d["sector_flow"] = sector_flow
+        # FAC-05: display-only theme provenance; never participates in ranking.
+        row = rows_by_code.get(str(ac.code))
+        theme_profile = getattr(row, "theme_profile", None) if row is not None else None
+        if isinstance(theme_profile, dict):
+            attribution = theme_profile.get("theme_attribution")
+            if isinstance(attribution, dict):
+                d["theme_attribution"] = attribution
         candidate_dicts.append(d)
+
+    # ── Step 4: typed counter-evidence (record-only by default) ─────────
+    # Attached AFTER allocation so it can never re-rank. With the veto switch
+    # off (default) every candidate is kept; facts only enter the payload.
+    from src.agent.candidate_experts_v2.counter_evidence import (
+        COUNTER_EVIDENCE_TYPES,
+        ANY_TYPE_VETO_SEVERITY,
+        VETO_TYPES,
+        VETO_TYPE_SEVERITY,
+        attach_counter_evidence,
+    )
+
+    candidate_dicts, counter_summary = attach_counter_evidence(
+        candidate_dicts,
+        rows,
+        veto_enabled=counter_evidence_veto_enabled,
+    )
+    payload["counter_evidence_summary"] = counter_summary
+    payload["counter_evidence_policy"] = {
+        "mode": "veto" if counter_evidence_veto_enabled else "record_only",
+        "veto_enabled": bool(counter_evidence_veto_enabled),
+        "types": list(COUNTER_EVIDENCE_TYPES),
+        "veto_types": list(VETO_TYPES),
+        "veto_type_severity": VETO_TYPE_SEVERITY,
+        "any_type_veto_severity": ANY_TYPE_VETO_SEVERITY,
+        "applies_penalty": False,
+        "affects_ranking": False,
+    }
+    payload["discovery_steps"].append(
+        {
+            "source": "counter_evidence",
+            "status": "ok",
+            "dimension": "post_allocation_observation",
+            "policy": "veto" if counter_evidence_veto_enabled else "record_only",
+            "triggered_candidates": counter_summary.get("triggered_candidates"),
+            "veto_eligible_count": counter_summary.get("veto_eligible_count"),
+            "vetoed": len(counter_summary.get("vetoed") or []),
+        }
+    )
+    if counter_evidence_veto_enabled:
+        removed_codes = {str(item.get("code")) for item in counter_summary.get("vetoed") or []}
+        if removed_codes:
+            final_candidates = [cand for cand in final_candidates if cand.code not in removed_codes]
 
     payload["candidates"] = candidate_dicts
     payload["candidate_count"] = len(candidate_dicts)
+    payload["sector_flow_summary"] = sector_flow_summary
     negative_reasons = _build_negative_conclusion_reasons(
         rows=rows,
         desk_packets=desk_packets,

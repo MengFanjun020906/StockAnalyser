@@ -138,6 +138,8 @@ def build_fact_sheet(
     *,
     market: str = "cn",
     hard_risk_flags: Optional[List[str]] = None,
+    hard_risk_evidence: Optional[List[Dict[str, Any]]] = None,
+    hard_risk_unknown: Optional[List[str]] = None,
     min_avg_turnover: Optional[float] = None,
     capital_direction: str = "unknown",
     capital_metrics: Optional[Dict[str, Any]] = None,
@@ -161,6 +163,8 @@ def build_fact_sheet(
     sheet.market = market  # type: ignore[attr-defined]
     sheet.freshness = freshness
     sheet.hard_risk_flags = list(hard_risk_flags or [])
+    sheet.hard_risk_evidence = list(hard_risk_evidence or [])
+    sheet.hard_risk_unknown = list(hard_risk_unknown or [])
 
     # --- Phase B (passed-in, deterministic relative to inputs) --------------
     if capital_direction in ("inflow", "outflow", "neutral", "unknown"):

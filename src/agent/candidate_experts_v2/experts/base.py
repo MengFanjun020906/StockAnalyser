@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -54,6 +55,21 @@ FINAL_JSON_REMINDER = (
 FINAL_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 FINAL_JSON_MAX_TOKENS = 8192
 
+# Final-output parse failures (empty / non-JSON / truncated) are retried a
+# bounded number of times because they are cheap model-format slips. Provider
+# errors (timeout / rate limit / context overflow) are NOT retried here: the
+# adapter already owns model fallback, and retrying them would amplify load.
+FINAL_OUTPUT_MAX_ATTEMPTS = 3
+FINAL_OUTPUT_RETRY_DELAY_S = 0.5
+
+FINAL_JSON_RETRY_REMINDER = (
+    "你上一次的最终输出不是可解析的 JSON object（可能为空、被截断，或混入了自然语言/工具标记）。"
+    "请只输出一个合法 JSON object，顶层字段仍为 data_quality、candidates、rejected；"
+    "不要输出 Markdown、代码块、解释或任何前后缀；如需精简，压缩 reason/evidence 文本，但必须闭合 JSON。"
+)
+
+_CODE_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
+
 
 ToolFn = Callable[..., Any]
 
@@ -74,6 +90,7 @@ class LLMTurn:
     tool_calls: List[LLMToolCall] = field(default_factory=list)
     text: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
+    finish_reason: str = ""
 
 
 LLMCallable = Callable[..., LLMTurn]
@@ -137,28 +154,96 @@ def _registry_lookup(tool_registry: Any, name: str) -> Any:
     return None
 
 
+def _iter_top_level_json_objects(text: str) -> List[str]:
+    """Return balanced top-level ``{...}`` slices from free-form text.
+
+    Only objects that start at brace depth 0 are considered.  This prevents a
+    truncated outer object (e.g. ``{"candidates":[{"code":"600000"}``) from
+    being silently downgraded to a nested fragment that happens to parse.
+    """
+
+    objects: List[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objects.append(text[start : idx + 1])
+                start = -1
+    return objects
+
+
+def _first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    for candidate in _iter_top_level_json_objects(text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first JSON object from an LLM final answer.
+
+    Tolerates markdown code fences and leading/trailing prose, while refusing
+    to accept a nested fragment of a truncated object.
+    """
+
     if not text:
         return None
-    # tolerate ```json fences
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                parsed = json.loads(cleaned[start : end + 1])
-                return parsed if isinstance(parsed, dict) else None
-            except json.JSONDecodeError:
-                return None
+    if not cleaned:
         return None
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    for block in _CODE_FENCE_RE.findall(cleaned):
+        block_text = block.strip()
+        if not block_text:
+            continue
+        try:
+            parsed = json.loads(block_text)
+        except json.JSONDecodeError:
+            parsed = _first_json_object(block_text)
+        if isinstance(parsed, dict):
+            return parsed
+
+    return _first_json_object(cleaned)
+
+
+def _raw_text_snippet(text: str, limit: int = 1200) -> str:
+    """Escape-preserving snippet so whitespace-only responses stay diagnosable."""
+
+    raw = str(text or "")
+    snippet = raw[:limit]
+    rendered = repr(snippet)
+    if len(raw) > limit:
+        rendered += f"...[truncated {len(raw) - limit} chars]"
+    return rendered
 
 
 def _completion_tokens(usage: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -195,6 +280,8 @@ class BaseExpert:
         max_llm_rounds: int = 3,
         max_tool_calls: int = 6,
         freshness: str = "intraday",
+        final_output_max_attempts: int = FINAL_OUTPUT_MAX_ATTEMPTS,
+        final_output_retry_delay_s: float = FINAL_OUTPUT_RETRY_DELAY_S,
     ) -> None:
         self.allowed_tools = set(allowed_tools)
         self.tool_registry = tool_registry
@@ -206,6 +293,8 @@ class BaseExpert:
         self.max_llm_rounds = max(1, int(max_llm_rounds))
         self.max_tool_calls = max(1, int(max_tool_calls))
         self.freshness = freshness
+        self.final_output_max_attempts = max(1, int(final_output_max_attempts))
+        self.final_output_retry_delay_s = max(0.0, float(final_output_retry_delay_s))
         self._progress_events: Optional[List[Dict[str, Any]]] = None
 
     def _tool_result_for_model(self, tool_name: str, result_payload: Any) -> Any:
@@ -257,6 +346,21 @@ class BaseExpert:
         errors: List[str] = []
         tool_calls_executed = 0
         used_tools_any = False
+        if not self.tool_decls:
+            # Surface the configuration error instead of letting it masquerade
+            # as a model JSON failure: without tool declarations the model
+            # cannot emit structured tool calls and may fall back to raw markup.
+            diagnostics.append(
+                {
+                    "source": "bounded_loop",
+                    "status": "tool_decls_missing",
+                    "expert": self.expert_name,
+                    "note": (
+                        "No tool declarations were provided/filtered for this expert; "
+                        "the LLM cannot emit structured tool_calls."
+                    ),
+                }
+            )
 
         for round_idx in range(self.max_llm_rounds):
             try:
@@ -513,23 +617,111 @@ class BaseExpert:
 
             # No tool calls -> treat as final answer
             parsed = _safe_json_loads(turn.text)
+            attempts = 1
+            while parsed is None and attempts < self.final_output_max_attempts:
+                attempt_started = time.time()
+                delay = self.final_output_retry_delay_s * attempts
+                if delay > 0:
+                    time.sleep(delay)
+                attempts += 1
+                retry_messages = [
+                    *messages,
+                    {"role": "user", "content": FINAL_JSON_RETRY_REMINDER},
+                ]
+                try:
+                    turn = _call_llm_driver(
+                        self.llm,
+                        retry_messages,
+                        [],
+                        response_format=FINAL_JSON_RESPONSE_FORMAT,
+                        max_tokens=FINAL_JSON_MAX_TOKENS,
+                    )
+                except Exception as exc:
+                    # Provider/transport errors are not retried here: retrying
+                    # timeouts or rate limits would amplify the outage.
+                    errors.append(f"final_output_retry_failed: {exc}")
+                    self._record_progress_event(
+                        {
+                            "source": "bounded_loop_progress",
+                            "phase": "final_output_retry",
+                            "status": "failed",
+                            "attempt": attempts,
+                            "error": str(exc),
+                            "elapsed_ms": int((time.time() - attempt_started) * 1000),
+                        }
+                    )
+                    break
+                parsed = _safe_json_loads(turn.text)
+                self._record_progress_event(
+                    {
+                        "source": "bounded_loop_progress",
+                        "phase": "final_output_retry",
+                        "status": "parsed" if parsed is not None else "unparsed",
+                        "attempt": attempts,
+                        "text_chars": len(turn.text or ""),
+                        "elapsed_ms": int((time.time() - attempt_started) * 1000),
+                    }
+                )
+
+            if parsed is not None and attempts > 1:
+                diagnostics.append(
+                    {
+                        "source": "bounded_loop",
+                        "status": "final_output_recovered",
+                        "expert": self.expert_name,
+                        "code": seeds[0].code if len(seeds) == 1 else "",
+                        "codes": [seed.code for seed in seeds],
+                        "attempts": attempts,
+                    }
+                )
+
             if parsed is None:
-                errors.append("final_output_not_json")
-                if not str(turn.text or "").strip():
-                    errors.append("final_output_empty_content")
+                raw_text = str(turn.text or "")
+                stripped_text = raw_text.strip()
                 completion_tokens = _completion_tokens(turn.usage)
-                if completion_tokens is not None and completion_tokens >= FINAL_JSON_MAX_TOKENS:
+                finish_reason = str(getattr(turn, "finish_reason", "") or "")
+                truncated = (
+                    (completion_tokens is not None and completion_tokens >= FINAL_JSON_MAX_TOKENS)
+                    or finish_reason in {"length", "max_tokens"}
+                )
+                if not stripped_text:
+                    error_type = "empty_content"
+                elif truncated:
+                    error_type = "truncated"
+                else:
+                    error_type = "not_json"
+                errors.append("final_output_not_json")
+                if not stripped_text:
+                    errors.append("final_output_empty_content")
+                if truncated:
                     errors.append("final_output_maybe_truncated")
+                errors.append(f"final_output_failed_after_attempts={attempts}")
                 diagnostics.append(
                     {
                         "source": "bounded_loop",
                         "status": "final_output_not_json",
-                        "text_chars": len(turn.text or ""),
+                        "error_type": error_type,
+                        "expert": self.expert_name,
+                        "code": seeds[0].code if len(seeds) == 1 else "",
+                        "codes": [seed.code for seed in seeds],
+                        "attempts": attempts,
+                        "max_attempts": self.final_output_max_attempts,
+                        "text_chars": len(raw_text),
+                        "text_stripped_chars": len(stripped_text),
+                        "whitespace_only": bool(raw_text) and not stripped_text,
+                        "finish_reason": finish_reason,
                         "text_preview": _preview_text(turn.text),
+                        "raw_snippet": _raw_text_snippet(turn.text),
                         "completion_tokens": completion_tokens,
                         "max_tokens": FINAL_JSON_MAX_TOKENS,
                     }
                 )
+                evidence_summary = _preview_text(turn.text)
+                if not evidence_summary:
+                    evidence_summary = (
+                        f"empty final output ({len(raw_text)} chars whitespace-only, "
+                        f"attempts={attempts}, error_type={error_type})"
+                    )
                 return self._packet(
                     seeds=seeds,
                     status="failed",
@@ -542,7 +734,7 @@ class BaseExpert:
                             "evidence": [
                                 {
                                     "tool": "llm_final_output",
-                                    "summary": _preview_text(turn.text) or "empty final output",
+                                    "summary": evidence_summary,
                                 }
                             ],
                         }
