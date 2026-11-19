@@ -58,6 +58,43 @@ approved = min(target, risk_cap, 总仓位剩余额度, 可用现金)
 - 成交价使用不复权价；日线价格口径未验证时标 `daily_price_basis_unverified`，运行结果可为 partial。
 - 公司行为缺失且策略为 `strict` 时标 `corporate_action_coverage_unavailable`；`assume_none` 是显式假设，仍会标 `corporate_action_assumed_none`。
 
+### 4.1 日线缺口补齐
+
+回测内核是 DB-only 的，不会自行联网；`stock_daily` 缺哪些标的，回测就只能报 `missing_bar`。如果计划标的从未进入日常分析流程（例如来自历史 Agent Trace 的计划），本地库可能整段没有它的日线。
+
+补齐入口复用现有链路，不新增抓取实现：
+
+```bash
+POST /api/v1/backtest/daily-bars/sync
+{"symbols": ["000021", "000636"], "start_date": "2026-01-28", "end_date": "2026-11-08"}
+```
+
+- 数据源：与日常分析相同的 `DataFetcherManager` 优先级链（Tushare → Efinance → Akshare → Pytdx → Baostock → Yfinance → Longbridge），每个标的记录实际命中的 `source`。
+- 落库：`StockRepository.save_dataframe` → `save_daily_data`，与主流程同一条 upsert 路径，可重复执行；第二次执行 `written_rows=0`。
+- 区间：应覆盖 `start_date - daily_warmup_sessions 个交易日`，否则首个 session 的前收盘/规则推导仍会缺数据。
+- 每条结果带 `status`（`ok` / `empty` / `failed`）、`gap_kind`、`local_rows_before`、`fetched_rows`、`written_rows`、`source`：
+  - `local_missing_backfilled`：补前本地为 0，上游有数据；
+  - `partial_gap_filled`：补前本地已有部分数据；
+  - `upstream_empty`：本地没有、上游也返回空（停牌/退市/代码迁移等），不做前向填充；
+  - `failed`：provider 异常，单标的失败不影响其他标的。
+- 快照影响：`StockDaily` 变化会改变 `content_hash`，旧 run 的 `snapshot.sqlite` 不受影响；重跑会新建快照，fingerprint 不复用旧值。
+- 周期隔离（已修复）：`InMemoryDataView.bars_at()` 现在按 `granularity` 严格分流——`1d` 只读日线，`5m` 只读分钟缓存。此前 `1d` 会先命中由 5 分钟 bar 构建的 `_bars_by_time`，只要任一标的在同一时刻有分钟数据，其它标的的日线就会被遮蔽并记为 `no_bar_for_order`。影响面：同一段 25 标的、2026-05~11 的回测中，`bar_drops` 由 262 降为 0，fills 由 16 增至 38，期末收益由 +0.996% 变为 -4.434%；凡是在同一 run 内混有分钟数据的 `1d` 历史回测都需要重跑。
+- 周期重叠告警：修复后仍会在快照构建阶段检查「执行粒度为 `1d`，但同一标的既有日线又有 5m bar」的情况，见 4.2。
+
+### 4.2 日线/分钟数据重叠告警
+
+历史 `1d` run 可能通过注入或 DB 中残留的 5m bar 命中过上述遮蔽缺陷。为避免把不可比的数字当成结论，快照构建阶段会做一次显式检测（`src/backtest/snapshot.py::_detect_daily_minute_overlap`）：
+
+- 触发条件：`config.granularity == "1d"`，且同一 run 内至少一个标的既有日线（含 warmup 区间），又有落在 `start_date..end_date` 内的 5m bar。
+- 命中动作：
+  - `manifest.quality_flags` / `result.json.quality_flags` 增加 `daily_minute_overlap`；
+  - `result.json` 与 `diagnostics.json` 增加 `daily_minute_overlap`，字段为 `granularity`、`symbols`、`overlap_symbol_count`、`overlap_symbol_session_count`、`daily_symbol_count`、`minute_symbol_count`；
+  - 日志输出一条 `WARNING`，列出重叠标的（最多 10 个），提示旧引擎版本的同类 run 不可比。
+- 不阻断：不修改 `coverage`、不改变撮合、不改变 `content_hash` 之外的行为；触发的 run 仍会正常完成。
+- 不触发：`5m` run 本身同时持有日线与分钟数据属于正常降级路径，不告警；日线与分钟标的完全不相交时不告警。
+
+核对历史 run 是否受影响的直接依据是它自己的 `manifest.json` / `snapshot.sqlite`：`minute_bar_count > 0` 且 `granularity == "1d"` 才可能命中遮蔽缺陷。
+
 ## 5. 撮合与账本要点
 
 - 卖出优先撮合；买单按 `(rank, available_at, symbol, plan_key, order_id)` 稳定排序竞争现金。
@@ -69,6 +106,50 @@ approved = min(target, risk_cap, 总仓位剩余额度, 可用现金)
 - 佣金最低收费按“委托/交易日”结算，日终做费用补差/退款；所有内部金额 Decimal，输出 pct 为百分数。
 - 订单有效期按交易日历计数；买入当日数量次交易日可卖；期末默认撤未成交单、持仓按最后有效收盘价 mark-to-market，可选 `liquidate`。
 - 核心不变量：可用现金非负、冻结不超过现金、可卖不超过持仓、成交不超过订单剩余和 bar 容量、权益 = 现金 + 持仓市值、已实现+未实现与净值变化扣费一致。
+
+## 5.1 Bar 丢弃账本
+
+每次回测都会在 `diagnostics.json` 的 `bar_drops`（完整，含样本）和 `result.json` 的 `bar_drops`（紧凑，不含样本）中输出逐条丢弃原因。实现位于 `src/backtest/bar_drops.py`，只记账，不参与任何取舍判断。
+
+每条记录字段：`symbol`、`session`、`timeframe`（`1d` / `5m`）、`slot`（分钟 bar 时间）、`reason`、`category`、`stage`（`load` / `normalize` / `coverage` / `execution` / `valuation` / `corporate_action`）、`source`、`occurrences`、`detail`（原始 OHLCV 或规则字段）。
+
+原因码互斥，按 `(symbol, session, timeframe, slot)` 去重，保留优先级最高的一条；同一 bar 被多层命中时只计一次，但 `total_events` 会记录命中次数。
+
+| 原因码 | 分类 | 触发点 | 默认告警 |
+| --- | --- | --- | --- |
+| `invalid_symbol` | data_issue | 代码无法规范化为 A 股代码 | 是 |
+| `missing_price` | data_issue | 加载时价格缺失/无法解析、分钟线缺 `bar_datetime` | 是 |
+| `non_positive_price` | data_issue | OHLC 出现 `<= 0` | 是 |
+| `impossible_ohlc` | data_issue | `high/low` 与 `open/close` 矛盾 | 是 |
+| `duplicate_bar` | data_issue | 同 key 重复，后写入覆盖 | 否 |
+| `missing_bar` | data_issue | 期望有 bar 但完全没有 | 是 |
+| `partial_session` | data_issue | 分钟 bar 少于该交易日应有数量 | 否 |
+| `no_bar_for_order` | data_issue | 有未完成订单但该标的当日无 bar | 是 |
+| `stale_price` | data_issue | 日终估值无最后价格 | 是 |
+| `corporate_action_unapplied` | data_issue | 公司行为未能完全应用（如分数股被丢） | 否 |
+| `zero_volume_suspended` | rule_exclusion | `volume <= 0`，执行层按停牌处理 | 否 |
+| `rule_suspended` | rule_exclusion | 规则快照标记停牌 | 否 |
+| `limit_up_locked` | rule_exclusion | 一字涨停，买单无法成交 | 否 |
+| `limit_down_locked` | rule_exclusion | 一字跌停，卖单无法成交 | 否 |
+| `pre_listing` | rule_exclusion | 当前交易日早于该标的首根可见 bar | 否 |
+| `unsupported_instrument` | rule_exclusion | 标的类型/板块不受回测支持 | 否 |
+| `capacity_zero` | rule_exclusion | 参与率/配置把可成交容量压到 0 | 否 |
+
+聚合字段：
+
+- `by_reason` / `by_reason_ratio_pct`：各原因计数与占比
+- `by_category`：`data_issue` vs `rule_exclusion`
+- `by_session`：按交易日分布
+- `top_symbols`：丢弃最多的前 20 个标的
+- `alerts`：`data_issue` 中默认应告警的原因（按计数）
+- `expected_symbol_sessions` / `drop_ratio_pct`：丢弃量相对「标的 × 交易日」的分母
+- `samples`（默认最多 500 条）/ `truncated`：样本明细与是否截断
+
+说明：
+
+- `ST` 在回测中不丢弃 bar，只影响涨跌停比例；`limit_up_locked` / `limit_down_locked` 的 `detail` 会带 `st_status`、`limit_up`、`limit_down` 作为上下文。
+- 涨跌停、停牌、上市不足属于规则排除，正常情况下不应告警；`impossible_ohlc`、`missing_price`、`missing_bar`、`no_bar_for_order`、`stale_price` 等出现即应排查数据链路。
+- 账本使用内存 dict 去重与增量聚合，`record` 单条约 2 微秒；只有前 500 条保留明细，其余仅计数，因此对整段回测耗时的增量通常在噪声范围内。
 
 ## 6. 存储与 worker
 

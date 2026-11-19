@@ -18,6 +18,7 @@ from src.agent.pricing.params import get_price_plan_params
 from src.agent.pricing.schemas import ZoneScenario
 
 from .calendar import CnTradingCalendar
+from .bar_drops import BarDrop, BarDropLedger, BarDropReason
 from .entities import Bar, DailyBar, FillCandidate, Order, candidate_slippage
 from .fees import estimate_max_buy_fees
 from .ledger import Ledger
@@ -26,6 +27,7 @@ from .schemas import (
     ExitReason,
     ExperimentConfig,
     FeePolicy,
+    Granularity,
     OrderSide,
     OrderType,
     ReplayPlan,
@@ -110,6 +112,7 @@ class ExecutionResult:
     quality_flags: list[str]
     status: str = "succeeded"
     last_clock: datetime | None = None
+    bar_drops: list[BarDrop] = field(default_factory=list)
 
 
 class ExecutionEngine:
@@ -167,6 +170,7 @@ class ExecutionEngine:
         self._downgraded_days = 0
         self._fill_count_by_plan: dict[str, int] = {}
         self._quality_flags: set[str] = set(self.data.quality_flags)
+        self._bar_drops = BarDropLedger()
         self._rules_unverified = False
         self._benchmark_base: Decimal | None = None
         self._cancel_check_counter = 0
@@ -218,6 +222,7 @@ class ExecutionEngine:
             quality_flags=sorted(self._quality_flags),
             status=status,
             last_clock=self._last_clock,
+            bar_drops=self._bar_drops.entries(),
         )
 
     def cancel(self) -> ExecutionResult:
@@ -235,6 +240,7 @@ class ExecutionEngine:
             quality_flags=sorted(self._quality_flags | {"cancelled"}),
             status="cancelled",
             last_clock=self._last_clock,
+            bar_drops=self._bar_drops.entries(),
         )
 
     def _call_plan_provider(self, session: date) -> None:
@@ -344,6 +350,14 @@ class ExecutionEngine:
             if not daily or daily[-1].session != session:
                 self._missing_bar_days += 1
                 state.notes.append(f"missing_daily_bar:{session.isoformat()}")
+                self._record_bar_drop(
+                    symbol=plan.symbol,
+                    session=session,
+                    timeframe="1d",
+                    reason=BarDropReason.MISSING_BAR,
+                    stage="execution",
+                    detail={"plan_key": plan.plan_key, "context": "confirmation"},
+                )
                 continue
             if self._position_exists(plan.symbol):
                 state.status = "already_position"
@@ -414,10 +428,26 @@ class ExecutionEngine:
             state.status = "unsupported"
             state.notes.append("unsupported_market_rule")
             self._rejections.append({"plan_key": plan.plan_key, "reason": "unsupported_market_rule"})
+            self._record_bar_drop(
+                symbol=plan.symbol,
+                session=session,
+                timeframe="1d",
+                reason=BarDropReason.UNSUPPORTED_INSTRUMENT,
+                stage="execution",
+                detail={"plan_key": plan.plan_key, "board": rule.board},
+            )
             return
         if rule.suspended:
             state.status = "suspended"
             state.notes.append("suspended_on_activation")
+            self._record_bar_drop(
+                symbol=plan.symbol,
+                session=session,
+                timeframe="1d",
+                reason=BarDropReason.RULE_SUSPENDED,
+                stage="execution",
+                detail={"plan_key": plan.plan_key},
+            )
             return
         self._rules_unverified = self._rules_unverified or not rule.verified
         limit_price = plan.entry_high
@@ -576,6 +606,20 @@ class ExecutionEngine:
                 continue
             bar = bars[symbol]
             if _is_suspended(bar):
+                self._record_bar_drop(
+                    symbol=symbol,
+                    session=session,
+                    timeframe="5m" if self.config.granularity is Granularity.MINUTE_5 else "1d",
+                    reason=BarDropReason.ZERO_VOLUME_SUSPENDED,
+                    stage="execution",
+                    slot="" if self.config.granularity is Granularity.DAILY else bar.end_at.isoformat(),
+                    detail={
+                        "bar_end_at": bar.end_at,
+                        "volume": bar.volume,
+                        "context": "exit",
+                        "plan_key": instruction.plan_key,
+                    },
+                )
                 continue
             stop_order = self._orders_by_id.get(instruction.stop_order_id or "")
             target_order = self._orders_by_id.get(instruction.target_order_id or "")
@@ -680,11 +724,27 @@ class ExecutionEngine:
         for order in sells:
             bar = bars.get(order.symbol)
             if bar is None:
+                self._record_bar_drop(
+                    symbol=order.symbol,
+                    session=session,
+                    timeframe="5m" if self.config.granularity is Granularity.MINUTE_5 else "1d",
+                    reason=BarDropReason.NO_BAR_FOR_ORDER,
+                    stage="execution",
+                    detail={"bar_end_at": clock, "side": order.side.value, "order_id": order.order_id},
+                )
                 continue
             self._match_one(order, bar, clock, session, capacities, is_buy=False)
         for order in buys:
             bar = bars.get(order.symbol)
             if bar is None:
+                self._record_bar_drop(
+                    symbol=order.symbol,
+                    session=session,
+                    timeframe="5m" if self.config.granularity is Granularity.MINUTE_5 else "1d",
+                    reason=BarDropReason.NO_BAR_FOR_ORDER,
+                    stage="execution",
+                    detail={"bar_end_at": clock, "side": order.side.value, "order_id": order.order_id},
+                )
                 continue
             self._match_one(order, bar, clock, session, capacities, is_buy=True)
 
@@ -698,10 +758,69 @@ class ExecutionEngine:
         *,
         is_buy: bool,
     ) -> None:
+        timeframe = "5m" if self.config.granularity is Granularity.MINUTE_5 else "1d"
+        slot = "" if self.config.granularity is Granularity.DAILY else bar.end_at.isoformat()
         if capacities.get(order.symbol, 0) <= 0:
+            self._record_bar_drop(
+                symbol=order.symbol,
+                session=session,
+                timeframe=timeframe,
+                reason=(
+                    BarDropReason.ZERO_VOLUME_SUSPENDED
+                    if bar.volume <= 0
+                    else BarDropReason.CAPACITY_ZERO
+                ),
+                stage="execution",
+                slot=slot,
+                detail={
+                    "bar_end_at": bar.end_at,
+                    "volume": bar.volume,
+                    "capacity": capacities.get(order.symbol, 0),
+                    "side": order.side.value,
+                    "order_id": order.order_id,
+                },
+            )
             return
         rule = self.data.rule(order.symbol, session)
         self._rules_unverified = self._rules_unverified or not rule.verified
+        if _is_suspended(bar):
+            self._record_bar_drop(
+                symbol=order.symbol,
+                session=session,
+                timeframe=timeframe,
+                reason=BarDropReason.ZERO_VOLUME_SUSPENDED,
+                stage="execution",
+                slot=slot,
+                detail={
+                    "bar_end_at": bar.end_at,
+                    "volume": bar.volume,
+                    "side": order.side.value,
+                    "order_id": order.order_id,
+                },
+            )
+            return
+        if is_buy and _is_one_price_limit_up(bar, rule):
+            self._record_bar_drop(
+                symbol=order.symbol,
+                session=session,
+                timeframe=timeframe,
+                reason=BarDropReason.LIMIT_UP_LOCKED,
+                stage="execution",
+                slot=slot,
+                detail=_limit_lock_detail(order, bar, rule),
+            )
+            return
+        if not is_buy and _is_one_price_limit_down(bar, rule):
+            self._record_bar_drop(
+                symbol=order.symbol,
+                session=session,
+                timeframe=timeframe,
+                reason=BarDropReason.LIMIT_DOWN_LOCKED,
+                stage="execution",
+                slot=slot,
+                detail=_limit_lock_detail(order, bar, rule),
+            )
+            return
         candidate = _match_order(
             order,
             bar,
@@ -914,6 +1033,15 @@ class ExecutionEngine:
                 continue
             price, is_stale = self.data.last_price(symbol, session)
             self.ledger.mark_price(symbol, price, session, stale=is_stale)
+            if price is None:
+                self._record_bar_drop(
+                    symbol=symbol,
+                    session=session,
+                    timeframe="1d",
+                    reason=BarDropReason.STALE_PRICE,
+                    stage="valuation",
+                    detail={"is_stale": is_stale, "position_quantity": position.quantity},
+                )
             if is_stale:
                 stale += 1
         if stale:
@@ -1004,7 +1132,45 @@ class ExecutionEngine:
     # ------------------------------------------------------------------
     def _apply_corporate_actions(self, session: date) -> None:
         for action in self.data.corporate_actions(session):
+            before = set(self.ledger.quality_flags)
             self.ledger.apply_corporate_action(action, event_time=self.calendar.session_open(session))
+            new_flags = sorted(set(self.ledger.quality_flags) - before)
+            if new_flags:
+                self._record_bar_drop(
+                    symbol=action.symbol,
+                    session=session,
+                    timeframe="1d",
+                    reason=BarDropReason.CORPORATE_ACTION_UNAPPLIED,
+                    stage="corporate_action",
+                    slot=action.action_type,
+                    detail={
+                        "ex_date": action.ex_date,
+                        "action_type": action.action_type,
+                        "flags": new_flags,
+                    },
+                )
+
+    def _record_bar_drop(
+        self,
+        *,
+        symbol: str,
+        session: date,
+        timeframe: str,
+        reason: BarDropReason,
+        stage: str,
+        slot: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        self._bar_drops.record(
+            symbol=symbol,
+            session=session,
+            timeframe=timeframe,
+            reason=reason,
+            stage=stage,
+            source="execution",
+            slot=slot,
+            detail=detail,
+        )
 
     def _build_diagnostics(self) -> dict[str, Any]:
         status_counts: dict[str, int] = {}
@@ -1016,6 +1182,7 @@ class ExecutionEngine:
         order_status_counts: dict[str, int] = {}
         for order in self.orders:
             order_status_counts[order.status.value] = order_status_counts.get(order.status.value, 0) + 1
+        bar_drop_summary = self._bar_drops.summary()
         return {
             "plans_included": included,
             "plan_status_counts": dict(sorted(status_counts.items())),
@@ -1037,6 +1204,8 @@ class ExecutionEngine:
             "downgraded_days": self._downgraded_days,
             "rules_unverified": self._rules_unverified,
             "quality_flags": sorted(self._quality_flags),
+            "bar_drops": bar_drop_summary,
+            "bar_drop_counts": bar_drop_summary["by_reason"],
         }
 
     def _is_partial(self) -> bool:
@@ -1295,6 +1464,23 @@ def _is_one_price_limit_up(bar: Bar, rule: MarketRule) -> bool:
 
 def _is_one_price_limit_down(bar: Bar, rule: MarketRule) -> bool:
     return _is_one_price(bar) and rule.limit_down is not None and bar.close <= rule.limit_down
+
+
+def _limit_lock_detail(order: Order, bar: Bar, rule: MarketRule) -> dict[str, Any]:
+    return {
+        "bar_end_at": bar.end_at,
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+        "st_status": rule.st_status,
+        "st_status_verified": rule.st_status_verified,
+        "limit_up": rule.limit_up,
+        "limit_down": rule.limit_down,
+        "side": order.side.value,
+        "order_id": order.order_id,
+    }
 
 
 def _evaluate_confirmation(plan: ReplayPlan, daily: list[DailyBar], session: date) -> str:

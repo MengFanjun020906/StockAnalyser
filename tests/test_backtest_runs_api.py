@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -226,3 +226,108 @@ def test_benchmark_endpoint_is_display_only(api_env):
     response = client.get("/api/v1/backtest/runs/bt-test-20260105/benchmarks")
     assert response.status_code == 200, response.text
     assert response.json()["series"][0]["symbol"] == "000001.SH"
+
+
+class _FakeDailyManager:
+    def __init__(self, frames):
+        self.frames = frames
+
+    def get_daily_data(self, symbol, start_date=None, end_date=None, days=30):
+        value = self.frames[symbol]
+        if isinstance(value, Exception):
+            raise value
+        return value, "FakeDaily"
+
+
+def _daily_frame():
+    import pandas as pd
+
+    return pd.DataFrame(
+        [
+            {
+                "date": date(2026, 1, 5) + timedelta(days=offset),
+                "open": 10 + offset,
+                "high": 11 + offset,
+                "low": 9 + offset,
+                "close": 10.5 + offset,
+                "volume": 1000,
+                "amount": 10000,
+            }
+            for offset in range(5)
+        ]
+    )
+
+
+def test_daily_sync_backfills_local_gap_and_reports_upstream_empty(api_env, monkeypatch):
+    _, _, data_service, _ = api_env
+    filled = _daily_frame()
+    monkeypatch.setattr(
+        "data_provider.base.DataFetcherManager",
+        lambda: _FakeDailyManager({"000021": filled, "000636": filled.iloc[0:0]}),
+    )
+    job = data_service.create_daily_sync_job(
+        symbols=["000021", "000636"],
+        start_date=date(2026, 1, 5),
+        end_date=date(2026, 1, 9),
+    )
+    assert job["status"] == "succeeded"
+    result = job["result_json"]
+    assert result["written_rows"] == 5
+    assert result["empty_symbols"] == 1
+    items = {item["symbol"]: item for item in result["items"]}
+    assert items["000021"]["gap_kind"] == "local_missing_backfilled"
+    assert items["000021"]["source"] == "FakeDaily"
+    assert items["000636"]["status"] == "empty"
+    assert items["000636"]["gap_kind"] == "upstream_empty"
+
+
+def test_daily_sync_is_idempotent(api_env, monkeypatch):
+    _, _, data_service, _ = api_env
+    monkeypatch.setattr(
+        "data_provider.base.DataFetcherManager",
+        lambda: _FakeDailyManager({"000021": _daily_frame()}),
+    )
+    first = data_service.create_daily_sync_job(
+        symbols=["000021"], start_date=date(2026, 1, 5), end_date=date(2026, 1, 9)
+    )
+    assert first["result_json"]["written_rows"] == 5
+    second = data_service.create_daily_sync_job(
+        symbols=["000021"], start_date=date(2026, 1, 5), end_date=date(2026, 1, 9)
+    )
+    assert second["result_json"]["written_rows"] == 0
+    assert second["result_json"]["items"][0]["gap_kind"] == "partial_gap_filled"
+
+
+def test_daily_sync_isolates_failures(api_env, monkeypatch):
+    _, _, data_service, _ = api_env
+    monkeypatch.setattr(
+        "data_provider.base.DataFetcherManager",
+        lambda: _FakeDailyManager(
+            {"000021": RuntimeError("provider down"), "000636": _daily_frame()}
+        ),
+    )
+    job = data_service.create_daily_sync_job(
+        symbols=["000021", "000636"],
+        start_date=date(2026, 1, 5),
+        end_date=date(2026, 1, 9),
+    )
+    assert job["status"] == "partial"
+    result = job["result_json"]
+    assert result["failed_symbols"] == 1
+    assert result["written_rows"] == 5
+
+
+def test_daily_bars_sync_endpoint_returns_job(api_env, monkeypatch):
+    client, _, _, _ = api_env
+    monkeypatch.setattr(
+        "data_provider.base.DataFetcherManager",
+        lambda: _FakeDailyManager({"000021": _daily_frame()}),
+    )
+    response = client.post(
+        "/api/v1/backtest/daily-bars/sync",
+        json={"symbols": ["000021"], "start_date": "2026-01-05", "end_date": "2026-01-09"},
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["job_type"] == "sync_daily_bars"
+    assert body["result"]["written_rows"] == 5

@@ -24,6 +24,7 @@ from api.v1.schemas.backtest_runs import (
     RunDetailResponse,
     RunListResponse,
     RunSummaryResponse,
+    SyncDailyBarsRequest,
     SyncMinuteBarsRequest,
 )
 from src.agent.pricing.repository import PricePlanRepository
@@ -371,6 +372,21 @@ def create_minute_sync_job(
         end_date=payload.end_date,
         frequency=payload.frequency,
         adjustflag=payload.adjustflag,
+        config=payload.config,
+    )
+    return _job_payload(job)
+
+
+@router.post("/daily-bars/sync", response_model=DataJobResponse, status_code=202, summary="Create daily-bar sync job")
+def create_daily_sync_job(
+    payload: SyncDailyBarsRequest,
+    service: BacktestDataService = Depends(get_backtest_data_service),
+) -> dict[str, Any]:
+    job = _service_call(
+        service.create_daily_sync_job,
+        symbols=payload.symbols,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
         config=payload.config,
     )
     return _job_payload(job)

@@ -35,6 +35,16 @@ class SyncMinuteBarsRequest(BaseModel):
     )
 
 
+class SyncDailyBarsRequest(BaseModel):
+    symbols: List[str] = Field(default_factory=list, max_length=2000)
+    start_date: date
+    end_date: date
+    config: Optional[ExperimentConfig] = Field(
+        None,
+        description="可选：未显式给 symbols 时从该实验的纳入计划推导",
+    )
+
+
 class RunSummaryResponse(BaseModel):
     model_config = {"extra": "allow"}
 

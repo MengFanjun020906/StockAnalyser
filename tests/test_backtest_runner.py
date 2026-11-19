@@ -13,6 +13,7 @@ from src.backtest.plan_adapter import PlanAdaptationResult
 from src.backtest.runner import EngineIdentity, RunnerOptions, run_experiment
 from src.backtest.schemas import (
     CorporateActionPolicy,
+    Granularity,
     PlanInputRecord,
     SourcePipeline,
 )
@@ -21,6 +22,7 @@ from tests.backtest_helpers import (
     CALENDAR,
     config,
     daily_bars,
+    full_session_minute_bars,
     plan,
     rules_for,
 )
@@ -162,3 +164,72 @@ def test_runner_fails_cleanly_when_no_plans(tmp_path):
     assert result.status == "failed"
     assert result.error_code == "no_included_plans"
     assert result.result_dir is None
+
+
+def _snapshot_with_minute_overlap(cfg):
+    return SnapshotBuilder(
+        run_id="bt-overlap-1",
+        config=cfg,
+        plans=[plan()],
+        calendar=CALENDAR,
+        minute_bars=full_session_minute_bars(),
+        daily_bars=daily_bars(),
+        rules=rules_for(),
+        created_at=datetime(2026, 1, 2, 20, 0),
+    ).build()
+
+
+def test_daily_run_with_minute_overlap_is_flagged_in_result_and_log(tmp_path, caplog):
+    cfg = config(granularity=Granularity.DAILY)
+    builder = SnapshotBuilder(
+        run_id="bt-overlap-1",
+        config=cfg,
+        plans=[plan()],
+        calendar=CALENDAR,
+        minute_bars=full_session_minute_bars(),
+        daily_bars=daily_bars(),
+        rules=rules_for(),
+        created_at=datetime(2026, 1, 2, 20, 0),
+    )
+    with caplog.at_level("WARNING", logger="src.backtest.snapshot"):
+        result = run_experiment(
+            run_id="bt-overlap-1",
+            config=cfg,
+            options=RunnerOptions(
+                runs_root=tmp_path,
+                calendar=CALENDAR,
+                engine_identity=EngineIdentity("test", "abc", False),
+                plan_adapter=FakeAdapter([plan()], _inputs(plan())),
+                snapshot_builder=builder,
+            ),
+        )
+    assert "daily_minute_overlap" in result.manifest.quality_flags
+    assert result.summary["daily_minute_overlap"]["symbols"] == ["600519"]
+    assert result.summary["daily_minute_overlap"]["overlap_symbol_count"] == 1
+    assert "daily_minute_overlap" in result.diagnostics
+    assert any("also carry 5m bars" in record.message for record in caplog.records)
+    persisted = (result.result_dir / "result.json").read_text(encoding="utf-8")
+    assert "daily_minute_overlap" in persisted
+
+
+def test_minute_run_with_daily_overlap_is_not_flagged():
+    cfg = config(granularity=Granularity.MINUTE_5)
+    snapshot = _snapshot_with_minute_overlap(cfg)
+    assert "daily_minute_overlap" not in snapshot.quality_flags
+    assert snapshot.daily_minute_overlap == {}
+
+
+def test_daily_run_without_minute_data_is_not_flagged():
+    cfg = config(granularity=Granularity.DAILY)
+    snapshot = SnapshotBuilder(
+        run_id="bt-no-overlap",
+        config=cfg,
+        plans=[plan()],
+        calendar=CALENDAR,
+        minute_bars=[],
+        daily_bars=daily_bars(),
+        rules=rules_for(),
+        created_at=datetime(2026, 1, 2, 20, 0),
+    ).build()
+    assert "daily_minute_overlap" not in snapshot.quality_flags
+    assert snapshot.daily_minute_overlap == {}

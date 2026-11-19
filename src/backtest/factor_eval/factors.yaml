@@ -1,0 +1,119 @@
+# Factor registry for the unified hit-evaluation protocol.
+#
+# Conventions:
+# - `benchmark` must be the full Tushare index code.  A-share factors use
+#   `000985.CSI` (中证全指); do not rely on bare-code suffix inference.
+# - Any change to a factor definition, lookback or horizon must bump `version`.
+#   Old evaluation results are not valid for a new version.
+# - `direction: positive` means higher factor value -> higher expected return;
+#   `negative` means the opposite.
+# - `status` / `note` are bookkeeping fields: they record evaluation state and
+#   where the factor is used, and are excluded from `definition_hash`.
+#   `status: pending` means "used by the stock-selection pipeline but not yet
+#   evaluated under this protocol" — do not treat pending factors as validated.
+
+defaults:
+  horizon: 5
+  cost_bps: 20
+  benchmark: "000985.CSI"
+  benchmark_name: "中证全指"
+  min_decision_dates: 60
+  promotion_decision_dates: 120
+  min_observations: 3000
+  min_stocks_per_date: 20
+  min_coverage_not_evaluable: 0.60
+  min_coverage_pass: 0.80
+  min_executability: 0.80
+  min_mean_rank_ic: 0.03
+  min_icir: 0.30
+  min_ic_t: 2.0
+  min_positive_ic_ratio: 0.55
+  min_monotonicity: 0.80
+  min_long_short_ci_positive: true
+  min_partial_ic: 0.02
+  min_partial_t: 2.0
+  min_month_positive_ratio: 0.60
+  max_mde: 0.03
+  fdr: 0.10
+  bootstrap_rounds: 1000
+
+factors:
+  - factor_id: momentum_5d
+    kind: momentum
+    version: "1.0.0"
+    description: "5 日价格动量：复权 close_T / close_(T-5) - 1"
+    direction: positive
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 5
+    status: evaluated_fail
+    note: "主窗口 2022-01-01~2026-11-13 判 fail（IC -0.030, t -2.89）。仍作为 gain_5d 用于 momentum_desk 入席（>=5%）与追高提示（>=30%）。"
+
+  - factor_id: reversal_5d
+    kind: reversal
+    version: "1.0.0"
+    description: "5 日反转：过去 5 日跌幅越大，未来 5 日超额预期越强；因子值 = -(close_T / close_(T-5) - 1)，IC 预期为正"
+    direction: positive
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 5
+    status: evaluated_fail
+    note: "主窗口判 fail（IC +0.030, ICIR 0.187, 偏 IC 0.0035）；5 日涨跌幅维度不成立。"
+
+  - factor_id: rsi14_reversal
+    kind: rsi_reversal
+    version: "1.0.0"
+    description: "RSI14 反转：RSI 越高，未来 5 日超额预期越弱"
+    direction: negative
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 14
+    status: pending
+    note: "FactSheet 已计算 rsi14，kind 已支持；尚未在统一评估器主窗口跑过。"
+
+  # --- 以下为选股链路正在使用、但尚未按本协议验证的因子（TODO OBS-06）---------
+  # 评估器当前只实现 momentum / reversal / rsi_reversal，下面的 kind 需要先补
+  # `_feature_matrices` 分支才能跑；先登记定义与事前方向，避免事后挑方向。
+  - factor_id: volume_ratio_1d
+    kind: volume_ratio
+    version: "0.0.0"
+    description: "量比：当日成交量 / 前 20 日均量；momentum_desk 入席阈值 1.5，放量突破 1.4，daily_basic 量比异常 1.8"
+    direction: positive
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 20
+    status: pending
+    note: "用于 momentum_desk 入席与多个召回信号；评估器尚未实现 kind=volume_ratio。"
+
+  - factor_id: range_pct_120
+    kind: range_position
+    version: "0.0.0"
+    description: "120 日区间位置：(close - low120) / (high120 - low120)；early_turn_desk 入席 <=0.45，quality_repair_desk <=0.35，假设低位后续跑赢"
+    direction: negative
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 120
+    status: pending
+    note: "两个 desk 的核心入席条件；评估器尚未实现 kind=range_position。"
+
+  - factor_id: ma_trend_20_60
+    kind: ma_trend
+    version: "0.0.0"
+    description: "趋势状态：close > MA20 > MA60 且 MA20 上行记为 bullish；同时使用 MA20/MA60 金叉/死叉信号"
+    direction: positive
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 60
+    status: pending
+    note: "momentum_desk 以 trend_state=bullish 入席；评估器尚未实现 kind=ma_trend。"
+
+  - factor_id: pe_ttm_low
+    kind: valuation_pe
+    version: "1.0.0"
+    description: "PE(TTM) 行业内分位：决策日按 SW2021 L1 行业对 PE 排序取百分位（0~1）；PE<=0 视为不可估值并置缺失，行业有效样本 <5 只不计分；方向 negative 表示分位越低预期超额越高"
+    direction: negative
+    horizon: 5
+    benchmark: "000985.CSI"
+    lookback: 0
+    status: evaluated_fail
+    note: "行业分位为主口径；自身历史分位（需更长回看）本版未实现。估值类因子覆盖率分母为有 PE 的可估值样本，并额外报告 valuable_ratio，<0.50 时最多 not_evaluable。2026-11-18 主窗口 2022-01-01~2026-11-17 判定 fail：IC 0.0235、ICIR 0.204、NW t 3.11、单调性 0.70、多空价差 t 0.50；coverage_valuable 96.3%，valuable_ratio 76.3%。"
