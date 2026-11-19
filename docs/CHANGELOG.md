@@ -9,7 +9,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
-- [改进] Agent Trace 与胜率复盘页的英文展示统一中文化：市场状态枚举（regime、波动档、情绪、趋势/波动方向等）、工具名、流水线阶段、动作、`OK/FAIL`、`step`、评测状态以及页面标题/分区标签均改为中文，工具参数等原始 JSON 明细保持技术原样。
+- [新功能] 选股链路新增确定性点位引擎影子模式（`AGENT_PRICING_SHADOW_ENABLED`，默认关闭）：在候选确定后、报告生成前对短名单/深研/持仓候选只读调用引擎，结果仅写 `data/pricing_shadow.json`，不写业务表、不进报告、不影响 action/排序/仓位；同时用 `data/adj_factors.db` 换算一份前复权点位做双口径对照，关闭时零开销。
+- [文档] `docs/architecture/deterministic-pricing-in-selection-integration-design.md` 补充 §11.10 扩窗 20 个交易日验收结果（`>=720` 根 4,370→5,188）与 §12.6 影子模式实际实现、落盘样例、实测耗时与守卫测试结论。
+- [修复] 选股报告渲染层统一“入池召回分不参与买入判定”：`candidate_discovery` 的 `signal_score/final_score/score` 改存为 `recall_score`，仅用于展示与“强观察”档位；`conditional_open` 改由 `candidate_screening.shortlist[].score`（`entry_quality_score`）驱动，排序 tiebreaker 同步改用质量分；不改变任何入场/止损点位生成。
+
+- [改进] 生成端 `trade_plan_guard` 从“改写器”回退为“校验器”：提示词第 10/11/20/21 条已删除并恢复原样；零宽区间与止损距离脱钩只记 `warning`，不再抬高入场区上沿或夹取止损距离；止损高于上沿或不低于下沿只判 `invalid` 并给出 `advisory_only` 建议值，不重算、不写回计划、不降级 `action`；判定写入 stage 级 `trade_plan_validation`，`invalid` 标记 `blocked=true` 表示不得执行。
+
+- [新功能] 选股生成端新增 `src/agent/trade_plan_guard.py` 校验器：最终报告落盘前判定入场区与止损结构，输出 `ok / needs_review / invalid` 与建议值；零宽/过窄区间与止损距离脱钩只记 `warning`，方向性错误判 `invalid` 且不写回计划；ATR20 只读本地缓存，不新增下载。
+
+- [文档] 新增 `docs/architecture/selection-pipeline-trade-plan-guard-evidence-review.md`：核查入场区间、ATR 止损、盘前风控分层与 LLM 裁量分工的公开依据，逐项裁定上一轮提示词、guard 规则与回测口径改动为“测量修正 / 生成体制变更 / 合法性校验”，并给出保留、回退与待验证清单；结论为限价回测口径与 `entry_rule` 映射应保留，强制改写点位数值的规则应回退。
+- [修复] `src/services/agent_entry_execution_backtest_service.py` 的严格入场改为真实限价买单：`low <= entry_zone_low` 触发、成交价取 `min(entry_zone_low, open)`，不再按入场区上沿成交；`entry_rule` 如实映射 `conditional_open → conditional`、`immediate_open → immediate`、`wait/plain_wait → unknown`。
+- [测试] 新增/更新 `tests/test_agent_trade_plan_guard.py` 与选股/回测用例，覆盖零宽告警、止损等于下沿、止损高于上沿、ATR 脱钩告警、极端 ATR 上限、不可解析、非正/倒置区间、校验前后计划不变、限价成交与跳空低开。
+- [文档] `docs/architecture/selection-pipeline-entry-stop-conservatism-diagnosis.md` 新增“修复落地与前后对照”：同一批 54 笔计划在修复后 45 笔成交，止损距离与 ATR20 相关系数由 -0.20 转为 +0.15，胜率 16.7%→13.3%、收益中位 -2.55%→-2.95%；结果略差已如实记录，未为回测调参；2026-11-19 已注明 9.1–9.4 为历史实现，并新增 9.5 说明最终校验器形态。
+
+- [文档] 新增 `docs/architecture/selection-pipeline-entry-stop-conservatism-diagnosis.md`：用 `entry_execution_backtest.jsonl` 的 121 条计划（54 笔成交）与现有日线复核入场/止损保守度；入场区上沿中位挂低 4.54%、下沿 6.65%，可评估样本成交率 49.5%（深档 39.4%），止损从成交价算中位 3.33%/0.78 ATR 且与波动率相关性仅 -0.09，74% 交易以止损结束；止损后 +5/+10/+20 日收盘回到成本仅 17.5%/15.0%/20.0%（盘中触及 50%/57.5%/60%），但不止损持有 20 日平均多亏 7.74pp。结论为“挂得低、止损窄”是事实但“因此少赚”不被支持，入场端是参与率主因、止损端是结构缺陷（15 条止损贴下沿、8 条成交价=止损、38 条零宽区间），并给出离线分层重放与结构修复方向，未改动任何参数或提示词。
+
+- [文档] 新增 `docs/architecture/selection-pipeline-zero-position-diagnosis.md`：基于 43 次有组合产物的委员会运行逐层定位 0 仓原因，结论为账户现金 43/43 缺失触发“不得 open”规则、深度分析 129/131 非 open（67 条命中 2 维缺失硬规则）、26 次限制性大盘强制归零，且 `recommended_position_count` 只统计 open 动作导致 106 条条件计划不可见；判定为结构性观察模式而非机会质量结论，未改动任何策略参数。
+
+- [文档] 新增 `docs/architecture/selection-pipeline-alpha-feasibility.md`：盘点种子池快照、候选池快照、Agent Trace、报告最终推荐四类主记录及 `data/agent_reviews` 两份日志的条数/覆盖日期/可复原性，核查补记缺口与同日重跑不一致；结论为按现有 `factor_eval` 协议判定 `not_evaluable`（T+20 非重叠 cohort 仅 3 个、最终推荐恒为 0 仓位），并给出 T+5 探索性回放口径与最小累积清单。
+
+- [新功能] 新增 `src/agent/candidate_experts_v2/sector_flow.py` 与 `FactSheet.sector_flow` 观察块（FAC-01b）：按交易日构建一次板块资金流快照并落库 `data/factor_eval_cache/sector_flow_snapshot_{date}.json`，个股按 `bk_code` O(1) 查询；`usage="observation"`、`display_only=True`，在 `allocate_slots` 之后挂载，不参与排序/入选/席位打分。
+
+- [改进] 板块映射改为 `bk_code` 精确匹配（akshare 东财行业板块与 efinance `get_belong_boards` 代码同源，20 股对拍 20/20 命中）→ 人工别名表精确等于 → 成分股反查（默认关闭）；多板块按“成分股家数最少 + `bk_code` 升序”选唯一主板块，禁止子串匹配。
+
+- [改进] 缺失分档显式化：`sample_days<2` 记 `missing`；`2..window-1` 记 `partial` 并按可用分项重归一权重（`score_partial=true`）；板块涨幅缺失时 `overheat_penalty=None` 不扣分；`0` 视为合法值不当缺失。
+
+- [新功能] `/agent/trace` 候选决策表新增板块资金流展示：状态 badge、5 日净流入/正流入天数/加速度/板块涨幅/过热惩罚、缺失原因与“仅观察，不构成建议”证据；payload 新增 `sector_flow` 与 `sector_flow_summary`，`_fallback_candidate_discovery` 白名单同步。
+
+- [改进] 新增开关 `AGENT_SECTOR_FLOW_OBSERVATION_ENABLED`（默认 `false`）与 `AGENT_SECTOR_FLOW_CACHE_DIR`；关闭时不构建快照、不发额外请求、不改变默认行为。
+
+- [测试] 新增 `tests/test_sector_flow.py`：分位并列、过热边界（7.9/8/13.4/20）、0 非缺失、中间缺失、`partial` 重归一、流出分支、别名精确/歧义、多板块选择、超时降级、快照往返与缓存、开关关闭、候选顺序不变，以及 aggregator / experts 不读取 `sector_flow.score/state`、compact 与 desk 序列化排除该字段的守卫测试。
+
+- [文档] 新增 `docs/architecture/sector-flow-observation.md`，记录字段契约、数据源对拍结论、映射与缺失分档、展示位置、开关、影子期（60 交易日）与有效性判定口径；`.env.example` 同步开关。
+
+- [改进] 板块资金流快照扩到全量行业板块（FAC-01c）：`universe_limit: 0` 表示抓取全部 496 个板块，截面分位口径由 `partial` 改为 `complete`；快照新增 `universe_coverage` / `percentile_sample_size` / `failed_boards` / `insufficient_history_boards` / `window_dates`，并显式记录覆盖率与样本量。
+
+- [改进] 并发与重试按实测取值：并发 8（30 板块样本 c=8 时 p50 229ms / p95 351ms，全量折算约 16s，实测 496 板块 20.3s、498 次请求、约 24.6 req/s），单板块失败重试 1 次并线性退避 0.5s；旧截断快照在全量模式下不再被复用。
+
+- [新功能] 失败板块支持单独重试：`retry_failed=True` 只重取 `errors` 中的板块并重算截面分位，受 `snapshot.error_retry_cooldown_minutes`（默认 10 分钟）冷却约束，同一交易日重复构建命中缓存，不整批重来。
+
+- [测试] 补充全量 universe 选择顺序、`complete`/`partial` 判据与失败清单、只重取失败板块、重试冷却命中缓存、全量模式重建旧截断快照等单测（`tests/test_sector_flow.py` 33 例）。
+
+- [文档] `docs/architecture/sector-flow-observation.md` 同步全量口径、并发取值依据、失败板块重试与冷却、实测耗时/成功率、建议每日 15:30–16:00 运行时间窗。
+
+- [新功能] 新增每日板块资金流影子采集（FAC-01d）：复用 `main.py --schedule` 的后台任务机制，在工作日 15:30–16:00（Asia/Shanghai）只构建快照落盘，不发通知、不写报告、不参与选股；同交易日重复触发命中缓存，失败板块单独重试。
+
+- [改进] 影子采集可观察性：每次触发写 `data/factor_eval_cache/sector_flow_shadow_runs/{date}.jsonl`，记录耗时、`cache_hit`、成功/失败板块数、`percentile_universe`、覆盖率与失败原因；日志统一 `[SectorFlowShadow]` 前缀，异常只记录不抛出。
+
+- [测试] 新增 `tests/test_sector_flow_shadow_scheduler.py`（时区窗口边界、窗口外跳过、落盘与运行记录、重复触发缓存、失败隔离、失败板块增量重试、开关注册）并补充 `main.py --schedule` 注册用例。
+
+- [文档] `docs/architecture/sector-flow-observation.md` 增加每日影子采集入口、时间窗、幂等/失败隔离、与 CI 每日任务的分工、影子期起算与 60 个交易日终点；`.env.example` 同步开关说明。
+
+- [文档] 新增 `docs/deployment/launchd-schedule.md`：用用户级 LaunchAgent（`com.stockanalyser.schedule`）常驻 `main.py --schedule`，覆盖工作日 15:30–16:00 影子采集窗口；记录 plist 配置、安装/停止/卸载、日志位置与轮转、与手动实例的重复采集处理。
+
+- [修复] 新增 `src/agent/candidate_experts_v2/instruments.py` 按代码段识别标的类型：可转债（`110/111/113/118/123/127/128`）、ETF（`15/51/56/58`）、基金（`16/18/50/52`）、债券、回购、B 股在 seed pool 与候选判定前置过滤，返回 `non_stock_instrument:<type>`；`hard_risk` 对这类标的输出 `not_applicable` + `source=instrument_type`，不再与“数据未知”混同；北交所 `920/43/83/87/88` 保留为 A 股，避免误伤。
+
+- [修复] 摘帽股不再被滞后的 `stock_basic.name` 误杀：ST 判定改为优先使用 `namechange` 中 `end_date` 为空的最新在册记录，在册名称非 ST 时即使 `stock_basic.name` 仍带 ST 也判 `clear` 并在证据中说明名称可能滞后；`end_date` 非空的历史 ST 记录永不触发 `hit`。
+
+- [改进] `hard_risk_summary` 新增 `unknowns` 与 `not_applicable_codes` 明细，明确区分“数据缺失但未否决”“确认安全”“非 A 股标的不适用”；`seed_facts._compact_fact_sheet` 白名单加入 `hard_risk_flags` / `hard_risk_evidence` / `hard_risk_unknown`，trace 可逐股复核“为什么没被拦”。
+
+- [测试] 补充非股票标的分类与入池过滤、`not_applicable` 判定、摘帽（含 `stock_basic` 名称滞后）、历史 ST 不命中、unknown/not_applicable 汇总明细、compact 字段保留，以及北交所 `920753` 不被误杀的单测。
+
+- [修复] 席位 LLM 最终输出解析容错：`_safe_json_loads` 现支持从 Markdown 代码块和前后缀说明文字中提取 JSON，并用括号配平扫描拒绝把截断 JSON 的内层片段误判为有效结果；解析失败时在 diagnostics 中记录 `expert` / `code` / `error_type` / `attempts` / `finish_reason` / `raw_snippet`（转义保留空白字符），失败不再只从候选中消失。
+
+- [改进] 席位最终输出新增有界重试：空内容、非 JSON、截断连续解析失败最多尝试 3 次（间隔 0.5s/1.0s），每次追加“只输出合法 JSON object”纠正提示；重试成功时写入 `final_output_recovered` 诊断（含尝试次数），`llm_call_failed_*` / 超时 / 限流等 provider 错误不在此层重试，避免把限流放大成雪崩。成功路径判定逻辑与默认入选标准不变。
+
+- [改进] 席位在没有可用 tool declarations 时记录 `tool_decls_missing` 诊断，避免把工具声明缺失伪装成模型 JSON 失败；`LLMTurn` 新增 `finish_reason` 并贯通生产 LLM 适配层。
+
+- [测试] 补充空内容、非 JSON、Markdown 代码块包裹、截断、重试后成功、provider 错误不重试、失败明细字段与嵌套片段不误判的单测。
+
+- [新功能] 新增 `src/agent/candidate_experts_v2/hard_risk.py`，把 ST / 退市 / 停牌识别接入 `build_recall_pool → build_fact_sheet(hard_risk_flags=...)` 上游：ST 取 `stock_basic.name` 并用 `namechange` 最新在册名称交叉确认（历史 ST 已更名只留痕、不否决），退市取 `stock_basic.list_status=D`/`delist_date` 与"退市"整理期名称，停牌取 `suspend_d` 参考交易日命中并以本地日线落后作为辅助证据。FactSheet 新增 `hard_risk_evidence`（每条含 flag/status/source/as_of/detail）与 `hard_risk_unknown`，任一来源缺失时显式标 `unknown` 并记录原因，不默认放行；payload 新增 `hard_risk_summary`。否决门仍默认关闭。
+
+- [改进] 动量席取消 `gain_5d >= 5%` 硬性入席门槛：`gain_5d` 降级为 FactSheet 事实字段并继续进入席位提示，是否入席改由召回来源、flag 类型、`trend_state=bullish` 或量比决定；旧门槛保留为 `AGENT_MOMENTUM_GAIN5D_GATE` 显式开关（默认 `false`），仅用于灰度 A/B。
+
+- [新功能] 看空红线否决门 `veto_gate.apply_veto` 接入委员会链路，在 seed facts 之后、4 个 desk 之前执行；新增 `AGENT_VETO_GATE_ENABLED`（默认 `false`，关闭时不改变任何行集合）与 `AGENT_VETO_ENFORCE_LIQUIDITY`（默认 `false`，开启后在否决门内额外过滤 `liquidity_ok=false`），否决结果写入 payload 的 `veto`/`recall_total_after_veto` 与 `discovery_steps`。
+
+- [测试] 补充 `gain_5d` 默认不入席/显式开关恢复旧门槛，以及 veto 默认关闭、`hard_risk_flags` 过滤、`enforce_liquidity` 追加否决的单元与接线测试。
+
+- [测试] 补充 ST/退市/停牌识别测试：命中、`namechange` 当前 ST 交叉确认、历史 ST 不再否决、`stock_basic` 缺记录与三类缓存全缺失时显式 `unknown`、本地日线落后只记未知不误杀，以及 `hard_risk_flags` 经 recall 进入 FactSheet 的接线测试。
+
+- [文档] 更新选股链路架构文档与实施方案中“否决门当前不生效 / `gain_5d` 仍为硬门槛”的表述，改为“已接线、默认关闭、开启后生效”。
+
+- [新功能] 新增统一因子命中评估器 `src/backtest/factor_eval/` 与 `scripts/evaluate_factor.py`：按非重叠 cohort、T+1 开盘入场/T+H 收盘出场、20bp 成本和中证全指 `000985.CSI` 基准评估因子，输出 `pass|fail|not_evaluable` 三态报告；因子版本与阈值集中在 `factors.yaml`。
+
+- [改进] 因子命中评估器股票池改为存续 ∪ 退市（`stock_basic` 的 `list_status` L/D），退市股按最后可交易日收盘退出且不做前向填充，报告新增 `delisted_sample_count`/`delisted_in_window_count`/`delisted_exit_count`/`delisted_skipped_count` 并自动解除 `survivorship_bias`；行业改用 SW2021 L1 快照（31 次拉取缓存 CSV），仅在 `decision_date >= in_date` 时赋值并输出 `industry_unmatched_rate`；CLI 主评估窗口默认改为 2022-01-01 起。
+
+- [新功能] 因子注册表新增独立反转因子 `reversal_5d`：因子值 = −近 5 日收益，`direction: positive`，作为 `momentum_5d` 的事前反向假设登记项，主窗口评估复用同一份缓存与 cohort 口径。
+
+- [改进] 因子注册表补登记选股链路在用但未验证的因子（`volume_ratio_1d`、`range_pct_120`、`ma_trend_20_60`、`pe_ttm_low`），统一标 `status: pending` 并事前固定方向；新增 `status`/`note` 元数据且不计入 `definition_hash`，旧报告仍可与配置对齐。
+
+- [文档] 新增 `docs/architecture/as-built-architecture.md` 作为仓库单一入口的 as-built 架构说明：按代码现状描述数据抓取 → 选股/专家打分 → 分析 → 报告 → 通知链路、模块边界、配置/数据源/报告/API 契约、失败降级矩阵、CI 覆盖与已知缺口，并在 `docs/README.md` 登记入口。
 
 - [改进] `detect_market_regime` 的状态确认改为非对称：`panic` / `risk_off` 当日生效，`trending_down` 缩短一天，`trending_up` / `bull_volatile` 延长一天，贴合 A 股急跌慢涨。
 
@@ -588,6 +677,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] planning Agent prompt 新增已持仓报告格式草案，约束持仓结论、账户影响、关键价格、行动计划和风险缺口。
 - [改进] planning Agent prompt 新增数据引用与 confidence 内部使用约束，禁止最终输出暴露置信度字段或编造缺失数据。
 - [测试] 新增 Agent 用户上下文 schema 与 planning prompt 拼接回归测试，锁定第一阶段契约不被后续改动破坏。
+- [新功能] 回测新增 bar 丢弃逐条原因账本（OBS-01）：覆盖加载/归一化/覆盖/执行/估值/公司行为各层，记录 `symbol`、`session`、`reason`、`category`、`detail`，原因码互斥并区分 `data_issue` 与 `rule_exclusion`；`diagnostics.json` 输出按原因/分类/交易日聚合、Top 标的与最多 500 条样本，`result.json` 输出不含样本的紧凑摘要，现有字段保持兼容。
+- [测试] 新增 `tests/test_backtest_bar_drops.py`，覆盖原因码字典完整性、去重优先级、聚合与样本截断、快照层非法/重复/缺失/上市前/停牌/分钟不完整，以及执行层零成交量、一字涨停、缺 bar 和 diagnostics 兼容性。
+- [文档] `docs/backtest/portfolio-backtest.md` 新增「Bar 丢弃账本」章节，登记原因码、分类、告警建议、输出字段与性能口径。
+- [新功能] 新增日线缺口补齐任务 `POST /api/v1/backtest/daily-bars/sync`：复用 `DataFetcherManager` 优先级链与 `StockRepository.save_dataframe` 落库，可重复执行；按标的返回 `status`、`gap_kind`（`local_missing_backfilled` / `partial_gap_filled` / `upstream_empty`）、`local_rows_before`、`fetched_rows`、`written_rows` 与实际 `source`，单标的失败不影响其他标的。
+- [测试] `tests/test_backtest_runs_api.py` 补充日线补齐用例：本地整段缺失回填、上游为空、单标的异常隔离、重复执行幂等与 API 202 响应。
+- [文档] `docs/backtest/portfolio-backtest.md` 新增「日线缺口补齐」小节（含 warmup 区间要求、缺口分类与快照影响）；`docs/api/backtest-runs.md` 登记 `daily-bars/sync` 契约。
+- [修复] `InMemoryDataView.bars_at()` 周期隔离：`1d` 模式只返回日线 bar，不再被由 5 分钟 bar 构建的 `_bars_by_time` 覆盖；此前只要 run 内任一标的在同一时刻有分钟数据，其它标的日线即被遮蔽并误记 `no_bar_for_order`，会低估日线成交。同一段 25 标的回测中 `bar_drops` 262→0、fills 16→38、期末收益 +0.996%→-4.434%，带分钟数据的 1d 历史回测需重跑。
+- [测试] `tests/test_backtest_data_view.py` 新增混合场景回归：部分标的仅有分钟数据、部分仅有日线，断言 `1d` 取日线且分钟标的不可见、`5m` 取分钟且日线标的不可见。
+- [新功能] 回测快照新增「日线/分钟重叠」告警：`1d` 执行且同一标的既有日线又有 5m bar 时，在 `quality_flags`、`result.json`、`diagnostics.json` 写入 `daily_minute_overlap`（含标的清单与重叠 session 数）并输出 WARNING 日志；仅告警，不阻断、不改撮合。
+- [测试] `tests/test_backtest_runner.py` 新增重叠告警用例：`1d` 重叠命中并落盘、`5m` 重叠不告警、`1d` 无分钟数据不告警。
+- [文档] `docs/backtest/portfolio-backtest.md` 新增「日线/分钟数据重叠告警」小节，说明触发条件、输出位置与历史 run 核对依据。
+- [新功能] 新增 `src/agent/candidate_experts_v2/counter_evidence.py`（FAC-02）类型化反证清单：覆盖 `theme_mismatch` / `missing_market_data` / `overextended_price` / `weak_technical_confirmation` / `negative_event_dominant` / `extreme_valuation`，每条带 `severity` / `reason` / `source` / `as_of` / `metrics`；默认 `record_only`，反证写入候选 `counter_evidence` 与 `risks`，不改排序、不加分、不扣分。
+- [改进] `RiskNote` 扩展 `severity` / `source` / `as_of` / `reason` / `metrics` 审计字段；委员会 payload 新增 `counter_evidence_summary`、`counter_evidence_policy` 与 `discovery_steps.source=counter_evidence` 观测步骤。
+- [改进] 新增开关 `AGENT_COUNTER_EVIDENCE_VETO_ENABLED`（默认 `false`）：开启后仅 `theme_mismatch` / `missing_market_data` 且 severity≥0.7，或任一类型 severity≥0.9 时移除候选，仍然只否决不额外加分；数据不足写入 `unknown_checks`，不伪装成未命中。
+- [测试] 新增 `tests/test_counter_evidence.py`：覆盖六类反证的命中/未知分支、嵌套 metrics、审计字段、默认 record-only 保持顺序与分数、开关开启后仅移除 veto-eligible 候选。
+- [文档] `docs/architecture/选股链路重构-实施方案.md` 新增 §2.3 FAC-02 类型清单、判定口径、payload/日志位置、真实 32 只候选回放分布与暂不触发原因。
+- [改进] 种子池持久化快照对全部候选写入 `theme_profile` / `stock_role` / `theme_regime` 及判定依据：取值优先级为 `SeedFactPacket.theme_profile` → `seed_pool_summary.preview` → `flags.metrics` 还原 → `missing`；`unrelated` / `unknown` 也落盘并新增 `theme_profile_source`、`theme_profile_missing_reason`，旧 `trigger_signals` 语义不变（`unrelated`/`unknown` 仍不追加主线动量信号）。
+- [新功能] 新增 `NewsSignalService.counter_evidence_for_codes()`：只读回查已入池标的的持久化 `news_signal_cards`，复用 harm/negative 卡补算 `negative_score`/`positive_score`/`neutral_score`，**不放开** benefit/score≥50 入池门槛；按 `signal_date` 窗口匹配 `company_impacts`，返回 `ok` / `unavailable`，成功但无匹配卡由调用方记为 `queried_no_match`。
+- [改进] 委员会为已入池候选挂载 `news_sentiment_status` / `negative_score` / `news_counter_evidence` / `news_sentiment_as_of`；`counter_evidence` 据此区分 `ok`（真实未命中）、`queried_no_match`（查询成功但无卡）、`unavailable`（查询失败记 `unknown_checks`）。
+- [测试] 补充 `tests/test_counter_evidence.py` 与 `tests/test_seed_pool_quality.py` 用例：`unrelated` 落盘且不污染旧信号、显式 `theme_profile` 读取、查询成功无匹配不记 unknown、查询失败记 unknown、harm 低分卡补算可审计、回查绕过入池门槛、缺失 `theme_profile` 显式标记原因。
+- [文档] `docs/architecture/选股链路重构-实施方案.md` §2.3 更新两处数据缺口修补说明与最新真实候选回放分布（32 只中 23 只至少命中 1 条反证，13 只达到 veto 线且全部为 `theme_mismatch`，开关仍默认关闭）。
+- [改进] 按决策在本机 `.env` 开启 `AGENT_COUNTER_EVIDENCE_VETO_ENABLED=true`，`.env.example` 仍保留模板默认 `false` 并补充开启后的判定口径与 13/32 已知特征说明；同快照回放 32 → 19，13 只全部由 `theme_mismatch=0.8` 移除，剩余候选相对顺序不变。
+- [新功能] FAC-05 主题来源分解：`classify_seed_theme_profile()` 在 `theme_profile` 中新增 `theme_attribution`，逐票记录 `decision`、权重贡献、具体来源（盘前新闻主题 / 新闻信号卡 / 领涨板块 / 热榜 / 涨停池 / 资金流 / 命中文本字段）、`as_of`、判定规则与 `missing_reason`；候选 payload 与种子快照新增 `theme_attribution` 字段，默认只展示审计。
+- [改进] `counter_evidence.theme_mismatch` 的 `reason` 与 `metrics` 引用 `theme_attribution.missing_reason` / 来源摘要，与 FAC-05 口径一致；severity 与否决阈值未变，`stock_role`、`membership_confidence`、排序均未改。
+- [测试] 补充主题来源分解用例：领涨板块来源追踪、盘前新闻主题与新闻卡双来源、unrelated 的 `missing_reason` 与文本字段清单、快照落盘 `theme_attribution`、`theme_mismatch` 引用归因原因。
+- [文档] `docs/architecture/选股链路重构-实施方案.md` 新增 §2.4 FAC-05 结构说明与真实回放分布（可解释 17 只、无法归因 15/32=46.9%，原因均为旧快照未持久化逐票 profile 或匹配原文）。
+- [改进] 主题归属拆分为三态 `theme_status=matched / unrelated_confirmed / unclassified`：只有 `explicit_other_theme`（明确他主题/板块/行业标签）或 `exclusion_rule`（对立/已退潮/排除信号）才算 `unrelated_confirmed`（severity 0.7 / 0.85）；无正证据一律 `unclassified`，`stock_role` 记为 `unknown`，只记录不否决。
+- [修复] `news_theme_daily` 的 `source_theme_priority=0.25` 改为条件生效：只有日报 `theme` / `related_boards` / `matched_keywords` 命中目标主题别名时才计权重，不再"来自新闻池就算主题贴靠"；航运、低空经济等非目标主题不再被判 follower。
+- [改进] `counter_evidence` 只对 `theme_status=unrelated_confirmed` 产出 `theme_mismatch`；`unclassified` 与旧快照无 `theme_status` 的 `stock_role=unrelated` 统一写入 `unknown_checks`，`reason` / `metrics` 带 `theme_status` / `evidence_kind` / `theme_labels`，区分"没查到"与"确认无关"。
+- [改进] 热榜种子保留来源自带的 `concepts` / `industry` / `plate_name`，让主题归属能用真实标签做正证据/反证据判断。
+- [改进] 按"否决收手"决策将本机 `AGENT_COUNTER_EVIDENCE_VETO_ENABLED` 回退为 `false`，`.env.example` 同步三态口径与 2026-11-16 快照回放（4/32 `unrelated_confirmed`、28 只 `unclassified`；若开启 veto 则 32 → 28）。
+- [测试] 补充三态用例：无证据 → `unclassified` 且不产生 veto、明确他主题 → `unrelated_confirmed`、排除规则 0.85、新闻来源非目标主题不再加 0.25、旧 `stock_role=unrelated` 无 `theme_status` 只进 `unknown_checks`、快照顶层 `theme_status` 落盘。
+- [文档] `docs/architecture/选股链路重构-实施方案.md` §2.3/§2.4 更新三态判定、`news_theme_daily` 权重原意与修正、撤回 13/32 旧结论并记录最新 32 只回放分布；否决开关保持 `false`。
+- [新功能] `factor_eval` 实现 `kind=valuation_pe`：`pe_ttm_low` 改为 PE(TTM) 按 SW2021 L1 行业内分位（决策日 `rank(pct=True)`），`PE<=0` 视为不可估值并置缺失、行业有效样本 <5 只不计分；`factors.yaml` 版本升至 `1.0.0`，方向 `negative` 事前固定。
+- [改进] 估值类因子覆盖率协议（仅 `kind=valuation_pe`）：判定分母改为有正 PE 的可估值样本，报告同时输出 `coverage_full_universe` / `coverage_valuable` / `valuable_ratio`；`valuable_ratio<0.50` 时最多 `not_evaluable`（原因码 `low_valuable_ratio`）；其它 kind 保持全样本 0.80 门槛，避免"缩分母"普适化。
+- [文档] 新增 `docs/architecture/factor-eval-valuation-quality-feasibility.md`：记录估值分位与质量因子的数据可得性、调用量、覆盖率口径；估值分位已实现并在 2022-01-01~2026-11-17 主窗口判 `fail`（IC 0.0235、ICIR 0.204、NW t 3.11、单调性 0.70、多空 t 0.50、`coverage_valuable` 96.3%、`valuable_ratio` 76.3%），质量因子仍缺 `fina_indicator` 数据层与 `quality_*` kind；不接排序。
+- [测试] `tests/test_factor_eval.py` 覆盖行业内 PE 分位（含行业维度）、`PE<=0` 置缺失、行业样本下限、双覆盖率口径与 `valuable_ratio`、`valuable_ratio<0.50` 判定闸门仅对估值类生效、`valuable` 观测计数。
+- [修复] `scripts/update_sequoia_candidates.py` 的 Tushare 日线目标日改为“交易日历目标 + 发布滞后回退”：目标日行情未发布时不再返回失败，而是回退到最新已发布交易日并输出 `[WARN]`，完成标记记录实际写入日，下一次续跑继续补齐目标日；同时禁止上游滞后响应把 `last_completed_date` 回退。
+- [修复] `scripts/daily_run.sh` 的 step1 按实际写入的已完成交易日写续跑标记：回退发生时记录回退日期，当天稍后重跑仍会重试日历目标日，不再出现“每天必失败一次 + 阻塞 step2”。
+- [修复] `scripts/update_fundamental_candidates.py` 在“有 pending 股票但无 `fina_indicator` 数据”时返回成功并提示未披露，不再把新股/未披露财报误判为 step2 失败；真实拉取错误仍返回失败。
+- [测试] 补充日线发布滞后回退（含 11-16→11-17 缺口补齐与完成日期）与财务快照“无财报非致命 / 全部报错仍失败”的单测。
+- [文档] `docs/full-guide.md` / `docs/full-guide_EN.md` 补充日线步骤的发布滞后回退语义。
 
 ## [3.14.2](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.1...v3.14.2) - 2026-04-30
 
