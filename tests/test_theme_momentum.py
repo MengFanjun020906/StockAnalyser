@@ -155,7 +155,127 @@ def test_single_stock_theme_profile_does_not_upgrade_unmatched_hot_rank():
     assert result["matched_sources"]["popularity_rank"] == 1
     assert result["profile"]["stock_role"] == "unrelated"
     assert result["profile"]["chase_permission"] == "none"
-    assert any("不能当作主线核心证据" in flag for flag in result["profile"]["risk_flags"])
+
+
+def test_theme_attribution_traces_leading_sector_without_changing_role():
+    snapshot = build_theme_momentum_snapshot(
+        hot_sectors={"status": "partial", "sectors": [{"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 90}]},
+        hot_sector_leaders={"status": "partial", "items": [{"code": "300001", "name": "光模块龙头", "bk_name": "CPO 光模块", "rank": 1, "net_inflow": 500_000_000}]},
+    )
+    seed = SeedItem(
+        code="300001",
+        name="光模块龙头",
+        source="sector_theme",
+        hint="CPO 光模块 龙头股",
+        priority_score=90,
+        freshness="2026-11-16",
+        extras={"metrics": {"rank": 1, "bk_name": "CPO 光模块", "bk_code": "BK1001", "source_label": "stockapi_hot_sector_leader", "net_inflow": 500_000_000}},
+    )
+
+    profile = classify_seed_theme_profile(seed, snapshot)
+    attribution = profile["theme_attribution"]
+
+    assert profile["stock_role"] == "core_leader"
+    assert attribution["decision"] == "matched"
+    assert attribution["stock_role"] == "core_leader"
+    assert attribution["as_of"] == "2026-11-16"
+    assert attribution["display_only"] is True
+    assert attribution["affects_ranking"] is False
+    assert attribution["rule"]["membership_threshold"] == 0.25
+    assert any(
+        item["factor"] == "alias_match" and item["hit"] and item["weight"] == 0.45
+        for item in attribution["contributions"]
+    )
+    sector = next(item for item in attribution["sources"] if item["source_type"] == "leading_sector")
+    assert sector["source_id"] == "BK1001"
+    assert sector["label"] == "CPO 光模块"
+    assert sector["as_of"] == "2026-11-16"
+    assert sector["detail"]["rank"] == 1
+    assert any(item["source_type"] == "seed_text" and "CPO" in item["matched_aliases"] for item in attribution["sources"])
+
+
+def test_theme_attribution_traces_news_theme_and_news_card():
+    snapshot = build_theme_momentum_snapshot(
+        hot_sectors={"status": "partial", "sectors": [{"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 90}]},
+    )
+    seed = SeedItem(
+        code="300308",
+        name="中际旭创",
+        source="news_theme_daily",
+        hint="AI服务器/光模块主题映射",
+        freshness="2026-11-16",
+        trigger_signals=[
+            {
+                "dimension": "news_event",
+                "signal_type": "news_signal_card",
+                "label": "光模块订单超预期",
+                "value": {
+                    "card_id": "card-300308-1",
+                    "signal_date": "2026-11-15",
+                    "summary_short": "光模块订单超预期",
+                    "primary_industries": ["光模块"],
+                    "company_direction": "benefit",
+                    "signal_score": 82.0,
+                    "mapping_confidence": 0.9,
+                    "evidence_grade": "confirmed",
+                },
+            }
+        ],
+        extras={
+            "metrics": {
+                "theme": "AI服务器",
+                "source_title": "11月16日财经早餐",
+                "source_url": "https://finance.eastmoney.com/a/demo.html",
+                "evidence_section": "热点题材",
+                "matched_keywords": ["光模块"],
+                "related_boards": ["光模块"],
+            }
+        },
+    )
+
+    profile = classify_seed_theme_profile(seed, snapshot)
+    attribution = profile["theme_attribution"]
+
+    assert profile["stock_role"] == "follower"
+    assert attribution["decision"] == "matched"
+    news_theme = next(item for item in attribution["sources"] if item["source_type"] == "news_theme")
+    assert news_theme["source_id"] == "https://finance.eastmoney.com/a/demo.html"
+    assert news_theme["detail"]["source_title"] == "11月16日财经早餐"
+    assert news_theme["detail"]["evidence_section"] == "热点题材"
+    news_card = next(item for item in attribution["sources"] if item["source_type"] == "news_card")
+    assert news_card["source_id"] == "card-300308-1"
+    assert news_card["as_of"] == "2026-11-15"
+    assert news_card["detail"]["evidence_grade"] == "confirmed"
+
+
+def test_theme_attribution_explains_unrelated_without_alias_hit():
+    snapshot = build_theme_momentum_snapshot(
+        hot_sectors={"status": "partial", "sectors": [{"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 90}]},
+    )
+    seed = SeedItem(
+        code="600000",
+        name="银行热榜",
+        source="hot_rank",
+        hint="银行热榜第1",
+        freshness="2026-11-16",
+        extras={"metrics": {"rank": 1, "concepts": ["银行"]}},
+    )
+
+    profile = classify_seed_theme_profile(seed, snapshot)
+    attribution = profile["theme_attribution"]
+
+    assert profile["stock_role"] == "unrelated"
+    assert profile["theme_status"] == "unrelated_confirmed"
+    assert attribution["decision"] == "unrelated_confirmed"
+    assert attribution["confirmation"]["evidence_kind"] == "explicit_other_theme"
+    assert attribution["missing_reason"]
+    assert "明确他主题标签" in attribution["missing_reason"]
+    assert "银行" in attribution["missing_reason"]
+    assert attribution["fields_checked"]
+    assert attribution["sources"][0]["source_type"] == "seed_source"
+    assert attribution["sources"][0]["source_id"] == "hot_rank"
+    assert attribution["sources"][0]["as_of"] == "2026-11-16"
+    assert not any(item["source_type"] == "seed_text" for item in attribution["sources"])
 
 
 def test_single_stock_theme_profile_survives_failed_stockapi_payloads():
@@ -171,4 +291,98 @@ def test_single_stock_theme_profile_survives_failed_stockapi_payloads():
     assert result["status"] == "insufficient"
     assert result["theme_momentum"]["regime"] == "unknown"
     assert result["theme_momentum"]["data_quality"] == "insufficient"
-    assert result["profile"]["stock_role"] == "unrelated"
+    assert result["profile"]["stock_role"] == "unknown"
+    assert result["profile"]["theme_status"] == "unclassified"
+
+
+def test_theme_status_keeps_unclassified_apart_from_confirmed_unrelated():
+    snapshot = build_theme_momentum_snapshot(
+        hot_sectors={"status": "partial", "sectors": [{"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 90}]},
+    )
+    # 没有别名命中,也没有任何明确主题标签 → 证据不足,不能判为无关。
+    blank_seed = SeedItem(
+        code="600001",
+        name="测试标的",
+        source="daily_screener",
+        hint="形态突破",
+        freshness="2026-11-16",
+        extras={"metrics": {}},
+    )
+    blank_profile = classify_seed_theme_profile(blank_seed, snapshot)
+    assert blank_profile["theme_status"] == "unclassified"
+    assert blank_profile["stock_role"] == "unknown"
+    assert blank_profile["theme_attribution"]["decision"] == "unclassified"
+    assert "证据不足" in blank_profile["theme_attribution"]["missing_reason"]
+    assert "不等于与主题无关" in blank_profile["theme_attribution"]["missing_reason"]
+
+    # 明确属于另一主题(航运) → 有正证据,才算确认无关。
+    shipping_seed = SeedItem(
+        code="601919",
+        name="中远海控",
+        source="hot_rank",
+        hint="航运热榜第1",
+        freshness="2026-11-16",
+        extras={"metrics": {"rank": 1, "concepts": ["航运港口"]}},
+    )
+    shipping_profile = classify_seed_theme_profile(shipping_seed, snapshot)
+    assert shipping_profile["theme_status"] == "unrelated_confirmed"
+    assert shipping_profile["stock_role"] == "unrelated"
+    assert shipping_profile["theme_attribution"]["confirmation"]["evidence_kind"] == "explicit_other_theme"
+
+
+def test_news_theme_daily_requires_theme_alias_hit_for_theme_weight():
+    snapshot = build_theme_momentum_snapshot(
+        hot_sectors={"status": "partial", "sectors": [{"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 90}]},
+    )
+    shipping_seed = SeedItem(
+        code="601919",
+        name="中远海控",
+        source="news_theme_daily",
+        hint="航运 盘前日报概念映射: 中远海控",
+        freshness="2026-11-16",
+        extras={
+            "metrics": {
+                "rank": 1,
+                "theme": "航运",
+                "related_boards": ["港口航运"],
+                "matched_keywords": ["航运", "运价"],
+            }
+        },
+    )
+    shipping_profile = classify_seed_theme_profile(shipping_seed, snapshot)
+    assert shipping_profile["theme_status"] == "unrelated_confirmed"
+    assert shipping_profile["stock_role"] == "unrelated"
+    weights = {item["factor"]: item["weight"] for item in shipping_profile["theme_attribution"]["contributions"]}
+    assert weights["source_theme_priority"] == 0.0
+
+    ai_seed = SeedItem(
+        code="300308",
+        name="中际旭创",
+        source="news_theme_daily",
+        hint="AI服务器 盘前日报概念映射: 中际旭创",
+        freshness="2026-11-16",
+        extras={"metrics": {"rank": 1, "theme": "AI服务器", "related_boards": ["CPO概念"]}},
+    )
+    ai_profile = classify_seed_theme_profile(ai_seed, snapshot)
+    assert ai_profile["theme_status"] == "matched"
+    assert ai_profile["stock_role"] == "follower"
+    ai_weights = {item["factor"]: item["weight"] for item in ai_profile["theme_attribution"]["contributions"]}
+    assert ai_weights["source_theme_priority"] == 0.25
+
+
+def test_exclusion_rule_confirms_unrelated_with_higher_severity():
+    snapshot = build_theme_momentum_snapshot(
+        hot_sectors={"status": "partial", "sectors": [{"bk_name": "CPO 光模块", "rank": 1, "net_inflow": 1_000_000_000, "strength": 90}]},
+    )
+    seed = SeedItem(
+        code="600002",
+        name="测试标的",
+        source="hot_rank",
+        hint="热榜第1",
+        freshness="2026-11-16",
+        extras={"metrics": {"rank": 1, "theme_relation": "opposite"}},
+    )
+    profile = classify_seed_theme_profile(seed, snapshot)
+    assert profile["theme_status"] == "unrelated_confirmed"
+    assert profile["theme_confirmation"]["evidence_kind"] == "exclusion_rule"
+    assert profile["theme_confirmation"]["severity"] == 0.85

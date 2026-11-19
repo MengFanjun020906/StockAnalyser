@@ -1384,6 +1384,88 @@ def _refresh_trace_price_plan_presentation(
         return content
 
 
+def _trace_session_id_from_artifact_dir(path: Path) -> Optional[str]:
+    """Extract the ``trace-*`` session id from a timestamped artifact directory."""
+    match = re.match(r"^\d{8}-\d{6}-(trace-.+)$", path.name)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _trace_history_list_item(path: Path) -> Dict[str, Any]:
+    """Build a lightweight history entry without loading the full artifact."""
+    session_id = _trace_session_id_from_artifact_dir(path) or path.name
+    summary = _read_trace_json_file(path / "summary.json", {}) or {}
+    request_payload = _read_trace_json_file(path / "request.json", {}) or {}
+    target_conflict = _stored_trace_target_conflict(path)
+    success = bool(summary.get("success")) and not target_conflict
+    expected_symbol = target_conflict["expected_symbol"] if target_conflict else None
+    stock_code = str(expected_symbol or request_payload.get("stock_code") or "")
+    return {
+        "id": session_id,
+        "createdAt": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+        "message": str(request_payload.get("message") or ""),
+        "stockCode": stock_code,
+        "accountId": request_payload.get("account_id"),
+        "status": "success" if success else "error",
+        "result": {
+            "success": success,
+            "session_id": session_id,
+            "content": "",
+            "error": summary.get("error"),
+            "total_steps": int(summary.get("total_steps") or 0),
+            "total_tokens": int(summary.get("total_tokens") or 0),
+            "provider": str(summary.get("provider") or ""),
+            "model": str(summary.get("model") or ""),
+            "mode": str(request_payload.get("analysis_mode") or "planning_execute"),
+            "events": [],
+            "tool_calls": [],
+            "planner": None,
+            "agent_user_context": None,
+            "context_summary": summary.get("context_summary"),
+            "dimension_evidence": None,
+            "report_quality": summary.get("report_quality"),
+            "debate": None,
+            "stock_selection": None,
+            "composite_verdict": None,
+            "risk_gate": None,
+            "llm_telemetry": None,
+            "judge_sanity": None,
+            "artifact_dir": str(path),
+            "runtime_config": None,
+        },
+    }
+
+
+@router.get("/trace/sessions")
+async def list_agent_trace_sessions(limit: int = 20):
+    """List recent Agent Trace sessions from local artifacts.
+
+    The browser keeps a localStorage index for convenience, but that index is
+    scoped to one origin and is lost when the origin or browser storage
+    changes. Listing artifacts makes completed runs recoverable.
+    """
+    safe_limit = max(1, min(int(limit or 20), 50))
+    root = _trace_artifact_root()
+    if not root.exists():
+        return {"sessions": []}
+
+    candidates: List[Path] = []
+    for path in root.iterdir():
+        if not path.is_dir() or _trace_session_id_from_artifact_dir(path) is None:
+            continue
+        if not (path / "summary.json").exists() and not (path / "request.json").exists():
+            continue
+        candidates.append(path)
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+
+    sessions = [
+        _trace_history_list_item(path)
+        for path in candidates[:safe_limit]
+    ]
+    return {"sessions": sessions}
+
+
 @router.get("/trace/sessions/{session_id}")
 async def get_agent_trace_session(session_id: str):
     """Load a completed Agent Trace from local artifacts by session id."""

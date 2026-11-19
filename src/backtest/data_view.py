@@ -100,12 +100,12 @@ class InMemoryDataView:
     # Execution-facing API
     # ------------------------------------------------------------------
     def bars_at(self, timestamp: datetime) -> dict[str, Bar]:
-        bars = self._bars_by_time.get(timestamp)
-        if bars is not None:
-            return bars
         if self.granularity == "1d":
-            return {symbol: bar for symbol, bar in self._daily_as_bars(timestamp).items()}
-        return {}
+            # Daily runs must not be shadowed by the minute-bar cache: a single
+            # symbol with 5m data at this timestamp would otherwise make every
+            # other symbol look like it has no bar.
+            return self._daily_as_bars(timestamp)
+        return self._bars_by_time.get(timestamp, {})
 
     def bar_for(self, symbol: str, timestamp: datetime) -> Bar | None:
         bars = self.bars_at(timestamp)

@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from src.backtest.data_view import InMemoryDataView
-from src.backtest.entities import CorporateAction, Order
+from src.backtest.entities import Bar, CorporateAction, DailyBar, Order
 from src.backtest.ledger import Ledger
 from src.backtest.schemas import (
     Granularity,
@@ -45,6 +45,74 @@ def _inputs():
             source_pipeline=SourcePipeline.SINGLE_STOCK,
         )
     ]
+
+
+def _mixed_minute_bar(symbol: str, session: date, close: str = "10.5") -> Bar:
+    price = Decimal(close)
+    return Bar(
+        symbol=symbol,
+        end_at=datetime.combine(session, datetime.min.time()).replace(hour=15),
+        session=session,
+        open=price,
+        high=price,
+        low=price,
+        close=price,
+        volume=Decimal("1000"),
+        amount=Decimal("10000"),
+        frequency="5m",
+    )
+
+
+def _mixed_daily_bar(symbol: str, session: date, close: str = "20.5") -> DailyBar:
+    price = Decimal(close)
+    return DailyBar(
+        symbol=symbol,
+        session=session,
+        open=price,
+        high=price,
+        low=price,
+        close=price,
+        volume=Decimal("2000"),
+        amount=Decimal("20000"),
+    )
+
+
+def test_daily_bars_at_is_not_shadowed_by_minute_bars_of_other_symbols():
+    session = date(2026, 1, 5)
+    timestamp = datetime(2026, 1, 5, 15, 0)
+    view = InMemoryDataView.from_records(
+        granularity="1d",
+        start_date=session,
+        end_date=session,
+        sessions=[session],
+        bars=[_mixed_minute_bar("000001", session)],
+        daily=[_mixed_daily_bar("000002", session)],
+        rules=[],
+    )
+    bars = view.bars_at(timestamp)
+    assert set(bars) == {"000002"}
+    assert bars["000002"].frequency == "1d"
+    assert bars["000002"].close == Decimal("20.5")
+    assert view.bar_for("000001", timestamp) is None
+
+
+def test_minute_bars_at_still_returns_minute_bars_only():
+    session = date(2026, 1, 5)
+    timestamp = datetime(2026, 1, 5, 15, 0)
+    view = InMemoryDataView.from_records(
+        granularity="5m",
+        start_date=session,
+        end_date=session,
+        sessions=[session],
+        bars=[_mixed_minute_bar("000001", session)],
+        daily=[_mixed_daily_bar("000002", session)],
+        rules=[],
+    )
+    bars = view.bars_at(timestamp)
+    assert set(bars) == {"000001"}
+    assert bars["000001"].frequency == "5m"
+    assert bars["000001"].close == Decimal("10.5")
+    assert view.bar_for("000002", timestamp) is None
 
 
 def test_data_view_only_exposes_bars_up_to_session():

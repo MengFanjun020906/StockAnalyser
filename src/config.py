@@ -811,11 +811,19 @@ class Config:
     agent_seed_pool_total_limit: int = 32  # Max seed-pool candidates before L1 thesis desks; lower for single-stock smoke tests
     agent_selection_deep_dive_limit: int = 4  # Max L1 candidates that enter stock-level deep-dive evidence collection
     agent_deep_dive_setup_router_enabled: bool = True  # Route deep-dive prompts by setup_type playbook; False uses legacy single prompt
-    agent_veto_gate_enabled: bool = True  # Enable shared bearish red-line veto gate (thesis_desk_committee); default only hard_risk_flags trigger
+    agent_veto_gate_enabled: bool = False  # Wire the shared bearish red-line veto gate before desks; default off keeps pre-wiring behavior
+    agent_veto_enforce_liquidity: bool = False  # When the veto gate is on, also veto liquidity_ok=False; default off (liquidity is not a red line)
+    agent_momentum_gain5d_gate: bool = False  # Legacy A/B switch: use gain_5d>=5% as a momentum-desk entry gate; default off (gain_5d is a fact field)
     agent_deterministic_price_plan_enabled: bool = True  # Deterministic price plan is the only source of entry/stop/target prices
     agent_price_plan_disabled_anchor_families: List[str] = field(default_factory=list)
+    agent_pricing_shadow_enabled: bool = False  # Read-only pricing shadow probe; writes pricing_shadow.json only, never affects ranking/actions
+    agent_pricing_shadow_path: str = ""  # Shadow output path; empty uses data/pricing_shadow.json
+    agent_pricing_shadow_max_codes: int = 60  # Max candidates probed per run; 0 means unlimited
     agent_veto_violent_outflow_threshold: Optional[float] = None  # Net-outflow % to flag capital_violent_outflow; None disables (never triggers)
     agent_veto_breakdown_accel_threshold: Optional[float] = None  # 5-day drop % to flag breakdown_accelerating; None disables (never triggers)
+    agent_counter_evidence_veto_enabled: bool = False  # When True, typed counter-evidence may remove candidates; default False = record-only facts
+    agent_sector_flow_observation_enabled: bool = False  # Attach sector-flow observation block (display only; never re-ranks or gates)
+    agent_sector_flow_cache_dir: str = ""  # Snapshot cache dir; empty uses data/factor_eval_cache
     agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
     agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
     agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
@@ -1841,8 +1849,25 @@ class Config:
             ),
             agent_veto_gate_enabled=parse_env_bool(
                 os.getenv('AGENT_VETO_GATE_ENABLED'),
-                True,
+                False,
             ),
+            agent_veto_enforce_liquidity=parse_env_bool(
+                os.getenv('AGENT_VETO_ENFORCE_LIQUIDITY'),
+                False,
+            ),
+            agent_counter_evidence_veto_enabled=parse_env_bool(
+                os.getenv('AGENT_COUNTER_EVIDENCE_VETO_ENABLED'),
+                False,
+            ),
+            agent_momentum_gain5d_gate=parse_env_bool(
+                os.getenv('AGENT_MOMENTUM_GAIN5D_GATE'),
+                False,
+            ),
+            agent_sector_flow_observation_enabled=parse_env_bool(
+                os.getenv('AGENT_SECTOR_FLOW_OBSERVATION_ENABLED'),
+                False,
+            ),
+            agent_sector_flow_cache_dir=os.getenv('AGENT_SECTOR_FLOW_CACHE_DIR', ''),
             agent_deterministic_price_plan_enabled=parse_env_bool(
                 os.getenv('AGENT_DETERMINISTIC_PRICE_PLAN_ENABLED'),
                 True,
@@ -1852,6 +1877,17 @@ class Config:
                 for family in os.getenv('AGENT_PRICE_PLAN_DISABLED_ANCHOR_FAMILIES', '').split(',')
                 if family.strip()
             ],
+            agent_pricing_shadow_enabled=parse_env_bool(
+                os.getenv('AGENT_PRICING_SHADOW_ENABLED'),
+                False,
+            ),
+            agent_pricing_shadow_path=os.getenv('AGENT_PRICING_SHADOW_PATH', ''),
+            agent_pricing_shadow_max_codes=parse_env_int(
+                os.getenv('AGENT_PRICING_SHADOW_MAX_CODES'),
+                60,
+                field_name='AGENT_PRICING_SHADOW_MAX_CODES',
+                minimum=0,
+            ),
             agent_veto_violent_outflow_threshold=parse_env_optional_float(
                 os.getenv('AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD'),
                 field_name='AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD',

@@ -676,6 +676,34 @@ class TestMomentumDeskEligibility:
         # Goes to fallback when primary empty
         assert len(filtered) == 1
 
+    def test_gain_5d_alone_is_not_a_primary_gate_by_default(self):
+        expert = self._make_expert()
+        expert._fallback_supplement_n = 0
+        rows = [
+            _make_row(
+                "A",
+                fact_sheet=FactSheet(code="A", trend_state="neutral", volume_ratio=1.0, gain_5d=9.0),
+            )
+        ]
+        assert expert._filter_eligible_rows(rows) == []
+
+    def test_gain_5d_legacy_gate_can_be_restored_for_ab(self):
+        from src.agent.candidate_experts_v2.experts.momentum_desk import MomentumDeskExpert
+
+        expert = MomentumDeskExpert(
+            tool_registry={},
+            tool_decls=[],
+            llm=MagicMock(),
+            gain_5d_gate_enabled=True,
+        )
+        rows = [
+            _make_row(
+                "A",
+                fact_sheet=FactSheet(code="A", trend_state="neutral", volume_ratio=1.0, gain_5d=9.0),
+            )
+        ]
+        assert [row.code for row in expert._filter_eligible_rows(rows)] == ["A"]
+
 
 # ---------------------------------------------------------------------------
 # Desk eligibility (QualityRepairDeskExpert)

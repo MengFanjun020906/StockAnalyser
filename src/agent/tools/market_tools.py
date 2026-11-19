@@ -2185,6 +2185,144 @@ def _derive_market_breadth(indices: List[Dict[str, Any]]) -> Optional[float]:
     return max(-1.0, min(1.0, (positive - negative) / total))
 
 
+def _fetch_market_activity_stats() -> Dict[str, Any]:
+    """Fetch A-share breadth from the lightweight market-activity endpoint."""
+    try:
+        import akshare as ak
+    except Exception:
+        return {}
+    try:
+        df = ak.stock_market_activity_legu()
+    except Exception as exc:
+        logger.debug("Market activity endpoint unavailable: %s", exc)
+        return {}
+    if df is None or getattr(df, "empty", True):
+        return {}
+    item_col = next((col for col in ("item", "指标", "项目") if col in df.columns), None)
+    value_col = next((col for col in ("value", "数值") if col in df.columns), None)
+    if not item_col or not value_col:
+        return {}
+    rows = dict(zip(df[item_col].astype(str), df[value_col]))
+    mapping = {
+        "上涨": "up_count",
+        "下跌": "down_count",
+        "平盘": "flat_count",
+        "涨停": "limit_up_count",
+        "跌停": "limit_down_count",
+    }
+    payload: Dict[str, Any] = {}
+    for label, key in mapping.items():
+        try:
+            payload[key] = max(0, int(float(rows.get(label) or 0)))
+        except Exception:
+            payload[key] = 0
+    if payload["up_count"] + payload["down_count"] <= 0:
+        return {}
+    payload["as_of"] = str(rows.get("统计日期") or "")
+    payload["source"] = "akshare.stock_market_activity_legu"
+    payload["source_chain"] = ["akshare.stock_market_activity_legu"]
+    return payload
+
+
+def _fetch_market_high_low_stats() -> Dict[str, Any]:
+    """Fetch 20/60-day new-high vs new-low counts as a breadth proxy."""
+    try:
+        import akshare as ak
+    except Exception:
+        return {}
+    try:
+        df = ak.stock_a_high_low_statistics(symbol="all")
+    except Exception as exc:
+        logger.debug("High/low statistics unavailable: %s", exc)
+        return {}
+    if df is None or getattr(df, "empty", True):
+        return {}
+    last = df.iloc[-1]
+
+    def _count(key: str) -> int:
+        try:
+            return max(0, int(float(last.get(key) or 0)))
+        except Exception:
+            return 0
+
+    payload = {
+        "high20": _count("high20"),
+        "low20": _count("low20"),
+        "high60": _count("high60"),
+        "low60": _count("low60"),
+        "as_of": str(last.get("date") or ""),
+    }
+    if payload["high20"] + payload["low20"] <= 0:
+        return {}
+    return payload
+
+
+def _fetch_market_stats() -> Dict[str, Any]:
+    """Fetch full-market advance/decline counts (A-share only)."""
+    stats = _fetch_market_activity_stats()
+    if stats:
+        high_low = _fetch_market_high_low_stats()
+        if high_low:
+            stats["high_low"] = high_low
+        return stats
+    try:
+        return _get_fetcher_manager().get_market_stats() or {}
+    except Exception as exc:
+        logger.debug("Market stats unavailable: %s", exc)
+        return {}
+
+
+def _derive_market_breadth_detail(stats: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build market breadth from per-stock advance/decline counts.
+
+    Falls back to ``None`` when the payload lacks usable counts so callers can
+    keep the index-based breadth derived from ``get_market_indices``.
+    """
+    def _count(key: str) -> int:
+        try:
+            return max(0, int(stats.get(key) or 0))
+        except Exception:
+            return 0
+
+    up_count = _count("up_count")
+    down_count = _count("down_count")
+    flat_count = _count("flat_count")
+    limit_up_count = _count("limit_up_count")
+    limit_down_count = _count("limit_down_count")
+    participants = up_count + down_count
+    if participants <= 0:
+        return None
+    advance_ratio = up_count / participants
+    advance_score = (advance_ratio - 0.5) * 2.0
+    limit_total = limit_up_count + limit_down_count
+    limit_score = (limit_up_count - limit_down_count) / limit_total if limit_total else 0.0
+    high_low = stats.get("high_low") if isinstance(stats.get("high_low"), dict) else {}
+    high20 = int(high_low.get("high20") or 0)
+    low20 = int(high_low.get("low20") or 0)
+    high_low_ratio = None
+    if high20 + low20 > 0:
+        high_low_ratio = high20 / (high20 + low20)
+        high_low_score = (high_low_ratio - 0.5) * 2.0
+        score = 0.6 * advance_score + 0.2 * limit_score + 0.2 * high_low_score
+    else:
+        score = 0.7 * advance_score + 0.3 * limit_score
+    score = max(-1.0, min(1.0, score))
+    return {
+        "score": score,
+        "advance_ratio": advance_ratio,
+        "high_low_ratio": high_low_ratio,
+        "high20": high20,
+        "low20": low20,
+        "up_count": up_count,
+        "down_count": down_count,
+        "flat_count": flat_count,
+        "limit_up_count": limit_up_count,
+        "limit_down_count": limit_down_count,
+        "as_of": stats.get("as_of"),
+        "source": stats.get("source"),
+    }
+
+
 def _derive_northbound_component(flow: Dict[str, Any]) -> Optional[float]:
     history = flow.get("history") or []
     values: List[float] = []
@@ -2604,6 +2742,7 @@ def _handle_detect_market_regime(
         previous = {}
 
     indices = []
+    market_stats: Dict[str, Any] = {}
     sector_rankings: Dict[str, Any] = {}
     northbound: Dict[str, Any] = {}
     margin: Dict[str, Any] = {}
@@ -2611,6 +2750,7 @@ def _handle_detect_market_regime(
 
     component_tasks: Dict[str, Tuple[Callable[[], Any], float]] = {
         "market_indices": (lambda: _handle_get_market_indices(region="cn"), auxiliary_timeout),
+        "market_stats": (_fetch_market_stats, auxiliary_timeout),
         "sector_rankings": (lambda: _handle_get_sector_rankings(top_n=10), auxiliary_timeout),
     }
     try:
@@ -2676,6 +2816,8 @@ def _handle_detect_market_regime(
                 data_errors.append(f"{name}: {errors}")
             if name == "market_indices":
                 indices = payload.get("indices") or []
+            elif name == "market_stats":
+                market_stats = payload
             elif name == "sector_rankings":
                 sector_rankings = payload
             elif name == "market_flow":
@@ -2687,19 +2829,22 @@ def _handle_detect_market_regime(
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
+    breadth_detail = _derive_market_breadth_detail(market_stats)
     sentiment = SentimentComponents(
         margin_balance_change=_derive_margin_component(margin),
-        market_breadth=_derive_market_breadth(indices),
+        market_breadth=breadth_detail["score"] if breadth_detail else _derive_market_breadth(indices),
         fear_greed_index=None,
         northbound_flow_z=_derive_northbound_component(northbound),
         market_flow_z=_derive_market_flow_component(market_flow),
         raw={
             "indices_count": len(indices),
+            "market_stats": breadth_detail or {},
             "top_sectors": (sector_rankings.get("top_sectors") or sector_rankings.get("sectors") or [])[:5],
             "component_sources": {
                 "northbound": northbound.get("source_chain"),
                 "margin": margin.get("source_chain"),
                 "market_flow": market_flow.get("source_chain"),
+                "market_stats": market_stats.get("source_chain"),
             },
         },
     )
@@ -2738,8 +2883,9 @@ def _handle_detect_market_regime(
             prev_payload = previous.get("payload") or previous
             payload["status"] = "stale_fallback"
             payload["regime"] = prev_regime
-            for key in ("volatility_bucket", "atr_percentile", "wyckoff_phase",
-                        "sentiment_score", "composite_score", "position_guidance"):
+            for key in ("volatility_bucket", "atr_percentile", "wyckoff_phase", "trend_direction",
+                        "vol_direction", "breadth_confirmed", "sentiment_score", "composite_score",
+                        "position_guidance"):
                 if key in prev_payload and (key not in payload or payload.get(key) is None):
                     payload[key] = prev_payload[key]
             payload["stale_source"] = "persisted_state"
@@ -2770,8 +2916,9 @@ detect_market_regime_tool = ToolDefinition(
     description=(
         "Detect China A-share market regime using empirical ATR percentile, damped volatility "
         "bucket, A-share sentiment/liquidity substitutes, Wyckoff phase, and persisted "
-        "confirmation state. Use as the default pre-check for entry, position review, and "
-        "watchlist selection."
+        "confirmation state. Trend direction and volatility direction are reported separately "
+        "so high-volatility uptrends are not treated as risk-off. Use as the default pre-check "
+        "for entry, position review, and watchlist selection."
     ),
     parameters=[
         ToolParameter(

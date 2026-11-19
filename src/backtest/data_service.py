@@ -95,6 +95,38 @@ class BacktestDataService:
         self._submit(job_id, "sync_minute_bars", payload)
         return self.get_job(job_id)
 
+    def create_daily_sync_job(
+        self,
+        *,
+        symbols: list[str],
+        start_date: date,
+        end_date: date,
+        config=None,
+    ) -> dict[str, Any]:
+        """Backfill daily bars through the normal provider chain.
+
+        Reuses ``DataFetcherManager`` adapter priority and
+        ``StockRepository.save_dataframe``; it does not introduce a parallel
+        fetch path.  Each symbol item distinguishes a local-only gap from an
+        upstream-empty result.
+        """
+        if start_date > end_date:
+            raise BacktestValidationError("invalid_date_range", "start_date must not be after end_date")
+        job_id = f"dj-{datetime.now(SHANGHAI).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        payload = {
+            "symbols": sorted({str(item).strip() for item in symbols if str(item).strip()}),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "config": config.model_dump(mode="json") if config is not None else None,
+        }
+        self.repo.create_data_job(
+            job_id=job_id,
+            job_type="sync_daily_bars",
+            request_json=json.dumps(payload, ensure_ascii=True),
+        )
+        self._submit(job_id, "sync_daily_bars", payload)
+        return self.get_job(job_id)
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         job = self.repo.get_data_job(job_id)
         if job is None:
@@ -125,6 +157,9 @@ class BacktestDataService:
             elif job_type == "sync_minute_bars":
                 result = self._run_sync(payload)
                 status = "partial" if result.get("failed_symbols") else "succeeded"
+            elif job_type == "sync_daily_bars":
+                result = self._run_daily_sync(payload)
+                status = "partial" if result.get("failed_symbols") else "succeeded"
             else:
                 raise BacktestValidationError("unsupported_job", f"unsupported job type: {job_type}")
             self.repo.finish_data_job(
@@ -148,7 +183,7 @@ class BacktestDataService:
         result = self.run_service.precheck(config)
         return result.model_dump(mode="json")
 
-    def _run_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_symbols(self, payload: dict[str, Any]) -> list[str]:
         from .schemas import ExperimentConfig
 
         symbols = list(payload.get("symbols") or [])
@@ -168,6 +203,10 @@ class BacktestDataService:
                 symbols = sorted({plan.symbol for plan in adaptation.plans})
         if not symbols:
             raise BacktestValidationError("no_symbols", "no symbols to sync")
+        return symbols
+
+    def _run_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        symbols = self._resolve_symbols(payload)
         start_date = date.fromisoformat(payload["start_date"])
         end_date = date.fromisoformat(payload["end_date"])
         frequency = str(payload.get("frequency") or "5")
@@ -216,6 +255,77 @@ class BacktestDataService:
             "written_rows": written_rows,
             "frequency": frequency,
             "adjustflag": adjustflag,
+            "items": items,
+        }
+
+    def _run_daily_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        symbols = self._resolve_symbols(payload)
+        start_date = date.fromisoformat(payload["start_date"])
+        end_date = date.fromisoformat(payload["end_date"])
+        days = max(1, (end_date - start_date).days + 5)
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager()
+        stock_repo = StockRepository(self.db)
+        items: list[dict[str, Any]] = []
+        fetched_rows = 0
+        written_rows = 0
+        failed = 0
+        for symbol in symbols:
+            local_rows = len(self.db.get_data_range(symbol, start_date, end_date))
+            try:
+                frame, source = manager.get_daily_data(
+                    symbol,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                    days=days,
+                )
+                rows = 0 if frame is None else len(frame)
+                fetched_rows += rows
+                if rows == 0:
+                    items.append(
+                        {
+                            "symbol": symbol,
+                            "status": "empty",
+                            "gap_kind": "upstream_empty",
+                            "local_rows_before": local_rows,
+                            "source": source,
+                            "fetched_rows": 0,
+                            "written_rows": 0,
+                        }
+                    )
+                    continue
+                written = stock_repo.save_dataframe(frame, symbol, data_source=source)
+                written_rows += written
+                items.append(
+                    {
+                        "symbol": symbol,
+                        "status": "ok",
+                        "gap_kind": "local_missing_backfilled" if local_rows == 0 else "partial_gap_filled",
+                        "local_rows_before": local_rows,
+                        "source": source,
+                        "fetched_rows": rows,
+                        "written_rows": written,
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                items.append(
+                    {
+                        "symbol": symbol,
+                        "status": "failed",
+                        "local_rows_before": local_rows,
+                        "error": str(exc),
+                    }
+                )
+        return {
+            "symbols": len(symbols),
+            "failed_symbols": failed,
+            "empty_symbols": sum(1 for item in items if item["status"] == "empty"),
+            "fetched_rows": fetched_rows,
+            "written_rows": written_rows,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
             "items": items,
         }
 

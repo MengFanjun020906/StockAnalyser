@@ -1599,6 +1599,115 @@ def test_seed_priority_score_soft_caps_high_local_scores():
     assert committee_module._compress_seed_priority_score(130.0) > committee_module._compress_seed_priority_score(105.0)
 
 
+def _run_thesis_desk_for_veto(
+    rows,
+    *,
+    veto_gate_enabled,
+    veto_enforce_liquidity=False,
+):
+    empty_packets = [
+        ExpertPacketV2(expert="early_turn_desk", dimension="early_turn", status="empty"),
+        ExpertPacketV2(expert="momentum_desk", dimension="momentum", status="empty"),
+        ExpertPacketV2(expert="quality_repair_desk", dimension="quality", status="empty"),
+        ExpertPacketV2(expert="theme_catalyst_desk", dimension="theme_catalyst", status="empty"),
+    ]
+    with patch(
+        "src.agent.candidate_experts_v2.recall.build_recall_pool",
+        return_value=RecallResult(rows=rows, all_rows=rows, total_in=len(rows), total_kept=len(rows)),
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.build_seed_fact_packets_parallel",
+        return_value=[],
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.summarize_seed_fact_packets",
+        return_value={"total": 0, "ok": 0, "partial": 0, "failed": 0, "elapsed_ms": 0},
+    ), patch(
+        "src.agent.candidate_experts_v2.seed_facts.compact_seed_fact_packets_for_model",
+        return_value=[],
+    ), patch.object(
+        committee_module,
+        "run_experts_parallel",
+        return_value=empty_packets,
+    ):
+        return run_thesis_desk_committee(
+            market="cn",
+            seed_symbols=[],
+            tool_registry={},
+            llm_adapter=lambda messages, tool_decls: LLMTurn(tool_calls=[], text="{}"),
+            overall_timeout_s=30.0,
+            veto_gate_enabled=veto_gate_enabled,
+            veto_enforce_liquidity=veto_enforce_liquidity,
+        )
+
+
+def _veto_test_rows():
+    return [
+        FeatureRow(
+            code="600111",
+            name="干净样本",
+            flags=[FeatureFlag(detector="alphasift", kind="pattern", summary="趋势候选")],
+            fact_sheet=FactSheet(code="600111", trend_state="bullish", liquidity_ok=True),
+            recall_sources=["alphasift"],
+        ),
+        FeatureRow(
+            code="600222",
+            name="ST样本",
+            flags=[FeatureFlag(detector="daily_screener", kind="pattern", summary="放量")],
+            fact_sheet=FactSheet(code="600222", trend_state="bullish", hard_risk_flags=["st"]),
+            recall_sources=["daily_screener"],
+        ),
+        FeatureRow(
+            code="600333",
+            name="低流动性样本",
+            flags=[FeatureFlag(detector="daily_screener", kind="pattern", summary="放量")],
+            fact_sheet=FactSheet(code="600333", trend_state="bullish", liquidity_ok=False),
+            recall_sources=["daily_screener"],
+        ),
+    ]
+
+
+def test_veto_gate_is_wired_but_off_by_default():
+    result = _run_thesis_desk_for_veto(_veto_test_rows(), veto_gate_enabled=False)
+
+    assert result["veto"] == {
+        "enabled": False,
+        "enforce_liquidity": False,
+        "vetoed_count": 0,
+        "vetoed": [],
+    }
+    assert "recall_total_after_veto" not in result
+    assert not any(step.get("source") == "veto_gate" for step in result["discovery_steps"])
+    assert result["recall_total_kept"] == 3
+
+
+def test_veto_gate_filters_hard_risk_flags_when_enabled():
+    result = _run_thesis_desk_for_veto(_veto_test_rows(), veto_gate_enabled=True)
+
+    assert result["veto"]["enabled"] is True
+    assert result["veto"]["enforce_liquidity"] is False
+    assert result["veto"]["vetoed_count"] == 1
+    assert [item["code"] for item in result["veto"]["vetoed"]] == ["600222"]
+    assert "hard_risk:st" in result["veto"]["vetoed"][0]["reasons"]
+    assert result["recall_total_after_veto"] == 2
+    veto_steps = [step for step in result["discovery_steps"] if step.get("source") == "veto_gate"]
+    assert len(veto_steps) == 1
+    assert veto_steps[0]["vetoed"] == 1
+    assert veto_steps[0]["kept"] == 2
+
+
+def test_veto_gate_enforce_liquidity_adds_illiquid_rows():
+    result = _run_thesis_desk_for_veto(
+        _veto_test_rows(),
+        veto_gate_enabled=True,
+        veto_enforce_liquidity=True,
+    )
+
+    assert result["veto"]["vetoed_count"] == 2
+    assert sorted(item["code"] for item in result["veto"]["vetoed"]) == ["600222", "600333"]
+    by_code = {item["code"]: item["reasons"] for item in result["veto"]["vetoed"]}
+    assert "liquidity_insufficient" in by_code["600333"]
+    assert result["recall_total_after_veto"] == 1
+
+
 def test_seed_candidate_payload_keeps_recall_score_as_source_diagnostic():
     seed = committee_module.SeedItem(
         code="600001",

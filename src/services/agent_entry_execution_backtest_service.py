@@ -19,6 +19,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from src.config import get_config
 from src.agent.pricing.backtest import evaluate_price_plan_backtest
 from src.agent.pricing.repository import PricePlanRepository
+from src.agent.trade_plan_guard import (
+    extract_price_range as _extract_price_range,
+    extract_single_price as _extract_single_price,
+)
 from src.repositories.stock_repo import StockRepository
 from src.storage import DatabaseManager
 
@@ -576,21 +580,46 @@ def _build_trade_plan(
         pricing.get("stop_loss"),
         pricing.get("take_profit"),
     ))
-    entry_low, entry_high = _extract_price_range(plan.get("entry_condition") or pricing.get("entry_zone") or source_text)
-    stop_loss = _extract_single_price(plan.get("stop_loss_condition") or pricing.get("stop_loss") or source_text)
-    take_profit = _extract_single_price(plan.get("take_profit_condition") or pricing.get("take_profit") or source_text)
-    breakout = _extract_single_price(pricing.get("breakout_trigger") or plan.get("breakout_trigger"))
+    rejected = bool(plan.get("trade_plan_rejected") or pricing.get("trade_plan_rejected"))
+    entry_low = _safe_float(plan.get("entry_zone_low"))
+    entry_high = _safe_float(plan.get("entry_zone_high"))
+    stop_loss = _safe_float(plan.get("stop_loss_price"))
+    take_profit = _safe_float(plan.get("take_profit_price"))
+    breakout = _safe_float(plan.get("breakout_trigger"))
     entry_rule = _infer_entry_rule(plan, pricing)
     signal_valid_until = _source_signal_valid_until(plan, pricing)
     expiry_days = _source_entry_expiry_days(plan, pricing, decision_date=decision_date, signal_valid_until=signal_valid_until)
     parse_warnings: List[str] = []
-    if entry_low is None and entry_high is None:
-        parse_warnings.append("missing_entry_zone")
-    parse_status = "ok" if not parse_warnings else "failed"
-    if not any([entry_low, entry_high, stop_loss, take_profit, breakout]):
+    if rejected:
+        parse_warnings.append("trade_plan_rejected")
+        reject_reason = str(
+            plan.get("trade_plan_reject_reason") or pricing.get("trade_plan_reject_reason") or ""
+        ).strip()
+        if reject_reason:
+            parse_warnings.append(reject_reason)
         parse_status = "failed"
-        if "no_numeric_trade_levels" not in parse_warnings:
-            parse_warnings.append("no_numeric_trade_levels")
+    else:
+        if entry_low is None or entry_high is None:
+            parsed_low, parsed_high = _extract_price_range(
+                plan.get("entry_condition") or pricing.get("entry_zone") or source_text
+            )
+            if entry_low is None:
+                entry_low = parsed_low
+            if entry_high is None:
+                entry_high = parsed_high
+        if stop_loss is None:
+            stop_loss = _extract_single_price(plan.get("stop_loss_condition") or pricing.get("stop_loss") or source_text)
+        if take_profit is None:
+            take_profit = _extract_single_price(plan.get("take_profit_condition") or pricing.get("take_profit") or source_text)
+        if breakout is None:
+            breakout = _extract_single_price(pricing.get("breakout_trigger") or plan.get("breakout_trigger"))
+        if entry_low is None and entry_high is None:
+            parse_warnings.append("missing_entry_zone")
+        parse_status = "ok" if not parse_warnings else "failed"
+        if not any([entry_low, entry_high, stop_loss, take_profit, breakout]):
+            parse_status = "failed"
+            if "no_numeric_trade_levels" not in parse_warnings:
+                parse_warnings.append("no_numeric_trade_levels")
     return {
         "schema_version": "agent_entry_execution_backtest.v1",
         "trace_id": _trace_id(trace_dir, {}),
@@ -614,6 +643,8 @@ def _build_trade_plan(
         "final_action": str(plan.get("action") or pricing.get("action") or "wait"),
         "parse_status": parse_status,
         "parse_warnings": parse_warnings,
+        "trade_plan_adjustments": plan.get("trade_plan_adjustments") or pricing.get("trade_plan_adjustments") or [],
+        "trade_plan_warnings": plan.get("trade_plan_warnings") or pricing.get("trade_plan_warnings") or [],
     }
 
 
@@ -630,17 +661,19 @@ def _simulate_strict(*, strategy_name: str, start_price: float, forward_bars: Li
         return {"status": "not_filled", "entry_reason": "missing_signal_validity", "limits": ["missing_signal_validity"]}
     entry_fill = None
     entry_date = None
+    limit_price = _safe_float(entry_low if entry_low is not None else entry_high)
     entry_window = _indexed_bars_for_first_trading_days(forward_bars, expiry)
     for idx, bar in entry_window:
         low = _bar_value(bar, "low")
-        high = _bar_value(bar, "high")
-        if low is None or high is None:
+        if low is None or limit_price is None:
             continue
-        if entry_low is not None and high < float(entry_low):
+        # 真实限价买单：价格触及下沿即成交，跳空低开按更优的开盘价成交。
+        if float(low) > limit_price:
             continue
-        if entry_high is not None and low > float(entry_high):
-            continue
-        entry_fill = float(entry_high if entry_high is not None else entry_low)
+        open_price = _bar_value(bar, "open")
+        entry_fill = limit_price
+        if open_price is not None and float(open_price) < limit_price:
+            entry_fill = float(open_price)
         entry_date = _bar_timestamp(bar)
         start_index = idx
         break
@@ -1251,76 +1284,15 @@ def _value_to_iso(value: Any) -> Optional[str]:
     return text or None
 
 
-def _extract_price_range(value: Any) -> tuple[Optional[float], Optional[float]]:
-    text = str(value or "").strip()
-    if not text:
-        return None, None
-    text = text.replace("元", "").replace(" ", "")
-    match = re.search(r"(\d+(?:\.\d+)?)\s*[-~到]\s*(\d+(?:\.\d+)?)", text)
-    if match:
-        if _is_percent_number(text, match) or (match.end() < len(text) and text[match.end()] == "%"):
-            return None, None
-        low = float(match.group(1))
-        high = float(match.group(2))
-        return (min(low, high), max(low, high))
-    single = _extract_single_price(text)
-    if single is not None:
-        return single, single
-    return None, None
-
-
-def _extract_single_price(value: Any) -> Optional[float]:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    for match in re.finditer(r"\d+(?:\.\d+)?", text):
-        if _is_list_marker_number(text, match):
-            continue
-        if _is_percent_number(text, match):
-            continue
-        if _is_indicator_number(text, match):
-            continue
-        try:
-            return float(match.group(0))
-        except ValueError:
-            continue
-    return None
-
-
-def _is_percent_number(text: str, match: re.Match[str]) -> bool:
-    end = match.end()
-    return end < len(text) and text[end] == "%"
-
-
-def _is_indicator_number(text: str, match: re.Match[str]) -> bool:
-    prefix = text[max(0, match.start() - 3): match.start()].upper()
-    return bool(re.search(r"(MA|RSI|CCI)$", prefix))
-
-
-def _is_list_marker_number(text: str, match: re.Match[str]) -> bool:
-    value = match.group(0)
-    if "." in value:
-        return False
-    try:
-        number = int(value)
-    except ValueError:
-        return False
-    if number < 1 or number > 30:
-        return False
-    prefix = text[max(0, match.start() - 2): match.start()]
-    suffix = text[match.end(): match.end() + 2]
-    previous_is_boundary = match.start() == 0 or bool(re.search(r"[\s\n\r:：,，;；。.!！?？(（[【]", prefix[-1:]))
-    next_is_marker = bool(suffix) and suffix[0] in ".．、)）]】"
-    return previous_is_boundary and next_is_marker
-
-
 def _infer_entry_rule(plan: Dict[str, Any], pricing: Dict[str, Any]) -> str:
     value = str(plan.get("execution_mode") or pricing.get("execution_mode") or "").strip().lower()
     if "break" in value:
         return "breakout"
-    if "open" in value:
+    if "immediate" in value:
         return "immediate"
-    if "wait" in value or "conditional" in value:
+    if "conditional" in value:
+        return "conditional"
+    if "pullback" in value:
         return "pullback"
     return "unknown"
 

@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getRuntimeConfig: vi.fn(),
   getTraceSession: vi.fn(),
+  listTraceSessions: vi.fn(),
   runTrace: vi.fn(),
   traceStream: vi.fn(),
 }));
@@ -15,6 +16,7 @@ vi.mock('../../api/agent', () => ({
   agentApi: {
     getRuntimeConfig: mocks.getRuntimeConfig,
     getTraceSession: mocks.getTraceSession,
+    listTraceSessions: mocks.listTraceSessions,
     runTrace: mocks.runTrace,
     traceStream: mocks.traceStream,
   },
@@ -42,10 +44,12 @@ describe('AgentTracePage', () => {
     mocks.getAccounts.mockReset();
     mocks.getRuntimeConfig.mockReset();
     mocks.getTraceSession.mockReset();
+    mocks.listTraceSessions.mockReset();
     mocks.runTrace.mockReset();
     mocks.traceStream.mockReset();
     mocks.getRuntimeConfig.mockResolvedValue({ runtime_config: { agent_orchestration_mode: 'legacy' } });
     mocks.getTraceSession.mockRejectedValue(new Error('not found'));
+    mocks.listTraceSessions.mockResolvedValue({ sessions: [] });
   });
 
   it('runs a trace and renders planner, events, tools, and final output', async () => {
@@ -318,7 +322,7 @@ describe('AgentTracePage', () => {
 
     expect(screen.getByText('A股主账户')).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('实时行情').length).toBeGreaterThan(0);
     });
     expect(screen.getByRole('heading', { name: '最终结论' })).toBeInTheDocument();
     expect(screen.getByText('持有，但不急着加仓')).toBeInTheDocument();
@@ -357,7 +361,7 @@ describe('AgentTracePage', () => {
     expect(screen.getByText('1.32')).toBeInTheDocument();
     expect(screen.getByText(/本周周线尚未收盘，Strategy 4 当前只显示临时分/)).toBeInTheDocument();
     expect(screen.getAllByText('风控通过，允许执行「hold」。').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('实时行情').length).toBeGreaterThan(0);
     expect(screen.getByText('历史')).toBeInTheDocument();
   });
 
@@ -447,6 +451,59 @@ describe('AgentTracePage', () => {
     expect(await screen.findByText('expert_graph')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /展开配置/ }));
     expect(screen.getByDisplayValue('601399')).toBeInTheDocument();
+  });
+
+  it('recovers history from server artifacts when browser storage is empty', async () => {
+    mocks.getAccounts.mockResolvedValue({ accounts: [] });
+    mocks.listTraceSessions.mockResolvedValue({
+      sessions: [{
+        id: 'trace-server',
+        createdAt: '2026-11-10T13:37:10.000Z',
+        message: '分析 600519',
+        stockCode: '600519',
+        status: 'success',
+        result: {
+          success: true,
+          session_id: 'trace-server',
+          content: '',
+          total_steps: 2,
+          total_tokens: 10,
+          provider: 'deepseek',
+          model: 'deepseek-chat',
+          mode: 'planning_execute',
+          events: [],
+          tool_calls: [],
+          artifact_dir: '/tmp/agent_traces/20261110-213710-trace-server',
+        },
+      }],
+    });
+    mocks.getTraceSession.mockResolvedValue({
+      id: 'trace-server',
+      createdAt: '2026-11-10T13:37:10.000Z',
+      message: '分析 600519',
+      stockCode: '600519',
+      status: 'success',
+      result: {
+        success: true,
+        session_id: 'trace-server',
+        content: '服务端历史报告',
+        total_steps: 2,
+        total_tokens: 10,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        mode: 'planning_execute',
+        events: [],
+        tool_calls: [],
+        artifact_dir: '/tmp/agent_traces/20261110-213710-trace-server',
+      },
+    });
+
+    renderPage();
+
+    const historyButton = await screen.findByRole('button', { name: /600519/ });
+    expect(window.localStorage.getItem('dsa.agentTrace.history.v1')).toContain('trace-server');
+    fireEvent.click(historyButton);
+    expect(await screen.findByText('服务端历史报告')).toBeInTheDocument();
   });
 
   it('continues a local history trace from the history row button', async () => {
@@ -723,8 +780,8 @@ describe('AgentTracePage', () => {
     await waitFor(() => expect(mocks.getTraceSession).toHaveBeenCalledWith('trace-degraded-report'));
     expect(await screen.findByRole('heading', { name: '分析状态' })).toBeInTheDocument();
     expect(await screen.findByText('主报告自动修复仍未通过，当前展示确定性降级报告；价格计划评审会继续执行。')).toBeInTheDocument();
-    expect((await screen.findAllByText(/Debate 失败，未形成有效裁决/)).length).toBeGreaterThan(0);
-    expect(screen.queryByText(/Judge 裁决：monitor/)).not.toBeInTheDocument();
+    expect((await screen.findAllByText(/辩论失败，未形成有效裁决/)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/裁决：观察/)).not.toBeInTheDocument();
   });
 
   it('labels legacy incomplete reports whose failed debate was quarantined at read time', async () => {
@@ -764,7 +821,7 @@ describe('AgentTracePage', () => {
     renderPage('/agent-trace/trace-legacy-incomplete');
 
     expect(await screen.findByText('该历史主报告生成于完整度门禁上线前；失败 Debate 已只读隔离，请重跑分析以生成完整报告。')).toBeInTheDocument();
-    expect((await screen.findAllByText(/Debate 失败，未形成有效裁决/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/辩论失败，未形成有效裁决/)).length).toBeGreaterThan(0);
   });
 
   it('continues a loaded trace by passing the source session id to trace stream', async () => {
@@ -867,8 +924,8 @@ describe('AgentTracePage', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /^运行$/ }));
 
-    expect((await screen.findAllByText('get_capital_flow')).length).toBeGreaterThan(0);
-    expect(screen.getAllByText('FAIL').length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('个股资金流')).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('失败').length).toBeGreaterThan(0);
     expect(screen.getByText('资金流工具失败，资金面证据缺失。')).toBeInTheDocument();
     expect(screen.getAllByText(/capital flow fetch failed/).length).toBeGreaterThan(0);
   });
@@ -1449,7 +1506,7 @@ describe('AgentTracePage', () => {
     expect(screen.getAllByText('情绪/热点候选').length).toBeGreaterThan(0);
     expect(screen.queryByText('为什么后续工具查这些股票')).not.toBeInTheDocument();
     expect(screen.queryByText('入池候选与理由')).not.toBeInTheDocument();
-    expect(screen.getAllByText('get_realtime_quote').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('实时行情').length).toBeGreaterThan(0);
     expect(screen.queryByText('候选池列表 (3)')).not.toBeInTheDocument();
     expect(screen.getAllByText(/强势板块/).length).toBeGreaterThan(0);
     expect(screen.getAllByText('600001').length).toBeGreaterThan(0);
@@ -2257,9 +2314,9 @@ describe('AgentTracePage', () => {
     expect(await screen.findByText('可观测性')).toBeInTheDocument();
     expect(screen.getByText('LLM 调用')).toBeInTheDocument();
     expect(screen.getByText('12,345')).toBeInTheDocument();
-    expect(screen.getByText('candidate_screening')).toBeInTheDocument();
-    expect(screen.getByText('judge_decision')).toBeInTheDocument();
-    expect(screen.getByText('Judge Sanity')).toBeInTheDocument();
+    expect(screen.getByText('候选初筛')).toBeInTheDocument();
+    expect(screen.getByText('裁决决策')).toBeInTheDocument();
+    expect(screen.getByText('裁决合理性')).toBeInTheDocument();
     expect(screen.getByText('open_without_position_plan')).toBeInTheDocument();
     expect(screen.getByText('等待回踩确认。')).toBeInTheDocument();
   });

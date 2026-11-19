@@ -99,7 +99,9 @@
 | `max_hold_days` | 成交后最长持有交易日数，默认 30 |
 | `parse_status` | `ok`、`partial`、`failed`，解析失败不得静默丢弃 |
 
-历史 Trace 中部分点位是自然语言，第一版可以做 best-effort 解析，但必须保留 `parse_status` 与 `parse_warnings`。后续应推动点位计算层直接输出结构化数值字段，减少自然语言解析误差。
+`entry_rule` 由 `execution_mode` 推断，且必须如实映射：`immediate_open → immediate`、`conditional_open → conditional`、`breakout* → breakout`、`pullback* → pullback`、`wait/plain_wait/monitor → unknown`。`conditional_open` 是有条件限价单，不得标成 `immediate`。
+
+历史 Trace 中部分点位是自然语言，第一版可以做 best-effort 解析，但必须保留 `parse_status`、`parse_warnings` 与 `trade_plan_adjustments`。后续应推动点位计算层直接输出结构化数值字段，减少自然语言解析误差。
 
 ## 撮合规则
 
@@ -114,10 +116,11 @@
 严格 AI 入场策略 `strict_ai_entry`：
 
 1. 如果有入场区间：
-   - 当日 `low <= entry_zone_high` 且 `high >= entry_zone_low`，视为触及区间。
-   - 默认成交价取 `entry_zone_high`，即保守假设只要回落到区间上沿才成交。
+   - 当日 `low <= entry_zone_low`，视为限价买单触发。
+   - 成交价取 `min(entry_zone_low, 当日 open)`：正常触及按下沿成交，跳空低开按更优的开盘价成交。
+   - `entry_zone_high` 只描述可接受区间上沿，不作为成交价。
 2. 如果只有单一入场价：
-   - 当日 `low <= entry_price <= high`，按 `entry_price` 成交。
+   - 当日 `low <= entry_price`，按 `min(entry_price, 当日 open)` 成交。
 3. 如果是立即开仓：
    - 按下一交易日开盘价成交。
 4. 如果超过 `entry_expiry_days=5` 仍未触发：

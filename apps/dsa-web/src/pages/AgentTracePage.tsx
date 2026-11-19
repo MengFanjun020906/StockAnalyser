@@ -16,7 +16,7 @@ import {
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams } from 'react-router-dom';
-import { agentApi, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
+import { agentApi, type AgentTraceHistoryItemResponse, type AgentTraceRunResponse, type AgentTraceToolCall } from '../api/agent';
 import { portfolioApi } from '../api/portfolio';
 import { CandidateDecisionTable, type CandidateDecisionRow, type CandidateDecisionTone } from '../components/candidates/CandidateDecisionTable';
 import { TraceStepNav, type TraceNavStep } from '../components/agent/TraceStepNav';
@@ -466,6 +466,33 @@ const persistTraceHistory = (items: TraceHistoryItem[], next: TraceHistoryItem):
   return merged;
 };
 
+const traceHistoryTimestamp = (item: TraceHistoryItem): number => {
+  const timestamp = new Date(item.createdAt).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const toTraceHistoryItem = (item: AgentTraceHistoryItemResponse): TraceHistoryItem => ({
+  ...item,
+  accountId: item.accountId ?? undefined,
+});
+
+const mergeTraceHistory = (
+  localItems: TraceHistoryItem[],
+  serverItems: AgentTraceHistoryItemResponse[],
+): TraceHistoryItem[] => {
+  const byId = new Map<string, TraceHistoryItem>();
+  // Server artifacts win over the browser index so stale localStorage entries
+  // cannot hide a run that still exists on disk.
+  [...serverItems.map(toTraceHistoryItem), ...localItems].forEach((item) => {
+    if (!item.id || byId.has(item.id)) return;
+    byId.set(item.id, item);
+  });
+  return [...byId.values()]
+    .sort((a, b) => traceHistoryTimestamp(b) - traceHistoryTimestamp(a))
+    .slice(0, TRACE_HISTORY_LIMIT)
+    .map(compactTraceHistoryItem);
+};
+
 const compactTraceHistoryItem = (item: TraceHistoryItem): TraceHistoryItem => {
   const result = item.result || createEmptyTraceResult();
   const finalReport = asRecord(result.stock_selection?.final_report_json) || {};
@@ -552,6 +579,34 @@ type CandidateReasonDimension = {
   detail: string;
 };
 
+type SectorFlowDisplay = {
+  status?: string;
+  state?: string;
+  score?: number;
+  scorePartial?: boolean;
+  asOfDate?: string;
+  bkCode?: string;
+  bkName?: string;
+  industryKey?: string;
+  mappingMethod?: string;
+  mappingConfidence?: string;
+  windowDays?: number;
+  sampleDays?: number;
+  unit?: string;
+  netInflowSum?: number;
+  mainInflowPctAvg?: number;
+  positiveInflowDays?: number;
+  latestNetInflow?: number;
+  inflowAcceleration?: number;
+  largeOrderPositiveDays?: number;
+  sectorReturnWindow?: number;
+  composite?: number;
+  overheatPenalty?: number;
+  overheatStatus?: string;
+  missingReason?: string;
+  qualityNotes?: string[];
+};
+
 type DisplayCandidate = {
   code: string;
   name: string;
@@ -578,6 +633,7 @@ type DisplayCandidate = {
   desks: string[];
   multiDeskConviction: boolean;
   conflictFlags: string[];
+  sectorFlow?: SectorFlowDisplay;
 };
 
 type CandidateDimensionGroup = {
@@ -858,6 +914,42 @@ const displaySourceName = (source: string): string => {
   return source;
 };
 
+const STAGE_LABELS: Record<string, string> = {
+  candidate_discovery: '候选发现',
+  balanced_candidate_evidence: '候选证据均衡',
+  candidate_screening: '候选初筛',
+  single_stock_deep_dive: '个股深度分析',
+  deterministic_scoring: '确定性评分',
+  meta_orchestrator: '总调度',
+  pricing_agent: '定价分析',
+  portfolio_allocation: '组合配置',
+  adversarial_review: '对抗复核',
+  judge_decision: '裁决决策',
+  symbol_regime_probability: '个股状态概率',
+};
+
+const TOOL_NAME_LABELS: Record<string, string> = {
+  detect_market_regime: '市场状态识别',
+  get_sector_rankings: '板块排行',
+  get_market_indices: '市场指数',
+  get_market_stats: '涨跌家数',
+  get_market_capital_flow: '市场资金流',
+  get_northbound_capital_flow: '北向资金',
+  get_margin_trading_summary: '两融数据',
+  get_stock_data: '个股行情',
+  get_stock_quote: '个股报价',
+  get_realtime_quote: '实时行情',
+  analyze_trend: '趋势分析',
+  analyze_technical: '技术分析',
+  get_capital_flow: '个股资金流',
+  get_stock_news: '个股新闻',
+  search_news: '新闻检索',
+  get_financial_data: '财务数据',
+};
+
+const displayStageName = (stage: string): string => STAGE_LABELS[stage] || stage.replace(/_/g, ' ');
+const displayToolName = (tool: string): string => TOOL_NAME_LABELS[tool] || tool;
+
 const displayReasonText = (reason: string): string => {
   let text = reason;
   Object.entries(STRATEGY_LABELS).forEach(([raw, label]) => {
@@ -873,6 +965,44 @@ const displayReasonText = (reason: string): string => {
   text = text.replaceAll('analyze_trend', '趋势分析工具');
   text = text.replaceAll('get_capital_flow', '资金流工具');
   return text;
+};
+
+const MARKET_REGIME_ENUM_LABELS: Record<string, string> = {
+  trending_up: '上行趋势',
+  bull_volatile: '高波动上涨',
+  trending_down: '下行趋势',
+  range_bound: '震荡市',
+  high_volatility: '高波动',
+  risk_off: '避险',
+  panic: '恐慌',
+  extreme_greed: '极度贪婪',
+  extreme_fear: '极度恐惧',
+  greed: '贪婪',
+  fear: '恐惧',
+  neutral: '中性',
+  very_low: '极低波动',
+  elevated: '波动抬升',
+  high_vol: '高波动',
+  extreme: '极端波动',
+  compressing: '收敛',
+  expanding: '放大',
+  accumulation: '吸筹',
+  distribution: '派发',
+  markup: '上升推进',
+  markdown: '下跌推进',
+  medium_high: '中高',
+  unknown: '未知',
+};
+
+/** 仅替换 JSON 中被引号包裹的枚举值，避免误伤字段名和普通文本。 */
+const localizeMarketRegimeEnums = (text: string): string => {
+  let output = text;
+  Object.keys(MARKET_REGIME_ENUM_LABELS)
+    .sort((a, b) => b.length - a.length)
+    .forEach((raw) => {
+      output = output.replaceAll(`"${raw}"`, `"${MARKET_REGIME_ENUM_LABELS[raw]}"`);
+    });
+  return output;
 };
 
 const STRATEGY_ONLY_TAGS = new Set(['breakout', 'rps', 'momentum', 'relative_strength', 'liquidity', 'ma_cross']);
@@ -1190,6 +1320,50 @@ const normalizeReasonDimensions = (item: Record<string, unknown>): CandidateReas
   return result.slice(0, 5);
 };
 
+const normalizeSectorFlow = (value: unknown): SectorFlowDisplay | undefined => {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  // NOTE: 0 是合法值（例如净流入 0、过热惩罚 0），这里不使用 `||` 兜底。
+  const numeric = (key: string): number | undefined => {
+    const raw = record[key];
+    if (raw == null || raw === '') return undefined;
+    const parsed = typeof raw === 'number' ? raw : Number(raw);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  const text = (key: string): string | undefined => {
+    const raw = record[key];
+    return raw == null || raw === '' ? undefined : String(raw);
+  };
+  const flags = toStringList(record.qualityNotes ?? record.quality_notes);
+  return {
+    status: text('status'),
+    state: text('state'),
+    score: numeric('score'),
+    scorePartial: Boolean(record.scorePartial ?? record.score_partial),
+    asOfDate: text('asOfDate') ?? text('as_of_date'),
+    bkCode: text('bkCode') ?? text('bk_code'),
+    bkName: text('bkName') ?? text('bk_nameRaw') ?? text('bk_name_raw'),
+    industryKey: text('industryKey') ?? text('industry_key'),
+    mappingMethod: text('mappingMethod') ?? text('mapping_method'),
+    mappingConfidence: text('mappingConfidence') ?? text('mapping_confidence'),
+    windowDays: numeric('windowDays') ?? numeric('window_days'),
+    sampleDays: numeric('sampleDays') ?? numeric('sample_days'),
+    unit: text('unit'),
+    netInflowSum: numeric('netInflowSum') ?? numeric('net_inflow_sum'),
+    mainInflowPctAvg: numeric('mainInflowPctAvg') ?? numeric('main_inflow_pct_avg'),
+    positiveInflowDays: numeric('positiveInflowDays') ?? numeric('positive_inflow_days'),
+    latestNetInflow: numeric('latestNetInflow') ?? numeric('latest_net_inflow'),
+    inflowAcceleration: numeric('inflowAcceleration') ?? numeric('inflow_acceleration'),
+    largeOrderPositiveDays: numeric('largeOrderPositiveDays') ?? numeric('large_order_positive_days'),
+    sectorReturnWindow: numeric('sectorReturnWindow') ?? numeric('sector_return_window'),
+    composite: numeric('composite'),
+    overheatPenalty: numeric('overheatPenalty') ?? numeric('overheat_penalty'),
+    overheatStatus: text('overheatStatus') ?? text('overheat_status'),
+    missingReason: text('missingReason') ?? text('missing_reason'),
+    qualityNotes: flags,
+  };
+};
+
 const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | null => {
   const code = String(item.code || item.stock_code || item.symbol || '').trim();
   if (!code) return null;
@@ -1228,6 +1402,7 @@ const normalizeCandidate = (item: Record<string, unknown>): DisplayCandidate | n
     desks: toStringList(item.desks),
     multiDeskConviction: Boolean(item.multi_desk_conviction),
     conflictFlags: toStringList(item.conflict_flags),
+    sectorFlow: normalizeSectorFlow(item.sector_flow),
   };
 };
 
@@ -1256,6 +1431,7 @@ const mergeDisplayCandidates = (groups: DisplayCandidate[][]): DisplayCandidate[
     current.latestDate = current.latestDate || candidate.latestDate;
     current.metrics = { ...candidate.metrics, ...current.metrics };
     current.lifecycleStatus = current.lifecycleStatus || candidate.lifecycleStatus;
+    current.sectorFlow = current.sectorFlow ?? candidate.sectorFlow;
     current.consensusBonus = Math.max(current.consensusBonus ?? 0, candidate.consensusBonus ?? 0) || current.consensusBonus || candidate.consensusBonus;
     current.mixedEvidence = current.mixedEvidence || candidate.mixedEvidence;
     current.reasonDimensions = [...current.reasonDimensions];
@@ -1732,6 +1908,69 @@ const candidateMetricHighlights = (candidate: DisplayCandidate): string[] => (
   [...fundamentalMetricBadges(candidate), ...technicalMetricBadges(candidate)].slice(0, 10)
 );
 
+const SECTOR_FLOW_STATE_LABELS: Record<string, string> = {
+  persistent_inflow: '持续流入',
+  net_inflow: '净流入',
+  neutral: '中性',
+  outflow: '流出',
+  unknown: '未知',
+};
+
+const SECTOR_FLOW_MISSING_LABELS: Record<string, string> = {
+  no_bk_code: '无行业板块代码',
+  unmapped_industry: '行业板块未映射',
+  insufficient_history: '板块资金流历史不足 2 天',
+  provider_failed: '板块资金流数据源失败',
+  date_mismatch: '板块快照日期不匹配',
+};
+
+const formatSectorAmountYi = (value: number): string => `${(value / 100000000).toFixed(2)}亿`;
+
+const sectorFlowHighlights = (sectorFlow?: SectorFlowDisplay): string[] => {
+  if (!sectorFlow || sectorFlow.status === 'missing') return [];
+  const items: string[] = [];
+  if (typeof sectorFlow.netInflowSum === 'number') items.push(`板块5日净流入 ${formatSectorAmountYi(sectorFlow.netInflowSum)}`);
+  if (typeof sectorFlow.positiveInflowDays === 'number') {
+    items.push(`正流入 ${sectorFlow.positiveInflowDays}/${sectorFlow.windowDays ?? 5} 天`);
+  }
+  if (typeof sectorFlow.inflowAcceleration === 'number') {
+    items.push(`加速度 ${formatSectorAmountYi(sectorFlow.inflowAcceleration)}`);
+  }
+  if (typeof sectorFlow.sectorReturnWindow === 'number') {
+    items.push(`板块5日涨幅 ${sectorFlow.sectorReturnWindow.toFixed(2)}%`);
+  }
+  if (typeof sectorFlow.overheatPenalty === 'number' && sectorFlow.overheatPenalty > 0) {
+    items.push(`过热惩罚 -${sectorFlow.overheatPenalty.toFixed(2)}`);
+  }
+  if (sectorFlow.asOfDate) items.push(`板块数据 ${sectorFlow.asOfDate}`);
+  return items.slice(0, 4);
+};
+
+const sectorFlowBadge = (sectorFlow?: SectorFlowDisplay): { label: string; tone: CandidateDecisionTone } | null => {
+  if (!sectorFlow) return null;
+  if (sectorFlow.status === 'missing') {
+    return { label: '板块资金流:数据不足', tone: 'warning' };
+  }
+  const stateLabel = SECTOR_FLOW_STATE_LABELS[sectorFlow.state || 'unknown'] || '未知';
+  const partial = sectorFlow.scorePartial || sectorFlow.status === 'partial';
+  return {
+    label: `板块:${stateLabel}${partial ? '(部分)' : ''}`,
+    tone: sectorFlow.state === 'outflow' ? 'warning' : 'info',
+  };
+};
+
+const sectorFlowRiskFlags = (sectorFlow?: SectorFlowDisplay): string[] => {
+  if (!sectorFlow) return [];
+  const flags: string[] = [];
+  if (sectorFlow.status === 'missing') {
+    const reason = sectorFlow.missingReason || '';
+    flags.push(`板块资金流数据不足：${SECTOR_FLOW_MISSING_LABELS[reason] || reason || '未知原因'}`);
+  } else if (sectorFlow.scorePartial || sectorFlow.status === 'partial') {
+    flags.push(`板块资金流仅 ${sectorFlow.sampleDays ?? 0}/${sectorFlow.windowDays ?? 5} 天，分数按可用天数重归一`);
+  }
+  return flags;
+};
+
 const candidateDecisionRank = (actionKey: string): number => {
   if (['buy', 'open', 'add', 'conditional_buy', 'deep_dive'].includes(actionKey)) return 0;
   if (['monitor', 'wait'].includes(actionKey)) return 1;
@@ -1766,6 +2005,7 @@ const toTraceCandidateDecisionRows = (
       const scoreNote = screeningScore != null
         ? 'candidate_screening 阶段的取证分；seed pool 召回分只保留为来源诊断。'
         : undefined;
+      const sectorBadge = sectorFlowBadge(candidate.sectorFlow);
       const evidence = [
         ...(screening ? [{
           label: `初筛：${displayCandidateAction(String(screening.screening_result || action.key)).label}`,
@@ -1777,6 +2017,13 @@ const toTraceCandidateDecisionRows = (
           detail: displayReasonText(entry.detail),
           tone: candidateEvidenceTone(entry.dimension),
         })),
+        ...(candidate.sectorFlow ? [{
+          label: '板块资金流（仅观察，不构成建议）',
+          detail: candidate.sectorFlow.status === 'missing'
+            ? `数据不足：${SECTOR_FLOW_MISSING_LABELS[candidate.sectorFlow.missingReason || ''] || candidate.sectorFlow.missingReason || '未知原因'}`
+            : `${candidate.sectorFlow.bkName || candidate.sectorFlow.industryKey || '板块'} ${SECTOR_FLOW_STATE_LABELS[candidate.sectorFlow.state || 'unknown'] || '未知'}（${candidate.sectorFlow.asOfDate || '日期未知'}）`,
+          tone: 'default' as CandidateDecisionTone,
+        }] : []),
       ];
       return {
         id: candidate.code,
@@ -1804,11 +2051,13 @@ const toTraceCandidateDecisionRows = (
             : []),
           ...(candidate.consensusBonus != null && candidate.consensusBonus > 0 ? [{ label: `共振 +${formatMetricValue(candidate.consensusBonus)}`, tone: 'success' as CandidateDecisionTone }] : []),
           ...(candidate.mixedEvidence ? [{ label: '存在反证', tone: 'warning' as CandidateDecisionTone }] : []),
+          ...(sectorBadge ? [sectorBadge] : []),
         ],
         evidence,
-        metricHighlights: candidateMetricHighlights(candidate),
+        metricHighlights: [...sectorFlowHighlights(candidate.sectorFlow), ...candidateMetricHighlights(candidate)].slice(0, 10),
         riskFlags: [
           ...(candidate.mixedEvidence ? ['存在反证，需要后续取证确认'] : []),
+          ...sectorFlowRiskFlags(candidate.sectorFlow),
           ...candidate.reasonDimensions
             .filter((entry) => entry.detail.includes('超买') || entry.detail.includes('追高') || entry.dimension === 'fallback')
             .map((entry) => displayReasonText(entry.detail)),
@@ -2125,8 +2374,23 @@ const AgentTracePage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    document.title = 'Agent Trace';
+    document.title = 'Agent 追踪';
     setHistoryItems(loadTraceHistory());
+    let alive = true;
+    agentApi.listTraceSessions(TRACE_HISTORY_LIMIT)
+      .then((response) => {
+        if (!alive) return;
+        const serverItems = Array.isArray(response?.sessions) ? response.sessions : [];
+        setHistoryItems((items) => {
+          const merged = mergeTraceHistory(items, serverItems);
+          saveTraceHistory(merged);
+          return merged;
+        });
+      })
+      .catch(() => {
+        // Server history is a recovery path; keep the local index if it is unavailable.
+      });
+    return () => { alive = false; };
   }, []);
 
   useEffect(() => {
@@ -2662,7 +2926,7 @@ const AgentTracePage: React.FC = () => {
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-semibold text-foreground">Agent Trace</h1>
+                <h1 className="text-lg font-semibold text-foreground">Agent 追踪</h1>
                 {result && resolvedRoute ? (
                   <span className={cn(
                     'rounded border px-2 py-0.5 text-[10px] font-medium',
@@ -2944,7 +3208,7 @@ const AgentTracePage: React.FC = () => {
             <TraceStepNav steps={navSteps} activeKey={activeStep} onSelect={setActiveStep} />
             <section className="min-w-0 rounded-xl border border-border bg-card px-4 py-4 shadow-sm">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-2">
-                <span className="text-[10px] uppercase tracking-[0.14em] text-muted-text">Trace Detail</span>
+                <span className="text-[10px] uppercase tracking-[0.14em] text-muted-text">追踪详情</span>
                 <span className="truncate font-mono text-[10px] text-muted-text">{activeStep}</span>
               </div>
               {traceSteps.map((step) => (
@@ -3603,7 +3867,7 @@ const L1Detail: React.FC<{
               return (
                 <span key={key} className="flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-label">
                   <span className={cn('h-1.5 w-1.5 rounded-full', status === 'ok' ? 'bg-success' : status === 'partial' ? 'bg-warning/100' : 'bg-muted-text')} />
-                  <span className="text-secondary-text">{key.replace(/_/g, ' ')}</span>
+                  <span className="text-secondary-text">{displayStageName(key)}</span>
                 </span>
               );
             })}
@@ -3617,7 +3881,7 @@ const L1Detail: React.FC<{
           <div className="flex flex-wrap gap-1.5">
             {result.tool_calls.filter((t) => t.tool.startsWith('get_') || t.tool.includes('quote')).map((t, i) => (
               <span key={`${t.tool}-${i}`} className={cn('rounded-md px-2 py-0.5 text-label', t.success ? 'bg-surface-2 text-secondary-text' : 'bg-danger/10 text-danger')}>
-                {t.tool}
+                {displayToolName(t.tool)}
               </span>
             ))}
           </div>
@@ -3690,7 +3954,9 @@ const L2Detail: React.FC<{
   onSelect: (i: number) => void;
   selectedTool: AgentTraceToolCall | null;
 }> = ({ toolCalls, selectedIndex, onSelect, selectedTool }) => {
-  const preview = selectedTool?.result_preview ? truncateText(String(selectedTool.result_preview), TOOL_PREVIEW_RENDER_CHARS) : '';
+  const preview = selectedTool?.result_preview
+    ? localizeMarketRegimeEnums(truncateText(String(selectedTool.result_preview), TOOL_PREVIEW_RENDER_CHARS))
+    : '';
   return (
     <div className="space-y-3">
       {/* Tool list */}
@@ -3706,7 +3972,7 @@ const L2Detail: React.FC<{
             )}
           >
             <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', call.success ? 'bg-success' : 'bg-danger')} />
-            <span className="min-w-0 flex-1 truncate font-medium text-foreground">{String(call.tool || '-')}</span>
+            <span className="min-w-0 flex-1 truncate font-medium text-foreground">{displayToolName(String(call.tool || '-'))}</span>
             <span className="shrink-0 font-mono text-muted-text">{formatDuration(call.duration)}</span>
           </button>
         )) : (
@@ -3718,11 +3984,11 @@ const L2Detail: React.FC<{
         <div className="rounded-lg border border-border p-4">
           <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
             <Wrench className="h-3.5 w-3.5 shrink-0 text-muted-text" />
-            <span className="min-w-0 break-all font-medium text-foreground">{String(selectedTool.tool || '-')}</span>
+            <span className="min-w-0 break-all font-medium text-foreground">{displayToolName(String(selectedTool.tool || '-'))}</span>
             <span className={cn('rounded-full px-2 py-0.5 text-xxs font-medium', selectedTool.success ? 'bg-success/10 text-success' : 'bg-danger/10 text-danger')}>
-              {selectedTool.success ? 'OK' : 'FAIL'}
+              {selectedTool.success ? '成功' : '失败'}
             </span>
-            <span className="ml-auto whitespace-nowrap font-mono text-muted-text">step {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
+            <span className="ml-auto whitespace-nowrap font-mono text-muted-text">步骤 {String(selectedTool.step ?? '-')} · {formatDuration(selectedTool.duration)}</span>
           </div>
           <JsonViewer data={(selectedTool.arguments || {}) as Record<string, unknown>} maxHeight="160px" />
           {preview ? (
@@ -3794,7 +4060,7 @@ const L3Detail: React.FC<{ result: AgentTraceRunResponse; debate: Record<string,
         <div className="mt-3 flex flex-wrap gap-1.5 text-[10px] text-muted-text">
           <span className="rounded border border-border/60 px-1.5 py-0.5">工具 {result.tool_calls.length} 次</span>
           <span className="rounded border border-border/60 px-1.5 py-0.5">失败 {failedTools} 次</span>
-          <span className="rounded border border-border/60 px-1.5 py-0.5">动作 {finalAction}</span>
+          <span className="rounded border border-border/60 px-1.5 py-0.5">动作 {traceActionLabel(finalAction)}</span>
         </div>
       </div>
     );
@@ -3895,7 +4161,7 @@ const L4Detail: React.FC<{ debate: Record<string, unknown> | null; planner: Reco
       {/* Planner intent */}
       {planner ? (
         <div className="rounded-lg bg-surface-2 p-3">
-          <p className="text-label font-medium uppercase tracking-wider text-muted-text">Planner</p>
+          <p className="text-label font-medium uppercase tracking-wider text-muted-text">规划器</p>
           <p className="mt-1 text-xs text-foreground">
             意图: {String(planner.intent || '-')} · 目标: {String(planner.primary_symbol || '-')} · {planner.has_position ? '持仓命中' : '未命中持仓'}
           </p>
@@ -4232,10 +4498,13 @@ const CompositeScoreDetail: React.FC<{ compositeVerdict: Record<string, unknown>
 const TRACE_ACTION_LABELS: Record<string, string> = {
   wait: '等待',
   monitor: '观察',
+  watch: '观察',
+  open: '开仓',
   buy: '买入',
   add: '加仓',
   hold: '持有',
   reduce: '减仓',
+  close: '清仓',
   sell: '卖出',
   reject: '回避',
   avoid: '回避',
@@ -4251,7 +4520,7 @@ const TRACE_RULE_LABELS: Record<string, string> = {
 
 const traceActionLabel = (value: unknown): string => {
   const raw = String(value || '-');
-  return TRACE_ACTION_LABELS[raw] ? TRACE_ACTION_LABELS[raw] + ' · ' + raw : raw;
+  return TRACE_ACTION_LABELS[raw] || raw;
 };
 
 const L5Detail: React.FC<{ riskPayload: Record<string, unknown> | null }> = ({ riskPayload }) => {
@@ -4413,7 +4682,7 @@ const ObservabilityDetail: React.FC<{
           <p className="mt-1 text-lg font-semibold text-foreground">{formatCount(llmTelemetry?.total_calls)}</p>
         </div>
         <div className="rounded-lg bg-surface-2 p-3">
-          <p className="text-xxs uppercase tracking-wider text-muted-text">Token</p>
+          <p className="text-xxs uppercase tracking-wider text-muted-text">Token 用量</p>
           <p className="mt-1 text-lg font-semibold text-foreground">{formatCount(llmTelemetry?.total_tokens)}</p>
         </div>
         <div className="rounded-lg bg-surface-2 p-3">
@@ -4432,7 +4701,7 @@ const ObservabilityDetail: React.FC<{
           <div className="space-y-2">
             {stages.map((stage, index) => (
               <div key={`${String(stage.stage || 'stage')}-${index}`} className="grid gap-2 rounded-md bg-surface-2 px-3 py-2 text-xs sm:grid-cols-[1fr_auto_auto_auto] sm:items-center">
-                <span className="min-w-0 truncate font-medium text-foreground">{String(stage.stage || 'unknown')}</span>
+                <span className="min-w-0 truncate font-medium text-foreground">{displayStageName(String(stage.stage || 'unknown'))}</span>
                 <span className="text-secondary-text">调用 {formatCount(stage.calls)}</span>
                 <span className="text-secondary-text">Token {formatCount(stage.total_tokens)}</span>
                 <span className={cn('text-secondary-text', toFiniteNumber(stage.failed_calls) ? 'text-danger' : '')}>
@@ -4449,8 +4718,8 @@ const ObservabilityDetail: React.FC<{
       {judgeSanity ? (
         <div className="rounded-lg border border-border p-4">
           <div className="mb-3 flex flex-wrap items-center gap-2">
-            <p className="text-label font-semibold uppercase tracking-wider text-muted-text">Judge Sanity</p>
-            <span className="rounded-full bg-surface-2 px-2.5 py-0.5 text-xxs text-secondary-text">动作 {finalAction}</span>
+            <p className="text-label font-semibold uppercase tracking-wider text-muted-text">裁决合理性</p>
+            <span className="rounded-full bg-surface-2 px-2.5 py-0.5 text-xxs text-secondary-text">动作 {traceActionLabel(finalAction)}</span>
             <span className={cn(
               'rounded-full px-2.5 py-0.5 text-xxs font-medium',
               primaryPlanVerdict === 'accepted' && 'bg-success/10 text-success',
@@ -4524,14 +4793,14 @@ function buildL1Narrative(result: AgentTraceRunResponse, stockSelection: Record<
 
 function buildL4Narrative(debate: Record<string, unknown> | null, planner: Record<string, unknown> | null): string {
   if (debate?.enabled === true && debate?.success === false) {
-    return `Debate 失败，未形成有效裁决：${String(debate.error || '结构化输出不完整')}`;
+    return `辩论失败，未形成有效裁决：${String(debate.error || '结构化输出不完整')}`;
   }
   const judge = asRecord(debate?.judge_decision);
   if (judge?.final_action) {
-    return `Judge 裁决：${String(judge.final_action)}。${String(judge.decision_summary || '')}`;
+    return `裁决：${traceActionLabel(judge.final_action)}。${String(judge.decision_summary || '')}`;
   }
   if (planner?.intent) {
-    return `Planner 已识别意图为「${String(planner.intent)}」，等待 Debate 完成裁决。`;
+    return `规划器已识别意图为「${String(planner.intent)}」，等待辩论完成裁决。`;
   }
   return '等待决策层生成裁决。';
 }

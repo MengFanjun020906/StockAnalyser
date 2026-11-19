@@ -431,7 +431,7 @@ def _regime_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
     delta = 0
     if regime in {"risk_off", "panic"} or risk in {"high", "extreme", "critical"}:
         delta -= 12
-    elif regime in {"trending_up", "risk_on"}:
+    elif regime in {"trending_up", "bull_volatile", "risk_on"}:
         delta += 6
     return [_signal("market_regime", regime, None, delta, f"市场状态 {regime}，风险等级 {risk}。")]
 

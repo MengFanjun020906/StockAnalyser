@@ -4,8 +4,10 @@
 
 ## 常用入口
 
+- [As-built 架构说明（单一入口）](architecture/as-built-architecture.md)：按代码现状描述整体链路、模块边界、关键契约、失败降级矩阵与已知缺口。
 - [仓库布局与命名规范](architecture/repository-layout.md)：顶层目录职责、`vendor/` 第三方仓库规则和命名约定。
 - [完整指南](full-guide.md)：安装、配置、运行、WebUI、数据源和排障。
+- [macOS launchd 常驻调度](deployment/launchd-schedule.md)：用用户级 LaunchAgent 常驻 `main.py --schedule`，覆盖工作日 15:30–16:00 影子采集窗口；含安装、停止、卸载、查日志与轮转。
 - [LLM 配置指南](LLM_CONFIG_GUIDE.md)：模型渠道、OpenAI-compatible 路由和常见问题。
 - [FAQ](FAQ.md)：常见使用问题。
 - [openInvest 原理实际接入点索引](integrations/openinvest-principles-integration-map.md)：说明 Regime、新闻、多席位、辩论、Judge sanity、telemetry 和复盘在后端链路中的真实落点。

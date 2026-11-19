@@ -16,6 +16,8 @@ from src.services.agent_entry_minute_data_service import AgentEntryMinuteDataSer
 from src.services.agent_entry_execution_backtest_service import (
     AgentEntryExecutionBacktestService,
     _attach_signal_validity,
+    _build_trade_plan,
+    _infer_entry_rule,
     _simulate_next_open,
     _simulate_strict,
 )
@@ -177,7 +179,7 @@ def test_entry_execution_backtest_builds_final_report_trades_from_stock_daily():
         )
         with db.get_session() as session:
             session.add(StockDaily(code="600001", date=date(2024, 1, 1), close=10.5, open=10.5, high=10.6, low=10.4))
-            session.add(StockDaily(code="600001", date=date(2024, 1, 2), close=10.4, open=10.4, high=10.5, low=10.1))
+            session.add(StockDaily(code="600001", date=date(2024, 1, 2), close=10.4, open=10.4, high=10.5, low=10.0))
             session.add(StockDaily(code="600001", date=date(2024, 1, 3), close=11.3, open=10.6, high=11.3, low=10.5))
             session.add(StockDaily(code="600002", date=date(2024, 1, 1), close=21.0, open=21.0, high=21.1, low=20.9))
             session.add(StockDaily(code="600002", date=date(2024, 1, 2), close=21.5, open=21.3, high=21.6, low=21.2))
@@ -226,7 +228,7 @@ def test_entry_execution_backtest_prefers_cached_minute_bars():
                     bar_time="09:35:00",
                     open=10.4,
                     high=10.3,
-                    low=10.1,
+                    low=10.0,
                     close=10.2,
                     volume=1000,
                     amount=10200,
@@ -666,3 +668,107 @@ def test_entry_execution_backtest_query_and_api_rebuild():
                 assert list_response.json()["exists"] is True
 
         DatabaseManager.reset_instance()
+
+
+def test_strict_entry_fills_at_entry_zone_low_not_high():
+    bars = [
+        {"date": "2026-07-02", "open": 10.4, "high": 10.5, "low": 10.0, "close": 10.4},
+        {"date": "2026-07-03", "open": 10.4, "high": 10.5, "low": 10.3, "close": 10.4},
+    ]
+    result = _simulate_strict(
+        strategy_name="strict_ai_entry",
+        start_price=10.5,
+        forward_bars=bars,
+        trade_plan={
+            "entry_expiry_days": 2,
+            "entry_zone_low": 10.0,
+            "entry_zone_high": 10.2,
+            "stop_loss_price": 9.5,
+            "take_profit_price": 12.0,
+        },
+    )
+
+    assert result["status"] == "filled"
+    assert result["entry_price"] == 10.0
+
+
+def test_strict_entry_gap_down_fills_at_open_below_limit():
+    bars = [
+        {"date": "2026-07-02", "open": 9.6, "high": 9.8, "low": 9.4, "close": 9.7},
+        {"date": "2026-07-03", "open": 9.7, "high": 9.9, "low": 9.6, "close": 9.8},
+    ]
+    result = _simulate_strict(
+        strategy_name="strict_ai_entry",
+        start_price=10.2,
+        forward_bars=bars,
+        trade_plan={
+            "entry_expiry_days": 2,
+            "entry_zone_low": 10.0,
+            "entry_zone_high": 10.2,
+            "stop_loss_price": 9.0,
+            "take_profit_price": 12.0,
+        },
+    )
+
+    assert result["status"] == "filled"
+    assert result["entry_price"] == 9.6
+
+
+def test_entry_rule_maps_conditional_open_honestly():
+    assert _infer_entry_rule({"execution_mode": "immediate_open"}, {}) == "immediate"
+    assert _infer_entry_rule({"execution_mode": "conditional_open"}, {}) == "conditional"
+    assert _infer_entry_rule({"execution_mode": "plain_wait"}, {}) == "unknown"
+
+
+def test_build_trade_plan_prefers_numeric_guarded_fields(tmp_path):
+    plan = {
+        "entry_condition": "回踩 10.0-10.5 企稳",
+        "stop_loss_condition": "跌破 9.0",
+        "entry_zone_low": 11.0,
+        "entry_zone_high": 12.0,
+        "stop_loss_price": 10.0,
+        "entry_expiry_days": 2,
+        "trade_plan_adjustments": [{"rule": "entry_zone_min_width"}],
+    }
+
+    result = _build_trade_plan(
+        trace_dir=tmp_path,
+        decision_date=date(2026, 7, 1),
+        symbol="600001",
+        name="测试",
+        rank=1,
+        plan=plan,
+        pricing={},
+    )
+
+    assert result["entry_zone_low"] == 11.0
+    assert result["entry_zone_high"] == 12.0
+    assert result["stop_loss_price"] == 10.0
+    assert result["trade_plan_adjustments"] == [{"rule": "entry_zone_min_width"}]
+
+
+def test_build_trade_plan_marks_rejected_plan_failed(tmp_path):
+    plan = {
+        "entry_condition": "回踩 10.0-10.5 企稳",
+        "stop_loss_condition": "跌破 10.4",
+        "entry_zone_low": 10.0,
+        "entry_zone_high": 10.5,
+        "stop_loss_price": 10.4,
+        "entry_expiry_days": 2,
+        "trade_plan_rejected": True,
+        "trade_plan_reject_reason": "stop_loss_above_entry_zone",
+    }
+
+    result = _build_trade_plan(
+        trace_dir=tmp_path,
+        decision_date=date(2026, 7, 1),
+        symbol="600001",
+        name="测试",
+        rank=1,
+        plan=plan,
+        pricing={},
+    )
+
+    assert result["parse_status"] == "failed"
+    assert "trade_plan_rejected" in result["parse_warnings"]
+    assert "stop_loss_above_entry_zone" in result["parse_warnings"]

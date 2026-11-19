@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,8 @@ from src.agent.orchestrator import AgentOrchestrator
 from src.agent import stock_selection as stock_selection_module
 from src.agent.stock_selection import (
     SelectionRunContext,
+    SelectionStage,
+    _apply_trade_plan_validation,
     _candidate_has_desk_tag,
     _compact_candidate_seed,
     _compact_tool_result_for_trace,
@@ -1536,6 +1539,60 @@ def test_stock_selection_recommendation_section_always_shows_deep_dived_candidat
     assert "### 👀 强观察 4：688266 泽璟制药-U（候选分 100）" in recommendation_section
 
 
+def test_recall_score_cannot_promote_to_conditional_entry_but_screening_score_can():
+    """入池召回分不得升级为条件入场；只有初筛质量分可以驱动条件入场。"""
+
+    def _report(screening_score=None):
+        screening_full = {}
+        if screening_score is not None:
+            screening_full = {"shortlist": [{"code": "688266", "score": screening_score}]}
+        return {
+            "candidate_discovery": {
+                "summary": {"source_count": 1},
+                "full": {
+                    "candidates": [
+                        {"code": "688266", "name": "泽璟制药-U", "source": "alphasift", "signal_score": 96}
+                    ]
+                },
+            },
+            "candidate_screening": {"summary": {}, "full": screening_full},
+            "single_stock_deep_dive": {
+                "summary": {},
+                "full": {
+                    "results": [
+                        {
+                            "summary": {
+                                "code": "688266",
+                                "name": "泽璟制药-U",
+                                "action_bias": "wait",
+                                "action_strength": "medium",
+                                "ideal_entry_zone": "回踩 5 日线不破",
+                                "stop_loss": "跌破前一日低点",
+                            },
+                            "full": {
+                                "stock": {"code": "688266", "name": "泽璟制药-U"},
+                                "failure_conditions": ["跌破前一日低点"],
+                                "missing_evidence": [],
+                            },
+                        }
+                    ]
+                },
+            },
+            "portfolio_allocation": {"summary": {"portfolio_action": "wait"}, "full": {"positions_plan": []}},
+            "adversarial_review": {"summary": {}, "full": {}},
+            "judge_decision": {"summary": {"primary_plan_verdict": "accept", "final_action": "wait"}, "full": {}},
+        }
+
+    # 仅召回分 96：只能进入“强观察”，不得变成条件入场。
+    recall_only = render_stock_selection_markdown(_report())
+    assert "### 👀 强观察 1：688266 泽璟制药-U（候选分 96）" in recall_only
+    assert "### ⚡ 条件入场" not in recall_only
+
+    # 初筛质量分 90（达到 conditional_entry 门槛）：允许条件入场。
+    with_quality = render_stock_selection_markdown(_report(screening_score=90))
+    assert "### ⚡ 条件入场 1：688266 泽璟制药-U（候选分 96）" in with_quality
+
+
 def test_stock_selection_wait_with_conditions_renders_conditional_entry():
     report = {
         "candidate_discovery": {
@@ -3030,3 +3087,194 @@ def test_stock_selection_pipeline_exits_when_candidate_mode_is_not_thesis_desk()
     assert discovery["full"]["required_candidate_discovery_mode"] == "thesis_desk_committee"
     assert result.tool_calls_log == []
     adapter.call_text.assert_not_called()
+
+
+def test_market_regime_constraints_allow_bull_volatile_open_with_higher_cap():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(market_regime={
+        "regime": "bull_volatile",
+        "risk_level": "medium",
+        "volatility_bucket": "extreme",
+        "trend_direction": "up",
+    })
+    payload = {
+        "summary": {},
+        "full": {
+            "positions_plan": [{
+                "code": "600001",
+                "action": "open",
+                "initial_position_pct": 20.0,
+                "initial_amount": 20000.0,
+            }],
+            "risk_controls": [],
+        },
+    }
+
+    result = stock_selection_module._apply_market_regime_constraints(ctx, payload)
+    plan = result["full"]["positions_plan"][0]
+
+    assert plan["action"] == "open"
+    assert plan["initial_position_pct"] == 15.0
+    assert plan["initial_amount"] == 15000.0
+
+
+def test_market_regime_constraints_cap_uptrend_without_breadth():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(market_regime={
+        "regime": "bull_volatile",
+        "risk_level": "medium",
+        "volatility_bucket": "extreme",
+        "trend_direction": "up",
+        "breadth_confirmed": False,
+    })
+    payload = {
+        "summary": {},
+        "full": {
+            "positions_plan": [{
+                "code": "600001",
+                "action": "open",
+                "initial_position_pct": 20.0,
+                "initial_amount": 20000.0,
+            }],
+            "risk_controls": [],
+        },
+    }
+
+    result = stock_selection_module._apply_market_regime_constraints(ctx, payload)
+    plan = result["full"]["positions_plan"][0]
+
+    assert plan["action"] == "open"
+    assert plan["initial_position_pct"] == 5.0
+    assert plan["initial_amount"] == 5000.0
+    assert "降低主动开仓" in plan["reason"]
+
+
+def test_market_regime_constraints_keep_five_percent_cap_without_uptrend():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(market_regime={
+        "regime": "high_volatility",
+        "risk_level": "medium_high",
+        "volatility_bucket": "high_vol",
+        "trend_direction": "flat",
+    })
+    payload = {
+        "summary": {},
+        "full": {
+            "positions_plan": [{
+                "code": "600001",
+                "action": "open",
+                "initial_position_pct": 20.0,
+                "initial_amount": 20000.0,
+            }],
+            "risk_controls": [],
+        },
+    }
+
+    result = stock_selection_module._apply_market_regime_constraints(ctx, payload)
+    plan = result["full"]["positions_plan"][0]
+
+    assert plan["action"] == "open"
+    assert plan["initial_position_pct"] == 5.0
+    assert plan["initial_amount"] == 5000.0
+
+
+def test_apply_trade_plan_validation_keeps_points_and_records_status(monkeypatch):
+    ctx = SelectionRunContext(run_id="validator", user_message="")
+    ctx.stages["pricing_agent"] = SelectionStage(
+        status="ok",
+        full={
+            "if_then_order_matrix": [
+                {
+                    "code": "600519",
+                    "scenarios": [
+                        {
+                            "action": "conditional_open",
+                            "execution_mode": "conditional_open",
+                            "entry_zone": "回踩 65.5",
+                            "stop_loss": "跌破 65.5",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    ctx.stages["portfolio_allocation"] = SelectionStage(
+        status="ok",
+        full={
+            "positions_plan": [
+                {
+                    "code": "600519",
+                    "action": "conditional_open",
+                    "execution_mode": "conditional_open",
+                    "entry_condition": "回踩 65.5",
+                    "stop_loss_condition": "跌破 63.0",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(stock_selection_module, "_load_atr20_by_code", lambda codes: {})
+
+    before_pricing = deepcopy(ctx.stages["pricing_agent"].full)
+    before_allocation = deepcopy(ctx.stages["portfolio_allocation"].full)
+
+    _apply_trade_plan_validation(ctx)
+
+    assert ctx.stages["pricing_agent"].full["if_then_order_matrix"] == before_pricing["if_then_order_matrix"]
+    assert ctx.stages["portfolio_allocation"].full["positions_plan"] == before_allocation["positions_plan"]
+
+    scenario = ctx.stages["pricing_agent"].full["if_then_order_matrix"][0]["scenarios"][0]
+    assert scenario["entry_zone"] == "回踩 65.5"
+    assert scenario["stop_loss"] == "跌破 65.5"
+    assert "entry_zone_low" not in scenario
+    assert "stop_loss_price" not in scenario
+
+    pricing_validation = ctx.stages["pricing_agent"].full["trade_plan_validation"]
+    assert pricing_validation["advisory_only"] is True
+    assert pricing_validation["checked"] == 1
+    assert pricing_validation["invalid"] == 1
+    assert pricing_validation["results"][0]["status"] == "invalid"
+    assert pricing_validation["results"][0]["blocked"] is True
+    assert pricing_validation["results"][0]["suggestions"]["stop_loss"] < 65.5
+
+    allocation_validation = ctx.stages["portfolio_allocation"].full["trade_plan_validation"]
+    assert allocation_validation["ok"] == 1
+    assert allocation_validation["results"] == []
+
+
+def test_apply_trade_plan_validation_rejects_inverted_stop_without_downgrade(monkeypatch):
+    ctx = SelectionRunContext(run_id="validator-reject", user_message="")
+    ctx.stages["portfolio_allocation"] = SelectionStage(
+        status="ok",
+        full={
+            "positions_plan": [
+                {
+                    "code": "600519",
+                    "action": "conditional_open",
+                    "execution_mode": "conditional_open",
+                    "entry_condition": "回踩 65.5-67.5",
+                    "stop_loss_condition": "跌破 70.0",
+                    "initial_position_pct": 15.0,
+                    "initial_amount": 15000.0,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(stock_selection_module, "_load_atr20_by_code", lambda codes: {})
+
+    _apply_trade_plan_validation(ctx)
+
+    position = ctx.stages["portfolio_allocation"].full["positions_plan"][0]
+    assert "trade_plan_rejected" not in position
+    assert "trade_plan_reject_reason" not in position
+    assert position["action"] == "conditional_open"
+    assert position["initial_position_pct"] == 15.0
+    assert position["initial_amount"] == 15000.0
+
+    validation = ctx.stages["portfolio_allocation"].full["trade_plan_validation"]
+    result = validation["results"][0]
+    assert result["status"] == "invalid"
+    assert result["blocked"] is True
+    assert result["issues"][0]["code"] == "stop_loss_above_entry_zone"

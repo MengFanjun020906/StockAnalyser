@@ -182,8 +182,8 @@ def build_candidate_screening_prompt(payload: Dict[str, Any]) -> str:
 - 技术结构 25 分，基本面质量 20 分，板块环境 15 分，消息风险 15 分，账户适配 15 分，数据质量 10 分。
 - 任何硬性淘汰项命中时，screening_result 必须为 reject，分数不得高于 40。
 - 2 个以上核心维度为 missing / tool_failed 时，screening_result 最高只能为 monitor。
-- 如果 market_regime 为 risk_off / panic / extreme volatility，不得只因热点或涨停把候选升为 deep_dive；必须降低趋势突破候选权重。
-- 如果 market_regime 为 trending_up 且 volatility_bucket 为 high_vol / elevated，高波动不是 deep_dive 否决项；强势候选可进入深挖，但必须标注更小首仓和次日承接确认。
+- 如果 market_regime 为 risk_off / panic，或 volatility_bucket 为 extreme 且 regime 不是 trending_up / bull_volatile，不得只因热点或涨停把候选升为 deep_dive；必须降低趋势突破候选权重。
+- 如果 market_regime 为 trending_up / bull_volatile 且 volatility_bucket 为 elevated / high_vol / extreme，高波动不是 deep_dive 否决项；强势候选可进入深挖，但必须标注更小首仓和次日承接确认。
 - `theme_profile.overbought_interpretation` 只能解释超买含义，不能覆盖流动性、重大利空、账户仓位和 Risk Gate；若 `chase_permission` 为 `blocked/strong_watch_only`，screening_result 最高为 monitor。
 
 {JSON_RULES}
@@ -508,7 +508,7 @@ def build_meta_orchestrator_prompt(payload: Dict[str, Any]) -> str:
 1. 禁止输出具体入场点位、止盈点位或“建议买入/卖出”结论。
 2. 允许引用上游已经给出的价格锚点，但只能作为约束来源，不得改写成最终交易点位。
 3. 反对席位的风险不能只写成提醒，必须落入 risk_constraints、invalidation_level、mean_reversion_anchor 或 max_chase_premium。
-4. 如果 market_regime 为 risk_off / panic / trending_down，asset_regime 必须偏防守，且 required_pricing_scenarios 不得鼓励主动追高；如果 market_regime=trending_up 且 volatility_bucket 为 high_vol/elevated，可以保留 Breakout_Continuation，但必须加入更小仓位、承接确认和 Fakeout_Exhaustion 约束。
+4. 如果 market_regime 为 risk_off / panic / trending_down，asset_regime 必须偏防守，且 required_pricing_scenarios 不得鼓励主动追高；如果 market_regime=trending_up / bull_volatile 且 volatility_bucket 为 elevated/high_vol/extreme，可以保留 Breakout_Continuation，但必须加入更小仓位、承接确认和 Fakeout_Exhaustion 约束。
 5. A 股默认不生成做空执行语义；Fakeout_Exhaustion 只能要求点位计算层计算退出/回避/风险提示，除非未来显式支持融券或对冲。
 6. 每只深挖股票都要输出一个 package；没有深挖股票时 status=insufficient_data。
 7. 如果 deep_dive 摘要或候选证据包含 theme_profile，必须原样传递 `theme_regime`、`stock_role`、`momentum_setup`、`overbought_interpretation` 和 `chase_permission` 到 market_context / meta_analysis，并把 `climax_extension/theme_risk_off`、`late_chaser/exhaustion_candidate` 转成 hard_constraints_for_pricing_agent。
@@ -666,8 +666,8 @@ def build_portfolio_allocation_prompt(payload: Dict[str, Any]) -> str:
 6. 每只股票必须给动作、首仓比例或不买原因、入场条件、信号有效期、加仓条件、止损条件、复查触发。
 7. 候选整体质量不足时输出本轮不建仓。
 8. 账户摘要为空或可用现金缺失时，portfolio_action 不得为 open；但如果候选具备强势延续条件、明确触发条件和失效条件，可以输出 action=wait + execution_mode=conditional_open，并将仓位写为“需按账户约束确认”或保守试探区间。
-9. 如果 market_regime 为 risk_off / panic，portfolio_action 必须为 wait 或 reject；如果 volatility_bucket 为 extreme，不得主动开新仓。
-10. 如果 market_regime 为 high_volatility 或 volatility_bucket 为 high_vol / extreme，任何 open/conditional_open 计划首仓必须显著降档，并写入 auto_downgrade_rules；若 regime=trending_up 且 volatility_bucket=high_vol，不得把高波动单独当作 reject 理由。
+9. 如果 market_regime 为 risk_off / panic，portfolio_action 必须为 wait 或 reject；如果 volatility_bucket 为 extreme 且 regime 不是 trending_up / bull_volatile，不得主动开新仓。
+10. 如果 market_regime 为 high_volatility 或 volatility_bucket 为 elevated / high_vol / extreme，任何 open/conditional_open 计划首仓必须显著降档，并写入 auto_downgrade_rules；若 regime 为 trending_up / bull_volatile，不得把高波动单独当作 reject 理由，但仍需降低首仓并等待承接确认。
 11. candidate_discovery 里的 signal_score/final_score 只是“入池召回分”，不得当成买入推荐分，也不得据此决定首选排序。
 12. positions_plan 的 rank 必须按“可执行性”排序：open 且证据完整优先；wait 只有在 execution_mode=conditional_open、动作强度至少 medium、具备明确入场条件和止损/失效条件、且没有强反向证据时才可排在前列；reject/monitor/watch 不得包装成首选。
 13. 如果所有标的都是 plain_wait/reject，summary.core_reason 必须明确写“本轮没有可直接入手标的”，recommended_position_count 必须为 0；如果存在 conditional_open 或 strong_watch，summary.core_reason 必须写“本轮没有无条件买入标的，但存在可按次日条件触发的强候选”。

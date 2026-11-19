@@ -199,6 +199,7 @@ def _make_expert(
     decls=None,
     max_tool_calls: int = 6,
     max_rounds: int = 3,
+    final_output_max_attempts: int = 1,
 ) -> BaseExpert:
     if decls is None:
         decls = [
@@ -213,6 +214,8 @@ def _make_expert(
         system_prompt="You are a test expert.",
         max_llm_rounds=max_rounds,
         max_tool_calls=max_tool_calls,
+        final_output_max_attempts=final_output_max_attempts,
+        final_output_retry_delay_s=0,
     )
 
 
@@ -287,6 +290,7 @@ def test_base_expert_marks_empty_json_output_content(tmp_path, monkeypatch):
     assert pkt.status == "failed"
     assert "final_output_not_json" in pkt.errors
     assert "final_output_empty_content" in pkt.errors
+    assert any(d.get("status") == "tool_decls_missing" for d in pkt.diagnostics)
 
 
 def test_base_desk_expert_runs_and_saves_one_prompt_per_seed(tmp_path, monkeypatch):
@@ -705,6 +709,125 @@ def test_base_expert_extracts_json_object_from_wrapped_final(tmp_path, monkeypat
     pkt = expert.run([SeedItem(code="600000")], use_cache=False)
     assert pkt.status == "partial"
     assert pkt.candidates[0].code == "600000"
+
+
+def _valid_final_text(code: str = "600000") -> str:
+    return json.dumps(
+        {
+            "candidates": [
+                {
+                    "code": code,
+                    "name": code,
+                    "evidence": [{"tool": "get_tushare_moneyflow_ths", "summary": "x"}],
+                }
+            ],
+            "rejected": [],
+            "data_quality": {"status": "partial"},
+        }
+    )
+
+
+def test_base_expert_extracts_json_from_markdown_code_block(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+    fenced = "好的，结果如下：\n```json\n" + _valid_final_text() + "\n```\n以上。" + "}"
+    llm = _ScriptedLLM([LLMTurn(text=fenced)])
+    expert = _make_expert(llm=llm, tool_registry={})
+
+    pkt = expert.run([SeedItem(code="600000")], use_cache=False)
+
+    assert pkt.status == "partial"
+    assert pkt.candidates[0].code == "600000"
+
+
+def test_base_expert_retries_empty_output_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+    llm = _ScriptedLLM(
+        [
+            LLMTurn(text="  \n\t "),
+            LLMTurn(text=_valid_final_text()),
+        ]
+    )
+    expert = _make_expert(llm=llm, tool_registry={}, final_output_max_attempts=3)
+
+    pkt = expert.run([SeedItem(code="600000")], use_cache=False)
+
+    assert pkt.status == "partial"
+    assert pkt.candidates[0].code == "600000"
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["kwargs"]["response_format"] == {"type": "json_object"}
+    recovered = [d for d in pkt.diagnostics if d.get("status") == "final_output_recovered"]
+    assert recovered and recovered[0]["attempts"] == 2
+    assert recovered[0]["expert"] == expert.expert_name
+    assert recovered[0]["code"] == "600000"
+
+
+def test_base_expert_reports_parse_failure_details_after_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+    llm = _ScriptedLLM(
+        [
+            LLMTurn(text="  \n\t ", usage={"completion_tokens": 320}),
+            LLMTurn(text="\n\n"),
+            LLMTurn(text="\n\t"),
+        ]
+    )
+    expert = _make_expert(llm=llm, tool_registry={}, final_output_max_attempts=3)
+
+    pkt = expert.run([SeedItem(code="600000")], use_cache=False)
+
+    assert pkt.status == "failed"
+    assert len(llm.calls) == 3
+    assert "final_output_not_json" in pkt.errors
+    assert "final_output_empty_content" in pkt.errors
+    assert "final_output_failed_after_attempts=3" in pkt.errors
+    diag = [item for item in pkt.diagnostics if item.get("status") == "final_output_not_json"][0]
+    assert diag["error_type"] == "empty_content"
+    assert diag["expert"] == expert.expert_name
+    assert diag["code"] == "600000"
+    assert diag["attempts"] == 3
+    assert diag["whitespace_only"] is True
+    assert diag["text_chars"] > 0
+    assert diag["text_stripped_chars"] == 0
+    assert "\\n" in diag["raw_snippet"]
+    assert pkt.rejected[0]["code"] == "600000"
+
+
+def test_base_expert_does_not_retry_provider_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+
+    class _RaisingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, messages, tool_decls, **kwargs):  # noqa: D401
+            self.calls += 1
+            raise RuntimeError("429 rate limited")
+
+    llm = _RaisingLLM()
+    expert = _make_expert(llm=llm, tool_registry={}, final_output_max_attempts=3)
+
+    pkt = expert.run([SeedItem(code="600000")], use_cache=False)
+
+    assert pkt.status == "failed"
+    assert llm.calls == 1
+    assert any("llm_call_failed_round_0" in err for err in pkt.errors)
+
+
+def test_base_expert_does_not_salvage_nested_fragment_from_truncated_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CANDIDATE_V2_CACHE_DIR", str(tmp_path))
+    truncated = '{"candidates":[{"code":"600000","name":"浦发银行","reason":"x"}'
+    llm = _ScriptedLLM(
+        [LLMTurn(text=truncated, finish_reason="length", usage={"completion_tokens": 8192})]
+    )
+    expert = _make_expert(llm=llm, tool_registry={})
+
+    pkt = expert.run([SeedItem(code="600000")], use_cache=False)
+
+    assert pkt.status == "failed"
+    assert "final_output_not_json" in pkt.errors
+    assert "final_output_maybe_truncated" in pkt.errors
+    diag = [item for item in pkt.diagnostics if item.get("status") == "final_output_not_json"][0]
+    assert diag["error_type"] == "truncated"
+    assert diag["finish_reason"] == "length"
 
 
 def test_base_expert_tool_call_cap(tmp_path, monkeypatch):

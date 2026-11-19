@@ -44,9 +44,22 @@ function day(value?: string | null): string {
 }
 
 function finite(value: unknown): number | null {
+  // Number(null) === 0 和 Number('') === 0 会把"没有这个价位"画成 0 元止损线。
+  if (value == null || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
+
+function price(value: number): string {
+  return Number(value).toFixed(2);
+}
+
+export type SignalChartRenderOptions = {
+  /** 默认窗口内展示的 K 线根数；窄屏传更小的值，避免 180 根挤成一团。 */
+  visibleBars?: number;
+  /** 窄屏模式：隐藏价格线标签、缩小事件点，减少遮挡。 */
+  compact?: boolean;
+};
 
 function categoryDate(value: string | null | undefined, dates: string[], edge: 'start' | 'end'): string | undefined {
   if (!dates.length) return undefined;
@@ -133,18 +146,10 @@ function entryPlanAreas(
           name,
           xAxis: start,
           yAxis: zone.low,
-          label: {
-            show: true,
-            position: 'insideTopLeft',
-            color: colors[1],
-            fontSize: 10,
-            fontWeight: 700,
-            formatter: name,
-          },
           itemStyle: {
             color: isCurrent ? colors[0] : 'rgba(100, 116, 139, 0.10)',
             borderColor: isCurrent ? colors[1] : '#94a3b8',
-            borderWidth: 2,
+            borderWidth: 1,
             borderType: isCurrent ? 'solid' : 'dashed',
           },
         },
@@ -163,13 +168,15 @@ function deterministicPlanAreas(
   const colors = {
     primary: ['rgba(14, 165, 233, 0.24)', '#0284c7'],
     secondary: ['rgba(13, 148, 136, 0.20)', '#2dd4bf'],
-    observation: ['rgba(100, 116, 139, 0.15)', '#cbd5e1'],
+    observation: ['rgba(100, 116, 139, 0.12)', 'rgba(148, 163, 184, 0.55)'],
   };
   return plan.scenarios.flatMap((scenario) => {
     const start = categoryDate(scenario.validFrom || plan.actualAsOfSession, dates, 'start');
     const end = categoryDate(scenario.confirmationDeadline || dates.at(-1), dates, 'end');
     if (!start || !end || start > end) return [];
     const palette = colors[scenario.role];
+    // 计划窗口完全落在最后一根 K 线之后（新计划常见）时没有可画的时间跨度，
+    // 退化为整幅价格带，标签交给页面上的"价格区间"图例，避免把标签塞进 K 线。
     const fullWidth = start === end;
     const label = labels[scenario.role];
     return [[
@@ -177,19 +184,10 @@ function deterministicPlanAreas(
         name: label,
         ...(fullWidth ? {} : { xAxis: start }),
         yAxis: scenario.entryLow,
-        label: {
-          show: true,
-          position: 'insideTopLeft',
-          color: palette[1],
-          fontSize: 11,
-          fontWeight: 700,
-          formatter: label,
-        },
         itemStyle: {
           color: palette[0],
           borderColor: palette[1],
-          borderWidth: 2,
-          borderType: scenario.role === 'observation' ? 'dashed' : 'solid',
+          borderWidth: 1,
         },
       },
       { ...(fullWidth ? {} : { xAxis: end }), yAxis: scenario.entryHigh },
@@ -257,25 +255,37 @@ function compactTooltipFormatter(params: unknown): string {
   return `<div style="min-width:170px;max-width:240px"><div style="margin-bottom:5px;padding-bottom:4px;border-bottom:1px solid rgba(148,163,184,.25);color:#f8fafc;font-weight:600;line-height:1.2">${escapeTooltipText(dateLabel)}</div>${valueRows.join('')}</div>`;
 }
 
+const EVENT_CHART_LABELS: Record<string, string> = {
+  signal_created: '创建',
+  signal_revised: '修订',
+  target_drift_rejected: '拒绝漂移',
+  signal_checked: '复核',
+  signal_needs_review: '待复核',
+  signal_reactivated: '重新生效',
+  entry_price_triggered: '触价',
+  signal_invalidated: '失效',
+  signal_expired: '到期',
+  signal_ambiguous: '待确认',
+  position_opened: '纳入监控',
+  position_changed: '持仓变化',
+  position_checked: '日检',
+  position_risk_changed: '风险变化',
+  position_closed: '持仓结束',
+  plan_created: '价格计划创建',
+  touched: '进入区间',
+  technical_confirmed: '技术确认',
+  invalidated: '场景失效',
+  expired: '场景到期',
+  ambiguous: '路径不明',
+  superseded: '被替代',
+  closed: '场景结束',
+  center_breakout: '中枢突破',
+  center_breakdown: '中枢下破',
+};
+
 function eventLabel(event: LifecycleEvent): string {
-  const labels: Record<string, string> = {
-    signal_created: '创建',
-    signal_revised: '修订',
-    target_drift_rejected: '拒绝漂移',
-    signal_checked: '复核',
-    signal_needs_review: '待复核',
-    signal_reactivated: '重新生效',
-    entry_price_triggered: '触价',
-    signal_invalidated: '失效',
-    signal_expired: '到期',
-    signal_ambiguous: '待确认',
-    position_opened: '纳入监控',
-    position_changed: '持仓变化',
-    position_checked: '日检',
-    position_risk_changed: '风险变化',
-    position_closed: '持仓结束',
-  };
-  return labels[event.eventType] || event.eventType;
+  // 兜底必须是中文，不能把后端枚举直接漏到图上。
+  return EVENT_CHART_LABELS[event.eventType] || '信号事件';
 }
 
 function penSeries(pens: ChanPen[]) {
@@ -307,7 +317,14 @@ function penSeries(pens: ChanPen[]) {
   });
 }
 
-function chanSignalPoints(signals: ChanSignal[], pens: ChanPen[], dates: string[], fallbackPrice: number) {
+function chanSignalPoints(
+  signals: ChanSignal[],
+  pens: ChanPen[],
+  dates: string[],
+  fallbackPrice: number,
+  compact: boolean,
+) {
+  const seen = new Set<string>();
   return signals.flatMap((signal) => {
     if (signal.triggered === false) return [];
     const metrics = signal.metrics || {};
@@ -317,6 +334,10 @@ function chanSignalPoints(signals: ChanSignal[], pens: ChanPen[], dates: string[
     const pointPrice = finite(pen?.end?.price) ?? fallbackPrice;
     if (!pointDate || pointPrice == null) return [];
     const name = CHAN_SIGNAL_LABELS[signal.name || ''] || signal.name || '结构信号';
+    // 同一根 K 线上多个结构信号只留一个点，细节交给 tooltip。
+    const key = `${name}:${pointDate}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
     const isSell = /sell|divergence|exhaustion|breakdown/.test(signal.name || '') && !/bottom/.test(signal.name || '');
     const isBuy = /buy|bottom|breakout/.test(signal.name || '') && !/top/.test(signal.name || '');
     return [{
@@ -325,15 +346,18 @@ function chanSignalPoints(signals: ChanSignal[], pens: ChanPen[], dates: string[
       value: name,
       symbol: 'triangle',
       symbolRotate: isSell ? 180 : 0,
-      symbolSize: name.length > 3 ? 28 : 24,
+      symbolSize: compact ? 10 : 14,
       itemStyle: { color: isSell ? '#16a34a' : isBuy ? '#dc2626' : '#0ea5e9' },
-      label: { color: '#ffffff', fontSize: 10, fontWeight: 700, formatter: name },
+      label: { show: false },
       tooltip: { formatter: `${name}${signal.timeframe ? ` · ${signal.timeframe}` : ''}` },
     }];
   });
 }
 
-export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echarts.EChartsOption {
+export function buildSignalPreviewChartOption(
+  detail: SignalPreviewDetail,
+  renderOptions: SignalChartRenderOptions = {},
+): echarts.EChartsOption {
   const bars = detail.chart.bars || [];
   const dates = bars.map((bar) => bar.date);
   const entry = subjectEntry(detail);
@@ -341,6 +365,8 @@ export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echa
   const lastClose = finite(bars.at(-1)?.close) ?? 0;
   const centers = detail.chart.structure?.centers || [];
   const structureSignals = detail.chart.structure?.signals || [];
+  const compact = renderOptions.compact ?? false;
+  const visibleBars = Math.max(20, Math.floor(renderOptions.visibleBars ?? 180));
 
   const markAreas: Array<Array<Record<string, unknown>>> = [
     ...entryPlanAreas(entry, detail.events, dates),
@@ -352,51 +378,83 @@ export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echa
     const startDate = center.startDate || dates[center.startIndex ?? -1];
     const endDate = center.endDate || dates[center.endIndex ?? -1];
     if (low == null || high == null || !startDate || !endDate) return;
+    // 只画面 ZG–ZD 的重叠核心区间；GG/DD（含进出段极值）不画，否则整段行情都会被框住。
+    const name = `中枢 ${center.id ?? ''}`.trim();
     markAreas.push([
       {
-        name: `中枢 ${center.id ?? ''}`.trim(),
+        name,
         xAxis: startDate,
         yAxis: low,
-        itemStyle: { color: 'rgba(245, 158, 11, 0.08)', borderColor: 'rgba(245, 158, 11, 0.38)', borderWidth: 1 },
+        // 中枢只画"淡填充 + 明确描边"，文字标签交给页面图例：
+        // markArea 的标签在窄带/密集区域会被挤位或压到 K 线上，反而更乱。
+        itemStyle: { color: 'rgba(245, 158, 11, 0.06)', borderColor: 'rgba(245, 158, 11, 0.75)', borderWidth: 1 },
       },
       { xAxis: endDate, yAxis: high },
     ]);
   });
 
   const markLines: Array<Record<string, unknown>> = [];
-  const stop = finite(entry?.stopPrice ?? watch?.stopPrice);
-  if (stop != null) {
-    markLines.push({ name: '止损', yAxis: stop, lineStyle: { color: '#dc2626', type: 'dashed', width: 1.4 } });
-  }
-  if (watch && finite(watch.averageCost) != null) {
-    markLines.push({ name: '持仓成本', yAxis: watch.averageCost, lineStyle: { color: '#7c3aed', type: 'dashed', width: 1.4 } });
-  }
-  const roleNames = { primary: '主场景', secondary: '次场景', observation: '观察场景' };
-  const roleColors = { primary: '#0284c7', secondary: '#0f766e', observation: '#64748b' };
-  (detail.pricePlan?.scenarios || []).forEach((scenario) => {
-    const prefix = roleNames[scenario.role];
-    const color = roleColors[scenario.role];
-    const planStop = finite(scenario.stopLoss);
-    const target1 = finite(scenario.target1);
-    const target2 = finite(scenario.target2);
-    if (planStop != null) markLines.push({ name: `${prefix}止损`, yAxis: planStop, lineStyle: { color: '#dc2626', type: 'dashed', width: 1.2 } });
-    if (target1 != null) markLines.push({ name: `${prefix}目标一`, yAxis: target1, lineStyle: { color, type: 'dotted', width: 1.2 } });
-    if (target2 != null) markLines.push({ name: `${prefix}目标二`, yAxis: target2, lineStyle: { color, type: 'dashed', width: 1.2 } });
+  const seenLines = new Set<string>();
+  const pushPriceLine = (kind: string, name: string, value: number | null, style: Record<string, unknown>) => {
+    if (value == null) return;
+    // 同一价位只画一条：三个场景的目标价通常完全相同，重复绘制会叠成"虚线墙"。
+    const key = `${kind}:${value}`;
+    if (seenLines.has(key)) return;
+    seenLines.add(key);
+    markLines.push({
+      name: `${name} ${price(value)}`,
+      yAxis: value,
+      lineStyle: style,
+      label: {
+        show: !compact,
+        position: 'insideStartTop',
+        formatter: '{b}',
+        color: '#cbd5e1',
+        fontSize: 10,
+        backgroundColor: 'rgba(2, 6, 23, 0.72)',
+        padding: [2, 4],
+        borderRadius: 3,
+      },
+    });
+  };
+
+  pushPriceLine('stop', '止损', finite(entry?.stopPrice ?? watch?.stopPrice), { color: '#dc2626', type: 'dashed', width: 1.4 });
+  pushPriceLine('cost', '持仓成本', finite(watch?.averageCost), { color: '#7c3aed', type: 'dashed', width: 1.4 });
+
+  const scenarios = detail.pricePlan?.scenarios || [];
+  const selectedScenarioId = detail.accountDecision?.selectedScenarioId;
+  // 观察场景没有可执行的止损/目标，不再往图上堆虚线；有选中场景时只画选中场景。
+  const executableScenarios = scenarios.filter((scenario) => scenario.role !== 'observation');
+  const selectedScenarios = executableScenarios.filter((scenario) => scenario.scenarioId === selectedScenarioId);
+  (selectedScenarios.length ? selectedScenarios : executableScenarios).forEach((scenario) => {
+    const prefix = scenario.role === 'primary' ? '主' : '次';
+    const color = scenario.role === 'primary' ? '#0284c7' : '#0f766e';
+    pushPriceLine('stop', `${prefix}止损`, finite(scenario.stopLoss), { color: '#dc2626', type: 'dashed', width: 1.2 });
+    pushPriceLine('target1', `${prefix}目标一`, finite(scenario.target1), { color, type: 'dotted', width: 1.2 });
+    pushPriceLine('target2', `${prefix}目标二`, finite(scenario.target2), { color, type: 'dashed', width: 1.2 });
   });
 
-  const markPoints: Array<Record<string, unknown>> = detail.events.map((event) => {
+  const markPoints: Array<Record<string, unknown>> = [];
+  const seenPoints = new Set<string>();
+  detail.events.forEach((event) => {
+    const occurred = day(event.occurredAt);
+    if (!occurred) return;
+    // 同一时刻的同类事件只留一个点（如三个场景各记一条 plan_created）。
+    const key = `${event.eventType}:${occurred}`;
+    if (seenPoints.has(key)) return;
+    seenPoints.add(key);
     const payloadBar = event.payload?.bar as Record<string, unknown> | undefined;
     const value = finite(payloadBar?.close) ?? lastClose;
-    const isRisk = /invalidated|risk_changed|closed|expired|ambiguous/.test(event.eventType);
-    return {
+    const isRisk = /invalidated|risk_changed|closed|expired|ambiguous|superseded/.test(event.eventType);
+    markPoints.push({
       name: eventLabel(event),
-      coord: [day(event.occurredAt), value],
+      coord: [occurred, value],
       value: eventLabel(event),
       symbol: isRisk ? 'diamond' : 'circle',
-      symbolSize: isRisk ? 28 : 20,
+      symbolSize: compact ? (isRisk ? 10 : 8) : (isRisk ? 14 : 10),
       itemStyle: { color: isRisk ? '#dc2626' : '#0284c7' },
-      label: { color: '#ffffff', fontSize: 9, formatter: eventLabel(event) },
-    };
+      label: { show: false },
+    });
   });
   (detail.chart.corporateActions || []).forEach((action) => {
     markPoints.push({
@@ -404,14 +462,14 @@ export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echa
       coord: [action.date, lastClose],
       value: '除权',
       symbol: 'pin',
-      symbolSize: 28,
+      symbolSize: 18,
       itemStyle: { color: '#7c3aed' },
-      label: { color: '#ffffff', fontSize: 9, formatter: '权' },
+      label: { show: true, color: '#ffffff', fontSize: 9, formatter: '权' },
     });
   });
-  markPoints.push(...chanSignalPoints(structureSignals, detail.chart.structure?.pens || [], dates, lastClose));
+  markPoints.push(...chanSignalPoints(structureSignals, detail.chart.structure?.pens || [], dates, lastClose, compact));
 
-  const zoomStart = Math.max(0, dates.length - 180);
+  const zoomStart = Math.max(0, dates.length - visibleBars);
   const commonCategoryAxis = {
     type: 'category' as const,
     data: dates,
@@ -421,13 +479,16 @@ export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echa
     axisLabel: { color: COLORS.text, fontSize: 10, hideOverlap: true },
     splitLine: { show: false },
   };
+  const noPointerLabel = { label: { show: false } };
 
   const option: echarts.EChartsOption = {
     animation: false,
     backgroundColor: 'transparent',
     legend: {
+      type: 'scroll',
       top: 4,
       left: 12,
+      right: 12,
       itemWidth: 14,
       itemHeight: 8,
       textStyle: { color: COLORS.text, fontSize: 11 },
@@ -448,19 +509,33 @@ export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echa
       order: 'seriesDesc',
     },
     grid: [
-      { left: 58, right: 18, top: 38, height: '54%' },
-      { left: 58, right: 18, top: '63%', height: '12%' },
-      { left: 58, right: 18, top: '78%', height: '14%' },
+      { left: 14, right: 64, top: 34, height: '53%' },
+      { left: 14, right: 64, top: '62%', height: '11%' },
+      { left: 14, right: 64, top: '77%', height: '14%' },
     ],
     xAxis: [
-      { ...commonCategoryAxis, gridIndex: 0, axisLabel: { show: false } },
-      { ...commonCategoryAxis, gridIndex: 1, axisLabel: { show: false } },
+      { ...commonCategoryAxis, gridIndex: 0, axisLabel: { show: false }, axisPointer: noPointerLabel },
+      { ...commonCategoryAxis, gridIndex: 1, axisLabel: { show: false }, axisPointer: noPointerLabel },
       { ...commonCategoryAxis, gridIndex: 2 },
     ],
     yAxis: [
       { scale: true, gridIndex: 0, position: 'right', axisLabel: { color: COLORS.text, fontSize: 10 }, splitLine: { lineStyle: { color: COLORS.grid } } },
-      { scale: true, gridIndex: 1, position: 'right', axisLabel: { color: COLORS.text, fontSize: 10, formatter: (value: number) => `${Math.round(value / 10000)}万` }, splitLine: { lineStyle: { color: COLORS.grid } } },
-      { scale: true, gridIndex: 2, position: 'right', axisLabel: { color: COLORS.text, fontSize: 10 }, splitLine: { lineStyle: { color: COLORS.grid } } },
+      {
+        scale: true,
+        gridIndex: 1,
+        position: 'right',
+        splitNumber: compact ? 2 : 3,
+        axisLabel: {
+          // 窄屏成交量副图只有 ~46px 高，放不下刻度文字，数值交给 tooltip。
+          show: !compact,
+          color: COLORS.text,
+          fontSize: 10,
+          hideOverlap: true,
+          formatter: (value: number) => (Math.abs(value) >= 1e8 ? `${(value / 1e8).toFixed(1)}亿` : `${Math.round(value / 1e4)}万`),
+        },
+        splitLine: { lineStyle: { color: COLORS.grid } },
+      },
+      { scale: true, gridIndex: 2, position: 'right', splitNumber: compact ? 2 : 3, axisLabel: { color: COLORS.text, fontSize: 10, hideOverlap: true }, splitLine: { lineStyle: { color: COLORS.grid } } },
     ],
     dataZoom: [
       { type: 'inside', xAxisIndex: [0, 1, 2], startValue: zoomStart, endValue: Math.max(0, dates.length - 1), minValueSpan: 20 },
@@ -477,11 +552,11 @@ export function buildSignalPreviewChartOption(detail: SignalPreviewDetail): echa
         markArea: {
           silent: true,
           z: 1,
-          label: { show: true, color: COLORS.text, fontSize: 10 },
+          label: { show: false },
           data: markAreas,
         },
-        markLine: { silent: true, symbol: ['none', 'none'], label: { color: COLORS.text, formatter: '{b} {c}' }, data: markLines },
-        markPoint: { data: markPoints, tooltip: { formatter: '{b}' } },
+        markLine: { silent: true, symbol: ['none', 'none'], data: markLines },
+        markPoint: { data: markPoints, tooltip: { formatter: '{b}' }, label: { show: false } },
         z: 3,
       },
       { name: 'EMA13 指导线', type: 'line', xAxisIndex: 0, yAxisIndex: 0, data: bars.map((bar) => bar.guideLine), showSymbol: false, connectNulls: false, lineStyle: { color: COLORS.guide, width: 1.4 }, z: 5 },

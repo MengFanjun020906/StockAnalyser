@@ -47,6 +47,35 @@ MOMENTUM_DESK_TOOLS: tuple[str, ...] = (
 # FeatureFlag/source kinds that signal trend-continuation eligibility.
 _ELIGIBLE_KINDS = {"limit", "capital", "pattern"}
 _ELIGIBLE_SOURCES = {"sequoia", "alphasift", "limit_up_pool", "capital_flow_anomaly"}
+_GAIN_5D_LEGACY_THRESHOLD = 5.0
+_VOLUME_RATIO_THRESHOLD = 1.5
+
+
+def is_momentum_primary_eligible(
+    row: FeatureRow,
+    *,
+    gain_5d_gate_enabled: bool = False,
+) -> bool:
+    """Deterministic primary eligibility for the momentum desk.
+
+    ``gain_5d`` is a fact field and stays out of the entry gate by default.
+    The legacy >=5% rule is kept behind ``gain_5d_gate_enabled`` for explicit
+    A/B comparison only.
+    """
+    fs = row.fact_sheet
+    if set(row.recall_sources) & _ELIGIBLE_SOURCES:
+        return True
+    if {f.kind for f in row.flags} & _ELIGIBLE_KINDS:
+        return True
+    if fs is None:
+        return False
+    if fs.trend_state == "bullish":
+        return True
+    if fs.volume_ratio is not None and fs.volume_ratio >= _VOLUME_RATIO_THRESHOLD:
+        return True
+    if gain_5d_gate_enabled and fs.gain_5d is not None and fs.gain_5d >= _GAIN_5D_LEGACY_THRESHOLD:
+        return True
+    return False
 
 
 class MomentumDeskExpert(BaseDeskExpert):
@@ -65,6 +94,7 @@ class MomentumDeskExpert(BaseDeskExpert):
         max_tool_calls: int = 10,
         prompt_variables: Optional[Mapping[str, Any]] = None,
         fallback_supplement_n: int = 10,
+        gain_5d_gate_enabled: bool = False,
     ) -> None:
         manifest = load_manifest("momentum_desk")
         if any(_registry_lookup(tool_registry, n) is not None for n in MOMENTUM_DESK_TOOLS):
@@ -83,6 +113,9 @@ class MomentumDeskExpert(BaseDeskExpert):
             max_tool_calls=max_tool_calls,
             fallback_supplement_n=fallback_supplement_n,
         )
+        # ``gain_5d`` is a fact field by default.  The legacy >=5% entry gate is
+        # kept only for explicit A/B comparison and defaults to off.
+        self._gain_5d_gate_enabled = bool(gain_5d_gate_enabled)
 
     def _filter_eligible_rows(self, rows: List[FeatureRow]) -> List[FeatureRow]:
         """Eligibility: strategy/limit/capital source OR bullish trend OR high volume."""
@@ -90,34 +123,13 @@ class MomentumDeskExpert(BaseDeskExpert):
         fallback_candidates: List[FeatureRow] = []
 
         for row in rows:
-            fs = row.fact_sheet
-            flag_kinds = {f.kind for f in row.flags}
-            sources = set(row.recall_sources)
-
-            # Criterion 1: main momentum recall sources.
-            if sources & _ELIGIBLE_SOURCES:
+            if is_momentum_primary_eligible(
+                row,
+                gain_5d_gate_enabled=self._gain_5d_gate_enabled,
+            ):
                 primary.append(row)
-                continue
-
-            # Criterion 2: has limit/capital/pattern flag.
-            if flag_kinds & _ELIGIBLE_KINDS:
-                primary.append(row)
-                continue
-
-            # Criterion 3: FactSheet shows bullish trend.
-            if fs is not None and fs.trend_state == "bullish":
-                primary.append(row)
-                continue
-
-            # Criterion 4: high volume ratio or strong 5d gain.
-            if fs is not None:
-                vr = fs.volume_ratio
-                gain = fs.gain_5d
-                if (vr is not None and vr >= 1.5) or (gain is not None and gain >= 5.0):
-                    primary.append(row)
-                    continue
-
-            fallback_candidates.append(row)
+            else:
+                fallback_candidates.append(row)
 
         if primary:
             return primary
@@ -146,7 +158,16 @@ class MomentumDeskExpert(BaseDeskExpert):
                 trend_note = f"趋势状态为 {fs.trend_state or 'unknown'}，不是 bullish"
             vr = fs.volume_ratio
             gain = fs.gain_5d
-            if not ((vr is not None and vr >= 1.5) or (gain is not None and gain >= 5.0)):
-                volume_note = f"量比 {vr if vr is not None else '缺失'}、5日涨幅 {gain if gain is not None else '缺失'} 未达动量阈值"
+            if vr is None or vr < _VOLUME_RATIO_THRESHOLD:
+                if self._gain_5d_gate_enabled:
+                    volume_note = (
+                        f"量比 {vr if vr is not None else '缺失'}、"
+                        f"5日涨幅 {gain if gain is not None else '缺失'} 未达动量阈值"
+                    )
+                else:
+                    volume_note = (
+                        f"量比 {vr if vr is not None else '缺失'} 低于 {_VOLUME_RATIO_THRESHOLD}；"
+                        f"5日涨幅 {gain if gain is not None else '缺失'} 仅作事实字段，未参与入席判断"
+                    )
         parts = [item for item in (source_note, flag_note, trend_note, volume_note) if item]
         return "动量席未入席：" + "；".join(parts) + "。"

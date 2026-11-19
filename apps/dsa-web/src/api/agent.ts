@@ -110,6 +110,12 @@ export const agentApi = {
     const response = await apiClient.get<AgentTraceHistoryItemResponse>(`/api/v1/agent/trace/sessions/${encodeURIComponent(sessionId)}`);
     return response.data;
   },
+  async listTraceSessions(limit = 30): Promise<{ sessions: AgentTraceHistoryItemResponse[] }> {
+    const response = await apiClient.get<{ sessions: AgentTraceHistoryItemResponse[] }>('/api/v1/agent/trace/sessions', {
+      params: { limit },
+    });
+    return response.data;
+  },
   async traceStream(
     payload: AgentTraceRunRequest,
     options?: AgentStreamOptions,

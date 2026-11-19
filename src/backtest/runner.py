@@ -17,6 +17,7 @@ from typing import Any, Callable, Iterable, Sequence
 from src.storage import DatabaseManager
 
 from .calendar import CnTradingCalendar
+from .bar_drops import BarDropLedger
 from .data_view import InMemoryDataView
 from .entities import ClosedTrade, EquityPoint, Fill, Order
 from .execution import BacktestCancelled, ExecutionEngine, ExecutionResult
@@ -230,6 +231,9 @@ def run_experiment(
         logger.exception("backtest execution failed: %s", exc)
         raise BacktestRunError("execution_failed", str(exc)) from exc
 
+    _merge_bar_drops(snapshot, execution)
+    _record_daily_minute_overlap(snapshot, execution)
+
     if execution.status == "cancelled":
         _progress(options, 0.95, "persisting")
         summary = _write_run_artifacts(
@@ -418,6 +422,8 @@ def _run_research_experiment(
         except Exception as exc:
             logger.exception("research execution failed: %s", exc)
             raise BacktestRunError("research_execution_failed", str(exc)) from exc
+        _merge_bar_drops(snapshot, execution)
+        _record_daily_minute_overlap(snapshot, execution)
         research_diagnostics = orchestrator.diagnostics()
         research_diagnostics["data_warnings"] = dataset_warnings
         research_diagnostics["data_source"] = dataset_source
@@ -665,6 +671,41 @@ def _write_run_artifacts(
     return summary
 
 
+def _merge_bar_drops(snapshot: Any, execution: ExecutionResult) -> None:
+    ledger = BarDropLedger()
+    ledger.extend(getattr(snapshot, "bar_drops", []) or [])
+    ledger.extend(execution.bar_drops)
+    expected = len(snapshot.manifest.coverage) * len(snapshot.sessions)
+    summary = ledger.summary(expected_symbol_sessions=expected)
+    execution.diagnostics["bar_drops"] = summary
+    execution.diagnostics["bar_drop_counts"] = summary["by_reason"]
+    execution.bar_drops = ledger.entries()
+
+
+def _record_daily_minute_overlap(snapshot: Any, execution: ExecutionResult) -> None:
+    payload = getattr(snapshot, "daily_minute_overlap", None) or {}
+    if payload:
+        execution.diagnostics["daily_minute_overlap"] = payload
+
+
+def _compact_bar_drops(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not payload:
+        return {"total_bars": 0, "by_reason": {}, "alerts": []}
+    return {
+        "total_bars": payload.get("total_bars", 0),
+        "total_events": payload.get("total_events", 0),
+        "by_reason": payload.get("by_reason", {}),
+        "by_category": payload.get("by_category", {}),
+        "by_reason_ratio_pct": payload.get("by_reason_ratio_pct", {}),
+        "by_session": payload.get("by_session", {}),
+        "top_symbols": payload.get("top_symbols", []),
+        "alerts": payload.get("alerts", []),
+        "expected_symbol_sessions": payload.get("expected_symbol_sessions"),
+        "drop_ratio_pct": payload.get("drop_ratio_pct"),
+        "truncated": payload.get("truncated", False),
+    }
+
+
 def _build_summary(
     *,
     run_id: str,
@@ -697,6 +738,8 @@ def _build_summary(
         "quality_flags": sorted(set(manifest.quality_flags) | set(adaptation.quality_flags)),
         "research": adaptation.diagnostics if config.mode.value == "historical_agent_research" else {},
         "coverage": [row.model_dump(mode="json") for row in manifest.coverage],
+        "bar_drops": _compact_bar_drops(execution.diagnostics.get("bar_drops")),
+        "daily_minute_overlap": execution.diagnostics.get("daily_minute_overlap", {}),
         "metrics": metrics.model_dump(mode="json") if metrics else None,
         "counts": {
             "orders": len(execution.orders),

@@ -134,6 +134,35 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
         )
 
+    def test_schedule_mode_registers_sector_flow_shadow_when_enabled(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=True,
+            agent_sector_flow_observation_enabled=True,
+        )
+        scheduled_call = {}
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            scheduled_call["background_tasks"] = background_tasks or []
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        names = [item["name"] for item in scheduled_call["background_tasks"]]
+        self.assertIn("sector_flow_shadow", names)
+
     def test_trading_day_filter_keeps_closed_market_stock_when_latest_data_missing(self) -> None:
         args = self._make_args()
         config = self._make_config(

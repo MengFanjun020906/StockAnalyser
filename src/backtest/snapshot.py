@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +26,7 @@ from src.storage import (
 )
 
 from .calendar import CnTradingCalendar, SHANGHAI
+from .bar_drops import BarDrop, BarDropLedger, BarDropReason
 from .data_view import InMemoryDataView
 from .entities import Bar, CorporateAction, DailyBar
 from .rules import MarketRule, derive_rule, normalize_cn_symbol, rule_from_snapshot
@@ -69,6 +70,8 @@ class SnapshotBuildResult:
     benchmark: dict[date, Decimal]
     plans: list[ReplayPlan]
     sessions: list[date]
+    bar_drops: list[BarDrop] = field(default_factory=list)
+    daily_minute_overlap: dict[str, Any] = field(default_factory=dict)
 
     def to_precheck(
         self,
@@ -184,21 +187,22 @@ class SnapshotBuilder:
         if not symbols:
             raise SnapshotError("no symbols selected")
         quality_flags: set[str] = set()
+        bar_ledger = BarDropLedger()
         if self.calendar.fallback_used:
             quality_flags.add("calendar_weekday_fallback")
         daily_start = self._warmup_start(sessions[0])
         daily_bars = (
             self._daily_input
             if self._daily_input is not None
-            else self._load_daily_bars(symbols, daily_start, self.config.end_date)
+            else self._load_daily_bars(symbols, daily_start, self.config.end_date, ledger=bar_ledger)
         )
         minute_bars = (
             self._minute_input
             if self._minute_input is not None
-            else self._load_minute_bars(symbols, self.config.start_date, self.config.end_date)
+            else self._load_minute_bars(symbols, self.config.start_date, self.config.end_date, ledger=bar_ledger)
         )
-        daily_bars, dq_flags = _normalize_daily_bars(daily_bars)
-        minute_bars, mq_flags = _normalize_minute_bars(minute_bars)
+        daily_bars, dq_flags = _normalize_daily_bars(daily_bars, ledger=bar_ledger)
+        minute_bars, mq_flags = _normalize_minute_bars(minute_bars, ledger=bar_ledger)
         quality_flags.update(dq_flags)
         quality_flags.update(mq_flags)
         daily_map = {(bar.symbol, bar.session): bar for bar in daily_bars}
@@ -207,6 +211,22 @@ class SnapshotBuilder:
             minute_by_symbol_session.setdefault((bar.symbol, bar.session), []).append(bar)
         for key in minute_by_symbol_session:
             minute_by_symbol_session[key].sort(key=lambda item: item.end_at)
+        daily_minute_overlap = _detect_daily_minute_overlap(
+            config=self.config,
+            sessions=sessions,
+            daily_bars=daily_bars,
+            minute_bars=minute_bars,
+        )
+        if daily_minute_overlap:
+            quality_flags.add("daily_minute_overlap")
+            logger.warning(
+                "backtest run %s executes at %s but %d symbol(s) also carry 5m bars (%s); "
+                "runs produced by engine versions before the bars_at period-isolation fix are not comparable",
+                self.run_id,
+                self.config.granularity.value,
+                daily_minute_overlap["overlap_symbol_count"],
+                ", ".join(daily_minute_overlap["symbols"][:10]),
+            )
 
         # Synthesize daily bars from complete-enough minute data for valuation and
         # previous close.  Confirmation still requires a real daily bar.
@@ -266,6 +286,7 @@ class SnapshotBuilder:
             rules=rules,
             downgraded=downgraded,
             granularity=self.config.granularity,
+            ledger=bar_ledger,
         )
         if any(row.sessions_missing or row.sessions_partial for row in coverage):
             quality_flags.add("incomplete_market_data")
@@ -360,6 +381,8 @@ class SnapshotBuilder:
             benchmark=benchmark,
             plans=self.plans,
             sessions=sessions,
+            bar_drops=bar_ledger.entries(),
+            daily_minute_overlap=daily_minute_overlap,
         )
 
     # ------------------------------------------------------------------
@@ -374,7 +397,9 @@ class SnapshotBuilder:
             return sessions[0] if sessions else start
         return sessions[-self.config.daily_warmup_sessions - 1]
 
-    def _load_daily_bars(self, symbols: list[str], start: date, end: date) -> list[DailyBar]:
+    def _load_daily_bars(
+        self, symbols: list[str], start: date, end: date, *, ledger: BarDropLedger | None = None
+    ) -> list[DailyBar]:
         if self.db is None:
             return []
         with self.db.get_session() as session:
@@ -391,12 +416,14 @@ class SnapshotBuilder:
             ).scalars().all()
         result: list[DailyBar] = []
         for row in rows:
-            bar = _daily_from_row(row)
+            bar = _daily_from_row(row, ledger=ledger)
             if bar is not None:
                 result.append(bar)
         return result
 
-    def _load_minute_bars(self, symbols: list[str], start: date, end: date) -> list[Bar]:
+    def _load_minute_bars(
+        self, symbols: list[str], start: date, end: date, *, ledger: BarDropLedger | None = None
+    ) -> list[Bar]:
         if self.db is None:
             return []
         with self.db.get_session() as session:
@@ -415,7 +442,7 @@ class SnapshotBuilder:
             ).scalars().all()
         result: list[Bar] = []
         for row in rows:
-            bar = _minute_from_row(row)
+            bar = _minute_from_row(row, ledger=ledger)
             if bar is not None:
                 result.append(bar)
         return result
@@ -917,6 +944,28 @@ def load_snapshot(output_dir: Path) -> tuple[InMemoryDataView, SnapshotManifest,
 # ----------------------------------------------------------------------
 # Coverage helpers
 # ----------------------------------------------------------------------
+def _record_coverage_drop(
+    ledger: BarDropLedger | None,
+    *,
+    symbol: str,
+    session: date,
+    timeframe: str,
+    reason: BarDropReason,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    if ledger is None:
+        return
+    ledger.record(
+        symbol=symbol,
+        session=session,
+        timeframe=timeframe,
+        reason=reason,
+        stage="coverage",
+        source="snapshot",
+        detail=None if ledger.is_full else detail,
+    )
+
+
 def _build_coverage(
     *,
     symbols: list[str],
@@ -926,7 +975,9 @@ def _build_coverage(
     rules: list[MarketRule],
     downgraded: set[tuple[str, date]],
     granularity: Granularity,
+    ledger: BarDropLedger | None = None,
 ) -> tuple[list[CoverageRow], list[GapRecord]]:
+    timeframe = "5m" if granularity is Granularity.MINUTE_5 else "1d"
     rule_map = {(rule.symbol, rule.session): rule for rule in rules}
     first_dates: dict[str, date] = {}
     for (symbol, session), bars in minute_map.items():
@@ -970,16 +1021,52 @@ def _build_coverage(
                 status = SessionStatus.PARTIAL
                 row.sessions_partial += 1
                 row.missing_bars += expected - actual
+                _record_coverage_drop(
+                    ledger,
+                    symbol=symbol,
+                    session=session,
+                    timeframe=timeframe,
+                    reason=BarDropReason.PARTIAL_SESSION,
+                    detail={
+                        "actual_bars": actual,
+                        "expected_bars": expected,
+                        "missing_bars": expected - actual,
+                    },
+                )
             elif rule is not None and rule.suspended:
                 status = SessionStatus.SUSPENDED
                 row.sessions_suspended += 1
+                _record_coverage_drop(
+                    ledger,
+                    symbol=symbol,
+                    session=session,
+                    timeframe=timeframe,
+                    reason=BarDropReason.RULE_SUSPENDED,
+                    detail={"actual_bars": actual, "expected_bars": expected},
+                )
             elif first_seen is not None and first_seen > session:
                 status = SessionStatus.PRE_LISTING
                 row.sessions_pre_listing += 1
+                _record_coverage_drop(
+                    ledger,
+                    symbol=symbol,
+                    session=session,
+                    timeframe=timeframe,
+                    reason=BarDropReason.PRE_LISTING,
+                    detail={"first_seen": first_seen, "session": session},
+                )
             else:
                 status = SessionStatus.MISSING
                 row.sessions_missing += 1
                 row.missing_bars += expected
+                _record_coverage_drop(
+                    ledger,
+                    symbol=symbol,
+                    session=session,
+                    timeframe=timeframe,
+                    reason=BarDropReason.MISSING_BAR,
+                    detail={"actual_bars": actual, "expected_bars": expected},
+                )
             if status is SessionStatus.FULL and downgraded_session:
                 row.flags.append("downgraded")
             gaps.append(
@@ -1010,6 +1097,53 @@ def _coverage_rows_from_gaps(
     gaps: list[GapRecord], symbols: list[str], sessions: list[date]
 ) -> list[GapRecord]:
     return gaps
+
+
+def _detect_daily_minute_overlap(
+    *,
+    config: ExperimentConfig,
+    sessions: list[date],
+    daily_bars: list[DailyBar],
+    minute_bars: list[Bar],
+) -> dict[str, Any]:
+    """Flag 1d runs whose symbols also carry 5m bars.
+
+    Before the ``InMemoryDataView.bars_at`` period-isolation fix a 1d run would
+    silently price any symbol that had a 5m bar at the same timestamp from that
+    minute bar.  The condition is only reported (never enforced) so historical
+    runs remain reproducible; the flag marks their numbers as not comparable.
+    """
+    if config.granularity is not Granularity.DAILY:
+        return {}
+    session_set = set(sessions)
+    daily_symbols: set[str] = set()
+    daily_sessions: dict[str, set[date]] = {}
+    for bar in daily_bars:
+        daily_symbols.add(bar.symbol)
+        if bar.session in session_set:
+            daily_sessions.setdefault(bar.symbol, set()).add(bar.session)
+    minute_symbols: set[str] = set()
+    minute_sessions: dict[str, set[date]] = {}
+    for bar in minute_bars:
+        if bar.session not in session_set:
+            continue
+        minute_symbols.add(bar.symbol)
+        minute_sessions.setdefault(bar.symbol, set()).add(bar.session)
+    overlap = sorted(daily_symbols & minute_symbols)
+    if not overlap:
+        return {}
+    mixed_sessions = sum(
+        len(daily_sessions.get(symbol, set()) & minute_sessions.get(symbol, set()))
+        for symbol in overlap
+    )
+    return {
+        "granularity": config.granularity.value,
+        "symbols": overlap,
+        "overlap_symbol_count": len(overlap),
+        "overlap_symbol_session_count": mixed_sessions,
+        "daily_symbol_count": len(daily_symbols),
+        "minute_symbol_count": len(minute_symbols),
+    }
 
 
 def _overall_quality(coverage: list[CoverageRow], flags: set[str]) -> DataQuality:
@@ -1055,18 +1189,56 @@ def _content_hash(
     return "sha256:" + digest.hexdigest()
 
 
-def _normalize_daily_bars(bars: Iterable[DailyBar]) -> tuple[list[DailyBar], list[str]]:
+def _normalize_daily_bars(
+    bars: Iterable[DailyBar], *, ledger: BarDropLedger | None = None
+) -> tuple[list[DailyBar], list[str]]:
     dedup: dict[tuple[str, date], DailyBar] = {}
     flags: set[str] = set()
     for bar in bars:
         symbol = normalize_cn_symbol(bar.symbol)
-        if not symbol or not _valid_ohlc(bar.open, bar.high, bar.low, bar.close):
+        if not symbol:
             flags.add("invalid_daily_bar_skipped")
+            _record_normalize_drop(
+                ledger,
+                bar,
+                symbol=bar.symbol,
+                session=bar.session,
+                timeframe="1d",
+                reason=BarDropReason.INVALID_SYMBOL,
+            )
+            continue
+        if not _valid_ohlc(bar.open, bar.high, bar.low, bar.close):
+            flags.add("invalid_daily_bar_skipped")
+            _record_normalize_drop(
+                ledger,
+                bar,
+                symbol=symbol,
+                session=bar.session,
+                timeframe="1d",
+                reason=_invalid_ohlc_reason(bar.open, bar.high, bar.low, bar.close),
+            )
             continue
         volume, unit, volume_flag = _normalize_volume(bar.volume, bar.amount, bar.close)
         if volume_flag:
             flags.add(volume_flag)
-        dedup[(symbol, bar.session)] = DailyBar(
+        key = (symbol, bar.session)
+        previous = dedup.get(key)
+        if previous is not None and ledger is not None:
+            ledger.record(
+                symbol=symbol,
+                session=bar.session,
+                timeframe="1d",
+                reason=BarDropReason.DUPLICATE_BAR,
+                stage="normalize",
+                source=bar.source or "",
+                detail={
+                    "previous_close": previous.close,
+                    "replacement_close": bar.close,
+                    "previous_source": previous.source,
+                    "replacement_source": bar.source,
+                },
+            )
+        dedup[key] = DailyBar(
             symbol=symbol,
             session=bar.session,
             open=bar.open,
@@ -1081,18 +1253,60 @@ def _normalize_daily_bars(bars: Iterable[DailyBar]) -> tuple[list[DailyBar], lis
     return [dedup[key] for key in sorted(dedup)], sorted(flags)
 
 
-def _normalize_minute_bars(bars: Iterable[Bar]) -> tuple[list[Bar], list[str]]:
+def _normalize_minute_bars(
+    bars: Iterable[Bar], *, ledger: BarDropLedger | None = None
+) -> tuple[list[Bar], list[str]]:
     dedup: dict[tuple[str, datetime], Bar] = {}
     flags: set[str] = set()
     for bar in bars:
         symbol = normalize_cn_symbol(bar.symbol)
-        if not symbol or not _valid_ohlc(bar.open, bar.high, bar.low, bar.close):
+        slot = bar.end_at.isoformat() if bar.end_at else ""
+        if not symbol:
             flags.add("invalid_minute_bar_skipped")
+            _record_normalize_drop(
+                ledger,
+                bar,
+                symbol=bar.symbol,
+                session=bar.session,
+                timeframe="5m",
+                reason=BarDropReason.INVALID_SYMBOL,
+                slot=slot,
+            )
+            continue
+        if not _valid_ohlc(bar.open, bar.high, bar.low, bar.close):
+            flags.add("invalid_minute_bar_skipped")
+            _record_normalize_drop(
+                ledger,
+                bar,
+                symbol=symbol,
+                session=bar.session,
+                timeframe="5m",
+                reason=_invalid_ohlc_reason(bar.open, bar.high, bar.low, bar.close),
+                slot=slot,
+            )
             continue
         volume, unit, volume_flag = _normalize_volume(bar.volume, bar.amount, bar.close)
         if volume_flag:
             flags.add(volume_flag)
-        dedup[(symbol, bar.end_at)] = Bar(
+        key = (symbol, bar.end_at)
+        previous = dedup.get(key)
+        if previous is not None and ledger is not None:
+            ledger.record(
+                symbol=symbol,
+                session=bar.session,
+                timeframe="5m",
+                reason=BarDropReason.DUPLICATE_BAR,
+                stage="normalize",
+                source=bar.source or "",
+                slot=slot,
+                detail={
+                    "previous_close": previous.close,
+                    "replacement_close": bar.close,
+                    "previous_source": previous.source,
+                    "replacement_source": bar.source,
+                },
+            )
+        dedup[key] = Bar(
             symbol=symbol,
             end_at=bar.end_at,
             session=bar.session,
@@ -1107,6 +1321,46 @@ def _normalize_minute_bars(bars: Iterable[Bar]) -> tuple[list[Bar], list[str]]:
             volume_unit=unit,
         )
     return [dedup[key] for key in sorted(dedup, key=lambda item: (item[0], item[1]))], sorted(flags)
+
+
+def _record_normalize_drop(
+    ledger: BarDropLedger | None,
+    bar: DailyBar | Bar,
+    *,
+    symbol: str,
+    session: date,
+    timeframe: str,
+    reason: BarDropReason,
+    slot: str = "",
+) -> None:
+    if ledger is None:
+        return
+    ledger.record(
+        symbol=symbol,
+        session=session,
+        timeframe=timeframe,
+        reason=reason,
+        stage="normalize",
+        source=getattr(bar, "source", "") or "",
+        slot=slot,
+        detail={
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "amount": bar.amount,
+            "end_at": getattr(bar, "end_at", None),
+        },
+    )
+
+
+def _invalid_ohlc_reason(
+    open_price: Decimal, high: Decimal, low: Decimal, close: Decimal
+) -> BarDropReason:
+    if min(open_price, high, low, close) <= 0:
+        return BarDropReason.NON_POSITIVE_PRICE
+    return BarDropReason.IMPOSSIBLE_OHLC
 
 
 def _valid_ohlc(open_price: Decimal, high: Decimal, low: Decimal, close: Decimal) -> bool:
@@ -1134,7 +1388,7 @@ def _normalize_volume(
     return volume, "unknown", "volume_unit_suspect"
 
 
-def _daily_from_row(row: StockDaily) -> DailyBar | None:
+def _daily_from_row(row: StockDaily, *, ledger: BarDropLedger | None = None) -> DailyBar | None:
     try:
         open_price = Decimal(str(row.open))
         high = Decimal(str(row.high))
@@ -1143,8 +1397,15 @@ def _daily_from_row(row: StockDaily) -> DailyBar | None:
         volume = Decimal(str(row.volume or 0))
         amount = Decimal(str(row.amount or 0))
     except Exception:
+        _record_row_drop(ledger, row, timeframe="1d", reason=BarDropReason.MISSING_PRICE)
         return None
     if not _valid_ohlc(open_price, high, low, close):
+        _record_row_drop(
+            ledger,
+            row,
+            timeframe="1d",
+            reason=_invalid_ohlc_reason(open_price, high, low, close),
+        )
         return None
     return DailyBar(
         symbol=normalize_cn_symbol(row.code),
@@ -1159,7 +1420,7 @@ def _daily_from_row(row: StockDaily) -> DailyBar | None:
     )
 
 
-def _minute_from_row(row: StockMinuteBar) -> Bar | None:
+def _minute_from_row(row: StockMinuteBar, *, ledger: BarDropLedger | None = None) -> Bar | None:
     try:
         open_price = Decimal(str(row.open))
         high = Decimal(str(row.high))
@@ -1169,8 +1430,24 @@ def _minute_from_row(row: StockMinuteBar) -> Bar | None:
         amount = Decimal(str(row.amount or 0))
         end_at = row.bar_datetime
     except Exception:
+        _record_row_drop(ledger, row, timeframe="5m", reason=BarDropReason.MISSING_PRICE)
         return None
-    if end_at is None or not _valid_ohlc(open_price, high, low, close):
+    if end_at is None:
+        _record_row_drop(
+            ledger,
+            row,
+            timeframe="5m",
+            reason=BarDropReason.MISSING_PRICE,
+            detail={"missing": "bar_datetime"},
+        )
+        return None
+    if not _valid_ohlc(open_price, high, low, close):
+        _record_row_drop(
+            ledger,
+            row,
+            timeframe="5m",
+            reason=_invalid_ohlc_reason(open_price, high, low, close),
+        )
         return None
     return Bar(
         symbol=normalize_cn_symbol(row.code),
@@ -1184,6 +1461,37 @@ def _minute_from_row(row: StockMinuteBar) -> Bar | None:
         amount=amount,
         frequency="5m",
         source=row.data_source or "",
+    )
+
+
+def _record_row_drop(
+    ledger: BarDropLedger | None,
+    row: Any,
+    *,
+    timeframe: str,
+    reason: BarDropReason,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    if ledger is None:
+        return
+    session = getattr(row, "date", None) or getattr(row, "bar_date", None)
+    ledger.record(
+        symbol=str(getattr(row, "code", "")),
+        session=session or "",
+        timeframe=timeframe,
+        reason=reason,
+        stage="load",
+        source=str(getattr(row, "data_source", "") or ""),
+        slot=str(getattr(row, "bar_datetime", "") or ""),
+        detail={
+            "open": getattr(row, "open", None),
+            "high": getattr(row, "high", None),
+            "low": getattr(row, "low", None),
+            "close": getattr(row, "close", None),
+            "volume": getattr(row, "volume", None),
+            "amount": getattr(row, "amount", None),
+            **(detail or {}),
+        },
     )
 
 

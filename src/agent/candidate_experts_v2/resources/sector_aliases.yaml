@@ -1,0 +1,167 @@
+# 板块规范化别名表（人工维护，可 review）
+#
+# 用途：
+#   1) 把个股所属行业板块名映射到稳定的 industry_key（供 FAC-03 等复用）；
+#   2) 当 bk_code 精确匹配失败时，作为名称精确等于的兜底（禁止子串/包含/正则）。
+#
+# 规则：
+#   - 只做「归一化后完全相等」匹配：NFKC + 去空白 + 全半角归一；
+#   - 同一个 alias 命中多个 canonical → 视为歧义，不计算，记 unmapped；
+#   - bk_code 仅作该 canonical 的代表板块；实际映射优先使用个股所属板块自身的 bk_code。
+version: 1
+
+canonical:
+  - key: food_beverage
+    display_name: 食品饮料
+    bk_code: BK0438
+    aliases: [食品饮料, 食品加工, 饮料制造]
+
+  - key: baijiu
+    display_name: 白酒
+    bk_code: BK0896
+    aliases: [白酒, 白酒Ⅱ, 白酒Ⅲ, 酿酒概念, 酿酒行业]
+
+  - key: bank
+    display_name: 银行
+    bk_code: BK1283
+    aliases: [银行, 银行Ⅱ, 银行Ⅲ, 银行业]
+
+  - key: joint_stock_bank
+    display_name: 股份制银行
+    bk_code: BK1610
+    aliases: [股份制银行, 股份制银行Ⅲ]
+
+  - key: securities
+    display_name: 证券
+    bk_code: BK0473
+    aliases: [证券, 证券Ⅱ, 证券Ⅲ, 券商]
+
+  - key: insurance
+    display_name: 保险
+    bk_code: BK0474
+    aliases: [保险, 保险Ⅱ, 保险Ⅲ]
+
+  - key: non_bank_finance
+    display_name: 非银金融
+    bk_code: BK1203
+    aliases: [非银金融, 多元金融]
+
+  - key: semiconductor
+    display_name: 半导体
+    bk_code: BK1036
+    aliases: [半导体, 半导体及元件, 集成电路, 半导体设备]
+
+  - key: ic_manufacturing
+    display_name: 集成电路制造
+    bk_code: BK1329
+    aliases: [集成电路制造, 集成电路封测]
+
+  - key: electronics
+    display_name: 电子
+    bk_code: BK1201
+    aliases: [电子, 电子元件, 元件, 消费电子, 印制电路板]
+
+  - key: computer
+    display_name: 计算机
+    bk_code: BK1207
+    aliases: [计算机, 计算机设备, 计算机应用]
+
+  - key: software
+    display_name: 软件开发
+    bk_code: BK0737
+    aliases: [软件开发, 横向通用软件, 垂直应用软件]
+
+  - key: security_equipment
+    display_name: 安防设备
+    bk_code: BK1445
+    aliases: [安防设备, 安防]
+
+  - key: battery
+    display_name: 电池
+    bk_code: BK1033
+    aliases: [电池, 锂电池, 电池化学品]
+
+  - key: power_equipment
+    display_name: 电力设备
+    bk_code: BK1200
+    aliases: [电力设备, 电气设备, 电源设备]
+
+  - key: pv
+    display_name: 光伏
+    bk_code: BK1031
+    aliases: [光伏设备, 光伏主材, 光伏, 硅料硅片]
+
+  - key: auto
+    display_name: 汽车
+    bk_code: BK1211
+    aliases: [汽车, 乘用车, 电动乘用车, 汽车零部件]
+
+  - key: home_appliance
+    display_name: 家用电器
+    bk_code: BK0456
+    aliases: [家用电器, 白色家电, 空调, 家电]
+
+  - key: dairy
+    display_name: 乳品
+    bk_code: BK1585
+    aliases: [乳品, 饮料乳品, 乳业]
+
+  - key: industrial_metal
+    display_name: 工业金属
+    bk_code: BK1287
+    aliases: [工业金属, 有色金属, 铜, 铝, 小金属]
+
+  - key: petroleum
+    display_name: 石油石化
+    bk_code: BK0464
+    aliases: [石油石化, 炼化及贸易, 炼油化工, 油气开采]
+
+  - key: coal
+    display_name: 煤炭
+    bk_code: BK0437
+    aliases: [煤炭, 煤炭开采, 动力煤, 焦煤]
+
+  - key: pharma_bio
+    display_name: 医药生物
+    bk_code: BK1216
+    aliases: [医药生物, 化学制药, 化学制剂, 生物制品, 中药]
+
+  - key: media
+    display_name: 传媒
+    bk_code: BK0486
+    aliases: [传媒, 文化传媒, 广告营销, 影视院线]
+
+  - key: telecom
+    display_name: 通信
+    bk_code: BK0448
+    aliases: [通信, 通信服务, 通信设备, 通信工程及服务]
+
+  - key: machinery
+    display_name: 机械设备
+    bk_code: BK0545
+    aliases: [机械设备, 通用设备, 专用设备, 工程机械]
+
+  - key: real_estate
+    display_name: 房地产
+    bk_code: BK0451
+    aliases: [房地产, 房地产开发, 房地产服务]
+
+  - key: agriculture
+    display_name: 农林牧渔
+    bk_code: BK0433
+    aliases: [农林牧渔, 种植业, 养殖业, 饲料]
+
+  - key: transportation
+    display_name: 交通运输
+    bk_code: BK0459
+    aliases: [交通运输, 航运港口, 航空机场, 物流, 铁路公路]
+
+  - key: building_material
+    display_name: 建筑材料
+    bk_code: BK0460
+    aliases: [建筑材料, 水泥, 玻璃玻纤]
+
+  - key: defense
+    display_name: 国防军工
+    bk_code: BK0480
+    aliases: [国防军工, 航空装备, 军工电子, 航天装备]

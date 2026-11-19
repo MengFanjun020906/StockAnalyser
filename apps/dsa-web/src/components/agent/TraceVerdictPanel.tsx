@@ -188,7 +188,7 @@ export const TraceVerdictPanel: React.FC<TraceVerdictPanelProps> = ({
             <div className="mt-0.5 font-mono text-xs text-foreground">{formatCount(result.total_steps)}</div>
           </div>
           <div className="rounded-md border border-border/50 bg-surface-2/30 px-2 py-1.5">
-            <div className="text-[9px] text-muted-text">Token</div>
+            <div className="text-[9px] text-muted-text">Token 用量</div>
             <div className="mt-0.5 font-mono text-xs text-foreground">{formatCount(result.total_tokens)}</div>
           </div>
           <div className="rounded-md border border-border/50 bg-surface-2/30 px-2 py-1.5">
@@ -293,7 +293,7 @@ export const TraceVerdictPanel: React.FC<TraceVerdictPanelProps> = ({
             <div className="flex justify-between gap-2"><span>模式</span><span className="truncate text-right">{result.mode || '--'}</span></div>
             <div className="flex justify-between gap-2"><span>LLM 用量</span><span>{totalCalls != null ? formatCount(totalCalls) : '--'} 次 / {totalTokens != null ? formatCount(totalTokens) : '--'} tok</span></div>
             <div className="flex justify-between gap-2"><span>报告质量</span><span className="truncate text-right">{String(quality.status || '--')}</span></div>
-            <div className="flex justify-between gap-2"><span>Session</span><span className="truncate text-right font-mono text-[9px]" title={result.session_id}>{result.session_id ? '…' + result.session_id.slice(-8) : '--'}</span></div>
+            <div className="flex justify-between gap-2"><span>会话</span><span className="truncate text-right font-mono text-[9px]" title={result.session_id}>{result.session_id ? '…' + result.session_id.slice(-8) : '--'}</span></div>
           </div>
         </section>
 

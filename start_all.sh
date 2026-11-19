@@ -9,6 +9,7 @@ BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+START_WEB="${START_WEB:-false}"
 START_NEO4J="${START_NEO4J:-true}"
 NEO4J_CONTAINER_NAME="${NEO4J_CONTAINER_NAME:-stock-graphiti-neo4j}"
 
@@ -177,6 +178,17 @@ start_neo4j() {
   )
 }
 
+prepare_frontend_assets() {
+  local python_bin="$1"
+  printf 'Preparing WebUI static assets for backend on port %s ...\n' "$BACKEND_PORT"
+  if ! (
+    cd "$ROOT_DIR"
+    "$python_bin" -c 'import logging; logging.basicConfig(level=logging.INFO, format="%(message)s"); from src.webui_frontend import prepare_webui_frontend_assets; raise SystemExit(0 if prepare_webui_frontend_assets() else 1)'
+  ); then
+    printf 'Warning: WebUI static assets are not ready; http://127.0.0.1:%s may show a stale or missing page.\n' "$BACKEND_PORT"
+  fi
+}
+
 start_backend() {
   if is_pid_running "$BACKEND_PID_FILE"; then
     printf 'Backend already running, pid=%s\n' "$(cat "$BACKEND_PID_FILE")"
@@ -190,6 +202,7 @@ start_backend() {
 
   local python_bin
   python_bin="$(find_python)"
+  prepare_frontend_assets "$python_bin"
   printf 'Starting backend on http://127.0.0.1:%s ...\n' "$BACKEND_PORT"
   (
     cd "$ROOT_DIR"
@@ -203,6 +216,12 @@ start_backend() {
 }
 
 start_frontend() {
+  if [[ "$START_WEB" != "true" ]]; then
+    printf 'Skipping Vite dev server. Web UI is served by the backend at http://127.0.0.1:%s.\n' "$BACKEND_PORT"
+    printf 'Set START_WEB=true to enable Vite hot reload on port %s.\n' "$FRONTEND_PORT"
+    FRONTEND_TRACKED="false"
+    return 0
+  fi
   if is_pid_running "$FRONTEND_PID_FILE"; then
     printf 'Frontend already running, pid=%s\n' "$(cat "$FRONTEND_PID_FILE")"
     return 0
@@ -237,16 +256,22 @@ if [[ "$START_NEO4J" == "true" ]]; then
   wait_for_port "Neo4j" 7687 90
 fi
 ensure_optional_tracked_process_running "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG" "$BACKEND_TRACKED"
-ensure_optional_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG" "$FRONTEND_TRACKED"
+if [[ "$START_WEB" == "true" ]]; then
+  ensure_optional_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG" "$FRONTEND_TRACKED"
+fi
 wait_for_url "Backend" "http://127.0.0.1:$BACKEND_PORT/api/health" 45
-wait_for_url "Frontend" "http://127.0.0.1:$FRONTEND_PORT" 45
+if [[ "$START_WEB" == "true" ]]; then
+  wait_for_url "Frontend" "http://127.0.0.1:$FRONTEND_PORT" 45
+fi
 ensure_optional_tracked_process_running "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG" "$BACKEND_TRACKED"
-ensure_optional_tracked_process_running "Frontend" "$FRONTEND_PID_FILE" "$FRONTEND_LOG" "$FRONTEND_TRACKED"
 
 printf '\nStarted services:\n'
 if [[ "$START_NEO4J" == "true" ]]; then
   printf '  Neo4j:    bolt://127.0.0.1:7687  browser=http://127.0.0.1:7474\n'
 fi
+printf '  Web UI:   http://127.0.0.1:%s  (API and frontend)\n' "$BACKEND_PORT"
 printf '  Backend:  http://127.0.0.1:%s  log=%s\n' "$BACKEND_PORT" "$BACKEND_LOG"
-printf '  Frontend: http://127.0.0.1:%s  log=%s\n' "$FRONTEND_PORT" "$FRONTEND_LOG"
+if [[ "$START_WEB" == "true" ]]; then
+  printf '  Vite dev: http://127.0.0.1:%s  log=%s\n' "$FRONTEND_PORT" "$FRONTEND_LOG"
+fi
 printf '\nStop with: ./stop_all.sh\n'

@@ -251,17 +251,21 @@ export type CompositePayload = {
   };
   compositeVerdict?: {
     score?: number | null;
+    /** 正式分不可用时的临时分（如本周周线未收盘）。 */
+    provisionalScore?: number | null;
     scaleMax?: number;
     signalLevel?: string;
     verdictStatus?: string;
     entryPermission?: string;
     requiredHoldingAction?: string | null;
     components?: {
-      s4?: { score?: number | null; status?: string };
+      s4?: { score?: number | null; provisionalScore?: number | null; status?: string };
       chan?: { score?: number | null; status?: string };
     };
     exitWarning?: { level?: number; items?: string[] };
     missingFeatures?: string[];
+    formalizationReasonCodes?: string[];
+    qualityWarningCodes?: string[];
   };
 };
 

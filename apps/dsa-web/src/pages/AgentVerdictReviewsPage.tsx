@@ -73,6 +73,59 @@ function countValue(counts: Record<string, number> | undefined, ...keys: string[
   return 0;
 }
 
+const regimeLabels: Record<string, string> = {
+  trending_up: '上行趋势',
+  bull_volatile: '高波动上涨',
+  trending_down: '下行趋势',
+  range_bound: '震荡市',
+  high_volatility: '高波动',
+  risk_off: '避险',
+  panic: '恐慌',
+  unknown: '未知',
+};
+
+const actionLabels: Record<string, string> = {
+  open: '开仓',
+  buy: '买入',
+  add: '加仓',
+  hold: '持有',
+  watch: '观察',
+  wait: '等待',
+  reduce: '减仓',
+  sell: '卖出',
+  close: '清仓',
+  avoid: '回避',
+};
+
+const decisionLabels: Record<string, string> = {
+  pass: '通过',
+  accepted: '接受',
+  downgrade: '降级',
+  downgraded: '降级',
+  block: '阻断',
+  blocked: '阻断',
+  reject: '拒绝',
+  rejected: '拒绝',
+  buy: '买入',
+  hold: '持有',
+  sell: '卖出',
+  watchlist_scan: '观察池扫描',
+  planning_execute: '计划执行',
+};
+
+const evalStatusLabels: Record<string, string> = {
+  completed: '已完成',
+  pending: '待评估',
+  insufficient: '数据不足',
+  insufficient_data: '数据不足',
+  error: '评估异常',
+  unknown: '未知',
+};
+
+const localizeEnum = (value: string | null | undefined, labels: Record<string, string>): string | null | undefined => (
+  value ? labels[value] || value : value
+);
+
 const MetricTile: React.FC<{ label: string; value: string; hint?: string; icon: React.ReactNode }> = ({ label, value, hint, icon }) => (
   <div className="min-h-[100px] border border-border/70 bg-card/70 px-4 py-3">
     <div className="flex items-center justify-between gap-3 text-secondary-text">
@@ -123,7 +176,7 @@ const ReviewTable: React.FC<{ rows: VerdictReviewRow[] }> = ({ rows }) => (
             <th className="px-4 py-3 text-left">动作</th>
             <th className="px-4 py-3 text-left">标签</th>
             <th className="px-4 py-3 text-right">后验收益</th>
-            <th className="px-4 py-3 text-left">Trace</th>
+            <th className="px-4 py-3 text-left">追踪</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border/50">
@@ -138,18 +191,20 @@ const ReviewTable: React.FC<{ rows: VerdictReviewRow[] }> = ({ rows }) => (
                 </td>
                 <td className="px-4 py-3">
                   <div className="font-medium text-foreground">{row.symbol || '--'}</div>
-                  <div className="text-xs text-secondary-text">{row.name || row.regime || '--'}</div>
+                  <div className="text-xs text-secondary-text">{row.name || regimeLabels[row.regime || ''] || row.regime || '--'}</div>
                 </td>
                 <td className="px-4 py-3">
-                  <div className="text-foreground">{row.symbolAction || row.finalAction || '--'}</div>
-                  <div className="text-xs text-secondary-text">{row.operationAdvice || row.primaryPlanVerdict || row.decisionType || '--'}</div>
+                  <div className="text-foreground">{localizeEnum(row.symbolAction || row.finalAction, actionLabels) || '--'}</div>
+                  <div className="text-xs text-secondary-text">
+                    {row.operationAdvice || localizeEnum(row.primaryPlanVerdict, decisionLabels) || localizeEnum(row.decisionType, decisionLabels) || '--'}
+                  </div>
                 </td>
                 <td className="whitespace-nowrap px-4 py-3">
                   <Badge variant={labelVariant(row.reviewLabel)}>{labelText[row.reviewLabel || ''] || row.reviewLabel || '--'}</Badge>
                 </td>
                 <td className={cn('whitespace-nowrap px-4 py-3 text-right font-semibold tabular-nums', Number(returnPct) > 0 ? 'text-danger' : Number(returnPct) < 0 ? 'text-success' : 'text-secondary-text')}>
                   {fmtPct(returnPct)}
-                  <div className="text-xs font-normal text-secondary-text">{window.evalStatus || 'unknown'}</div>
+                  <div className="text-xs font-normal text-secondary-text">{localizeEnum(window.evalStatus, evalStatusLabels) || '未知'}</div>
                 </td>
                 <td className="max-w-[220px] truncate px-4 py-3 text-xs text-secondary-text" title={row.traceId || row.traceDir || ''}>
                   {row.traceId || '--'}
@@ -275,7 +330,7 @@ const AgentVerdictReviewsPage: React.FC = () => {
 
       <div className="grid gap-3 md:grid-cols-4">
         <MetricTile label="样本数" value={String(summary.total ?? data?.total ?? 0)} hint={data?.exists ? 'verdict_review.jsonl' : '文件未生成'} icon={<Database className="h-4 w-4" />} />
-        <MetricTile label="已完成窗口" value={`${fmtPct(summary.completionRatePct)}`} hint={`${summary.completedCount ?? 0} completed`} icon={<Activity className="h-4 w-4" />} />
+        <MetricTile label="已完成窗口" value={`${fmtPct(summary.completionRatePct)}`} hint={`${summary.completedCount ?? 0} 条已完成`} icon={<Activity className="h-4 w-4" />} />
         <MetricTile label="平均后验收益" value={fmtPct(summary.avgFutureReturnPct)} hint="优先 30d / 7d 窗口" icon={<BarChart3 className="h-4 w-4" />} />
         <MetricTile label="链路覆盖" value={`${countValue(summary.chainCounts, 'stock_selection', 'stockSelection')}/${countValue(summary.chainCounts, 'single_stock_analysis', 'singleStockAnalysis')}`} hint="选股 / 单股" icon={<GitBranch className="h-4 w-4" />} />
       </div>

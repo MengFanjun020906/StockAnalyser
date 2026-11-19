@@ -70,7 +70,12 @@ def _prepare_fake_bin(tmp_path: Path) -> Path:
     return fake_bin
 
 
-def _run_start_all(tmp_path: Path, *, container_running: str) -> subprocess.CompletedProcess[str]:
+def _run_start_all(
+    tmp_path: Path,
+    *,
+    container_running: str,
+    extra_env=None,
+) -> subprocess.CompletedProcess[str]:
     fake_bin = _prepare_fake_bin(tmp_path)
     env = os.environ.copy()
     env.update(
@@ -83,6 +88,7 @@ def _run_start_all(tmp_path: Path, *, container_running: str) -> subprocess.Comp
             "START_NEO4J": "true",
         }
     )
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", str(ROOT_DIR / "start_all.sh")],
         cwd=ROOT_DIR,
@@ -107,3 +113,20 @@ def test_start_all_starts_existing_stopped_neo4j_container(tmp_path: Path) -> No
     assert result.returncode == 0, result.stderr
     assert "Neo4j container stock-graphiti-neo4j already exists but is not running. Starting it ..." in result.stdout
     assert "start existing-neo4j" in (tmp_path / "docker_calls.log").read_text(encoding="utf-8")
+
+
+def test_start_all_skips_vite_by_default(tmp_path: Path) -> None:
+    result = _run_start_all(tmp_path, container_running="true")
+
+    assert result.returncode == 0, result.stderr
+    assert "Skipping Vite dev server" in result.stdout
+    assert "Set START_WEB=true" in result.stdout
+    assert "Web UI:   http://127.0.0.1:18000" in result.stdout
+
+
+def test_start_all_starts_vite_when_start_web_enabled(tmp_path: Path) -> None:
+    result = _run_start_all(tmp_path, container_running="true", extra_env={"START_WEB": "true"})
+
+    assert result.returncode == 0, result.stderr
+    assert "Skipping Vite dev server" not in result.stdout
+    assert "Vite dev: http://127.0.0.1:15173" in result.stdout

@@ -212,5 +212,6 @@ test('signal preview renders chart evidence on desktop and mobile', async ({ pag
 test('legacy verdict path redirects to signal preview', async ({ page }) => {
   await mockSignalApi(page);
   await page.goto('/agent-verdict-reviews');
-  await expect(page).toHaveURL(/\/signal-preview$/);
+  // 选中标的会写回 query（?mode=&id=），重定向本身仍然落到 /signal-preview。
+  await expect(page).toHaveURL(/\/signal-preview(\?.*)?$/);
 });

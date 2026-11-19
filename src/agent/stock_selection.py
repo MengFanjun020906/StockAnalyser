@@ -20,6 +20,7 @@ from src.agent.evidence import build_evidence_cards_for_stock
 from src.agent.evidence.adapter import cards_to_json
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
 from src.agent.judge_sanity import apply_judge_sanity
+from src.agent.trade_plan_guard import compute_atr20_pct, validate_plan_fields
 from src.agent.llm_adapter import LLMResponse, LLMToolAdapter
 from src.agent.llm_telemetry import llm_telemetry_scope
 from src.agent.multi_expert import AgentState, ExpertOrchestrator
@@ -42,7 +43,7 @@ from src.agent.stock_selection_graph import StockSelectionGraphEvidence
 from src.agent.tools.registry import ToolRegistry
 from src.config import Config
 from src.schemas.agent_context import AgentUserContext
-from src.services.history_loader import get_frozen_target_date
+from src.services.history_loader import get_frozen_target_date, load_history_df
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +251,55 @@ def should_run_stock_selection(agent_user_context: Optional[AgentUserContext]) -
         return False
     report = agent_user_context.report
     return report.analysis_mode == "planning_execute" and report.intent == SELECTION_INTENT
+
+
+def _pricing_shadow_codes(ctx: SelectionRunContext) -> List[str]:
+    """Candidate codes for the read-only pricing probe (screening + deep dive + plan)."""
+    codes: List[str] = []
+    screening_full = ctx.stage_full("candidate_screening")
+    for item in screening_full.get("shortlist") or []:
+        if isinstance(item, dict):
+            codes.append(str(item.get("code") or ""))
+        elif item:
+            codes.append(str(item))
+    codes.extend(_deep_dive_target_codes(ctx.stage_full("single_stock_deep_dive")))
+    allocation_full = ctx.stage_full("portfolio_allocation")
+    for item in allocation_full.get("positions_plan") or []:
+        if isinstance(item, dict):
+            codes.append(str(item.get("code") or ""))
+    seen: set = set()
+    ordered: List[str] = []
+    for code in codes:
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        ordered.append(code)
+    return ordered
+
+
+def _run_pricing_shadow_if_enabled(ctx: SelectionRunContext) -> None:
+    """Run the deterministic engine in shadow mode; never mutates ctx or report."""
+    try:
+        from src.config import get_config
+
+        if not bool(getattr(get_config(), "agent_pricing_shadow_enabled", False)):
+            return
+    except Exception:
+        return
+    try:
+        from src.agent.pricing.shadow import run_pricing_shadow_probe
+
+        codes = _pricing_shadow_codes(ctx)
+        if not codes:
+            return
+        run_pricing_shadow_probe(
+            codes,
+            as_of=date.today(),
+            run_id=ctx.run_id,
+            market=ctx.market,
+        )
+    except Exception as exc:  # pragma: no cover - shadow must never break selection
+        logger.warning("pricing shadow probe failed: %s", exc)
 
 
 def run_stock_selection_pipeline(
@@ -765,6 +815,11 @@ def run_stock_selection_pipeline(
             progress_callback=progress_callback,
         )
 
+        try:
+            _apply_trade_plan_validation(ctx)
+        except Exception as exc:  # pragma: no cover - 校验失败不得拖垮选股主流程
+            logger.warning("trade plan validation failed: %s", exc)
+        _run_pricing_shadow_if_enabled(ctx)
         result.success = True
         result.final_report_json = _build_final_report_json(ctx)
         _enforce_report_stock_identity(ctx, result.final_report_json)
@@ -812,6 +867,15 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
     }
     candidate_quality = discovery_full.get("quality") if isinstance(discovery_full.get("quality"), dict) else {}
     screening_summary = report.get("candidate_screening", {}).get("summary", {})
+    screening_full = report.get("candidate_screening", {}).get("full", {})
+    screening_shortlist = screening_full.get("shortlist") if isinstance(screening_full, dict) and isinstance(screening_full.get("shortlist"), list) else []
+    screening_scores: Dict[str, float] = {}
+    for item in screening_shortlist:
+        if not isinstance(item, dict) or item.get("score") is None:
+            continue
+        code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+        if code:
+            screening_scores[code] = item.get("score")
     deep_dive_full = report.get("single_stock_deep_dive", {}).get("full", {})
     deep_results = deep_dive_full.get("results") if isinstance(deep_dive_full, dict) and isinstance(deep_dive_full.get("results"), list) else []
     all_missing = _report_missing_evidence(report)
@@ -826,6 +890,7 @@ def render_stock_selection_markdown(report: Dict[str, Any]) -> str:
         deep_results=deep_results,
         candidates=candidates,
         llm_candidate_by_code=llm_candidate_by_code,
+        screening_scores=screening_scores,
     )
     deep_dive_order = [
         _normalize_stock_identity_code(
@@ -2217,6 +2282,7 @@ def _run_candidate_discovery_tool(
                         tool_calls=tc_list,
                         text=content,
                         usage=dict(getattr(resp, "usage", {}) or {}),
+                        finish_reason=str(getattr(resp, "finish_reason", "") or ""),
                     )
 
                 committee_llm = _committee_llm_callable
@@ -2297,6 +2363,30 @@ def _run_candidate_discovery_tool(
                     per_seed_timeout_budget_s=per_desk_llm_timeout,
                     desk_row_concurrency=int(
                         getattr(Config.get_instance(), "agent_desk_row_concurrency", 3) or 3
+                    ),
+                    momentum_gain5d_gate_enabled=bool(
+                        getattr(Config.get_instance(), "agent_momentum_gain5d_gate", False)
+                    ),
+                    veto_gate_enabled=bool(
+                        getattr(Config.get_instance(), "agent_veto_gate_enabled", False)
+                    ),
+                    veto_enforce_liquidity=bool(
+                        getattr(Config.get_instance(), "agent_veto_enforce_liquidity", False)
+                    ),
+                    veto_violent_outflow_threshold=getattr(
+                        Config.get_instance(), "agent_veto_violent_outflow_threshold", None
+                    ),
+                    veto_breakdown_accel_threshold=getattr(
+                        Config.get_instance(), "agent_veto_breakdown_accel_threshold", None
+                    ),
+                    counter_evidence_veto_enabled=bool(
+                        getattr(Config.get_instance(), "agent_counter_evidence_veto_enabled", False)
+                    ),
+                    sector_flow_enabled=bool(
+                        getattr(Config.get_instance(), "agent_sector_flow_observation_enabled", False)
+                    ),
+                    sector_flow_cache_dir=(
+                        getattr(Config.get_instance(), "agent_sector_flow_cache_dir", "") or None
                     ),
                 )
             if not isinstance(payload, dict):
@@ -3829,6 +3919,7 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
             "thesis_desk_diagnostics",
             "thesis_desk_committee",
             "thesis_desk_committee_elapsed_ms",
+            "sector_flow_summary",
             "llm_expert_committee",
             "negative_conclusion_reasons",
             "error",
@@ -4199,6 +4290,8 @@ def _meta_regime_adjustment(market: Dict[str, Any]) -> str:
     regime = str(market.get("regime") or "unknown")
     if regime == "trending_up":
         return "大盘偏强,可保留动量延续剧本,但仍需回踩确认和追高约束。"
+    if regime == "bull_volatile":
+        return "大盘偏强但波动放大,可保留动量延续剧本,但必须降低首仓、等待承接确认并收紧失效条件。"
     if regime in {"range_bound", "high_volatility"}:
         return "震荡或高波动环境,高位突破需按诱多风险处理,提高回撤确认要求。"
     if regime in {"risk_off", "panic", "trending_down"}:
@@ -4815,6 +4908,8 @@ def _summarize_market_regime(regime: Dict[str, Any]) -> Dict[str, Any]:
         "volatility_bucket": regime.get("volatility_bucket"),
         "sentiment_state": regime.get("sentiment_state"),
         "wyckoff_phase": regime.get("wyckoff_phase"),
+        "trend_direction": regime.get("trend_direction"),
+        "vol_direction": regime.get("vol_direction"),
         "risk_multiplier": regime.get("risk_multiplier"),
         "strategy_hints": list(regime.get("strategy_hints") or [])[:5],
         "data_quality": regime.get("data_quality"),
@@ -4884,12 +4979,20 @@ def _apply_market_regime_constraints(
     regime_name = str(regime.get("regime") or "").strip().lower()
     risk_level = str(regime.get("risk_level") or "").strip().lower()
     volatility = str(regime.get("volatility_bucket") or "").strip().lower()
+    trend_direction = str(regime.get("trend_direction") or "").strip().lower()
+    trend_up = trend_direction == "up" or regime_name in {"trending_up", "bull_volatile"}
+    breadth_confirmed = regime.get("breadth_confirmed")
+    breadth_ok = breadth_confirmed is not False
     restrictive = (
         regime_name in {"risk_off", "panic"}
         or risk_level in {"high", "extreme"}
-        or volatility == "extreme"
+        or (volatility == "extreme" and not trend_up)
     )
-    high_vol = restrictive or volatility in {"high_vol", "extreme"} or risk_level == "medium_high"
+    high_vol = (
+        restrictive
+        or volatility in {"elevated", "high_vol", "extreme"}
+        or risk_level == "medium_high"
+    )
     if not high_vol:
         return allocation_payload
 
@@ -4917,7 +5020,8 @@ def _apply_market_regime_constraints(
             plan["initial_amount"] = 0
             plan["reason"] = f"{plan.get('reason') or ''}；{rule}".strip("；")
         elif high_vol and action == "open":
-            capped = min(pct_num, 5.0)
+            cap_pct = 15.0 if trend_up and breadth_ok else 5.0
+            capped = min(pct_num, cap_pct)
             plan["initial_position_pct"] = capped
             if isinstance(plan.get("initial_amount"), (int, float)) and pct_num > 0:
                 plan["initial_amount"] = plan["initial_amount"] * capped / pct_num
@@ -4953,7 +5057,19 @@ def _apply_market_regime_constraints(
 def _market_regime_rule_text(regime: Dict[str, Any]) -> str:
     regime_name = regime.get("regime") or "unknown"
     volatility = regime.get("volatility_bucket") or "unknown"
-    return f"市场状态约束：regime={regime_name}, volatility={volatility}，降低主动开仓和追高权重"
+    regime_label = _market_regime_label(regime_name)
+    volatility_label = _volatility_label(volatility)
+    trend_direction = str(regime.get("trend_direction") or "").strip().lower()
+    breadth_confirmed = regime.get("breadth_confirmed")
+    if (
+        (trend_direction == "up" or str(regime_name).strip().lower() in {"trending_up", "bull_volatile"})
+        and breadth_confirmed is not False
+    ):
+        return (
+            f"市场状态约束：{regime_label}，波动 {volatility_label}，"
+            "降低首仓并等待承接确认，不把波动单独作为开仓否决理由"
+        )
+    return f"市场状态约束：{regime_label}，波动 {volatility_label}，降低主动开仓和追高权重"
 
 
 def _fallback_adversarial_review(ctx: SelectionRunContext) -> Dict[str, Any]:
@@ -5174,6 +5290,135 @@ def _downgrade_position_to_monitor(item: Dict[str, Any], *, reason: str) -> None
     if reason not in risk_flags:
         risk_flags.append(reason)
     item["risk_flags"] = risk_flags
+
+
+def _load_atr20_by_code(codes: List[str]) -> Dict[str, float]:
+    """只读本地缓存计算 ATR20，不触发网络下载。"""
+    atr_by_code: Dict[str, float] = {}
+    for raw_code in codes:
+        code = _normalize_stock_identity_code(raw_code)
+        if not code or code in atr_by_code:
+            continue
+        try:
+            df, _source = load_history_df(code, days=40, fallback_to_network=False)
+        except Exception as exc:  # pragma: no cover - 本地缓存读取异常按缺失处理
+            logger.debug("ATR20 load failed for %s: %s", code, exc)
+            continue
+        if df is None or getattr(df, "empty", True):
+            continue
+        atr_pct = compute_atr20_pct(df.to_dict("records"))
+        if atr_pct is not None and atr_pct > 0:
+            atr_by_code[code] = atr_pct
+    return atr_by_code
+
+
+def _validate_plan_items(
+    items: List[Any],
+    *,
+    entry_field: str,
+    stop_field: str,
+    atr_by_code: Dict[str, float],
+    scope: str,
+    nested_scenarios: bool = False,
+) -> Dict[str, Any]:
+    """逐个校验价格计划，只产出判定与建议，不修改计划字段。"""
+    summary: Dict[str, Any] = {
+        "scope": scope,
+        "validator": "trade_plan_guard.validate_price_plan",
+        "advisory_only": True,
+        "checked": 0,
+        "ok": 0,
+        "needs_review": 0,
+        "invalid": 0,
+        "atr_unavailable": 0,
+        "atr_available": len(atr_by_code),
+        "results": [],
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        code = _normalize_stock_identity_code(item.get("code"))
+        atr_pct = atr_by_code.get(code)
+        targets = item.get("scenarios") if nested_scenarios else [item]
+        if not isinstance(targets, list):
+            continue
+        for index, target in enumerate(targets):
+            if not isinstance(target, dict):
+                continue
+            summary["checked"] += 1
+            if atr_pct is None:
+                summary["atr_unavailable"] += 1
+            validation = validate_plan_fields(
+                target,
+                entry_field=entry_field,
+                stop_field=stop_field,
+                atr_pct=atr_pct,
+            )
+            status = validation["status"]
+            summary[status] += 1
+            if status == "ok":
+                continue
+            summary["results"].append(
+                {
+                    "scope": scope,
+                    "code": code,
+                    "name": item.get("name"),
+                    "scenario_index": index if nested_scenarios else None,
+                    "status": status,
+                    "blocked": status == "invalid",
+                    "issues": validation["issues"],
+                    "suggestions": validation["suggestions"],
+                    "observed": validation["observed"],
+                    "atr20_pct": validation["atr20_pct"],
+                }
+            )
+    return summary
+
+
+def _apply_trade_plan_validation(ctx: SelectionRunContext) -> None:
+    """在最终报告落盘前校验入场区与止损结构。
+
+    只记录 ``ok`` / ``needs_review`` / ``invalid`` 判定与建议值，**不修改**
+    任何模型给出的价格、区间或止损字段；``invalid`` 表示该计划不得执行，
+    由消费方按此拒绝或回问模型。
+    """
+    pricing_stage = ctx.stages.get("pricing_agent")
+    allocation_stage = ctx.stages.get("portfolio_allocation")
+    pricing_full = pricing_stage.full if pricing_stage and isinstance(pricing_stage.full, dict) else {}
+    allocation_full = allocation_stage.full if allocation_stage and isinstance(allocation_stage.full, dict) else {}
+    matrix = pricing_full.get("if_then_order_matrix")
+    positions = allocation_full.get("positions_plan")
+    matrix_items = matrix if isinstance(matrix, list) else []
+    position_items = positions if isinstance(positions, list) else []
+    if not matrix_items and not position_items:
+        return
+
+    codes: List[str] = []
+    for item in list(matrix_items) + list(position_items):
+        if not isinstance(item, dict):
+            continue
+        code = _normalize_stock_identity_code(item.get("code"))
+        if code and code not in codes:
+            codes.append(code)
+    atr_by_code = _load_atr20_by_code(codes)
+
+    if matrix_items:
+        pricing_full["trade_plan_validation"] = _validate_plan_items(
+            matrix_items,
+            entry_field="entry_zone",
+            stop_field="stop_loss",
+            atr_by_code=atr_by_code,
+            scope="pricing_agent",
+            nested_scenarios=True,
+        )
+    if position_items:
+        allocation_full["trade_plan_validation"] = _validate_plan_items(
+            position_items,
+            entry_field="entry_condition",
+            stop_field="stop_loss_condition",
+            atr_by_code=atr_by_code,
+            scope="portfolio_allocation",
+        )
 
 
 def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
@@ -5943,6 +6188,7 @@ def _recommendation_items(
     deep_results: List[Any],
     candidates: List[Any],
     llm_candidate_by_code: Dict[str, Any],
+    screening_scores: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     by_code: Dict[str, Dict[str, Any]] = {}
     for result in deep_results:
@@ -6000,7 +6246,11 @@ def _recommendation_items(
         target = by_code.setdefault(code, {"code": code, "name": display_item.get("name"), "action": "watch", "action_strength": "weak"})
         target.setdefault("name", display_item.get("name"))
         target["has_candidate"] = True
-        target["candidate_score"] = display_item.get("final_score") or display_item.get("signal_score") or display_item.get("score")
+        # candidate_discovery 的 final_score/signal_score/score 只是入池召回分，
+        # 只用于展示与“强观察”档位，不能作为买入推荐分（见 portfolio prompt 规则）。
+        target["recall_score"] = display_item.get("final_score") or display_item.get("signal_score") or display_item.get("score")
+        # 只有 candidate_screening 的质量分才允许驱动条件入场判定。
+        target["entry_quality_score"] = (screening_scores or {}).get(code)
         target["candidate_reason"] = _candidate_reason(display_item)
         target["candidate_source"] = _candidate_source_label(display_item)
         target["candidate_labels"] = _candidate_labels(display_item)
@@ -6041,7 +6291,8 @@ def _recommendation_items(
     items.sort(key=lambda item: (
         _recommendation_sort_rank(item),
         int(item.get("rank") or 999),
-        -_safe_float(item.get("candidate_score")),
+        -_safe_float(item.get("entry_quality_score")),
+        -_safe_float(item.get("recall_score")),
         str(item.get("code") or ""),
     ))
     return items
@@ -6160,7 +6411,8 @@ def _is_conditional_entry_item(item: Dict[str, Any]) -> bool:
         return False
     if not _strength_at_least(item.get("action_strength"), _conditional_entry_min_strength()):
         return False
-    score = _safe_float(item.get("candidate_score"))
+    # 条件入场必须由初筛质量分驱动；入池召回分不得升级为买入/条件入场。
+    score = _safe_float(item.get("entry_quality_score"))
     if score < _conditional_entry_score_min() and not (score >= _strong_watch_score_min() and _has_consensus_signal(item)):
         return False
     if not _has_entry_condition(item):
@@ -6178,7 +6430,8 @@ def _is_strong_watch_item(item: Dict[str, Any]) -> bool:
         return False
     if _has_hard_bearish_risk(item):
         return False
-    score = _safe_float(item.get("candidate_score"))
+    # 入池召回分只允许把标的放进“强观察”这一观察档位，不参与买入判定。
+    score = _safe_float(item.get("recall_score"))
     return score >= _strong_watch_score_min() or _has_consensus_signal(item)
 
 
@@ -6344,7 +6597,7 @@ def _render_recommendation_block(rank: int, item: Dict[str, Any]) -> List[str]:
         medal = f"👀 观察 {rank}"
     else:
         medal = f"⏳ 等待确认 {rank}"
-    score = item.get("candidate_score")
+    score = item.get("recall_score")
     title_suffix = f"（候选分 {_format_score(score)}）" if score is not None else ""
     lines = [
         f"### {medal}：{_markdown_cell(_stock_label(item))}{title_suffix}",
@@ -6520,7 +6773,7 @@ def _render_strong_watch_table(item: Dict[str, Any]) -> List[str]:
         "| --- | --- |",
         "| 看盘动作 | 强观察，暂不形成交易脚本 |",
         f"| 动作强度 | {_markdown_cell(item.get('action_strength') or '-')} |",
-        f"| 候选分 | {_markdown_cell(_format_score(item.get('candidate_score')) if item.get('candidate_score') is not None else '-')} |",
+        f"| 候选分 | {_markdown_cell(_format_score(item.get('recall_score')) if item.get('recall_score') is not None else '-')} |",
         f"| 不能直接入场原因 | {_markdown_cell(_strong_watch_blocker(item))} |",
         f"| 明日重点观察 | {_markdown_cell(_strong_watch_focus(item))} |",
         f"| 观察有效期 | {_markdown_cell(_watch_validity_text(item))} |",
@@ -7515,6 +7768,7 @@ def _translate_machine_tokens(text: str) -> str:
         "latest_trading_day": "最近有效交易日",
         "unknown": "未知",
         "high_volatility": "高波动",
+        "bull_volatile": "高波动上涨",
         "range_bound": "震荡市",
         "uptrend": "上行趋势",
         "downtrend": "下行趋势",
@@ -7535,7 +7789,10 @@ def _market_regime_label(value: Any) -> str:
     raw = str(value or "").strip()
     labels = {
         "high_volatility": "高波动",
+        "bull_volatile": "高波动上涨",
         "range_bound": "震荡市",
+        "trending_up": "上行趋势",
+        "trending_down": "下行趋势",
         "uptrend": "上行趋势",
         "downtrend": "下行趋势",
         "bull": "牛市",
@@ -7543,6 +7800,7 @@ def _market_regime_label(value: Any) -> str:
         "neutral": "中性",
         "panic": "恐慌",
         "risk_off": "避险",
+        "unknown": "未知",
     }
     return labels.get(raw, raw or "-")
 
@@ -7552,9 +7810,13 @@ def _volatility_label(value: Any) -> str:
     labels = {
         "extreme": "极端",
         "high": "高",
+        "high_vol": "高波动",
         "medium": "中",
-        "low": "低",
+        "elevated": "抬升",
         "normal": "正常",
+        "low": "低",
+        "very_low": "极低",
+        "unknown": "未知",
     }
     return labels.get(raw, raw or "-")
 

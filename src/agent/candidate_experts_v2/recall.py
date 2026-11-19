@@ -5,7 +5,9 @@
 1. 调用现有数据源(复用 _build_seed_pool_result 的结果),将每只股票的
    SeedItem 转换为 FeatureRow + FeatureFlag.  召回层只陈述可证伪事实,
    **不打分、不排序**.
-2. 对全部召回 row 跑 FactSheet Phase A(纯本地 SQLite,无网络请求).
+2. 对全部召回 row 跑 FactSheet Phase A(纯本地 SQLite,无网络请求);硬风险
+   (ST/退市/停牌)在送入 FactSheet 前由 `hard_risk` 计算,默认只读本地缓存,
+   生产链路通过 `hard_risk_allow_online=True` best-effort 补数.
 3. 按「命中探测器数量(hit count)」做粗筛截断(RECALL_COARSE_CAP);
    并列边界全保,不靠分数做二次裁剪.
 
@@ -164,11 +166,22 @@ def _seeds_to_rows(seeds: Sequence[SeedItem]) -> Dict[str, FeatureRow]:
                 market=seed.market or "cn",
                 flags=flags,
                 recall_sources=recall_sources,
+                theme_profile=(
+                    seed.theme_profile
+                    if isinstance(getattr(seed, "theme_profile", None), dict)
+                    else (seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None)
+                ),
             )
         else:
             # Should not happen after committee._dedupe_by_code, but be safe.
             existing = rows[code]
             existing.flags.extend(flags)
+            if existing.theme_profile is None:
+                existing.theme_profile = (
+                    seed.theme_profile
+                    if isinstance(getattr(seed, "theme_profile", None), dict)
+                    else (seed.extras.get("theme_profile") if isinstance(seed.extras, dict) else None)
+                )
             for s in recall_sources:
                 if s not in existing.recall_sources:
                     existing.recall_sources.append(s)
@@ -229,11 +242,14 @@ def _build_fact_sheet_phase_a(
     bars: List[Dict[str, Any]],
     *,
     market: str = "cn",
+    hard_risk_flags: Optional[List[str]] = None,
+    hard_risk_evidence: Optional[List[Dict[str, Any]]] = None,
+    hard_risk_unknown: Optional[List[str]] = None,
     min_avg_turnover: Optional[float] = None,
     violent_outflow_threshold: Optional[float] = None,
     breakdown_accel_threshold: Optional[float] = None,
 ) -> FactSheet:
-    """Call build_fact_sheet with local bars only (Phase A, no network)."""
+    """Call build_fact_sheet with local bars + upstream hard-risk verdict."""
     try:
         import pandas as pd
         from src.agent.candidate_experts_v2.fact_sheet import build_fact_sheet
@@ -243,6 +259,9 @@ def _build_fact_sheet_phase_a(
             code,
             df,
             market=market,
+            hard_risk_flags=hard_risk_flags,
+            hard_risk_evidence=hard_risk_evidence,
+            hard_risk_unknown=hard_risk_unknown,
             min_avg_turnover=min_avg_turnover,
             violent_outflow_threshold=violent_outflow_threshold,
             breakdown_accel_threshold=breakdown_accel_threshold,
@@ -251,6 +270,30 @@ def _build_fact_sheet_phase_a(
     except Exception as exc:
         logger.debug("recall: fact_sheet phase A failed for %s: %s", code, exc)
         return FactSheet(code=code, warnings=[f"phase_a_error: {exc}"])
+
+
+def _latest_local_bar_date() -> str:
+    """Latest ``stock_daily.date`` in the local SQLite (read-only, no network)."""
+    db = _db_path()
+    if db is None:
+        return ""
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            row = conn.execute("SELECT MAX(date) FROM stock_daily").fetchone()
+        raw = str(row[0]) if row and row[0] is not None else ""
+        return raw[:10] if raw else ""
+    except Exception as exc:
+        logger.debug("recall: failed to read local max bar date: %s", exc)
+        return ""
+
+
+def _normalize_iso_date(value: Any) -> str:
+    """Normalize ``YYYYMMDD`` / ``YYYY-MM-DD`` into ``YYYY-MM-DD`` (else "")."""
+    text = str(value or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    return text[:10] if len(text) >= 10 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +345,9 @@ def build_recall_pool(
     min_avg_turnover: Optional[float] = None,
     violent_outflow_threshold: Optional[float] = None,
     breakdown_accel_threshold: Optional[float] = None,
+    hard_risk_snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
+    hard_risk_allow_online: bool = False,
+    hard_risk_cache_dir: Optional[Path] = None,
 ) -> RecallResult:
     """Build the P3 recall pool: features + FactSheet Phase A + coarse cap.
 
@@ -325,6 +371,16 @@ def build_recall_pool(
         consistency and avoiding a second round of online source calls.
     min_avg_turnover, violent_outflow_threshold, breakdown_accel_threshold:
         Forwarded to ``build_fact_sheet`` / FactSheet red-line logic.
+    hard_risk_snapshot:
+        Optional precomputed ``{code: {hard_risk_flags, evidence, unknown}}``.
+        When omitted, it is built from the ST/退市/停牌 cache (see
+        ``hard_risk.build_hard_risk_snapshot``).
+    hard_risk_allow_online:
+        Whether the hard-risk loader may refresh missing/stale caches from
+        Tushare.  Default ``False`` keeps recall Phase A network-free; the
+        production thesis-desk pipeline opts in explicitly.
+    hard_risk_cache_dir:
+        Override for the shared ``data/factor_eval_cache`` directory.
     """
     # --- Step 1: call the existing seed builder to collect candidates ----------
     # Use a generous total_limit so the coarse cap, not the seed-builder cap,
@@ -341,25 +397,85 @@ def build_recall_pool(
             total_limit=seed_total_limit,
         )
 
+    # --- Step 1.5: cn 市场剔除可转债/ETF/基金等非 A 股标的 -------------------
+    # 这些标的是 6 位数字代码但不应进入 seed pool / 候选判定; 代码段已能确定
+    # 类型, 不按"未知股票"处理。UNKNOWN 段保留, 避免误伤未来新增的 A 股代码段。
+    diagnostics = list(getattr(pool, "diagnostics", None) or [])
+    seeds = list(getattr(pool, "seeds", None) or [])
+    if str(market or "cn").strip().lower() == "cn":
+        from src.agent.candidate_experts_v2.instruments import (
+            A_SHARE,
+            UNKNOWN as UNKNOWN_INSTRUMENT,
+            classify_instrument,
+        )
+
+        kept_seeds: List[SeedItem] = []
+        excluded: Dict[str, int] = {}
+        for seed in seeds:
+            instrument_type, _label = classify_instrument(getattr(seed, "code", ""))
+            if instrument_type not in (A_SHARE, UNKNOWN_INSTRUMENT):
+                excluded[instrument_type] = excluded.get(instrument_type, 0) + 1
+                continue
+            kept_seeds.append(seed)
+        if excluded:
+            diagnostics.append(
+                {
+                    "source": "instrument_type_filter",
+                    "status": "filtered",
+                    "count": sum(excluded.values()),
+                    "detail": {"market": market, "excluded_by_type": excluded},
+                }
+            )
+            logger.info(
+                "recall: dropped %d non-A-share instruments: %s",
+                sum(excluded.values()),
+                excluded,
+            )
+        seeds = kept_seeds
+
     # --- Step 2: SeedItems → FeatureRows / FeatureFlags -----------------------
-    rows_by_code = _seeds_to_rows(pool.seeds)
+    rows_by_code = _seeds_to_rows(seeds)
     all_rows: List[FeatureRow] = list(rows_by_code.values())
 
     logger.info(
         "recall: converted %d seeds → %d feature rows",
-        len(pool.seeds),
+        len(seeds),
         len(all_rows),
     )
 
     # --- Step 3: FactSheet Phase A (local SQLite, batch, no network) -----------
     codes = [r.code for r in all_rows]
     bars_by_code = _load_daily_bars_batch(codes)
+
+    # Upstream hard-risk verdict (ST / 退市 / 停牌) — feeds hard_risk_flags.
+    risk_by_code = hard_risk_snapshot
+    if risk_by_code is None:
+        from src.agent.candidate_experts_v2.hard_risk import build_hard_risk_snapshot
+
+        local_bar_date = _latest_local_bar_date()
+        reference_date = max(
+            [value for value in (_normalize_iso_date(today), local_bar_date) if value],
+            default="",
+        )
+        risk_by_code = build_hard_risk_snapshot(
+            codes,
+            bars_by_code=bars_by_code,
+            reference_date=reference_date,
+            local_bar_date=local_bar_date,
+            cache_dir=hard_risk_cache_dir,
+            allow_online=hard_risk_allow_online,
+        )
+
     for row in all_rows:
         bars = bars_by_code.get(row.code, [])
+        risk = risk_by_code.get(row.code) or {}
         row.fact_sheet = _build_fact_sheet_phase_a(
             row.code,
             bars,
             market=row.market,
+            hard_risk_flags=risk.get("hard_risk_flags"),
+            hard_risk_evidence=risk.get("evidence"),
+            hard_risk_unknown=risk.get("unknown"),
             min_avg_turnover=min_avg_turnover,
             violent_outflow_threshold=violent_outflow_threshold,
             breakdown_accel_threshold=breakdown_accel_threshold,
@@ -394,7 +510,7 @@ def build_recall_pool(
     return RecallResult(
         rows=kept_rows,
         all_rows=all_rows,
-        diagnostics=pool.diagnostics,
+        diagnostics=diagnostics,
         coarse_truncated=coarse_truncated,
         hit_count_hist=hit_count_hist,
         sources=sources,

@@ -245,6 +245,19 @@ Web 结果页顶部“上证超额”卡片直接展示 `excess_vs_shanghai_pct`
 
 → `202 DataJobResponse`；`GET /api/v1/backtest/data-jobs/{job_id}` 轮询。网络下载是独立 job，纯回测不会静默下载。
 
+`POST /api/v1/backtest/daily-bars/sync`
+
+```json
+{
+  "symbols": ["000021", "000636"],
+  "start_date": "2026-01-28",
+  "end_date": "2026-11-08",
+  "config": null
+}
+```
+
+→ `202 DataJobResponse`。复用 `DataFetcherManager` 优先级链与 `save_daily_data`，按标的返回 `status`（`ok`/`empty`/`failed`）、`gap_kind`（`local_missing_backfilled`/`partial_gap_filled`/`upstream_empty`）、`local_rows_before`、`fetched_rows`、`written_rows`、`source`；可重复执行。区间应覆盖 `daily_warmup_sessions`，否则首个交易日仍会缺前收盘。
+
 ## 7. 辅助资源
 
 - `GET /api/v1/backtest/candidates?start_date=&end_date=&symbol=&limit=`：结构化价格计划候选（含 decision 状态、trace_refs），用于新建表单。
