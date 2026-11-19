@@ -90,3 +90,17 @@ verify_*.py
 static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
+
+# SQLite WAL/SHM 运行时文件
+*.wal
+*.shm
+
+# 本地 agent/IDE 产物
+/.trae/
+
+# 按日期命名的临时分析产物目录（如 2026-11-17/）
+/2026-*-*/
+
+# vendor 下的展示打包产物，只读引用不入库
+/vendor/showcase_package/
+/vendor/stock-agent-showcase-*.zip
