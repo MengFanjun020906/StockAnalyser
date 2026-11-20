@@ -45,7 +45,7 @@
 | `role`（PRIMARY/SECONDARY/OBSERVATION） | `execution_mode`（部分） | 语义转换 | 只有 PRIMARY 可映射 `conditional_open`；SECONDARY 视强度；OBSERVATION 只能 `strong_watch`/`plain_wait` |
 | `entry_low` / `entry_high` | `entry_condition`（字符串） | **新增数值 + 文本派生** | 建议同时保留数值字段，文本由数值生成 |
 | `entry_reference`（恒等于 `entry_high`） | — | 新增 | [plan.py#L304](file:///Users/mengfanjun/Desktop/mfj/StockAnalyser/src/agent/pricing/plan.py#L304) |
-| `stop_loss` | `stop_loss_condition`（字符串） | **新增数值 + 文本派生** | 可能为 `None`（`NO_VALID_STOP`） |
+| `stop_loss` | `stop_loss_condition`（字符串） | **新增数值 + 文本派生** | 可能为 `None`（`NO_STRUCTURAL_SUPPORT` / `STOP_DISTANCE_EXCEEDED` / `STOP_LEVEL_INVALID`） |
 | `target_1` / `target_2` | — | **新增** | 现有选股结构没有目标价字段 |
 | `target_1_exit_ratio` | — | **新增** | 有 `target_2` 时 50%，否则 100% |
 | `reference_net_rr_1` | — | **新增** | 净盈亏比（含成本） |
@@ -177,12 +177,14 @@
 | 复权口径冲突 | `no_plan` + `PRICE_SCALE_UNVERIFIED` |
 | 元数据无法验证（如北交所、历史日期） | `SYSTEM_NOT_READY`（`system_unready`） |
 | HK/US | `UNSUPPORTED_INSTRUMENT`，`execution_status=no_plan` |
-| 有数据但止损不可用 | 场景 `role=OBSERVATION` + `NO_VALID_STOP`，计划仍可 `observation` |
-| 有数据但目标太近 | 场景 `OBSERVATION` + `TARGET_TOO_CLOSE` |
+| 有数据但没有结构支撑 | 场景 `role=OBSERVATION` + `NO_STRUCTURAL_SUPPORT`，计划仍可 `observation` |
+| 有数据、有支撑但止损过远 | 场景 `OBSERVATION` + `STOP_DISTANCE_EXCEEDED` |
+| 止损位数据异常（ATR 退化/取整） | 场景 `OBSERVATION` + `STOP_LEVEL_INVALID` |
+| 有数据但目标太近 | 场景 `OBSERVATION` + `RISK_REWARD_BELOW_MINIMUM`（目标空间不足并入盈亏比门） |
 | 净盈亏比不足 | 场景 `OBSERVATION` + `RISK_REWARD_BELOW_MINIMUM` |
 | 有正式场景 | `generation_status=generated`，最多 3 个，至少 1 个 PRIMARY |
 
-【事实】是否 `no_plan` 只看 §2.3 第 5 步那 7 个计划级原因；`NO_VALID_STOP`、`TARGET_TOO_CLOSE`、`RISK_REWARD_BELOW_MINIMUM` **不会**让整只票失败，只会让该场景降级为观察（[plan.py#L196-L246](file:///Users/mengfanjun/Desktop/mfj/StockAnalyser/src/agent/pricing/plan.py#L196-L246)）。
+【事实】是否 `no_plan` 只看 §2.3 第 5 步那 7 个计划级原因；`NO_STRUCTURAL_SUPPORT`、`STOP_DISTANCE_EXCEEDED`、`STOP_LEVEL_INVALID`、`RISK_REWARD_BELOW_MINIMUM` **不会**让整只票失败，只会让该场景降级为观察（[plan.py#L196-L246](file:///Users/mengfanjun/Desktop/mfj/StockAnalyser/src/agent/pricing/plan.py#L196-L246)）。`NO_VALID_STOP` 与 `TARGET_TOO_CLOSE` 仅作为历史落库数据的兼容展示码。
 
 ### 3.3 一次选股的开销
 
@@ -216,7 +218,7 @@
 | `UNSUPPORTED_INSTRUMENT` | 按 D1 的港美股/非普通股策略处理 | 事实：非普通股在 `MARKET_RULES_UNAVAILABLE`/符号层就失败 |
 | `no_plan` + `INSUFFICIENT_DAILY_HISTORY` / `MISSING_CASH_PRICE` / `PRICE_SCALE_UNVERIFIED` | 观察池 / `needs_review`，不入选 | 数据问题，不代表标的不好 |
 | `no_plan` + `MARKET_RULES_UNAVAILABLE`（停牌/退市/非普通股） | 剔除 | 不可交易 |
-| 场景全为 `OBSERVATION`（`NO_VALID_STOP` / `TARGET_TOO_CLOSE` / `RISK_REWARD_BELOW_MINIMUM`） | 强观察（`strong_watch`），可出现在观察池，不可给 `conditional_open` | 有价但不可执行 |
+| 场景全为 `OBSERVATION`（`NO_STRUCTURAL_SUPPORT` / `STOP_DISTANCE_EXCEEDED` / `STOP_LEVEL_INVALID` / `RISK_REWARD_BELOW_MINIMUM`） | 强观察（`strong_watch`），可出现在观察池，不可给 `conditional_open` | 有价但不可执行 |
 | `actionable` + PRIMARY | 可给 `conditional_open`，首仓按引擎的 `target_position_pct`（若接 decision） | |
 | `waiting_confirmation` | `conditional_open`，文本写确认条件 | |
 | `vetoed` / `closed` / `risk_blocked` | `reject` 或 `plain_wait` | |
@@ -380,7 +382,7 @@
 - 引擎要求 720 根日线 + 100 根周线；本地 `stock_daily` 只有 50 个代码、1 个达到 720 根；Sequoia 库约 260 根。
 - 本地索引 5,191 个 CN 代码，无北交所；规则快照 14 条、集中在 2026-09-18。
 - 纯计算约 31 ms/只；`persist=True` 约 8–10 次 DB 往返 + 最多 2 次网络请求。
-- 计划级失败只有 7 个原因；`NO_VALID_STOP` 等只降级场景，不整票失败。
+- 计划级失败只有 7 个原因；`NO_STRUCTURAL_SUPPORT` / `STOP_DISTANCE_EXCEEDED` / `STOP_LEVEL_INVALID` 等只降级场景，不整票失败。
 - 引擎失败不会回退 LLM 价格——**但前提是选股链路改造时主动删除回退路径**；现状里 `_fallback_pricing_agent` 仍会复制上游文本价。
 
 ### 10.2 未验证/不确定

@@ -75,8 +75,12 @@ _REASON_LABELS = {
     "NO_SELECTABLE_SCENARIO": "没有可选择的正式场景",
     "AS_OF_ROLLED_BACK": "行情提供方尚未返回目标日完整 K 线，已回退到实际最新交易日",
     "INSUFFICIENT_SOURCE_FAMILIES": "独立价格来源不足",
-    "NO_VALID_STOP": "没有满足风险约束的有效止损",
-    "TARGET_TOO_CLOSE": "目标空间过近",
+    "NO_STRUCTURAL_SUPPORT": "没有可用的结构性支撑",
+    "STOP_DISTANCE_EXCEEDED": "有结构支撑但止损距离过远",
+    "STOP_LEVEL_INVALID": "止损位数据异常（ATR 退化或取整异常）",
+    # 兼容历史计划与影子快照里已落库的旧 reason, 新引擎不再产出.
+    "NO_VALID_STOP": "没有满足风险约束的有效止损（历史数据兼容）",
+    "TARGET_TOO_CLOSE": "目标空间过近（已并入盈亏比门槛）",
     "WEEKLY_TREND_OPPOSING": "周线趋势与入场方向相反",
     "PLAN_VERDICT_UNAVAILABLE": "模型未给出该维度对价格计划的明确结论",
 }

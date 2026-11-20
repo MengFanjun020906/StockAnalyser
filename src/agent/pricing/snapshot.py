@@ -14,6 +14,7 @@ from src.core.trading_calendar import (
 )
 from src.services.sequoia_price_rebaser import resolve_amount_volume_cash_price_rebase
 
+from .historical_metadata import historical_cn_common_stock_metadata
 from .market_rules import current_cn_common_stock_metadata, resolve_cn_market_rules
 from .params import PRICE_PLAN_PARAMS_V1, PricePlanParams
 from .schemas import ChipSnapshot, PriceBarSnapshot, PricePlanSnapshot
@@ -99,6 +100,14 @@ class PricePlanSnapshotBuilder:
             market_metadata = current_cn_common_stock_metadata(
                 symbol,
                 trade_date=target_date,
+            ) or {}
+        # Historical replays have no "current session" identity to reuse. The
+        # resolver returns None for current/future sessions, so the live path
+        # above keeps its behaviour unchanged.
+        if not market_metadata:
+            market_metadata = historical_cn_common_stock_metadata(
+                symbol,
+                trade_date=actual_as_of,
             ) or {}
         persisted_rules = (
             self._market_rules_loader(symbol, actual_as_of)

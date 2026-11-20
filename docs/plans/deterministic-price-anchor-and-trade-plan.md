@@ -291,9 +291,9 @@ unknown: price_relation in {below, invalidated}，或 ATR/现金价格不可用
 
 1. `entry_reference = zone.high`，作为最保守计划入场参考价。
 2. 从 `as_of` 前已确认的分型低点、摆动低点和中枢下沿中，寻找不高于 `zone.low` 的最近结构支撑；如果场景内本身含价格结构锚点，则同时把 `zone.low` 作为保护边界候选。
-3. `protective_level = max(符合条件的结构支撑)`；没有结构支撑时场景只能观察并记录 `NO_VALID_STOP`。
-4. `stop_loss = floor_to_tick(min(zone.low, protective_level) - stop_buffer_atr * ATR14)`。必须满足 `stop_loss < zone.low`，且 `(entry_reference - stop_loss) / ATR14 <= max_stop_distance_atr`，否则只能观察。
-5. 从同一冻结快照的 `eligible` 阻力锚点中选目标。`target_1` 是**高于 `entry_reference` 的最低阻力**；阻力先按来源族去重，同价时用 6.1 排序键裁决。选出后必须满足 `target_1 - entry_reference >= min_target_gap_atr * ATR14`，否则记录 `TARGET_TOO_CLOSE` 并降为观察，禁止跳过这个最近阻力去挑更远的目标。`target_2` 是高于 `target_1` 且至少相隔 `second_target_gap_atr * ATR14` 的最低阻力。
+3. `protective_level = max(符合条件的结构支撑)`；没有结构支撑时场景只能观察并记录 `NO_STRUCTURAL_SUPPORT`（锚点覆盖不足）。
+4. `stop_loss = floor_to_tick(min(zone.low, protective_level) - stop_buffer_atr * ATR14)`。必须满足 `stop_loss < zone.low`（不满足记 `STOP_LEVEL_INVALID`，属 ATR 退化或取整导致的数据异常），且 `(entry_reference - stop_loss) / ATR14 <= max_stop_distance_atr`（不满足记 `STOP_DISTANCE_EXCEEDED`，属有支撑但过远），否则只能观察。
+5. 从同一冻结快照的 `eligible` 阻力锚点中选目标。`target_1` 是**高于 `entry_reference` 的最低阻力**；阻力先按来源族去重，同价时用 6.1 排序键裁决。选出后必须满足 `target_1 - entry_reference >= min_target_gap_atr * ATR14`，否则不单独产出原因码，而是并入盈亏比判定记 `RISK_REWARD_BELOW_MINIMUM` 并降为观察，禁止跳过这个最近阻力去挑更远的目标。`target_2` 是高于 `target_1` 且至少相隔 `second_target_gap_atr * ATR14` 的最低阻力。
 6. 没有 `target_1` 时记录 `NO_VALID_TARGET` 并降为观察。`target_2` 可以为空；为空时 `target_1_exit_ratio=1.0`，否则使用 `execution-policy.v1` 冻结的退出比例。
 7. 做多计划采用保守取整：入场上沿向上、止损向下、目标向下取最小报价单位。
 
@@ -686,9 +686,12 @@ PlanLifecycleState {
 | `ANCHOR_EXPIRED` / `ANCHOR_BROKEN` / `STRUCTURE_UNCONFIRMED` | 单个锚点过期、被破坏或尚未完成右侧确认 |
 | `NO_ELIGIBLE_ANCHORS` | 没有通过资格审查的锚点 |
 | `INSUFFICIENT_SOURCE_FAMILIES` | 不足两个独立来源族 |
-| `NO_VALID_STOP` / `NO_VALID_TARGET` | 无法形成结构止损或目标 |
-| `TARGET_TOO_CLOSE` | 最近结构阻力距离不足，不允许跳过阻力选远目标 |
-| `RISK_REWARD_BELOW_MINIMUM` | 所有区间均低于最低风险收益比 |
+| `NO_STRUCTURAL_SUPPORT` | 没有可用的结构性支撑（锚点覆盖不足） |
+| `STOP_DISTANCE_EXCEEDED` | 有结构支撑，但止损距离超过 `max_stop_distance_atr` |
+| `STOP_LEVEL_INVALID` | 止损位数据异常（ATR 退化或取整后不低于入场下沿） |
+| `NO_VALID_TARGET` | 无法形成结构目标 |
+| `RISK_REWARD_BELOW_MINIMUM` | 参考净盈亏比低于门槛，或最近结构阻力空间不足（两者共用同一拒绝码） |
+| `NO_VALID_STOP` / `TARGET_TOO_CLOSE` | 历史兼容码，新引擎不再产出，仅用于渲染已落库的旧计划 |
 | `ZONE_WIDTH_EXCEEDED` | padding 后区间超过最大宽度 |
 | `AS_OF_ROLLED_BACK` | 请求发生在未收盘时，已回退到上一已收盘交易日 |
 | `REVIEW_PENDING` / `REVIEW_FAILED` | 数学计划存在，但评审未完成或失败，只能观察 |
@@ -701,7 +704,7 @@ PlanLifecycleState {
 
 `NO_PLAN` 只使用导致数学计划无法形成的原因；评审、仓位、Risk Gate 和系统开关原因保留在同一结果中，但通过 `execution_status` 表达，不能反向改写 `generation_status`。详细诊断可另存结构化 `diagnostics`，不参与状态判断。
 
-原因码还需声明作用域：`plan` 级错误影响 `generation_status`；`scenario` 级错误只降级对应场景；`review/account/system` 级错误只影响 `execution_status`。`MISSING_HISTORICAL_CHIP_SNAPSHOT`、`TARGET_TOO_CLOSE`、`ZONE_WIDTH_EXCEEDED` 默认是 scenario 级；只有所有场景均因此不可用时，聚合器才补充 `NO_ELIGIBLE_ANCHORS` 或 `INSUFFICIENT_SOURCE_FAMILIES` 形成 `no_plan`。
+原因码还需声明作用域：`plan` 级错误影响 `generation_status`；`scenario` 级错误只降级对应场景；`review/account/system` 级错误只影响 `execution_status`。`MISSING_HISTORICAL_CHIP_SNAPSHOT`、`NO_STRUCTURAL_SUPPORT`、`STOP_DISTANCE_EXCEEDED`、`STOP_LEVEL_INVALID`、`RISK_REWARD_BELOW_MINIMUM`、`ZONE_WIDTH_EXCEEDED` 默认是 scenario 级；只有所有场景均因此不可用时，聚合器才补充 `NO_ELIGIBLE_ANCHORS` 或 `INSUFFICIENT_SOURCE_FAMILIES` 形成 `no_plan`。
 
 ### 13.5 旧 `TradePlan` 兼容投影
 
@@ -888,7 +891,7 @@ src/agent/pricing/
 | 日/周线根数或 EMA/MACD 预热不足 | 实际根数与参数包最小值比较 | `no_plan` + `INSUFFICIENT_*_HISTORY` |
 | 两个来源族共振但区间宽度超限 | 重新计算 padding 后的完整宽度 | 只保留观察场景并记录 `ZONE_WIDTH_EXCEEDED`，不裁锚点凑交易区 |
 | 当前价低于区间下沿但高于止损 | `price_relation=below`，禁止 `max(0, distance)` | `ReachabilityBand=unknown`，不得显示 `near` |
-| 最近阻力过近 | 先选最近阻力，再检查 `min_target_gap_atr` | `TARGET_TOO_CLOSE`，禁止跳过阻力选远目标 |
+| 最近阻力过近 | 先选最近阻力，再检查 `min_target_gap_atr` | 并入盈亏比门记 `RISK_REWARD_BELOW_MINIMUM`，禁止跳过阻力选远目标 |
 | LLM 返回价格、自由文本或 JSON 解析失败 | Schema 严格校验和价格字段 diff | 丢弃价格字段，评审 `failed/observe_only`，数学价格不变 |
 | 账户费率、手数或真实净盈亏比缺失 | `AccountCostPolicy` 和 lot rounding 校验 | 保留参考计划，`risk_blocked` 或标记账户净值不可评估，不改价格 |
 | Risk Gate 再次乘 review/risk multiplier | 检查 `RiskGateInput.position_cap` 与 clamp 检查 | 失败；只允许一个 `COMPOSITE_VERDICT_CEILING_APPLIED` 检查 |

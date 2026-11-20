@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [改进] 确定性点位引擎将“最近结构阻力空间不足”并入参考净盈亏比门槛（`RISK_REWARD_BELOW_MINIMUM`），不再单独产出 `TARGET_TOO_CLOSE`；阈值未改，429 样本回放 `generated/observation/no_plan = 147/231/51` 与逐样本场景状态完全一致。
+- [改进] `NO_VALID_STOP` 拆分为 `NO_STRUCTURAL_SUPPORT`（无结构支撑）、`STOP_DISTANCE_EXCEEDED`（有支撑但止损过远）、`STOP_LEVEL_INVALID`（止损位数据异常）；旧码保留中文标签用于渲染历史计划，拆分守恒 255 = 130 + 125 + 0。
+
 - [新功能] 选股链路新增确定性点位引擎影子模式（`AGENT_PRICING_SHADOW_ENABLED`，默认关闭）：在候选确定后、报告生成前对短名单/深研/持仓候选只读调用引擎，结果仅写 `data/pricing_shadow.json`，不写业务表、不进报告、不影响 action/排序/仓位；同时用 `data/adj_factors.db` 换算一份前复权点位做双口径对照，关闭时零开销。
 - [文档] `docs/architecture/deterministic-pricing-in-selection-integration-design.md` 补充 §11.10 扩窗 20 个交易日验收结果（`>=720` 根 4,370→5,188）与 §12.6 影子模式实际实现、落盘样例、实测耗时与守卫测试结论。
 - [修复] 选股报告渲染层统一“入池召回分不参与买入判定”：`candidate_discovery` 的 `signal_score/final_score/score` 改存为 `recall_score`，仅用于展示与“强观察”档位；`conditional_open` 改由 `candidate_screening.shortlist[].score`（`entry_quality_score`）驱动，排序 tiebreaker 同步改用质量分；不改变任何入场/止损点位生成。

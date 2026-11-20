@@ -193,7 +193,7 @@ def _build_scenarios(
         protective_level = max(protective_candidates) if protective_candidates else None
         stop_loss = None
         if protective_level is None:
-            reasons.append("NO_VALID_STOP")
+            reasons.append("NO_STRUCTURAL_SUPPORT")
         else:
             stop_loss = floor_to_tick(
                 min(cluster.entry_low, protective_level)
@@ -201,12 +201,17 @@ def _build_scenarios(
                 snapshot.market_rules.tick_size,
             )
             stop_distance = (cluster.entry_high - stop_loss) / anchor_result.atr
-            if stop_loss >= cluster.entry_low or stop_distance > params.max_stop_distance_atr:
-                reasons.append("NO_VALID_STOP")
+            if stop_loss >= cluster.entry_low:
+                # ATR 退化为 0 或取整异常时止损无法低于入场下沿.
+                reasons.append("STOP_LEVEL_INVALID")
+                stop_loss = None
+            elif stop_distance > params.max_stop_distance_atr:
+                reasons.append("STOP_DISTANCE_EXCEEDED")
                 stop_loss = None
 
         target_1 = None
         target_2 = None
+        target_gap_insufficient = False
         target_candidates = [
             item.price for item in resistances if item.price > cluster.entry_high
         ]
@@ -215,7 +220,8 @@ def _build_scenarios(
         else:
             nearest = target_candidates[0]
             if nearest - cluster.entry_high < params.min_target_gap_atr * anchor_result.atr:
-                reasons.append("TARGET_TOO_CLOSE")
+                # 目标空间不足不再单独产出 TARGET_TOO_CLOSE, 统一并入盈亏比门.
+                target_gap_insufficient = True
             else:
                 target_1 = floor_to_tick(nearest, snapshot.market_rules.tick_size)
                 target_2 = next(
@@ -231,7 +237,10 @@ def _build_scenarios(
         net_risk = None
         net_reward = None
         net_rr = None
-        if stop_loss is not None and target_1 is not None:
+        if stop_loss is not None and target_gap_insufficient:
+            # 目标空间不足时净盈亏比不可能达标, 与参考净盈亏比共用同一拒绝码.
+            reasons.append("RISK_REWARD_BELOW_MINIMUM")
+        elif stop_loss is not None and target_1 is not None:
             net_risk, net_reward, net_rr = _reference_net_rr(
                 entry_reference=cluster.entry_high,
                 stop_loss=stop_loss,
