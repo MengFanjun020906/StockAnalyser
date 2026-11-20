@@ -16,6 +16,11 @@ def normalize_cn_symbol(symbol: str) -> str:
     return digits if len(digits) == 6 else ""
 
 
+def is_st_stock_name(name: object) -> bool:
+    """Return whether a security name carries the ST / *ST prefix."""
+    return str(name or "").strip().upper().startswith(("ST", "*ST", "S*ST"))
+
+
 def is_supported_cn_common_stock(symbol: str) -> bool:
     """Return whether V1 can safely classify the symbol as a common A-share."""
     digits = normalize_cn_symbol(symbol)
@@ -136,8 +141,7 @@ def current_cn_common_stock_metadata(
     name = get_index_stock_name(normalize_cn_symbol(symbol))
     if not name:
         return None
-    normalized_name = str(name).strip().upper()
-    st_status = normalized_name.startswith(("ST", "*ST", "S*ST"))
+    st_status = is_st_stock_name(name)
     return {
         "st_status": st_status,
         "st_status_verified": True,

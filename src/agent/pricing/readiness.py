@@ -8,6 +8,7 @@ from sqlalchemy import inspect
 from src.storage import DatabaseManager
 
 from .fingerprint import fingerprint
+from .historical_metadata import historical_cn_common_stock_metadata
 from .market_rules import current_cn_common_stock_metadata, normalize_cn_symbol
 from .params import PARAMS_REGISTRY, PRICE_PLAN_PARAMS_V1
 from .repository import PricePlanRepository
@@ -69,6 +70,13 @@ class PricePlanReadinessGate:
             if persisted is not None:
                 return _verified_common_stock_rules(persisted, symbol)
             metadata = current_cn_common_stock_metadata(symbol, trade_date=as_of)
+            if metadata is None:
+                # The current-session resolver returns None for historical
+                # dates; fall back to the dated stock_basic/namechange view.
+                metadata = historical_cn_common_stock_metadata(
+                    symbol,
+                    trade_date=as_of,
+                )
             return bool(
                 metadata
                 and metadata.get("instrument_type") == "common_stock"

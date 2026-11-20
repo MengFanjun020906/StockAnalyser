@@ -544,6 +544,10 @@ def test_readiness_rejects_historical_date_without_verified_market_rules(
         "src.agent.pricing.readiness.current_cn_common_stock_metadata",
         lambda *_args, **_kwargs: None,
     )
+    monkeypatch.setattr(
+        "src.agent.pricing.readiness.historical_cn_common_stock_metadata",
+        lambda *_args, **_kwargs: None,
+    )
     try:
         result = PricePlanReadinessGate(db).evaluate(
             symbol="600519",
