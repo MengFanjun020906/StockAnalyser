@@ -1121,9 +1121,12 @@ def _fact_sheet_to_dict(fact_sheet: Optional[FactSheet]) -> Dict[str, Any]:
     if fact_sheet is None:
         return {}
     try:
-        return fact_sheet.model_dump(mode="json")
+        payload = fact_sheet.model_dump(mode="json")
     except Exception:
         return {}
+    # valuation 为纯展示观察值（FAC-03），不得进入 seed 事实包。
+    payload.pop("valuation", None)
+    return payload
 
 
 def _lookup_tool(tool_registry: Any, name: str) -> Optional[Callable[..., Any]]:
