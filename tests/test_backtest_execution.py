@@ -10,7 +10,7 @@ from src.backtest.data_view import InMemoryDataView
 from src.backtest.entities import DailyBar
 from src.backtest.execution import ExecutionEngine
 from src.backtest.rules import derive_rule
-from src.backtest.schemas import Granularity
+from src.backtest.schemas import FeePolicy, FeeRule, Granularity
 from tests.backtest_helpers import (
     CALENDAR,
     END,
@@ -250,3 +250,39 @@ def test_same_time_buy_orders_compete_for_cash_and_never_overspend():
     assert result.plan_states["plan-2:s1"].status == "insufficient_cash"
     assert result.ledger.cash >= 0
     assert result.ledger.reserved_cash >= 0
+
+
+def test_diagnostics_echo_effective_execution_params():
+    fee_policy = FeePolicy(
+        version="test-fee",
+        rules=[
+            FeeRule(
+                effective_from=date(2000, 1, 1),
+                commission_bps=Decimal("2.5"),
+                minimum_commission=Decimal("5"),
+                transfer_fee_bps=Decimal("0.1"),
+                stamp_duty_sell_bps=Decimal("5"),
+                stamp_duty_buy_bps=Decimal("0"),
+            )
+        ],
+    )
+    engine = ExecutionEngine(
+        run_id="run-echo",
+        config=config(),
+        plans=[plan()],
+        data=_daily_data("600519", dict(PRICES)),
+        calendar=CALENDAR,
+        fee_policy=fee_policy,
+    )
+    params = engine.run().diagnostics["execution_params"]
+    assert params["effective_session"] == SESSIONS[0].isoformat()
+    assert params["symbol"] == "600519"
+    assert params["price_basis"] == "daily_declared_unadjusted"
+    assert params["t_plus"] == 1
+    assert params["buy_lot_size"] == 100
+    assert params["fee_policy_version"] == "test-fee"
+    assert params["commission_bps"] == 2.5
+    assert params["transfer_fee_bps"] == 0.1
+    assert params["stamp_duty_bps"] == 5.0
+    assert params["stamp_duty_buy_bps"] == 0.0
+    assert params["min_commission"] == 5.0
