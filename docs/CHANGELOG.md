@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [新功能] 新增 `src/agent/candidate_experts_v2/valuation_fact.py` 与 `FactSheet.valuation` 观察块（FAC-03）：只读本地 `data/factor_eval_cache` 的 `basic_*.csv` 与 `industry_snapshot_sw2021.csv`，输出 `pe_ttm` / `industry_pe_median` / `industry_pe_percentile` / `history_pe_percentile` / `pe_change_20d` 与 `pe_negative`；行业口径为申万一级（`industry_source="sw2021_l1"`），分位值域 0–1，行业分位需 ≥8 个同业样本、历史分位需 ≥20 个正 PE 观测（窗口 120 天），20 日前 PE≤0 或缺失时 `pe_change_20d=None`；`usage="observation"`、`display_only=True`，在 `allocate_slots` 之后挂载，desk/seed 事实包与 LLM 均不可见，不参与排序、入选、阈值与 veto。
+- [改进] 新增开关 `AGENT_VALUATION_FACT_ENABLED`（默认 `false`）与 `AGENT_VALUATION_CACHE_DIR`；关闭时不读缓存、不写字段，默认行为与既有完全一致。动态 PE 与估值综合评分未纳入：前者无本地数据源，后者无经评估的公式口径。
+- [改进] 运行产物 `selection_context` 新增 `prompt_versions`（`stock_selection` / `planning` 两个 prompt 模块的文本版本），便于回溯一次 Agent 运行实际使用的提示词版本；prompt 文案与默认行为不变。
+- [改进] 回测执行摘要新增 `execution_params`，回显实际生效的 `price_basis` / `t_plus` / `buy_lot_size` / 佣金·过户费·印花税·最低佣金 / `fee_policy_version`；撮合与账本逻辑不变（OBS-01 验收项 4）。
+- [测试] 新增 `tests/test_prompt_versions.py`：校验两个 prompt 版本常量格式、`selection_context` 中的版本映射，以及版本号不会被注入 prompt 文本。
+- [测试] 新增 `tests/test_valuation_fact.py`：分位计算与 20 日变化、亏损股排除、同业样本不足、历史观测不足、120 天窗口截断、20 日前 PE≤0、缓存缺失降级、展示序列化与 desk/seed 隔离，共 9 例。
+- [文档] 新增 `docs/architecture/valuation-percentile-observation.md`：记录 FAC-03 的边界、数据源、5 个指标字段契约、缺失分档、配置开关，以及动态 PE 与估值综合评分两项不做的原因。
+
 - [改进] 确定性点位引擎将“最近结构阻力空间不足”并入参考净盈亏比门槛（`RISK_REWARD_BELOW_MINIMUM`），不再单独产出 `TARGET_TOO_CLOSE`；阈值未改，429 样本回放 `generated/observation/no_plan = 147/231/51` 与逐样本场景状态完全一致。
 - [改进] `NO_VALID_STOP` 拆分为 `NO_STRUCTURAL_SUPPORT`（无结构支撑）、`STOP_DISTANCE_EXCEEDED`（有支撑但止损过远）、`STOP_LEVEL_INVALID`（止损位数据异常）；旧码保留中文标签用于渲染历史计划，拆分守恒 255 = 130 + 125 + 0。
 
