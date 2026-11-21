@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 
+# 提示词文本版本；仅在 prompt 文案变更时更新，与产物中的 prompt_versions 对应。
+PROMPT_VERSION = "2026-11-21"
+
 PromptLanguage = Literal["zh", "en"]
 
 

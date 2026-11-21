@@ -29,6 +29,7 @@ from src.agent.scoring import CompositeSnapshotBuilder, score_symbol_composite
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.agent.stock_selection_prompts import (
+    PROMPT_VERSION as STOCK_SELECTION_PROMPT_VERSION,
     STRATEGY_THRESHOLDS,
     build_adversarial_review_prompt,
     build_candidate_discovery_prompt,
@@ -39,6 +40,7 @@ from src.agent.stock_selection_prompts import (
     build_portfolio_allocation_prompt,
     build_pricing_agent_prompt,
 )
+from src.agent.planning_prompts import PROMPT_VERSION as PLANNING_PROMPT_VERSION
 from src.agent.stock_selection_graph import StockSelectionGraphEvidence
 from src.agent.tools.registry import ToolRegistry
 from src.config import Config
@@ -194,6 +196,10 @@ class SelectionRunContext:
             "account_summary": self.account_summary,
             "investor_profile": self.investor_profile,
             "candidate_strategy": self.candidate_strategy,
+            "prompt_versions": {
+                "stock_selection": STOCK_SELECTION_PROMPT_VERSION,
+                "planning": PLANNING_PROMPT_VERSION,
+            },
             "strategy_thresholds": self.strategy_thresholds,
             "stages": {
                 name: stage.to_dict(include_full=include_full)
@@ -2388,6 +2394,12 @@ def _run_candidate_discovery_tool(
                     sector_flow_cache_dir=(
                         getattr(Config.get_instance(), "agent_sector_flow_cache_dir", "") or None
                     ),
+                    valuation_fact_enabled=bool(
+                        getattr(Config.get_instance(), "agent_valuation_fact_enabled", False)
+                    ),
+                    valuation_cache_dir=(
+                        getattr(Config.get_instance(), "agent_valuation_cache_dir", "") or None
+                    ),
                 )
             if not isinstance(payload, dict):
                 raise RuntimeError(f"committee discovery returned {type(payload).__name__}")
@@ -3920,6 +3932,7 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
             "thesis_desk_committee",
             "thesis_desk_committee_elapsed_ms",
             "sector_flow_summary",
+            "valuation_summary",
             "llm_expert_committee",
             "negative_conclusion_reasons",
             "error",
