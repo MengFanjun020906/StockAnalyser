@@ -87,7 +87,7 @@
 - **失败板块单独重试**：`retry_failed=True` 时只重取 `errors` 中的板块，成功后重算截面分位并覆盖原快照；其余板块不重复取数。重试受 `snapshot.error_retry_cooldown_minutes`（默认 10 分钟）冷却约束，冷却内继续命中缓存。
 - **全量实测（2026-11-18，akshare 东财）**：496/496 板块 `status=ok`，`failed_boards=[]`，`percentile_universe=complete`，`percentile_sample_size=496`；总请求 498 次（目录 1 + 5 日截面 1 + 逐板块 496），并发 8 下耗时 **20.3s**，折算约 **24.6 req/s**。
 - **并发取值依据**（30 板块样本，0 错误）：c=4 → p50 139ms / p95 220ms，折算约 21s；c=8 → p50 229ms / p95 351ms，折算约 16s；c=12 → p50 190ms / p95 245ms，折算约 9s（瞬时约 52 req/s）。选 **8 并发 + 重试 1 次 + 0.5s 线性退避**，为瞬时失败留出重试余量，同时避免把并发压到东财接口的限流阈值。
-- **建议每日运行时间窗**：A 股收盘（15:00）后、东财板块资金流完成当日更新后再构建，建议 **15:30–16:00** 之间首次触发；构建约 20–30s，单日只跑一次，盘中重复触发直接命中缓存。
+- **建议每日运行时间窗**：A 股收盘（15:00）后、东财板块资金流完成当日更新后再构建，建议 **15:30 之后**首次触发；构建约 20–30s，单日只跑一次，当日快照 `complete` 后重复触发不再采集。
 
 ## 8. 展示位置
 
@@ -125,7 +125,7 @@ AGENT_SECTOR_FLOW_CACHE_DIR=                  # 留空 = data/factor_eval_cache
 
 - **入口**：`main.py --schedule`（或 `SCHEDULE_ENABLED=true`）已有的 `background_tasks` 机制，由 `src/scheduler.py` 轮询线程触发；模块 `src/services/sector_flow_shadow_scheduler.py`，任务名 `sector_flow_shadow`。不新增独立进程/定时器。
 - **开关**：与观察值共用 `AGENT_SECTOR_FLOW_OBSERVATION_ENABLED`（默认关闭）。关闭时不注册任何后台任务。
-- **时间**：工作日 **15:30–16:00（Asia/Shanghai）**，每 600s 检查一次；窗口外直接 `skipped`，不取数。
+- **时间**：工作日 **15:30–18:00（Asia/Shanghai）**，每 600s 检查一次；窗口外直接 `skipped`，不取数。窗口放宽到 18:00 是为了在上游偶发连接重置时多出约 13 次独立重试，避免 15:30–16:00 内三次全失败就当天零样本；当日快照 `complete` 后不再重复采集。
 - **只做落盘**：仅调用 `build_or_load_snapshot` 构建/补全快照；不发通知、不生成报告、不参与选股与排序。
 - **幂等**：同交易日重复触发命中当日快照缓存（`generated_at` 不变，记录 `cache_hit=true`）；旧截断快照在全量模式下会重建一次。
 - **失败隔离与增量**：单板块失败只记入 `failed_boards`，`retry_failed=True` 在冷却（`snapshot.error_retry_cooldown_minutes`，默认 10 分钟）后只重试失败板块；任何异常都被捕获并写入运行记录，后台线程不向上抛，不影响每日主分析。

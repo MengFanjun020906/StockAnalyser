@@ -7,7 +7,8 @@
 接入方式：复用 ``main.py --schedule`` 已有的 ``background_tasks`` 机制，
 由 ``src/scheduler.py`` 的轮询循环每 10 分钟触发一次；窗口外直接跳过，
 窗口内重复触发命中快照缓存（``build_or_load_snapshot`` 的当日缓存），
-失败板块由 ``retry_failed=True`` 单独重试，不影响主分析流程。
+当日快照已 complete 后不再重复采集，失败板块由 ``retry_failed=True``
+单独重试，不影响主分析流程。
 """
 
 from __future__ import annotations
@@ -27,10 +28,13 @@ logger = logging.getLogger(__name__)
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 SHADOW_WINDOW_START = dt_time(15, 30)
-SHADOW_WINDOW_END = dt_time(16, 0)
+# 窗口终点放宽到 18:00：上游偶发连接重置时，10 分钟一次的检查可提供约 16 次
+# 独立尝试，避免 15:30–16:00 内三次全失败就当天零样本。
+SHADOW_WINDOW_END = dt_time(18, 0)
 SHADOW_INTERVAL_SECONDS = 600
 MAX_REPORTED_FAILURES = 50
 RUN_RECORD_SUBDIR = "sector_flow_shadow_runs"
+WINDOW_LABEL = f"{SHADOW_WINDOW_START.strftime('%H:%M')}-{SHADOW_WINDOW_END.strftime('%H:%M')}"
 
 
 def _to_shanghai(moment: Optional[datetime] = None) -> datetime:
@@ -43,7 +47,7 @@ def _to_shanghai(moment: Optional[datetime] = None) -> datetime:
 
 
 def in_shadow_window(moment: Optional[datetime] = None) -> bool:
-    """是否落在工作日 15:30–16:00（Asia/Shanghai）。
+    """是否落在工作日 15:30–18:00（Asia/Shanghai）。
 
     只按周一至周五判断，法定节假日不单独识别；节假日触发会构建一次
     无新增交易日的快照，不会报错。
@@ -53,6 +57,24 @@ def in_shadow_window(moment: Optional[datetime] = None) -> bool:
         return False
     clock = current.replace(tzinfo=None).time()
     return SHADOW_WINDOW_START <= clock <= SHADOW_WINDOW_END
+
+
+def _snapshot_complete_for(cache: Path, day: str) -> bool:
+    """当天快照是否已完整；成功后不再重复采集。
+
+    截断快照（``universe_size < catalog_size``）不算完成，仍需走一次全量重建。
+    """
+    snapshot = sector_flow._read_json(
+        cache / sector_flow._SNAPSHOT_TMPL.format(date=day)
+    ) or {}
+    catalog_size = int(snapshot.get("catalog_size") or 0)
+    universe_size = int(snapshot.get("universe_size") or 0)
+    return (
+        str(snapshot.get("as_of_date") or "") == day
+        and str(snapshot.get("percentile_universe") or "") == "complete"
+        and catalog_size > 0
+        and universe_size == catalog_size
+    )
 
 
 def _cache_root(config: Any, settings: Dict[str, Any]) -> Path:
@@ -104,10 +126,14 @@ def run_shadow_snapshot_once(
     day = moment.date().isoformat()
 
     if not force and not in_shadow_window(moment):
-        logger.debug("[SectorFlowShadow] 跳过：%s 不在 15:30–16:00 窗口", moment.isoformat())
+        logger.debug("[SectorFlowShadow] 跳过：%s 不在 %s 窗口", moment.isoformat(), WINDOW_LABEL)
         return {"status": "skipped", "reason": "outside_window", "date": day}
 
     cache = _cache_root(config, settings)
+    if not force and _snapshot_complete_for(cache, day):
+        logger.debug("[SectorFlowShadow] 跳过：%s 当日快照已 complete", day)
+        return {"status": "skipped", "reason": "already_complete", "date": day}
+
     snapshot_path = cache / sector_flow._SNAPSHOT_TMPL.format(date=day)
     prior = sector_flow._read_json(snapshot_path) or {}
     started = time.time()
@@ -116,7 +142,7 @@ def run_shadow_snapshot_once(
         "requested_date": day,
         "started_at": moment.replace(microsecond=0).isoformat(),
         "timezone": "Asia/Shanghai",
-        "window": "15:30-16:00",
+        "window": WINDOW_LABEL,
     }
 
     try:
@@ -198,7 +224,8 @@ def build_sector_flow_shadow_background_tasks(config: Any) -> List[Dict[str, Any
         run_shadow_snapshot_once(config=config)
 
     logger.info(
-        "[SectorFlowShadow] 已注册每日影子采集：工作日 15:30–16:00（Asia/Shanghai），每 %ss 检查一次",
+        "[SectorFlowShadow] 已注册每日影子采集：工作日 %s（Asia/Shanghai），每 %ss 检查一次",
+        WINDOW_LABEL,
         SHADOW_INTERVAL_SECONDS,
     )
     return [

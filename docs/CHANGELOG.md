@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [新功能] 新增 `src/agent/candidate_experts_v2/valuation_fact.py` 与 `FactSheet.valuation` 观察块（FAC-03）：只读本地 `data/factor_eval_cache` 的 `basic_*.csv` 与 `industry_snapshot_sw2021.csv`，输出 `pe_ttm` / `industry_pe_median` / `industry_pe_percentile` / `history_pe_percentile` / `pe_change_20d` 与 `pe_negative`；行业口径为申万一级（`industry_source="sw2021_l1"`），分位值域 0–1，行业分位需 ≥8 个同业样本、历史分位需 ≥20 个正 PE 观测（窗口 120 天），20 日前 PE≤0 或缺失时 `pe_change_20d=None`；`usage="observation"`、`display_only=True`，在 `allocate_slots` 之后挂载，desk/seed 事实包与 LLM 均不可见，不参与排序、入选、阈值与 veto。
 - [改进] 新增开关 `AGENT_VALUATION_FACT_ENABLED`（默认 `false`）与 `AGENT_VALUATION_CACHE_DIR`；关闭时不读缓存、不写字段，默认行为与既有完全一致。动态 PE 与估值综合评分未纳入：前者无本地数据源，后者无经评估的公式口径。
+- [改进] 板块资金流影子采集窗口由 15:30–16:00 放宽到 **15:30–18:00**（每 600s 检查），上游偶发连接失败时当天最多约 16 次尝试，避免三次全失败即当天零样本；当日快照 `complete` 后不再重复采集、不再追加运行记录。采集内容、板块口径、分位算法与 60 个交易日要求不变。
 - [改进] 运行产物 `selection_context` 新增 `prompt_versions`（`stock_selection` / `planning` 两个 prompt 模块的文本版本），便于回溯一次 Agent 运行实际使用的提示词版本；prompt 文案与默认行为不变。
 - [改进] 回测执行摘要新增 `execution_params`，回显实际生效的 `price_basis` / `t_plus` / `buy_lot_size` / 佣金·过户费·印花税·最低佣金 / `fee_policy_version`；撮合与账本逻辑不变（OBS-01 验收项 4）。
 - [测试] 新增 `tests/test_prompt_versions.py`：校验两个 prompt 版本常量格式、`selection_context` 中的版本映射，以及版本号不会被注入 prompt 文本。
