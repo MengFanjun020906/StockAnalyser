@@ -29,6 +29,7 @@ from src.agent.scoring import CompositeSnapshotBuilder, score_symbol_composite
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.agent.stock_selection_prompts import (
+    PROMPT_VERSION as STOCK_SELECTION_PROMPT_VERSION,
     STRATEGY_THRESHOLDS,
     build_adversarial_review_prompt,
     build_candidate_discovery_prompt,
@@ -39,6 +40,7 @@ from src.agent.stock_selection_prompts import (
     build_portfolio_allocation_prompt,
     build_pricing_agent_prompt,
 )
+from src.agent.planning_prompts import PROMPT_VERSION as PLANNING_PROMPT_VERSION
 from src.agent.stock_selection_graph import StockSelectionGraphEvidence
 from src.agent.tools.registry import ToolRegistry
 from src.config import Config
@@ -194,6 +196,10 @@ class SelectionRunContext:
             "account_summary": self.account_summary,
             "investor_profile": self.investor_profile,
             "candidate_strategy": self.candidate_strategy,
+            "prompt_versions": {
+                "stock_selection": STOCK_SELECTION_PROMPT_VERSION,
+                "planning": PLANNING_PROMPT_VERSION,
+            },
             "strategy_thresholds": self.strategy_thresholds,
             "stages": {
                 name: stage.to_dict(include_full=include_full)
@@ -2388,6 +2394,12 @@ def _run_candidate_discovery_tool(
                     sector_flow_cache_dir=(
                         getattr(Config.get_instance(), "agent_sector_flow_cache_dir", "") or None
                     ),
+                    valuation_fact_enabled=bool(
+                        getattr(Config.get_instance(), "agent_valuation_fact_enabled", False)
+                    ),
+                    valuation_cache_dir=(
+                        getattr(Config.get_instance(), "agent_valuation_cache_dir", "") or None
+                    ),
                 )
             if not isinstance(payload, dict):
                 raise RuntimeError(f"committee discovery returned {type(payload).__name__}")
@@ -3920,6 +3932,7 @@ def _fallback_candidate_discovery(ctx: SelectionRunContext, seed_result: Dict[st
             "thesis_desk_committee",
             "thesis_desk_committee_elapsed_ms",
             "sector_flow_summary",
+            "valuation_summary",
             "llm_expert_committee",
             "negative_conclusion_reasons",
             "error",
@@ -5422,7 +5435,7 @@ def _apply_trade_plan_validation(ctx: SelectionRunContext) -> None:
 
 
 def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
-    return {
+    report = {
         "selection_context": ctx.to_dict(include_full=False),
         "market_regime": ctx.market_regime,
         "orchestration_mode": ctx.orchestration_mode,
@@ -5440,6 +5453,77 @@ def _build_final_report_json(ctx: SelectionRunContext) -> Dict[str, Any]:
         "judge_decision": ctx.stages.get("judge_decision", SelectionStage()).to_dict(include_full=True),
         "evidence_ledger": ctx.evidence_ledger,
     }
+    _record_decision_outcomes(ctx, report)
+    return report
+
+
+def _record_decision_outcomes(ctx: SelectionRunContext, report: Dict[str, Any]) -> None:
+    """Persist pending outcome rows (MEM-01a); never affects selection results."""
+
+    try:
+        if not bool(getattr(Config.get_instance(), "agent_decision_outcome_enabled", False)):
+            return
+        from src.services.decision_outcome_service import record_pending_records
+
+        record_pending_records(
+            run_id=ctx.run_id,
+            decision_as_of=date.today(),
+            market=ctx.market,
+            items=_report_recommendation_items(report),
+            enabled=True,
+        )
+    except Exception:
+        logger.warning("decision outcome record failed", exc_info=True)
+
+
+def _report_recommendation_items(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Read-only extraction mirroring the markdown recommendation list."""
+
+    discovery = report.get("candidate_discovery", {})
+    discovery_full = discovery.get("full") if isinstance(discovery.get("full"), dict) else {}
+    candidates = discovery_full.get("candidates") if isinstance(discovery_full.get("candidates"), list) else []
+    llm_candidate_summary = (
+        discovery_full.get("llm_candidate_summary")
+        if isinstance(discovery_full.get("llm_candidate_summary"), list)
+        else []
+    )
+    llm_candidate_by_code = {
+        str(item.get("code") or item.get("stock_code")): item
+        for item in llm_candidate_summary
+        if isinstance(item, dict) and (item.get("code") or item.get("stock_code"))
+    }
+    screening_full = report.get("candidate_screening", {}).get("full", {})
+    screening_shortlist = (
+        screening_full.get("shortlist")
+        if isinstance(screening_full, dict) and isinstance(screening_full.get("shortlist"), list)
+        else []
+    )
+    screening_scores: Dict[str, float] = {}
+    for item in screening_shortlist:
+        if not isinstance(item, dict) or item.get("score") is None:
+            continue
+        code = _normalize_stock_identity_code(item.get("code") or item.get("stock_code"))
+        if code:
+            screening_scores[code] = item.get("score")
+    deep_dive_full = report.get("single_stock_deep_dive", {}).get("full", {})
+    deep_results = (
+        deep_dive_full.get("results")
+        if isinstance(deep_dive_full, dict) and isinstance(deep_dive_full.get("results"), list)
+        else []
+    )
+    portfolio_full = report.get("portfolio_allocation", {}).get("full", {})
+    positions = (
+        portfolio_full.get("positions_plan")
+        if isinstance(portfolio_full, dict) and isinstance(portfolio_full.get("positions_plan"), list)
+        else []
+    )
+    return _recommendation_items(
+        positions=positions,
+        deep_results=deep_results,
+        candidates=candidates,
+        llm_candidate_by_code=llm_candidate_by_code,
+        screening_scores=screening_scores,
+    )
 
 
 def _combine_deep_dive_outputs(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:

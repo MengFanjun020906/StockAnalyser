@@ -1401,6 +1401,40 @@ class AccountPlanDecisionRecord(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
 
 
+class DecisionOutcomeRecord(Base):
+    """Post-decision outcome awaiting T+5 settlement (memory data only)."""
+
+    __tablename__ = 'decision_outcome_records'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(128), nullable=False, index=True)
+    code = Column(String(20), nullable=False, index=True)
+    market = Column(String(12), default='cn')
+    decision_as_of = Column(Date, nullable=False, index=True)
+    action = Column(String(32))
+    execution_mode = Column(String(32))
+    plan_mode = Column(String(32))
+    plan_id = Column(String(128))
+    entry_zone_text = Column(Text)
+    entry_reference = Column(Float)
+    horizon_days = Column(Integer, nullable=False, default=5)
+    entry_session = Column(Date)
+    exit_session = Column(Date)
+    entry_price = Column(Float)
+    exit_price = Column(Float)
+    cost_bps = Column(Float, nullable=False, default=20.0)
+    trade_return = Column(Float)
+    status = Column(String(32), nullable=False, default='pending', index=True)
+    reason_code = Column(String(64))
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    settled_at = Column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'code', name='uix_decision_outcome_run_code'),
+    )
+
+
 class PricePlanLifecycleEvent(Base):
     """Append-only event stream for one price-plan scenario."""
 

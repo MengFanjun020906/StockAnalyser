@@ -1172,6 +1172,34 @@ class ExecutionEngine:
             detail=detail,
         )
 
+    def _execution_params_echo(self) -> dict[str, Any]:
+        """Echo effective fee / settlement / lot / price-basis assumptions (display only)."""
+        session = self._sessions[0] if self._sessions else self.config.start_date
+        try:
+            fee_rule = self.fee_policy.rule_for(session)
+        except ValueError:
+            fee_rule = None
+        market_rule = None
+        if self.plans:
+            try:
+                market_rule = self.data.rule(self.plans[0].symbol, session)
+            except Exception:  # display-only echo must never break execution
+                market_rule = None
+        price_basis = getattr(self.config.price_basis, "value", self.config.price_basis)
+        return {
+            "effective_session": session.isoformat(),
+            "symbol": self.plans[0].symbol if self.plans else None,
+            "price_basis": price_basis,
+            "t_plus": (1 if market_rule.t_plus_one else 0) if market_rule else None,
+            "buy_lot_size": market_rule.buy_lot_size if market_rule else None,
+            "fee_policy_version": self.fee_policy.version,
+            "commission_bps": float(fee_rule.commission_bps) if fee_rule else None,
+            "transfer_fee_bps": float(fee_rule.transfer_fee_bps) if fee_rule else None,
+            "stamp_duty_bps": float(fee_rule.stamp_duty_sell_bps) if fee_rule else None,
+            "stamp_duty_buy_bps": float(fee_rule.stamp_duty_buy_bps) if fee_rule else None,
+            "min_commission": float(fee_rule.minimum_commission) if fee_rule else None,
+        }
+
     def _build_diagnostics(self) -> dict[str, Any]:
         status_counts: dict[str, int] = {}
         for state in self.plan_states.values():
@@ -1206,6 +1234,7 @@ class ExecutionEngine:
             "quality_flags": sorted(self._quality_flags),
             "bar_drops": bar_drop_summary,
             "bar_drop_counts": bar_drop_summary["by_reason"],
+            "execution_params": self._execution_params_echo(),
         }
 
     def _is_partial(self) -> bool:

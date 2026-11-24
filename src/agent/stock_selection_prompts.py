@@ -13,6 +13,9 @@ import json
 from typing import Any, Dict
 
 
+# 提示词文本版本；仅在 prompt 文案变更时更新，与产物中的 prompt_versions 对应。
+PROMPT_VERSION = "2026-11-21"
+
 ROLE_BOUNDARY = """\
 你不是投资顾问，不提供最终投资建议，不承诺收益，也不替用户做交易决定。
 你只基于可复核数据输出结构化分析、候选排序、风险提示和条件型执行方案，供用户自行决策。

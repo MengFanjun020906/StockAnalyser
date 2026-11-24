@@ -3741,6 +3741,8 @@ def run_committee_discovery(
     sector_flow_enabled: bool = False,
     sector_flow_cache_dir: Optional[str] = None,
     counter_evidence_veto_enabled: bool = False,
+    valuation_fact_enabled: bool = False,
+    valuation_cache_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the LLM expert committee and return a discover-compatible payload.
 
@@ -3778,6 +3780,11 @@ def run_committee_discovery(
         counter_evidence_veto_enabled: When True, candidates whose typed
             counter-evidence is ``veto_eligible`` are removed after allocation.
             Default False = record-only (facts enter payload, ranking untouched).
+        valuation_fact_enabled: Attach FAC-03 valuation percentile facts after
+            allocation (display only; never enters desks, ranking or vetoes).
+            Default False keeps the flow byte-identical.
+        valuation_cache_dir: Local ``factor_eval_cache`` directory; empty uses
+            ``data/factor_eval_cache``. Missing files stay ``None`` (no network).
     """
 
     started = time.time()
@@ -3862,6 +3869,8 @@ def run_committee_discovery(
             veto_breakdown_accel_threshold=veto_breakdown_accel_threshold,
             sector_flow_enabled=sector_flow_enabled,
             sector_flow_cache_dir=sector_flow_cache_dir,
+            valuation_fact_enabled=valuation_fact_enabled,
+            valuation_cache_dir=valuation_cache_dir,
             counter_evidence_veto_enabled=counter_evidence_veto_enabled,
         )
         # Merge thesis result into payload while preserving seed-pool diagnostics.
@@ -4010,6 +4019,8 @@ def run_thesis_desk_committee(
     veto_breakdown_accel_threshold: Optional[float] = None,
     sector_flow_enabled: bool = False,
     sector_flow_cache_dir: Optional[str] = None,
+    valuation_fact_enabled: bool = False,
+    valuation_cache_dir: Optional[str] = None,
     counter_evidence_veto_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Run P4 thesis-desk committee and return a discover-compatible payload.
@@ -4423,6 +4434,21 @@ def run_thesis_desk_committee(
             cache_dir=sector_flow_cache_dir or None,
         )
 
+    # ── Step 3.6: valuation observation (FAC-03, display only) ───────────
+    # Attached AFTER allocate_slots so it can never influence order or picks.
+    valuation_summary: Dict[str, Any] = {"enabled": False}
+    if valuation_fact_enabled and final_candidates:
+        from src.agent.candidate_experts_v2.valuation_fact import (
+            attach_valuation_facts,
+        )
+
+        valuation_summary = attach_valuation_facts(
+            final_candidates,
+            as_of_date=_format_stockapi_date(today) if today else None,
+            enabled=True,
+            cache_dir=valuation_cache_dir or None,
+        )
+
     # ── Step 4: convert to payload-compatible candidate dicts ────────────
     candidate_dicts: List[Dict[str, Any]] = []
     rows_by_code: Dict[str, Any] = {str(row.code): row for row in rows}
@@ -4478,6 +4504,16 @@ def run_thesis_desk_committee(
             )
             if sector_flow:
                 d["sector_flow"] = sector_flow
+        if valuation_fact_enabled:
+            from src.agent.candidate_experts_v2.valuation_fact import (
+                serialize_for_display as serialize_valuation,
+            )
+
+            valuation = serialize_valuation(
+                getattr(getattr(ac, "fact_sheet", None), "valuation", None)
+            )
+            if valuation:
+                d["valuation"] = valuation
         # FAC-05: display-only theme provenance; never participates in ranking.
         row = rows_by_code.get(str(ac.code))
         theme_profile = getattr(row, "theme_profile", None) if row is not None else None
@@ -4533,6 +4569,7 @@ def run_thesis_desk_committee(
     payload["candidates"] = candidate_dicts
     payload["candidate_count"] = len(candidate_dicts)
     payload["sector_flow_summary"] = sector_flow_summary
+    payload["valuation_summary"] = valuation_summary
     negative_reasons = _build_negative_conclusion_reasons(
         rows=rows,
         desk_packets=desk_packets,

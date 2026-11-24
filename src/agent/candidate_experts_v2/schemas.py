@@ -194,6 +194,43 @@ class SectorFlowFact(BaseModel):
     display_only: bool = True
 
 
+class ValuationFact(BaseModel):
+    """估值分位观察值(FAC-03, 仅展示, 不参与排序/阈值/否决)。
+
+    由 ``valuation_fact.attach_valuation_facts`` 在候选确定后填充: 只读本地
+    ``data/factor_eval_cache`` 的 ``basic_*.csv`` 与申万一级快照, 缺口直接写
+    ``None``, 不联网补数。``usage`` 固定 ``observation``、``display_only=True``。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # 口径
+    industry_source: Literal["sw2021_l1"] = "sw2021_l1"
+    industry_code: Optional[str] = None
+    industry_name: Optional[str] = None
+    as_of_date: Optional[str] = None  # 请求日 YYYY-MM-DD
+    data_as_of_date: Optional[str] = None  # 实际取到的最后一个交易日 YYYY-MM-DD
+
+    # 原始事实
+    pe_ttm: Optional[float] = None
+    pe_negative: bool = False  # pe_ttm <= 0 推断的亏损标记
+    industry_pe_median: Optional[float] = None
+    industry_peer_count: int = 0
+
+    # 分位(0-1)
+    industry_pe_percentile: Optional[float] = None
+    history_pe_percentile: Optional[float] = None
+    history_observations: int = 0
+    pe_change_20d: Optional[float] = None  # %, 20 个观测前对比
+
+    # 质量与来源
+    status: Literal["ok", "partial", "missing"] = "missing"
+    missing_reason: Optional[str] = None
+    quality_notes: List[str] = Field(default_factory=list)
+    usage: Literal["observation"] = "observation"
+    display_only: bool = True
+
+
 class FactSheet(BaseModel):
     """Deterministic fact底表 computed once per stock.
 
@@ -233,6 +270,8 @@ class FactSheet(BaseModel):
     leader_already_up: Optional[bool] = None  # 板块龙头是否已涨(补涨判断用)
     # 板块资金流观察块: 仅展示, 默认 None, 不进入 desk LLM 事实包/排序
     sector_flow: Optional[SectorFlowFact] = None
+    # 估值分位观察块(FAC-03): 仅展示, 默认 None, 不进入 desk LLM 事实包/排序
+    valuation: Optional[ValuationFact] = None
     freshness: str = "unknown"
     warnings: List[str] = Field(default_factory=list)
 

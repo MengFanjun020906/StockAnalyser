@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [新功能] `scripts/daily_run.sh` 新增 Step 1b：调用 `scripts/sync_main_db_daily.py` 按交易日把主库 `data/stock_analysis.db` 最近 30 个交易日的全市场日线缺口补齐，并同步 `data/adj_factors.db` 复权因子；使用 `INSERT OR IGNORE`，已完整交易日不重拉，不按标的循环。
+- [改进] 主库日线同步幂等且失败隔离：单日异常或上游尚未发布只输出 `[WARN]` 并留待下次运行补齐，不阻断财务快照、新闻信号等后续步骤；写入期间每交易日 PASSIVE checkpoint，结束 TRUNCATE WAL。
+- [测试] 新增 `tests/test_sync_main_db_daily.py`：已完整日跳过、`INSERT OR IGNORE` 不覆盖、重复运行零新增、单日失败不影响其他日、上游未发布显式告警、主库完整时仅补复权因子，共 5 例。
+- [文档] `docs/full-guide.md` / `docs/full-guide_EN.md` 补充主库日线同步说明，`docs/architecture/decision-outcome-record.md` 更新日线覆盖来源与限制。
+- [新功能] 新增决策结果待结算记录（MEM-01a）：`decision_outcome_records` 表建在 `data/stock_analysis.db`，以 `UNIQUE(run_id, code)` 保证幂等；只记录 `immediate_open` / `conditional_open` 两类可执行入场，`watch / avoid` 计入 `skipped_actions`；同一 run 重跑只刷新 pending 行的引用字段，已结算行永不覆盖。
+- [改进] 新增结算链路：复用 `main.py --schedule` 的 background_tasks 每小时扫描 pending 行，并新增手工补跑脚本 `scripts/settle_decision_outcomes.py`；收益口径与因子回测一致（T+1 开盘入场、决策日 +5 交易日收盘出场、20bp 成本、退市用最后可成交日收盘、一字涨停不入场），只读本地 `stock_daily`，不联网；状态覆盖 `pending / settled / skipped_missing_entry / skipped_unfillable / expired_missing_exit / delisted_exit`。
+- [改进] 新增开关 `AGENT_DECISION_OUTCOME_ENABLED`（默认 `false`）；关闭时不写表、不注册后台任务、不查询行情，选股与报告结果与既有完全一致。
+- [测试] 新增 `tests/test_decision_outcomes.py`：幂等重复写入、pending 引用字段刷新、已结算不被覆盖、T+5 正常结算与 20bp 成本、缺入场、一字涨停、退市强制出场、无出场价过期、开关关闭零写入、写失败不影响报告生成，共 10 例。
+- [文档] 新增 `docs/architecture/decision-outcome-record.md`：记录表结构、记录范围、结算口径、状态边界、开关与手工补跑方式。
+- [新功能] 新增 `src/agent/candidate_experts_v2/valuation_fact.py` 与 `FactSheet.valuation` 观察块（FAC-03）：只读本地 `data/factor_eval_cache` 的 `basic_*.csv` 与 `industry_snapshot_sw2021.csv`，输出 `pe_ttm` / `industry_pe_median` / `industry_pe_percentile` / `history_pe_percentile` / `pe_change_20d` 与 `pe_negative`；行业口径为申万一级（`industry_source="sw2021_l1"`），分位值域 0–1，行业分位需 ≥8 个同业样本、历史分位需 ≥20 个正 PE 观测（窗口 120 天），20 日前 PE≤0 或缺失时 `pe_change_20d=None`；`usage="observation"`、`display_only=True`，在 `allocate_slots` 之后挂载，desk/seed 事实包与 LLM 均不可见，不参与排序、入选、阈值与 veto。
+- [改进] 新增开关 `AGENT_VALUATION_FACT_ENABLED`（默认 `false`）与 `AGENT_VALUATION_CACHE_DIR`；关闭时不读缓存、不写字段，默认行为与既有完全一致。动态 PE 与估值综合评分未纳入：前者无本地数据源，后者无经评估的公式口径。
+- [改进] 板块资金流影子采集窗口由 15:30–16:00 放宽到 **15:30–18:00**（每 600s 检查），上游偶发连接失败时当天最多约 16 次尝试，避免三次全失败即当天零样本；当日快照 `complete` 后不再重复采集、不再追加运行记录。采集内容、板块口径、分位算法与 60 个交易日要求不变。
+- [改进] 运行产物 `selection_context` 新增 `prompt_versions`（`stock_selection` / `planning` 两个 prompt 模块的文本版本），便于回溯一次 Agent 运行实际使用的提示词版本；prompt 文案与默认行为不变。
+- [改进] 回测执行摘要新增 `execution_params`，回显实际生效的 `price_basis` / `t_plus` / `buy_lot_size` / 佣金·过户费·印花税·最低佣金 / `fee_policy_version`；撮合与账本逻辑不变（OBS-01 验收项 4）。
+- [测试] 新增 `tests/test_prompt_versions.py`：校验两个 prompt 版本常量格式、`selection_context` 中的版本映射，以及版本号不会被注入 prompt 文本。
+- [测试] 新增 `tests/test_valuation_fact.py`：分位计算与 20 日变化、亏损股排除、同业样本不足、历史观测不足、120 天窗口截断、20 日前 PE≤0、缓存缺失降级、展示序列化与 desk/seed 隔离，共 9 例。
+- [文档] 新增 `docs/architecture/valuation-percentile-observation.md`：记录 FAC-03 的边界、数据源、5 个指标字段契约、缺失分档、配置开关，以及动态 PE 与估值综合评分两项不做的原因。
+- [文档] 板块资金流 FAC-01b 首次板块层评估（60 个交易日回补样本，489/496 板块）判定为 `not_evaluable`：MDE 0.132、outflow 状态占比 71.3%、仅单窗口且有效决策日 50 < 60；该因子维持观察态，不进入排序。
+
 - [改进] 确定性点位引擎将“最近结构阻力空间不足”并入参考净盈亏比门槛（`RISK_REWARD_BELOW_MINIMUM`），不再单独产出 `TARGET_TOO_CLOSE`；阈值未改，429 样本回放 `generated/observation/no_plan = 147/231/51` 与逐样本场景状态完全一致。
 - [改进] `NO_VALID_STOP` 拆分为 `NO_STRUCTURAL_SUPPORT`（无结构支撑）、`STOP_DISTANCE_EXCEEDED`（有支撑但止损过远）、`STOP_LEVEL_INVALID`（止损位数据异常）；旧码保留中文标签用于渲染历史计划，拆分守恒 255 = 130 + 125 + 0。
 

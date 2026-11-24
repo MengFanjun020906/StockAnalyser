@@ -78,8 +78,11 @@ def _read_records(tmp_path, day="2026-11-13"):
 def test_in_shadow_window_uses_shanghai_timezone_and_weekdays():
     assert shadow.in_shadow_window(datetime(2026, 11, 13, 15, 30)) is True
     assert shadow.in_shadow_window(datetime(2026, 11, 13, 16, 0)) is True
+    # 窗口已放宽到 18:00，16:00 之后仍允许继续重试
+    assert shadow.in_shadow_window(datetime(2026, 11, 13, 16, 30)) is True
+    assert shadow.in_shadow_window(datetime(2026, 11, 13, 18, 0)) is True
     assert shadow.in_shadow_window(datetime(2026, 11, 13, 15, 29)) is False
-    assert shadow.in_shadow_window(datetime(2026, 11, 13, 16, 1)) is False
+    assert shadow.in_shadow_window(datetime(2026, 11, 13, 18, 1)) is False
     # UTC 07:30 == 上海 15:30
     assert shadow.in_shadow_window(datetime(2026, 11, 13, 7, 30, tzinfo=timezone.utc)) is True
     assert shadow.in_shadow_window(datetime(2026, 11, 13, 7, 29, tzinfo=timezone.utc)) is False
@@ -121,7 +124,7 @@ def test_window_build_writes_snapshot_and_run_record(tmp_path):
     assert _read_records(tmp_path)[-1]["outcome"] == "complete"
 
 
-def test_repeat_trigger_hits_cache_and_does_not_refetch(tmp_path):
+def test_repeat_trigger_after_complete_skips_without_refetch_or_record(tmp_path):
     source = _FakeSource(_catalog(("BK0001", "板块一", 10), ("BK0002", "板块二", 10)), _histories_map())
     shadow.run_shadow_snapshot_once(
         config=_config(tmp_path), now=datetime(2026, 11, 13, 15, 32), source=source
@@ -131,9 +134,76 @@ def test_repeat_trigger_hits_cache_and_does_not_refetch(tmp_path):
         config=_config(tmp_path), now=datetime(2026, 11, 13, 15, 45), source=source
     )
     assert source.history_calls == calls_before
-    assert record["cache_hit"] is True
+    assert record["status"] == "skipped"
+    assert record["reason"] == "already_complete"
+    assert len(_read_records(tmp_path)) == 1
+
+
+def test_truncated_snapshot_is_rebuilt_instead_of_skipped(tmp_path):
+    truncated = {
+        "as_of_date": "2026-11-13",
+        "percentile_universe": "complete",
+        "catalog_size": 2,
+        "universe_size": 1,
+        "boards": [],
+    }
+    (Path(tmp_path) / "sector_flow_snapshot_2026-11-13.json").write_text(
+        json.dumps(truncated), encoding="utf-8"
+    )
+    source = _FakeSource(_catalog(("BK0001", "板块一", 10), ("BK0002", "板块二", 10)), _histories_map())
+    record = shadow.run_shadow_snapshot_once(
+        config=_config(tmp_path), now=datetime(2026, 11, 13, 15, 40), source=source
+    )
     assert record["outcome"] == "complete"
-    assert len(_read_records(tmp_path)) == 2
+    assert record["boards_ok"] == 2
+
+
+def test_failed_attempt_is_retried_later_in_extended_window(tmp_path):
+    failing = _FakeSource(_catalog(("BK0001", "板块一", 10)), _histories_map(), fail_catalog=True)
+    first = shadow.run_shadow_snapshot_once(
+        config=_config(tmp_path), now=datetime(2026, 11, 13, 16, 40), source=failing
+    )
+    assert first["outcome"] == "error"
+
+    recovered = _FakeSource(_catalog(("BK0001", "板块一", 10)), _histories_map())
+    second = shadow.run_shadow_snapshot_once(
+        config=_config(tmp_path), now=datetime(2026, 11, 13, 17, 20), source=recovered
+    )
+    assert second["outcome"] == "complete"
+    assert second["window"] == "15:30-18:00"
+    assert [item["outcome"] for item in _read_records(tmp_path)] == ["error", "complete"]
+
+
+def test_retries_continue_after_three_failures_in_old_window(tmp_path):
+    for hour, minute in ((15, 35), (15, 45), (15, 55)):
+        failing = _FakeSource(_catalog(("BK0001", "板块一", 10)), _histories_map(), fail_catalog=True)
+        record = shadow.run_shadow_snapshot_once(
+            config=_config(tmp_path), now=datetime(2026, 11, 13, hour, minute), source=failing
+        )
+        assert record["outcome"] == "error"
+
+    recovered = _FakeSource(_catalog(("BK0001", "板块一", 10)), _histories_map())
+    record = shadow.run_shadow_snapshot_once(
+        config=_config(tmp_path), now=datetime(2026, 11, 13, 17, 10), source=recovered
+    )
+    assert record["outcome"] == "complete"
+    assert [item["outcome"] for item in _read_records(tmp_path)] == [
+        "error",
+        "error",
+        "error",
+        "complete",
+    ]
+
+
+def test_window_exhausted_after_1800_skips(tmp_path):
+    source = _FakeSource(_catalog(("BK0001", "板块一", 10)), _histories_map())
+    record = shadow.run_shadow_snapshot_once(
+        config=_config(tmp_path), now=datetime(2026, 11, 13, 18, 5), source=source
+    )
+    assert record["status"] == "skipped"
+    assert record["reason"] == "outside_window"
+    assert source.history_calls == 0
+    assert not (Path(tmp_path) / shadow.RUN_RECORD_SUBDIR).exists()
 
 
 def test_failure_is_recorded_and_never_raises(tmp_path):
