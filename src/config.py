@@ -826,6 +826,7 @@ class Config:
     agent_sector_flow_cache_dir: str = ""  # Snapshot cache dir; empty uses data/factor_eval_cache
     agent_valuation_fact_enabled: bool = False  # Attach FAC-03 valuation percentile block (display only; never re-ranks or gates)
     agent_valuation_cache_dir: str = ""  # Local factor_eval_cache dir; empty uses data/factor_eval_cache
+    agent_decision_outcome_enabled: bool = False  # Write pending decision outcomes for later T+5 settlement (memory data only; never affects selection)
     agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
     agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
     agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
@@ -1875,6 +1876,10 @@ class Config:
                 default=False,
             ),
             agent_valuation_cache_dir=os.getenv('AGENT_VALUATION_CACHE_DIR', ''),
+            agent_decision_outcome_enabled=parse_env_bool(
+                os.getenv('AGENT_DECISION_OUTCOME_ENABLED'),
+                default=False,
+            ),
             agent_deterministic_price_plan_enabled=parse_env_bool(
                 os.getenv('AGENT_DETERMINISTIC_PRICE_PLAN_ENABLED'),
                 True,
