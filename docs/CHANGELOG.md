@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] 新增 `tests/test_prompt_versions.py`：校验两个 prompt 版本常量格式、`selection_context` 中的版本映射，以及版本号不会被注入 prompt 文本。
 - [测试] 新增 `tests/test_valuation_fact.py`：分位计算与 20 日变化、亏损股排除、同业样本不足、历史观测不足、120 天窗口截断、20 日前 PE≤0、缓存缺失降级、展示序列化与 desk/seed 隔离，共 9 例。
 - [文档] 新增 `docs/architecture/valuation-percentile-observation.md`：记录 FAC-03 的边界、数据源、5 个指标字段契约、缺失分档、配置开关，以及动态 PE 与估值综合评分两项不做的原因。
+- [文档] 板块资金流 FAC-01b 首次板块层评估（60 个交易日回补样本，489/496 板块）判定为 `not_evaluable`：MDE 0.132、outflow 状态占比 71.3%、仅单窗口且有效决策日 50 < 60；该因子维持观察态，不进入排序。
 
 - [改进] 确定性点位引擎将“最近结构阻力空间不足”并入参考净盈亏比门槛（`RISK_REWARD_BELOW_MINIMUM`），不再单独产出 `TARGET_TOO_CLOSE`；阈值未改，429 样本回放 `generated/observation/no_plan = 147/231/51` 与逐样本场景状态完全一致。
 - [改进] `NO_VALID_STOP` 拆分为 `NO_STRUCTURAL_SUPPORT`（无结构支撑）、`STOP_DISTANCE_EXCEEDED`（有支撑但止损过远）、`STOP_LEVEL_INVALID`（止损位数据异常）；旧码保留中文标签用于渲染历史计划，拆分守恒 255 = 130 + 125 + 0。
