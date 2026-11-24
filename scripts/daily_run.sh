@@ -11,6 +11,7 @@
 #
 # 执行顺序:
 #   1. update_sequoia_candidates.py   (tushare, 批量更新 stock_daily 个股日线 + 指数)
+#   1b. sync_main_db_daily.py         (tushare, 按交易日把主库全市场日线/复权因子缺口补齐)
 #   2. update_fundamental_candidates.py (tushare, 更新财务快照, 可跳过)
 #   3. maintain_news_signals.py       (opt-in, 新闻卡片/事件/outcome/Graphiti repair)
 #   4. evaluate_seed_pool_quality.py  (opt-in, Seed Pool T+1 质量评估)
@@ -21,6 +22,8 @@
 #   阻止收盘后补齐当日行情；当 Tushare 尚未发布日历目标日行情时，脚本会回退到最新
 #   已发布交易日，此时按回退后的日期写标记，当天稍后重跑仍会继续尝试补齐目标日。
 #   其他步骤按自然日写入标记。
+#   Step 1b（主库日线同步）不写标记：本身幂等，已完整的交易日不重拉，
+#   目标日上游未发布时下次运行会自动重试。
 #   每步成功完成后写入标记；中断重跑时自动跳过已完成步骤。
 #   --reset 可强制清除状态重头跑。
 
@@ -85,6 +88,18 @@ db_stat() {
     printf "%s 行 / %s 个标的 / %s ~ %s" "$rows" "$symbols" "${dmin:-(空)}" "${dmax:-(空)}"
 }
 
+main_db_stat() {
+    local db="$1"
+    [ -f "$db" ] || { echo "DB 不存在"; return; }
+    local out
+    out=$(sqlite3 "$db" \
+        "SELECT COUNT(*), COUNT(DISTINCT code), MIN(date), MAX(date) FROM stock_daily;" \
+        2>/dev/null) || { echo "读取失败"; return; }
+    local rows codes dmin dmax
+    IFS='|' read -r rows codes dmin dmax <<< "$out"
+    printf "%s 行 / %s 个标的 / %s ~ %s" "$rows" "$codes" "${dmin:-(空)}" "${dmax:-(空)}"
+}
+
 # ---------- 续跑状态管理 ----------
 DATE_KEY=$(TZ='Asia/Shanghai' date '+%Y%m%d')
 STATE_DIR="$REPO_ROOT/.cache"
@@ -146,6 +161,12 @@ info "GRAPH_REPAIR_MODE    : ${NEWS_SIGNAL_GRAPH_REPAIR_MODE:-edges}"
 info "SEED_QUALITY_DAILY   : ${SEED_POOL_QUALITY_DAILY_EVALUATION_ENABLED:-false}"
 
 SEQUOIA_DB="${SEQUOIA_CANDIDATE_DB_PATH:-vendor/Sequoia-X/data/sequoia_v2.db}"
+MAIN_DB="${DATABASE_PATH:-data/stock_analysis.db}"
+case "$MAIN_DB" in
+    /*) ;;
+    *) MAIN_DB="$REPO_ROOT/$MAIN_DB" ;;
+esac
+info "MAIN_DB              : $MAIN_DB"
 STEP1_TARGET_DATE=$("$PYTHON" - <<'PY' 2>/dev/null
 from scripts.update_sequoia_candidates import resolve_cn_resume_target_date
 
@@ -193,6 +214,27 @@ else
             warn "stock_daily 更新脚本失败，已有 $(db_stat "$SEQUOIA_DB") 仍可用"
             warn "step1 未标记完成，下次续跑会重试"
         fi
+    fi
+fi
+
+# ============================================================
+# Step 1b: 同步主库全市场日线（幂等，只补缺口）
+# ============================================================
+sep
+log ">>> [1b/4] 同步主库全市场日线 + 复权因子  (tushare bulk daily, 只补缺口)"
+
+if [ "$DRY_RUN" = true ]; then
+    warn "dry-run: 跳过"
+else
+    info "目标 DB : $MAIN_DB"
+    info "当前状态: $(main_db_stat "$MAIN_DB")"
+    T1B=$SECONDS
+    # 单日失败/上游未发布只告警，不阻断后续主分析步骤。
+    if "$PYTHON" scripts/sync_main_db_daily.py; then
+        ok "主库日线同步完成  (耗时: $(elapsed $((SECONDS - T1B))))"
+        info "同步后: $(main_db_stat "$MAIN_DB")"
+    else
+        warn "主库日线同步部分失败，已有 $(main_db_stat "$MAIN_DB") 仍可用；下次日更会自动重试"
     fi
 fi
 
