@@ -22,6 +22,7 @@ from data_provider.fundamental_adapter import (
     _build_dividend_payload,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
+    _recent_weekday_ymds,
     _stockapi_code_flow_completed_date,
     _stockapi_default_completed_date,
     _stockapi_hot_sector_completed_date,
@@ -795,6 +796,73 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertNotIn("token", mock_get.call_args_list[1].kwargs["params"])
         self.assertIn("/v1/hotBkJlrDr", _STOCKAPI_TOKEN_DENIED_ENDPOINTS)
 
+    def test_stockapi_expired_token_60046_retries_anonymous(self) -> None:
+        _STOCKAPI_RESPONSE_CACHE.clear()
+        adapter = AkshareFundamentalAdapter()
+
+        def _resp(payload):
+            response = unittest.mock.MagicMock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = payload
+            return response
+
+        with patch.dict("os.environ", {"STOCKAPI_TOKEN": "expired-token"}, clear=False), patch(
+            "data_provider.fundamental_adapter.requests.get",
+            side_effect=[
+                _resp({"code": 60046, "msg": "token 已过期", "data": []}),
+                _resp({"code": 20000, "msg": "success", "data": [{"bkCode": "BK1234", "bkName": "机器人"}]}),
+            ],
+        ) as mock_get:
+            result = adapter.get_stockapi_hot_sectors(date="2026-07-16", limit=5)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("token", mock_get.call_args_list[0].kwargs["params"])
+        self.assertNotIn("token", mock_get.call_args_list[1].kwargs["params"])
+        self.assertIn("/v1/hotBkJlrDr", _STOCKAPI_TOKEN_DENIED_ENDPOINTS)
+        _STOCKAPI_RESPONSE_CACHE.clear()
+
+    def test_stockapi_popularity_rank_falls_back_to_tushare_dc_hot(self) -> None:
+        _STOCKAPI_RESPONSE_CACHE.clear()
+        adapter = AkshareFundamentalAdapter()
+
+        def _resp(payload):
+            response = unittest.mock.MagicMock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = payload
+            return response
+
+        hot_df = pd.DataFrame([
+            {
+                "trade_date": "20261124", "data_type": "A股市场", "ts_code": "600818.SH",
+                "ts_name": "ST中路", "rank": 1, "pct_change": 10.05, "current_price": 7.01,
+                "hot": None, "concept": "", "rank_reason": "", "rank_time": "2026-11-24 22:30:01",
+            },
+            {
+                "trade_date": "20261124", "data_type": "A股市场", "ts_code": "600410.SH",
+                "ts_name": "华胜天成", "rank": 2, "pct_change": 3.12, "current_price": 17.17,
+                "hot": None, "concept": "", "rank_reason": "", "rank_time": "2026-11-24 22:30:01",
+            },
+        ])
+
+        with patch.dict("os.environ", {"STOCKAPI_TOKEN": "expired-token"}, clear=False), patch(
+            "data_provider.fundamental_adapter.requests.get",
+            side_effect=[
+                _resp({"code": 60046, "msg": "token 已过期", "data": []}),
+                _resp({"code": 88886, "msg": "今日免费1000次调用机会被其他人抢先用完了", "data": []}),
+            ],
+        ), patch(
+            "data_provider.fundamental_adapter.query_tushare_api",
+            return_value=hot_df,
+        ) as mock_ts:
+            result = adapter.get_stockapi_popularity_rank(limit=2)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result.get("degraded"))
+        self.assertEqual(result["fallback_source"], "tushare:dc_hot")
+        self.assertEqual([item["code"] for item in result["items"]], ["600818", "600410"])
+        self.assertEqual(result["items"][0]["rank"], 1.0)
+        self.assertEqual(mock_ts.call_args.args[0], "dc_hot")
+
     def test_stockapi_request_errors_redact_token(self) -> None:
         adapter = AkshareFundamentalAdapter()
         with patch.dict("os.environ", {"STOCKAPI_TOKEN": "secret-token"}, clear=False), patch(
@@ -815,6 +883,66 @@ class TestFundamentalAdapter(unittest.TestCase):
             _stockapi_hot_sector_completed_date(datetime(2026, 7, 15, 17, 5)),
             datetime(2026, 7, 15).date(),
         )
+
+    def test_recent_weekday_ymds_skips_weekends(self) -> None:
+        self.assertEqual(
+            _recent_weekday_ymds("20261122", lookback=3),
+            ["20261120", "20261119", "20261118"],
+        )
+
+    def test_hot_sectors_backoff_retries_previous_trading_day(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        def _fake_query(api_name, params=None, fields=None, timeout=15):
+            self.assertEqual(api_name, "moneyflow_ind_dc")
+            trade_date = (params or {}).get("trade_date")
+            if trade_date == "20261124":
+                return pd.DataFrame([
+                    {"ts_code": "BK1036.DC", "name": "半导体", "net_amount": 123.0, "pct_change": 2.5},
+                ])
+            return pd.DataFrame()
+
+        with patch(
+            "data_provider.fundamental_adapter._stockapi_default_completed_date",
+            return_value="2026-11-25",
+        ), patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=_fake_query) as mock_query:
+            sectors, errors, source = adapter._fallback_hot_sectors(1)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(source, "tushare:moneyflow_ind_dc")
+        self.assertEqual(sectors[0]["bk_name"], "半导体")
+        self.assertEqual(sectors[0]["time"], "2026-11-24")
+        attempted = [call.kwargs["params"]["trade_date"] for call in mock_query.call_args_list]
+        self.assertEqual(attempted[:2], ["20261125", "20261124"])
+
+    def test_hot_sector_leaders_backoff_reuses_matched_trade_date(self) -> None:
+        adapter = AkshareFundamentalAdapter()
+
+        def _fake_query(api_name, params=None, fields=None, timeout=15):
+            params = params or {}
+            trade_date = params.get("trade_date")
+            if api_name == "moneyflow_ind_dc":
+                if trade_date == "20261124":
+                    return pd.DataFrame([
+                        {"ts_code": "BK1036.DC", "name": "半导体", "net_amount": 123.0},
+                    ])
+                return pd.DataFrame()
+            if api_name == "daily":
+                self.assertEqual(trade_date, "20261124")
+                return pd.DataFrame([{"ts_code": "600001.SH", "close": 12.5, "pct_chg": 3.1}])
+            if api_name == "dc_member":
+                self.assertEqual(trade_date, "20261124")
+                return pd.DataFrame([{"con_code": "600001.SH", "name": "测试股"}])
+            return pd.DataFrame()
+
+        with patch("data_provider.fundamental_adapter.query_tushare_api", side_effect=_fake_query):
+            items, errors, source = adapter._fallback_hot_sector_leaders("2026-11-25", "BK1036", 1)
+
+        self.assertEqual(source, "tushare:moneyflow_ind_dc+dc_member+daily")
+        self.assertEqual(items[0]["code"], "600001")
+        self.assertEqual(items[0]["bk_name"], "半导体")
+        self.assertEqual(items[0]["time"], "2026-11-24")
+        self.assertTrue(any("20261125:empty_data" in err for err in errors))
 
     def test_stockapi_hot_sectors_fallbacks_when_permission_denied(self) -> None:
         adapter = AkshareFundamentalAdapter()

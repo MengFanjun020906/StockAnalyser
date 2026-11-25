@@ -833,7 +833,7 @@ class Config:
     agent_candidate_enforce_name_code_match: bool = True  # Exclude candidates whose provided name conflicts with stock master data
     agent_candidate_pool_db_path: str = ""  # Optional SQLite path for persisted candidate-pool runs; empty reuses DATABASE_PATH
     agent_fundamental_candidate_db_path: str = ""  # Optional SQLite path for precomputed fundamental candidate snapshots
-    agent_stock_info_boards_timeout_seconds: float = 3.0  # Max seconds for optional stock board membership enrichment
+    agent_stock_info_boards_timeout_seconds: float = 5.0  # Max seconds for optional stock board membership enrichment (covers slow push2 + Tushare fallback)
     agent_chip_distribution_timeout_seconds: float = 12.0  # Max seconds for chip distribution data-source probing
     agent_sector_rankings_timeout_seconds: float = 10.0  # Max seconds for sector ranking data-source probing
     agent_regime_component_timeout_seconds: float = 25.0  # Max seconds for one market-regime auxiliary component
@@ -1933,7 +1933,7 @@ class Config:
             agent_fundamental_candidate_db_path=os.getenv('AGENT_FUNDAMENTAL_CANDIDATE_DB_PATH', '').strip(),
             agent_stock_info_boards_timeout_seconds=parse_env_float(
                 os.getenv('AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS'),
-                3.0,
+                5.0,
                 field_name='AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS',
                 minimum=0.0,
             ),

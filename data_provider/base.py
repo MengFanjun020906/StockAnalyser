@@ -17,6 +17,7 @@
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -30,6 +31,10 @@ from .fundamental_adapter import AkshareFundamentalAdapter
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+# 进程内缓存 Tushare 行业兜底结果，避免同一轮里多只/多次取板块重复打网关。
+_TUSHARE_INDUSTRY_BOARD_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+_TUSHARE_INDUSTRY_BOARD_LOCK = RLock()
 
 
 # === 标准化列名定义 ===
@@ -1719,19 +1724,90 @@ class DataFetcherManager:
         stock_code = normalize_stock_code(stock_code)
         if _market_tag(stock_code) != "cn":
             return []
-        for fetcher in self._fetchers:
-            if not hasattr(fetcher, "get_belong_board"):
-                continue
-            try:
-                raw_data = fetcher.get_belong_board(stock_code)
-                boards = self._normalize_belong_boards(raw_data)
-                if boards:
-                    logger.info(f"[{fetcher.name}] 获取所属板块成功: {stock_code}, count={len(boards)}")
-                    return boards
-            except Exception as e:
-                logger.debug(f"[{fetcher.name}] 获取所属板块失败: {e}")
-                continue
-        return []
+        # The Eastmoney push2 primary lookups can be slow or unreachable. Start
+        # the Tushare industry fallback in parallel so it can complete inside the
+        # caller's short boards budget instead of sitting behind the slow primary.
+        fallback_pool: Optional[ThreadPoolExecutor] = None
+        fallback_future = None
+        try:
+            fallback_pool = ThreadPoolExecutor(max_workers=1)
+            fallback_future = fallback_pool.submit(self._tushare_industry_board, stock_code)
+        except Exception:
+            fallback_pool = None
+            fallback_future = None
+        try:
+            for fetcher in self._fetchers:
+                if not hasattr(fetcher, "get_belong_board"):
+                    continue
+                try:
+                    raw_data = fetcher.get_belong_board(stock_code)
+                    boards = self._normalize_belong_boards(raw_data)
+                    if boards:
+                        logger.info(f"[{fetcher.name}] 获取所属板块成功: {stock_code}, count={len(boards)}")
+                        return boards
+                except Exception as e:
+                    logger.debug(f"[{fetcher.name}] 获取所属板块失败: {e}")
+                    continue
+            fallback = None
+            if fallback_future is not None:
+                try:
+                    fallback = fallback_future.result(timeout=2.0)
+                except Exception as exc:
+                    logger.debug(f"[tushare] 所属板块降级未在预算内完成: {stock_code}: {exc}")
+                    fallback = None
+            if fallback:
+                logger.info(f"[tushare] 获取所属板块降级成功: {stock_code}, industry={fallback.get('name')}")
+                return [fallback]
+            return []
+        finally:
+            if fallback_pool is not None:
+                fallback_pool.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _tushare_industry_board(stock_code: str) -> Optional[Dict[str, Any]]:
+        """Fallback board membership from Tushare ``stock_basic.industry``.
+
+        The Eastmoney push2 quote cluster that backs akshare board lookups can
+        be unreachable on some networks; Tushare ``stock_basic`` still returns
+        the primary industry, so return it as a single degraded board instead of
+        an empty list.
+        """
+        with _TUSHARE_INDUSTRY_BOARD_LOCK:
+            if stock_code in _TUSHARE_INDUSTRY_BOARD_CACHE:
+                cached = _TUSHARE_INDUSTRY_BOARD_CACHE[stock_code]
+                return dict(cached) if cached else None
+        try:
+            from data_provider.tushare_client import query_tushare_api
+
+            params: Dict[str, Any]
+            if stock_code.startswith("6"):
+                params = {"ts_code": f"{stock_code}.SH"}
+            elif stock_code.startswith(("0", "3")):
+                params = {"ts_code": f"{stock_code}.SZ"}
+            elif stock_code.startswith(("4", "8", "9")):
+                params = {"ts_code": f"{stock_code}.BJ"}
+            else:
+                params = {"symbol": stock_code}
+            df = query_tushare_api(
+                "stock_basic", params=params, fields="ts_code,name,industry", timeout=8
+            )
+            if df is None or df.empty:
+                return None
+            industry = str(df.iloc[0].get("industry") or "").strip()
+            if not industry:
+                return None
+            board = {
+                "name": industry,
+                "type": "industry",
+                "source": "tushare:stock_basic.industry",
+                "degraded": True,
+            }
+            with _TUSHARE_INDUSTRY_BOARD_LOCK:
+                _TUSHARE_INDUSTRY_BOARD_CACHE[stock_code] = dict(board)
+            return board
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.debug(f"[tushare] 所属板块降级失败: {stock_code}: {exc}")
+            return None
 
     def prefetch_stock_names(self, stock_codes: List[str], use_bulk: bool = False) -> None:
         """

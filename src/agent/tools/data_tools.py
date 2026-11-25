@@ -4462,6 +4462,49 @@ get_eastmoney_cjzc_daily_tool = ToolDefinition(
 )
 
 
+def _fallback_announcements_cninfo(
+    stock_code: str,
+    start_date: str,
+    end_date: str,
+    limit: int,
+) -> tuple[list, list]:
+    """Read announcements from CNINFO when Tushare ``anns_d`` is not permitted."""
+    import akshare as ak
+
+    codes = [code for code in stock_code.replace(",", " ").split() if code]
+    if not codes:
+        return [], ["akshare:stock_zh_a_disclosure_report_cninfo:requires_stock_code"]
+    items = []
+    errors = []
+    for code in codes:
+        try:
+            df = ak.stock_zh_a_disclosure_report_cninfo(
+                symbol=code,
+                market="沪深京",
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception as exc:  # pragma: no cover - network dependent
+            errors.append(
+                f"akshare:stock_zh_a_disclosure_report_cninfo:{code}:{type(exc).__name__}:{exc}"
+            )
+            continue
+        if df is None or getattr(df, "empty", True):
+            continue
+        for row in df.to_dict(orient="records"):
+            ann_date = str(row.get("公告时间") or "").replace("-", "")
+            items.append({
+                "ts_code": str(row.get("代码") or code),
+                "name": row.get("简称"),
+                "title": row.get("公告标题"),
+                "ann_date": ann_date,
+                "url": row.get("公告链接"),
+                "rec_time": None,
+            })
+    items.sort(key=lambda item: item.get("ann_date") or "", reverse=True)
+    return items[: max(1, min(int(limit or 30), 200))], errors
+
+
 def _handle_get_tushare_announcements(
     stock_code: str = "",
     ann_date: str = "",
@@ -4485,6 +4528,32 @@ def _handle_get_tushare_announcements(
         limit,
         timeout=max(5.0, _get_agent_timeout_attr("agent_tushare_tool_timeout_seconds", 5.0)),
     )
+    if result.get("status") in ("failed", "timeout") and stock_code:
+        fb_start = requested_start_date or start
+        fb_end = requested_end_date or end
+        fb_items, fb_errors = _fallback_announcements_cninfo(
+            stock_code, fb_start, fb_end, limit
+        )
+        if fb_items:
+            chain = list(result.get("source_chain") or [])
+            chain.append({
+                "provider": "akshare:stock_zh_a_disclosure_report_cninfo",
+                "result": "ok",
+                "params": {"stock_code": stock_code, "start_date": fb_start, "end_date": fb_end},
+            })
+            result = {
+                "status": "partial",
+                "api_name": "anns_d",
+                "items": fb_items,
+                "total_rows": len(fb_items),
+                "source_chain": chain,
+                "errors": list(result.get("errors") or []),
+                "degraded": True,
+                "primary_source": "tushare:anns_d",
+                "fallback_source": "akshare:stock_zh_a_disclosure_report_cninfo",
+            }
+        elif fb_errors:
+            result.setdefault("fallback_errors", []).extend(fb_errors)
     result["stock_code"] = stock_code
     result["date_window"] = {
         "ann_date": requested_ann_date,
@@ -4496,7 +4565,7 @@ def _handle_get_tushare_announcements(
 
 get_tushare_announcements_tool = ToolDefinition(
     name="get_tushare_announcements",
-    description="Get Tushare listed-company announcements (anns_d) without fallback.",
+    description="Get listed-company announcements (Tushare anns_d; falls back to CNINFO when the Tushare permission is unavailable).",
     parameters=[
         ToolParameter(name="stock_code", type="string", description="Optional A-share stock code.", required=False, default=""),
         ToolParameter(name="ann_date", type="string", description="Optional announcement date YYYYMMDD or YYYY-MM-DD.", required=False, default=""),

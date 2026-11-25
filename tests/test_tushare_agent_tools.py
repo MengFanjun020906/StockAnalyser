@@ -934,3 +934,32 @@ def test_get_tushare_moneyflow_mkt_dc_accepts_date_range_params():
     assert result["start_date"] == "20240901"
     assert result["end_date"] == "20240930"
     assert result["items"][0]["net_amount"] == 200000000.0
+
+
+def test_get_tushare_announcements_falls_back_to_cninfo_when_permission_denied():
+    cninfo_df = pd.DataFrame([
+        {
+            "代码": "000001",
+            "简称": "平安银行",
+            "公告标题": "关于发行二级资本债券的公告",
+            "公告时间": "2026-11-18",
+            "公告链接": "http://example/1",
+        }
+    ])
+    with patch(
+        "data_provider.tushare_client.query_tushare_api",
+        side_effect=RuntimeError("Tushare API HTTP 403: 接口 anns_d 不在积分档范围内，请单独开通该接口权限"),
+    ), patch(
+        "data_provider.tushare_client.get_tushare_http_url", return_value="http://unit/"
+    ), patch(
+        "akshare.stock_zh_a_disclosure_report_cninfo", return_value=cninfo_df
+    ):
+        result = _handle_get_tushare_announcements(
+            stock_code="000001", start_date="20261105", end_date="20261125", limit=5
+        )
+
+    assert result["status"] == "partial"
+    assert result["degraded"] is True
+    assert result["fallback_source"] == "akshare:stock_zh_a_disclosure_report_cninfo"
+    assert result["items"][0]["title"] == "关于发行二级资本债券的公告"
+    assert any("403" in error for error in result["errors"])
