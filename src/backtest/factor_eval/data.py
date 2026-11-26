@@ -14,18 +14,244 @@ an evaluation error, not a reason to switch to another index.
 
 from __future__ import annotations
 
+import csv
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from data_provider.tushare_client import query_tushare_api
 
 logger = logging.getLogger(__name__)
+
+_ROOT = Path(__file__).resolve().parents[3]
+
+# Bare 6-digit codes are shared by stocks and indices (``000985`` is both the
+# CSI All Share index and 大庆华科).  Only this explicit allow-list may be
+# upgraded to a qualified index identifier; everything else must already carry
+# an exchange/type suffix.  Index levels are never resolved from ``stock_daily``.
+_CN_BENCHMARK_ALIASES = {
+    "000985": "000985.CSI",
+    "000300": "000300.SH",
+    "000001": "000001.SH",
+    "000905": "000905.SH",
+    "000688": "000688.SH",
+    "399001": "399001.SZ",
+    "399006": "399006.SZ",
+}
+
+
+@dataclass(frozen=True)
+class BenchmarkSeries:
+    """Index benchmark bars keyed by trading day."""
+
+    code: str
+    bars: Dict[date, Dict[str, float]]
+    source: str  # "cache" | "cache+tushare" | "tushare" | "none"
+    files: Tuple[str, ...] = ()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.bars)
+
+
+_SERIES_CACHE: Dict[Tuple[str, str], BenchmarkSeries] = {}
+
+
+def reset_benchmark_series_cache() -> None:
+    """Drop the in-process benchmark cache (tests / long-lived workers)."""
+
+    _SERIES_CACHE.clear()
+
+
+def normalize_benchmark_code(code: str, market: str = "cn") -> Optional[str]:
+    """Return a qualified index identifier, or ``None`` when not resolvable.
+
+    Qualified codes such as ``000985.CSI`` / ``000001.SH`` are returned as-is.
+    Bare codes are only accepted for the fixed CN index allow-list above; the
+    function never inspects stock bars.
+    """
+
+    text = str(code or "").strip()
+    if not text:
+        return None
+    if "." in text:
+        return text.upper()
+    if market != "cn":
+        return None
+    return _CN_BENCHMARK_ALIASES.get(text)
+
+
+def default_benchmark_cache_dir() -> Path:
+    """Resolve the factor-eval cache dir (env > config > ``data/factor_eval_cache``)."""
+
+    raw = os.getenv("INDEX_BENCHMARK_CACHE_DIR", "").strip()
+    if not raw:
+        try:
+            from src.config import get_config
+
+            raw = str(getattr(get_config(), "index_benchmark_cache_dir", "") or "").strip()
+        except Exception:  # pragma: no cover - config is optional for data access
+            raw = ""
+    if raw:
+        candidate = Path(raw).expanduser()
+        return candidate if candidate.is_absolute() else _ROOT / candidate
+    return _ROOT / "data" / "factor_eval_cache"
+
+
+def load_benchmark_series(
+    code: str,
+    start: date,
+    end: date,
+    *,
+    cache_dir: Optional[Path | str] = None,
+    allow_fetch: Optional[bool] = None,
+    query: Optional[Callable[..., pd.DataFrame]] = None,
+) -> BenchmarkSeries:
+    """Load an index benchmark from the ``index_daily`` CSV cache.
+
+    Existing ``benchmark_{safe(code)}_{start}_{end}.csv`` files are merged so a
+    caller asking for an arbitrary window still gets the cached index levels.
+    Only when the cached coverage misses part of the window *and* fetching is
+    explicitly allowed do we call :meth:`TushareEvaluationSource.load_benchmark`
+    (which is ``index_daily``).  Fetch failures are logged, never fabricated.
+    """
+
+    normalized = normalize_benchmark_code(code)
+    if normalized is None:
+        return BenchmarkSeries(code=str(code or ""), bars={}, source="none")
+
+    directory = Path(cache_dir).expanduser() if cache_dir else default_benchmark_cache_dir()
+    cache_key = (normalized, str(directory))
+    cached = _SERIES_CACHE.get(cache_key)
+    if cached is None:
+        bars: Dict[date, Dict[str, float]] = {}
+        files: List[str] = []
+        for path in sorted(directory.glob(f"benchmark_{_safe(normalized)}_*.csv")):
+            files.append(path.name)
+            for day, bar in _read_benchmark_csv(path):
+                bars.setdefault(day, bar)
+        cached = BenchmarkSeries(
+            code=normalized,
+            bars=bars,
+            source="cache" if bars else "none",
+            files=tuple(files),
+        )
+        _SERIES_CACHE[cache_key] = cached
+
+    if _should_fetch(cached, start, end, allow_fetch):
+        fetched = _fetch_benchmark(normalized, start, end, directory, query)
+        if fetched:
+            merged = dict(cached.bars)
+            for day, bar in fetched.items():
+                merged.setdefault(day, bar)
+            cached = BenchmarkSeries(
+                code=normalized,
+                bars=merged,
+                source="cache+tushare" if cached.bars else "tushare",
+                files=cached.files,
+            )
+            _SERIES_CACHE[cache_key] = cached
+
+    return BenchmarkSeries(
+        code=cached.code,
+        bars={day: bar for day, bar in cached.bars.items() if start <= day <= end},
+        source=cached.source,
+        files=cached.files,
+    )
+
+
+def _read_benchmark_csv(path: Path) -> List[Tuple[date, Dict[str, float]]]:
+    rows: List[Tuple[date, Dict[str, float]]] = []
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            for item in csv.DictReader(handle):
+                day = _parse_benchmark_date(item.get("trade_date") or item.get("date"))
+                if day is None:
+                    continue
+                close = _to_float(item.get("close"))
+                if close is None:
+                    continue
+                rows.append((day, {"open": _to_float(item.get("open")), "close": close}))
+    except OSError as exc:  # pragma: no cover - unreadable cache is non-fatal
+        logger.warning("ignoring unreadable benchmark cache %s: %s", path, exc)
+    return rows
+
+
+def _parse_benchmark_date(value) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+    if len(text) == 8 and text.isdigit():
+        try:
+            return date(int(text[:4]), int(text[4:6]), int(text[6:]))
+        except ValueError:
+            return None
+    return None
+
+
+def _to_float(value) -> Optional[float]:
+    try:
+        if value in (None, "", "nan", "None"):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _should_fetch(
+    series: BenchmarkSeries, start: date, end: date, allow_fetch: Optional[bool]
+) -> bool:
+    if allow_fetch is None:
+        raw = os.getenv("INDEX_BENCHMARK_ALLOW_FETCH", "").strip().lower()
+        if raw:
+            allow_fetch = raw in {"1", "true", "yes", "on"}
+        else:
+            try:
+                from src.config import get_config
+
+                allow_fetch = bool(getattr(get_config(), "index_benchmark_allow_fetch", False))
+            except Exception:  # pragma: no cover
+                allow_fetch = False
+    if not allow_fetch:
+        return False
+    if not series.bars:
+        return True
+    return min(series.bars) > start or max(series.bars) < end
+
+
+def _fetch_benchmark(
+    code: str,
+    start: date,
+    end: date,
+    cache_dir: Path,
+    query: Optional[Callable[..., pd.DataFrame]],
+) -> Dict[date, Dict[str, float]]:
+    try:
+        source = TushareEvaluationSource(cache_dir=cache_dir, query=query)
+        frame = source.load_benchmark(code, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+    except Exception as exc:  # pragma: no cover - network / token failures are expected
+        logger.warning("benchmark %s index_daily fetch skipped: %s: %s", code, type(exc).__name__, exc)
+        return {}
+    bars: Dict[date, Dict[str, float]] = {}
+    for row in frame.itertuples(index=False):
+        day = _parse_benchmark_date(getattr(row, "trade_date", None))
+        close = _to_float(getattr(row, "close", None))
+        if day is None or close is None:
+            continue
+        bars[day] = {"open": _to_float(getattr(row, "open", None)), "close": close}
+    return bars
 
 BAR_FIELDS = "ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount"
 BASIC_FIELDS = (

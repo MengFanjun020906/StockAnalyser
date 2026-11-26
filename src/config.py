@@ -835,6 +835,25 @@ class Config:
     news_no_stock_triage_stock_basic_path: str = ""  # A-share basic CSV; empty uses data/factor_eval_cache/stock_basic_LD.csv
     news_triage_search_sort_enabled: bool = False  # Re-order real-time search news by no_stock triage (order only; no scoring/threshold change)
     news_triage_market_brief_enabled: bool = False  # Inject a display-only market/overseas brief from triaged news into the deep-dive payload
+    news_signal_outcome_settlement_enabled: bool = False  # Allow scheduled/manual news event outcome settlement (data only; never affects selection)
+    news_signal_outcome_benchmark: str = "000985.CSI"  # Qualified index code read via index_daily cache
+    news_signal_outcome_cost_bps: float = 20.0  # Round-trip cost applied to the stock leg
+    news_signal_outcome_horizons: str = "1,5"  # Comma-separated event-study horizons in trading days
+    index_benchmark_ts_code: str = "000985.CSI"  # Default qualified CN index for benchmark reads
+    index_benchmark_cache_dir: str = ""  # Benchmark CSV cache dir; empty uses data/factor_eval_cache
+    index_benchmark_allow_fetch: bool = False  # Allow Tushare index_daily top-up on cache miss (non-fatal)
+    agent_paper_trading_enabled: bool = False  # Persistent paper-trading shadow books (isolated SQLite; never touches portfolio_* tables)
+    agent_paper_trading_db_dir: str = ""  # Shadow DB dir; empty uses <DATABASE_PATH dir>/paper_trading (a.db / b.db)
+    agent_paper_trading_trace_dir: str = ""  # Selection trace artifacts dir; empty uses <DATABASE_PATH dir>/agent_traces
+    agent_paper_trading_output_dir: str = ""  # Report output dir; empty uses <shadow db dir>/report
+    agent_paper_trading_initial_cash: float = 100000.0  # One-time virtual funding per book; never topped up
+    agent_paper_trading_max_position_pct: float = 20.0  # Fallback per-position budget when neither AI nor engine gives a ratio
+    agent_paper_trading_max_positions: int = 5  # Concurrent holdings cap per book
+    agent_paper_trading_max_ingest_per_run: int = 20  # Max new artifacts parsed per ingest tick
+    agent_paper_trading_ingest_lookback_days: int = 7  # Only scan artifacts from the last N days
+    agent_paper_trading_benchmark: str = "000985.CSI"  # Qualified index code read via index_daily cache
+    agent_paper_trading_entry_fill_mode: str = "touch"  # touch: limit at entry_high when low touches zone; close: only close inside zone
+    agent_paper_trading_run_after: str = "18:00"  # Earliest local time (Asia/Shanghai) to record the daily close NAV
     agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
     agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
     agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
@@ -1915,6 +1934,23 @@ class Config:
                 os.getenv('NEWS_TRIAGE_MARKET_BRIEF_ENABLED'),
                 default=False,
             ),
+            news_signal_outcome_settlement_enabled=parse_env_bool(
+                os.getenv('NEWS_SIGNAL_OUTCOME_SETTLEMENT_ENABLED'),
+                default=False,
+            ),
+            news_signal_outcome_benchmark=(
+                os.getenv('NEWS_SIGNAL_OUTCOME_BENCHMARK', '000985.CSI').strip() or '000985.CSI'
+            ),
+            news_signal_outcome_cost_bps=float(os.getenv('NEWS_SIGNAL_OUTCOME_COST_BPS', '20')),
+            news_signal_outcome_horizons=os.getenv('NEWS_SIGNAL_OUTCOME_HORIZONS', '1,5'),
+            index_benchmark_ts_code=(
+                os.getenv('INDEX_BENCHMARK_TS_CODE', '000985.CSI').strip() or '000985.CSI'
+            ),
+            index_benchmark_cache_dir=os.getenv('INDEX_BENCHMARK_CACHE_DIR', '').strip(),
+            index_benchmark_allow_fetch=parse_env_bool(
+                os.getenv('INDEX_BENCHMARK_ALLOW_FETCH'),
+                default=False,
+            ),
             agent_deterministic_price_plan_enabled=parse_env_bool(
                 os.getenv('AGENT_DETERMINISTIC_PRICE_PLAN_ENABLED'),
                 True,
@@ -1935,6 +1971,51 @@ class Config:
                 field_name='AGENT_PRICING_SHADOW_MAX_CODES',
                 minimum=0,
             ),
+            agent_paper_trading_enabled=parse_env_bool(
+                os.getenv('AGENT_PAPER_TRADING_ENABLED'),
+                False,
+            ),
+            agent_paper_trading_db_dir=os.getenv('AGENT_PAPER_TRADING_DB_DIR', '').strip(),
+            agent_paper_trading_trace_dir=os.getenv('AGENT_PAPER_TRADING_TRACE_DIR', '').strip(),
+            agent_paper_trading_output_dir=os.getenv('AGENT_PAPER_TRADING_OUTPUT_DIR', '').strip(),
+            agent_paper_trading_initial_cash=parse_env_float(
+                os.getenv('AGENT_PAPER_TRADING_INITIAL_CASH'),
+                100000.0,
+                field_name='AGENT_PAPER_TRADING_INITIAL_CASH',
+                minimum=1000.0,
+            ),
+            agent_paper_trading_max_position_pct=parse_env_float(
+                os.getenv('AGENT_PAPER_TRADING_MAX_POSITION_PCT'),
+                20.0,
+                field_name='AGENT_PAPER_TRADING_MAX_POSITION_PCT',
+                minimum=1.0,
+                maximum=100.0,
+            ),
+            agent_paper_trading_max_positions=parse_env_int(
+                os.getenv('AGENT_PAPER_TRADING_MAX_POSITIONS'),
+                5,
+                field_name='AGENT_PAPER_TRADING_MAX_POSITIONS',
+                minimum=1,
+            ),
+            agent_paper_trading_max_ingest_per_run=parse_env_int(
+                os.getenv('AGENT_PAPER_TRADING_MAX_INGEST_PER_RUN'),
+                20,
+                field_name='AGENT_PAPER_TRADING_MAX_INGEST_PER_RUN',
+                minimum=1,
+            ),
+            agent_paper_trading_ingest_lookback_days=parse_env_int(
+                os.getenv('AGENT_PAPER_TRADING_INGEST_LOOKBACK_DAYS'),
+                7,
+                field_name='AGENT_PAPER_TRADING_INGEST_LOOKBACK_DAYS',
+                minimum=0,
+            ),
+            agent_paper_trading_benchmark=(
+                os.getenv('AGENT_PAPER_TRADING_BENCHMARK', '000985.CSI').strip() or '000985.CSI'
+            ),
+            agent_paper_trading_entry_fill_mode=(
+                os.getenv('AGENT_PAPER_TRADING_ENTRY_FILL_MODE', 'touch').strip().lower() or 'touch'
+            ),
+            agent_paper_trading_run_after=os.getenv('AGENT_PAPER_TRADING_RUN_AFTER', '18:00').strip() or '18:00',
             agent_veto_violent_outflow_threshold=parse_env_optional_float(
                 os.getenv('AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD'),
                 field_name='AGENT_VETO_VIOLENT_OUTFLOW_THRESHOLD',

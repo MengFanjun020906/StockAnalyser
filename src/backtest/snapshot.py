@@ -27,6 +27,7 @@ from src.storage import (
 
 from .calendar import CnTradingCalendar, SHANGHAI
 from .bar_drops import BarDrop, BarDropLedger, BarDropReason
+from .factor_eval.data import load_benchmark_series, normalize_benchmark_code
 from .data_view import InMemoryDataView
 from .entities import Bar, CorporateAction, DailyBar
 from .rules import MarketRule, derive_rule, normalize_cn_symbol, rule_from_snapshot
@@ -633,35 +634,23 @@ class SnapshotBuilder:
             return {}, "not_requested", []
         if self.config.benchmark.price_basis == "total_return":
             return {}, "unavailable", ["benchmark_total_return_unavailable"]
-        symbol = normalize_cn_symbol(self.config.benchmark.symbol)
+        raw_symbol = self.config.benchmark.symbol
+        symbol = normalize_benchmark_code(raw_symbol)
+        if symbol is None:
+            self._benchmark_symbol = raw_symbol
+            return {}, "unavailable", ["benchmark_unavailable"]
         self._benchmark_symbol = symbol
         if self._benchmark_input is not None:
             return self._benchmark_input, "available" if self._benchmark_input else "unavailable", []
-        if self.db is None:
-            return {}, "unavailable", ["benchmark_unavailable"]
-        candidates = _benchmark_code_candidates(symbol)
-        with self.db.get_session() as session:
-            rows = session.execute(
-                select(StockDaily)
-                .where(
-                    and_(
-                        StockDaily.code.in_(candidates),
-                        StockDaily.date >= sessions[0],
-                        StockDaily.date <= sessions[-1],
-                    )
-                )
-                .order_by(StockDaily.date)
-            ).scalars().all()
-        if not rows:
-            return {}, "unavailable", ["benchmark_unavailable"]
+        series = load_benchmark_series(symbol, sessions[0], sessions[-1])
         values: dict[date, Decimal] = {}
-        for row in rows:
+        for day, bar in series.bars.items():
             try:
-                close = Decimal(str(row.close))
+                close = Decimal(str(bar.get("close")))
             except Exception:
                 continue
             if close > 0:
-                values[row.date] = close
+                values[day] = close
         return values, ("available" if values else "unavailable"), ([] if values else ["benchmark_unavailable"])
 
 
@@ -1493,11 +1482,6 @@ def _record_row_drop(
             **(detail or {}),
         },
     )
-
-
-def _benchmark_code_candidates(symbol: str) -> list[str]:
-    digits = normalize_cn_symbol(symbol)
-    return sorted({digits, f"sh{digits}", f"sz{digits}", f"{digits}.SH", f"{digits}.SZ", symbol})
 
 
 def _sha256_file(path: Path) -> str:

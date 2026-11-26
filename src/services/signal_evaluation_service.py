@@ -9,18 +9,16 @@ from datetime import date, datetime
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import select
-
+from src.backtest.factor_eval.data import load_benchmark_series
 from src.core.trading_calendar import is_market_open
 from src.repositories.signal_lifecycle_repo import SignalLifecycleRepository
 from src.services.signal_market_data_service import SignalMarketDataService
-from src.storage import StockDaily
 
 
 MIN_SAMPLES_FOR_REVIEW = 30
 MIN_COVERAGE_DAYS_FOR_REVIEW = 60
 HORIZONS = (5, 10, 20)
-BENCHMARK_SYMBOLS = {"cn": "000300", "hk": "HSI", "us": "SPX"}
+BENCHMARK_SYMBOLS = {"cn": "000985.CSI", "hk": "HSI", "us": "SPX"}
 
 
 def _as_date(value: Any) -> Optional[date]:
@@ -307,11 +305,14 @@ class SignalEvaluationService:
         return output
 
     def _benchmark_closes(self, symbol: str) -> Dict[date, float]:
-        with self.repo.db.get_session() as session:
-            rows = session.execute(
-                select(StockDaily).where(StockDaily.code == symbol).order_by(StockDaily.date)
-            ).scalars().all()
-        return {row.date: float(row.close) for row in rows if row.close is not None}
+        if not symbol:
+            return {}
+        series = load_benchmark_series(symbol, date(1990, 1, 1), date(2100, 1, 1))
+        return {
+            day: float(bar["close"])
+            for day, bar in series.bars.items()
+            if bar.get("close") is not None
+        }
 
     @staticmethod
     def _opportunity_cost(bars: Dict[date, Dict[str, Any]], start: Optional[date], end: Optional[date]) -> Dict[str, Any]:

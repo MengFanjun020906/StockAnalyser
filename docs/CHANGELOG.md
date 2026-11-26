@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [修复] 指数基准统一改走 `index_daily` 缓存（默认 `000985.CSI`），修复 `000985` 被当作大庆华科从 `stock_daily` 取数导致的基准失真；新闻结算、paper trading、回测 snapshot、种子池评估、信号评估五处同类路径一并修正。
+- [改进] 新闻事件结算新增 `dataset_version=news_event_outcome.v2`：v1 存量 983 settled / 1,729 unavailable 原值保留，v2 用正确基准重算；唯一索引加入 `dataset_version`。
+- [改进] 新增 `INDEX_BENCHMARK_TS_CODE` / `INDEX_BENCHMARK_CACHE_DIR` / `INDEX_BENCHMARK_ALLOW_FETCH` 配置；`NEWS_SIGNAL_OUTCOME_BENCHMARK`、`AGENT_PAPER_TRADING_BENCHMARK` 默认值改为 `000985.CSI`。
+- [测试] 新增 `tests/test_index_benchmark_series.py`；更新新闻结算、paper trading、种子池评估测试改用指数缓存。
+- [文档] `.env.example` 与新闻事件/paper trading 架构文档同步新的指数基准口径。
+- [改进] 补齐中证全指 `000985.CSI` 基准缓存至 2026-11-24（新增 `benchmark_000985_CSI_20261118_20261124.csv`）：Tushare 不可用时改用 akshare 腾讯源，并用 1,237 个重叠交易日逐日对齐 close/涨跌幅、与上证指数日收益相关性 0.9449 交叉校验；新闻事件 v2 结算可用条数由 462 增至 1,273。
 - [新功能] 新增 DeepSeek Search API provider（`POST /v1/tools/search`）：配置 `DEEPSEEK_API_KEY(S)` 后自动作为首选搜索源并复用原有 key；无 key 或调用失败自动回落 AnySearch / 其他 provider。
 - [改进] 实时搜索新增 `summary` 长摘要字段（`snippet` 保持短摘要），并透传 `site:` / `after:` / `lang:` 查询语法；408/429/5xx 重试，402 与其余 4xx 不重试；`search_comprehensive_intel` 顶层 `summary` 默认由长摘要填充，`report` 仍由 triage 开关控制。
 
@@ -51,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] 新增 `tests/test_valuation_fact.py`：分位计算与 20 日变化、亏损股排除、同业样本不足、历史观测不足、120 天窗口截断、20 日前 PE≤0、缓存缺失降级、展示序列化与 desk/seed 隔离，共 9 例。
 - [文档] 新增 `docs/architecture/valuation-percentile-observation.md`：记录 FAC-03 的边界、数据源、5 个指标字段契约、缺失分档、配置开关，以及动态 PE 与估值综合评分两项不做的原因。
 - [文档] 板块资金流 FAC-01b 首次板块层评估（60 个交易日回补样本，489/496 板块）判定为 `not_evaluable`：MDE 0.132、outflow 状态占比 71.3%、仅单窗口且有效决策日 50 < 60；该因子维持观察态，不进入排序。
+- [新功能] 新增常驻影子账户（Paper Trading）A/B 双账本：每本各自 10 万元、一次性给足、不补钱、允许满仓，分别落在独立 `data/paper_trading/a.db`、`b.db`，完全不读写真实 `portfolio_*` 表；A 本只在 AI 最终动作为 `open` 时买入，B 本在引擎入场区被触及且非涨停一字板时买入、AI 意见只记录不执行；默认关闭（`AGENT_PAPER_TRADING_ENABLED=false`），关闭时不建库、不注册任务、不产生交易。
+- [改进] 影子账户改为消费产物而非自跑链路：读取选股 trace（`agent_traces/<run_id>/stock_selection.json`）与单股分析（`analysis_history`），选股产物同时进 A/B 两本、单股分析只进 A 本；以 `(source, run_id)` 幂等入账，同决策日按标的后写覆盖，不再按 18:00 定时触发完整链路。
+- [改进] 影子账户只按 `src/agent/pricing/` 引擎点位成交（优先持久化计划产物，缺失时用同一确定性引擎现算，不联网不调 LLM）：日线最低价触及入场区上沿按限价成交（`touch`，可选更保守的 `close` 收盘确认），每笔额外记录 `close_in_zone` 供收盘口径对照；同日止损优先于目标，目标 1 按比例部分止盈、目标 2 清仓；T+1、一字涨停不买、一字跌停不卖，佣金/过户费/印花税按 `cn-a-share-2023.v1` 计收。
+- [改进] 每日收盘后按收盘价记一条净值（同日重跑覆盖而非累加，历史日期禁止回写），刷新每笔决策的 T+5 / T+20 收益并与本地 `000985` 对比；无新产物的日期只更新净值、不成交、不补造数据；产出 `report.json`、`nav_curve_A/B.csv`、`decisions_A/B.csv`。
+- [改进] 新增手工脚本 `scripts/run_paper_trading.py`（`--date/--book/--ingest-only/--report-only/--reingest`）与后台入账/净值任务；配置新增 `AGENT_PAPER_TRADING_DB_DIR`、`AGENT_PAPER_TRADING_TRACE_DIR`、`AGENT_PAPER_TRADING_MAX_INGEST_PER_RUN`、`AGENT_PAPER_TRADING_INGEST_LOOKBACK_DAYS`。
+- [测试] 新增 `tests/test_paper_trading.py`：入场区限价与收盘确认、止损优先、目标分批、T+1、涨跌停、费用、产物解析、run_id 幂等、A 本 AI 门控、B 本忽略 AI、单股产物不进 B 本、有效窗口、`close_in_zone` 标记、无产物日只记净值、同日重跑覆盖、历史回写拒绝、T+5/T+20 与双账本报告，共 23 例。
+- [文档] 新增 `docs/architecture/paper-trading-shadow-account.md`，记录 A/B 口径、两类产物来源与路由、引擎点位解析优先级、日线近似偏差方向、手工喂产物的操作步骤，以及实测结论：Tushare 私有网关 `stk_mins` / `rt_k` / `rt_min` 均因积分档未开通返回 403，Baostock 与 Sina 分钟线只覆盖近期，暂不做全量分钟采集。
 
 - [改进] 确定性点位引擎将“最近结构阻力空间不足”并入参考净盈亏比门槛（`RISK_REWARD_BELOW_MINIMUM`），不再单独产出 `TARGET_TOO_CLOSE`；阈值未改，429 样本回放 `generated/observation/no_plan = 147/231/51` 与逐样本场景状态完全一致。
 - [改进] `NO_VALID_STOP` 拆分为 `NO_STRUCTURAL_SUPPORT`（无结构支撑）、`STOP_DISTANCE_EXCEEDED`（有支撑但止损过远）、`STOP_LEVEL_INVALID`（止损位数据异常）；旧码保留中文标签用于渲染历史计划，拆分守恒 255 = 130 + 125 + 0。
@@ -767,7 +780,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] `docs/full-guide.md` / `docs/full-guide_EN.md` 补充日线步骤的发布滞后回退语义。
 - [新功能] 新增新闻事件研究地基：`raw_news_episodes` / `news_extracted_events` 增加 `stock_codes_json`、`stock_scope`（`single` / `multi` / `no_stock`）、`trade_date`、`event_category` 与规则 id；抽不到证券代码时显式标 `no_stock`（无标的），不伪造标的。
 - [改进] 新增确定性事件类型映射（财报 / 业绩预告 / 减持 / 增持回购 / 质押 / 监管处罚 / 中标订单 / 分红 / 诉讼 / 停复牌 / 重组并购 / 其他），按固定关键词顺序命中并保留规则 id；`NEWS_EVENT_FOUNDATION_ENABLED` 默认关闭，关闭时入库行为不变。
+- [新功能] 新增新闻事件结果结算链路：按 `trade_date` 的 T+1 开盘入场，算事件后 1 / 5 个交易日收盘的前复权收益、`000985` 基准收益与扣 20bp 成本后的超额收益，写入 `news_signal_outcomes`；不可结算的行写 `unavailable` 与原因码，不丢弃。
 - [新功能] 新增手工脚本 `scripts/backfill_news_event_foundation.py`（历史存量回填与覆盖率报告）与 `scripts/settle_news_signal_outcomes.py`（可指定窗口 / 事件 / 重算 / 试算）。
+- [测试] 新增 `tests/test_news_event_foundation.py`：代码抽取、交易日回退、事件类型映射、前复权超额收益、限价一字板不可入场、结算幂等，共 6 例。
+- [文档] 新增 `docs/architecture/news-event-foundation.md`：字段口径、事件类型映射、覆盖率与结算公式、已知局限。
 
 ## [3.14.2](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.1...v3.14.2) - 2026-04-30
 

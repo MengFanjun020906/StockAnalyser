@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src.backtest.factor_eval.data import load_benchmark_series
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import is_meaningful_stock_name
 from src.repositories.seed_pool_quality_repo import SeedPoolQualityRepository
@@ -24,8 +25,7 @@ from src.storage import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
-BENCHMARK_CODE = "000001.SH"
-BENCHMARK_BAOSTOCK_CODE = "sh.000001"
+BENCHMARK_CODE = "000985.CSI"
 PRICE_LINE_META = {
     "bos_level": {"label": "BOS 支撑", "color": "#16a34a"},
     "invalidation_level": {"label": "证伪/止损", "color": "#dc2626"},
@@ -69,6 +69,8 @@ class MarketDataProvider:
         self.db = db_manager or DatabaseManager.get_instance()
 
     def get_daily_bars(self, symbol: str, start_date: date, end_date: date, market: str = "cn") -> List[DailyBar]:
+        if _is_benchmark(symbol):
+            return _benchmark_daily_bars(symbol, start_date, end_date)
         bars = self._load_from_db(symbol, start_date, end_date)
         if bars:
             return bars
@@ -76,13 +78,11 @@ class MarketDataProvider:
         return self._load_from_db(symbol, start_date, end_date)
 
     def get_daily_bars_from_db(self, symbol: str, start_date: date, end_date: date) -> List[DailyBar]:
+        if _is_benchmark(symbol):
+            return _benchmark_daily_bars(symbol, start_date, end_date)
         return self._load_from_db(symbol, start_date, end_date)
 
     def _load_from_db(self, symbol: str, start_date: date, end_date: date) -> List[DailyBar]:
-        if _normalize_code(symbol) == BENCHMARK_CODE:
-            sequoia_bars = _load_from_sequoia_db(symbol, start_date, end_date)
-            if sequoia_bars:
-                return sequoia_bars
         sequoia_bars = _load_from_sequoia_db(symbol, start_date, end_date)
         if sequoia_bars:
             return sequoia_bars
@@ -95,12 +95,11 @@ class MarketDataProvider:
         return _merge_daily_bars(db_bars)
 
     def _try_online_fill(self, symbol: str, start_date: date, end_date: date, market: str = "cn") -> None:
-        fetch_symbols = _fetch_variants(symbol)
         try:
             from data_provider import DataFetcherManager
 
             manager = DataFetcherManager()
-            for fetch_symbol in fetch_symbols:
+            for fetch_symbol in [symbol]:
                 try:
                     df, source = manager.get_daily_data(
                         fetch_symbol,
@@ -247,12 +246,12 @@ class SeedPoolQualityService:
             raise SeedPoolEvaluationPreconditionError(
                 status_code=409,
                 error="missing_benchmark_ohlc",
-                message="本地数据库缺少上证指数行情，无法识别 seed 基准日和下一交易日；请先同步 OHLC。",
+                message="本地指数基准缓存缺少行情，无法识别 seed 基准日和下一交易日；请先同步 index_daily 缓存。",
                 details={
                     "seed_date": seed_date.isoformat(),
                     "fallback_expected_evaluation_date": expected.isoformat(),
                     "benchmark_code": BENCHMARK_CODE,
-                    "data_source": "local_db",
+                    "data_source": "index_benchmark_cache",
                 },
             )
         has_seed_benchmark_bar = any(bar.trade_date <= seed_date for bar in benchmark_bars)
@@ -260,24 +259,24 @@ class SeedPoolQualityService:
             raise SeedPoolEvaluationPreconditionError(
                 status_code=409,
                 error="missing_benchmark_ohlc",
-                message="本地数据库缺少上证指数 seed 基准日行情，无法计算 Alpha；请先同步 OHLC。",
+                message="本地指数基准缓存缺少 seed 基准日行情，无法计算 Alpha；请先同步 index_daily 缓存。",
                 details={
                     "seed_date": seed_date.isoformat(),
                     "expected_evaluation_date": expected.isoformat(),
                     "benchmark_code": BENCHMARK_CODE,
-                    "data_source": "local_db",
+                    "data_source": "index_benchmark_cache",
                 },
             )
         if not has_future_benchmark_bar:
             raise SeedPoolEvaluationPreconditionError(
                 status_code=409,
                 error="missing_benchmark_ohlc",
-                message=f"本地数据库缺少 {seed_date.isoformat()} 之后的上证指数下一交易日行情，无法识别评估日并计算 Alpha；请先同步 OHLC。",
+                message=f"本地指数基准缓存缺少 {seed_date.isoformat()} 之后的下一交易日行情，无法识别评估日并计算 Alpha；请先同步 index_daily 缓存。",
                 details={
                     "seed_date": seed_date.isoformat(),
                     "fallback_expected_evaluation_date": expected.isoformat(),
                     "benchmark_code": BENCHMARK_CODE,
-                    "data_source": "local_db",
+                    "data_source": "index_benchmark_cache",
                 },
             )
 
@@ -947,23 +946,45 @@ def _next_weekday(value: date) -> date:
 def _code_variants(symbol: str) -> List[str]:
     text = str(symbol or "").strip()
     variants = [text]
-    upper = text.upper()
-    if upper == BENCHMARK_CODE:
-        return [BENCHMARK_CODE, BENCHMARK_BAOSTOCK_CODE, "sh000001"]
     if "." in text:
         variants.append(text.split(".")[0])
     return list(dict.fromkeys(v for v in variants if v))
 
 
-def _fetch_variants(symbol: str) -> List[str]:
-    text = str(symbol or "").strip()
-    if text.upper() == BENCHMARK_CODE:
-        return [BENCHMARK_CODE, BENCHMARK_BAOSTOCK_CODE, "sh000001"]
-    return [text]
-
-
 def _normalize_code(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def _is_benchmark(symbol: str) -> bool:
+    return _normalize_code(symbol) == BENCHMARK_CODE
+
+
+def _benchmark_daily_bars(symbol: str, start_date: date, end_date: date) -> List[DailyBar]:
+    """Index benchmark from the index_daily cache; never from ``stock_daily``."""
+
+    series = load_benchmark_series(BENCHMARK_CODE, start_date, end_date)
+    bars: List[DailyBar] = []
+    for day in sorted(series.bars):
+        bar = series.bars[day]
+        close = _safe_float(bar.get("close"))
+        if close is None:
+            continue
+        open_ = _safe_float(bar.get("open"))
+        open_ = close if open_ is None else open_
+        high = _safe_float(bar.get("high"))
+        low = _safe_float(bar.get("low"))
+        bars.append(
+            DailyBar(
+                code=symbol,
+                trade_date=day,
+                open=open_,
+                high=max(open_, close) if high is None else high,
+                low=min(open_, close) if low is None else low,
+                close=close,
+                source="index_benchmark_cache",
+            )
+        )
+    return bars
 
 
 def _load_from_sequoia_db(symbol: str, start_date: date, end_date: date) -> List[DailyBar]:
@@ -1020,9 +1041,6 @@ def _load_from_sequoia_db(symbol: str, start_date: date, end_date: date) -> List
 
 def _sequoia_symbol_variants(symbol: str) -> List[str]:
     text = str(symbol or "").strip()
-    upper = text.upper()
-    if upper == BENCHMARK_CODE:
-        return [BENCHMARK_CODE, BENCHMARK_BAOSTOCK_CODE, "sh000001"]
     variants = [text]
     if "." in text:
         variants.append(text.split(".", 1)[0])

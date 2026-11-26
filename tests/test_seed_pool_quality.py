@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     sys.modules["litellm"] = MagicMock()
 
 import src.auth as auth
+from src.backtest.factor_eval.data import reset_benchmark_series_cache
 from src.data import stock_index_loader
 from api.app import create_app
 from src.config import Config
@@ -45,6 +46,7 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.data_dir = Path(self.temp_dir.name)
         self.db_path = self.data_dir / "seed_pool_quality.db"
         self.sequoia_db_path = self.data_dir / "sequoia_v2.db"
+        self.benchmark_cache_dir = self.data_dir / "benchmark_cache"
         self.env_path = self.data_dir / ".env"
         self.env_path.write_text(
             "\n".join(
@@ -61,12 +63,16 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         os.environ["ENV_FILE"] = str(self.env_path)
         os.environ["DATABASE_PATH"] = str(self.db_path)
         os.environ["SEQUOIA_CANDIDATE_DB_PATH"] = str(self.sequoia_db_path)
+        os.environ["INDEX_BENCHMARK_CACHE_DIR"] = str(self.benchmark_cache_dir)
+        reset_benchmark_series_cache()
         Config.reset_instance()
         DatabaseManager.reset_instance()
         self.client = TestClient(create_app(static_dir=self.data_dir / "empty-static"))
         self.db = DatabaseManager.get_instance()
 
     def tearDown(self) -> None:
+        reset_benchmark_series_cache()
+        os.environ.pop("INDEX_BENCHMARK_CACHE_DIR", None)
         DatabaseManager.reset_instance()
         Config.reset_instance()
         stock_index_loader._clear_stock_index_cache_for_tests()
@@ -76,8 +82,23 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def _save_bars(self, code: str, rows: list[dict]) -> None:
+        if code.endswith(".CSI") or code in {"000001.SH", "000300.SH", "000905.SH", "000688.SH"}:
+            self._save_benchmark_cache(rows)
+            return
         df = pd.DataFrame(rows)
         self.db.save_daily_data(df, code=code, data_source="seed-quality-test")
+
+    def _save_benchmark_cache(self, rows: list[dict]) -> None:
+        self.benchmark_cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self.benchmark_cache_dir / "benchmark_000985_CSI_test.csv"
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write("trade_date,open,close\n")
+            for row in rows:
+                day = row["date"]
+                if isinstance(day, str):
+                    day = date.fromisoformat(day)
+                handle.write(f"{day.strftime('%Y%m%d')},{row['open']},{row['close']}\n")
+        reset_benchmark_series_cache()
 
     def _save_sequoia_bars(self, symbol: str, rows: list[dict]) -> None:
         from scripts.update_sequoia_candidates import init_db, upsert_rows
@@ -181,10 +202,10 @@ class SeedPoolQualityTestCase(unittest.TestCase):
             ],
         )
         self._save_bars(
-            "000001.SH",
+            "000985.CSI",
             [
-                {"date": seed_date, "open": 3000, "high": 3020, "low": 2990, "close": 3000, "volume": 1, "amount": 3000},
-                {"date": eval_date, "open": 3010, "high": 3040, "low": 3000, "close": 3030, "volume": 1, "amount": 3030},
+                {"date": seed_date, "open": 3000, "close": 3000},
+                {"date": eval_date, "open": 3010, "close": 3030},
             ],
         )
 
@@ -202,7 +223,7 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         self.assertAlmostEqual(quality["summary"]["avg_alpha_return_pct"], 4.0)
 
         first = next(item for item in quality["items"] if item["code"] == "600001")
-        self.assertEqual(first["evaluation"]["benchmark_code"], "000001.SH")
+        self.assertEqual(first["evaluation"]["benchmark_code"], "000985.CSI")
         self.assertAlmostEqual(first["evaluation"]["mfe_pct"], 10.0)
         self.assertAlmostEqual(first["evaluation"]["mae_pct"], -5.0)
         self.assertEqual(first["catalyst_tags"], ["100亿算力大单"])
@@ -725,7 +746,7 @@ class SeedPoolQualityTestCase(unittest.TestCase):
         missing_stock_error = missing_stock.json().get("detail", missing_stock.json())
         self.assertEqual(missing_stock_error["error"], "missing_stock_ohlc")
 
-    def test_benchmark_prefers_sequoia_index_and_avoids_stock_code_ambiguity(self) -> None:
+    def test_benchmark_uses_index_cache_and_avoids_stock_code_ambiguity(self) -> None:
         seed_date = date(2026, 6, 5)
         eval_date = date(2026, 6, 8)
         payload = {
@@ -759,11 +780,11 @@ class SeedPoolQualityTestCase(unittest.TestCase):
                 {"date": eval_date, "open": 20, "high": 20, "low": 20, "close": 20},
             ],
         )
-        self._save_sequoia_bars(
+        self._save_bars(
             "000001.SH",
             [
-                {"date": seed_date, "open": 3000, "high": 3020, "low": 2990, "close": 3000},
-                {"date": eval_date, "open": 3010, "high": 3040, "low": 3000, "close": 3030},
+                {"date": seed_date, "open": 3000, "close": 3000},
+                {"date": eval_date, "open": 3010, "close": 3030},
             ],
         )
 
