@@ -153,6 +153,59 @@ def _stockapi_hot_sector_completed_date(now: Optional[datetime] = None) -> date:
     return _previous_weekday(target)
 
 
+def _recent_weekday_ymds(seed_ymd: str, lookback: int = 6) -> List[str]:
+    """Return ``YYYYMMDD`` weekdays starting from ``seed_ymd`` and walking back.
+
+    Used when a same-day upstream feed (e.g. ``moneyflow_ind_dc``) is not yet
+    published: the fallback can retry the previous trading days instead of
+    giving up on an empty same-day response.
+    """
+    text = re.sub(r"\D", "", str(seed_ymd or ""))
+    if len(text) != 8:
+        return []
+    try:
+        cursor = datetime.strptime(text, "%Y%m%d").date()
+    except ValueError:
+        return []
+    out: List[str] = []
+    for _ in range(max(1, lookback)):
+        while cursor.weekday() >= 5:
+            cursor -= timedelta(days=1)
+        out.append(cursor.strftime("%Y%m%d"))
+        cursor -= timedelta(days=1)
+    return out
+
+
+def _query_ind_dc_with_backoff(
+    seed_ymd: str,
+    lookback: int = 6,
+    timeout: float = 15,
+) -> Tuple[Optional[pd.DataFrame], str, List[str]]:
+    """Query ``moneyflow_ind_dc`` walking back to the latest non-empty trade day.
+
+    Tushare publishes ``moneyflow_ind_dc`` with a lag, so the completed-date
+    helper may point at a trading day whose rows are not available yet. Retry
+    the previous weekdays instead of surrendering to ``empty_data`` on the
+    first attempt. Returns ``(df, used_ymd, errors)``; ``df`` is ``None`` when
+    every retry came back empty.
+    """
+    errors: List[str] = []
+    for candidate in _recent_weekday_ymds(seed_ymd, lookback):
+        try:
+            board_df = query_tushare_api(
+                "moneyflow_ind_dc",
+                params={"trade_date": candidate},
+                timeout=timeout,
+            )
+        except Exception as exc:  # pragma: no cover - network dependent
+            errors.append(f"{candidate}:{type(exc).__name__}:{exc}")
+            continue
+        if board_df is not None and not board_df.empty:
+            return board_df, candidate, errors
+        errors.append(f"{candidate}:empty_data")
+    return None, "", errors
+
+
 def _redact_stockapi_error(error: Any) -> str:
     text = str(error or "")
     return re.sub(
@@ -639,9 +692,16 @@ class AkshareFundamentalAdapter:
 
                 if not isinstance(payload, dict):
                     return None, [f"stockapi:{endpoint}:invalid_response"]
-                if payload.get("code") == 60050 and request_params.get("token"):
+                # 60050: token rejected; 60046: token expired. Both fall back to
+                # the anonymous quota instead of failing the whole data source.
+                if payload.get("code") in (60050, 60046) and request_params.get("token"):
                     _STOCKAPI_TOKEN_DENIED_ENDPOINTS.add(endpoint)
                     retry_anonymous = True
+                    logger.warning(
+                        "StockAPI %s token unusable (code=%s), retrying anonymously",
+                        endpoint,
+                        payload.get("code"),
+                    )
                     break
                 if not _stockapi_is_rate_limited(payload):
                     if payload.get("code") == 20000 and use_cache:
@@ -805,18 +865,56 @@ class AkshareFundamentalAdapter:
         }
 
     def _fallback_hot_sectors(self, limit: int) -> Tuple[List[Dict[str, Any]], List[str], str]:
-        """Fallback sector heat source when StockAPI hotBkJlrDr is unavailable."""
+        """Fallback sector heat source when StockAPI hotBkJlrDr is unavailable.
+
+        Tushare ``moneyflow_ind_dc`` is tried first: the Eastmoney push2 quote
+        cluster used by akshare is unreachable on some networks, while the
+        Tushare HTTP gateway stays available.
+        """
+        tushare_source = "tushare:moneyflow_ind_dc"
+        tushare_errors: List[str] = []
+        try:
+            completed = _stockapi_default_completed_date()
+            board_df, used_ymd, backoff_errors = _query_ind_dc_with_backoff(
+                completed.replace("-", "")
+            )
+            if board_df is not None:
+                ranked = board_df.sort_values("net_amount", ascending=False).head(max(1, limit))
+                rows: List[Dict[str, Any]] = []
+                for row in ranked.to_dict(orient="records"):
+                    ts_code = _safe_str(row.get("ts_code"))
+                    rows.append({
+                        "id": None,
+                        "bk_code": ts_code.split(".")[0],
+                        "bk_name": _safe_str(row.get("name")),
+                        "return_pct": _safe_float(row.get("pct_change")),
+                        "return_diff": None,
+                        "net_inflow": _safe_float(row.get("net_amount")),
+                        "net_inflow_diff": None,
+                        "inflow_days": None,
+                        "strength": None,
+                        "strength_diff": None,
+                        "time": _date_key_from_tushare(used_ymd) or completed,
+                    })
+                if rows:
+                    return rows, [], tushare_source
+            tushare_errors.extend(f"{tushare_source}:{err}" for err in backoff_errors)
+            if not tushare_errors:
+                tushare_errors.append(f"{tushare_source}:empty_data")
+        except Exception as exc:  # pragma: no cover - network dependent
+            tushare_errors.append(f"{tushare_source}:{type(exc).__name__}:{exc}")
+
         try:
             import akshare as ak
         except Exception as exc:
-            return [], [f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"], "akshare:stock_board_industry_name_em"
+            return [], [*tushare_errors, f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"], "akshare:stock_board_industry_name_em"
 
         try:
             df = ak.stock_board_industry_name_em()
         except Exception as exc:
-            return [], [f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"], "akshare:stock_board_industry_name_em"
+            return [], [*tushare_errors, f"akshare:stock_board_industry_name_em:{type(exc).__name__}:{exc}"], "akshare:stock_board_industry_name_em"
         if df is None or getattr(df, "empty", True):
-            return [], ["akshare:stock_board_industry_name_em:empty_data"], "akshare:stock_board_industry_name_em"
+            return [], [*tushare_errors, "akshare:stock_board_industry_name_em:empty_data"], "akshare:stock_board_industry_name_em"
 
         name_col = _first_column_by_keywords(df, ["板块名称", "名称", "板块", "行业", "name"])
         code_col = _first_column_by_keywords(df, ["板块代码", "代码", "code"])
@@ -891,6 +989,25 @@ class AkshareFundamentalAdapter:
                 "small_net_inflow_pct": _safe_float(row.get("f87")),
             })
 
+        if not rows and code:
+            fallback_items, fallback_errors, fallback_source = self._fallback_sector_constituents(
+                code, effective_page_size
+            )
+            if fallback_items:
+                return {
+                    "status": "partial",
+                    "bk_code": code,
+                    "page_no": effective_page_no,
+                    "page_size": effective_page_size,
+                    "items": fallback_items,
+                    "source_chain": [fallback_source],
+                    "errors": errors,
+                    "degraded": True,
+                    "primary_source": "stockapi:bkList",
+                    "fallback_source": fallback_source,
+                }
+            errors = [*errors, *fallback_errors]
+
         return {
             "status": "partial" if items else "failed",
             "bk_code": code,
@@ -900,6 +1017,70 @@ class AkshareFundamentalAdapter:
             "source_chain": ["stockapi:bkList"] if items else [],
             "errors": errors,
         }
+
+    def _fallback_sector_constituents(
+        self,
+        bk_code: str,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], List[str], str]:
+        """Rebuild board constituents from Tushare when StockAPI bkList is gone."""
+        source = "tushare:dc_member+daily"
+        normalized = _safe_str(bk_code).upper()
+        if normalized.endswith(".DC"):
+            board_code = normalized
+        elif normalized.startswith("BK"):
+            board_code = f"{normalized}.DC"
+        else:
+            return [], [f"{source}:unsupported_board_code:{bk_code}"], source
+        completed = _stockapi_default_completed_date()
+        ymd = completed.replace("-", "")
+        try:
+            members = query_tushare_api(
+                "dc_member", params={"ts_code": board_code, "trade_date": ymd}, timeout=12
+            )
+            if members is None or members.empty:
+                members = query_tushare_api("dc_member", params={"ts_code": board_code}, timeout=12)
+        except Exception as exc:  # pragma: no cover - network dependent
+            return [], [f"{source}:dc_member:{type(exc).__name__}:{exc}"], source
+        if members is None or members.empty:
+            return [], [f"{source}:dc_member:empty_data"], source
+
+        pct_by_code: Dict[str, float] = {}
+        close_by_code: Dict[str, float] = {}
+        try:
+            daily_df = query_tushare_api(
+                "daily", params={"trade_date": ymd}, fields="ts_code,close,pct_chg", timeout=15
+            )
+            if daily_df is not None and not daily_df.empty:
+                for row in daily_df.to_dict(orient="records"):
+                    code = _normalize_code(row.get("ts_code"))
+                    pct_by_code[code] = _safe_float(row.get("pct_chg"))
+                    close_by_code[code] = _safe_float(row.get("close"))
+        except Exception:
+            pass
+
+        items: List[Dict[str, Any]] = []
+        for member in members.to_dict(orient="records")[:limit]:
+            code = _normalize_code(member.get("con_code") or member.get("ts_code"))
+            if not code:
+                continue
+            items.append({
+                "code": code,
+                "name": _safe_str(member.get("name")),
+                "last_price": close_by_code.get(code),
+                "change_ratio": pct_by_code.get(code),
+                "main_net_inflow": None,
+                "main_net_inflow_pct": None,
+                "super_large_net_inflow": None,
+                "super_large_net_inflow_pct": None,
+                "large_net_inflow": None,
+                "large_net_inflow_pct": None,
+                "medium_net_inflow": None,
+                "medium_net_inflow_pct": None,
+                "small_net_inflow": None,
+                "small_net_inflow_pct": None,
+            })
+        return items, [], source
 
     def get_stockapi_sector_flow_history(self, bk_code: str, limit: int = 10) -> Dict[str, Any]:
         """Return StockAPI sector/concept historical capital flow."""
@@ -988,14 +1169,136 @@ class AkshareFundamentalAdapter:
                 "raw": row,
             })
 
+        items = [item for item in items if item.get("code")]
+        if not items:
+            fallback_items, fallback_errors, fallback_source = self._fallback_hot_sector_leaders(
+                trade_date, bk_code, effective_limit
+            )
+            if fallback_items:
+                return {
+                    "status": "partial",
+                    "date": trade_date,
+                    "bk_code": _safe_str(bk_code),
+                    "items": fallback_items,
+                    "source_chain": [fallback_source],
+                    "errors": errors,
+                    "degraded": True,
+                    "primary_source": "stockapi:hotBkJlrLongTou",
+                    "fallback_source": fallback_source,
+                }
+            errors = [*errors, *fallback_errors]
+
         return {
             "status": "partial" if items else "failed",
             "date": trade_date,
             "bk_code": _safe_str(bk_code),
-            "items": [item for item in items if item.get("code")],
+            "items": items,
             "source_chain": ["stockapi:hotBkJlrLongTou"] if items else [],
             "errors": errors,
         }
+
+    def _fallback_hot_sector_leaders(
+        self,
+        trade_date: str,
+        bk_code: Optional[str],
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], List[str], str]:
+        """Rebuild hot-sector leaders from Tushare when StockAPI denies access.
+
+        Chain: ``moneyflow_ind_dc`` (board ranking by net inflow) ->
+        ``dc_member`` (board constituents) -> ``daily`` (member pct change).
+        Every row returned here is real upstream data; if a step fails the
+        caller receives an error string instead of placeholder rows.
+        """
+        source = "tushare:moneyflow_ind_dc+dc_member+daily"
+        ymd = _safe_str(trade_date).replace("-", "")
+        if not ymd:
+            return [], [f"{source}:missing_trade_date"], source
+        board_df, used_ymd, backoff_errors = _query_ind_dc_with_backoff(ymd)
+        if board_df is None:
+            return [], [f"{source}:ind_dc:{err}" for err in backoff_errors], source
+        # ``daily`` / ``dc_member`` must follow the trade date that actually
+        # returned board rows, not the (possibly unpublished) requested date.
+        ymd = used_ymd
+        time_label = _date_key_from_tushare(ymd) or _safe_str(trade_date)
+
+        wanted = _safe_str(bk_code)
+        if wanted:
+            prefix = wanted.split(".")[0]
+            matched = board_df[board_df["ts_code"].astype(str).str.startswith(prefix)]
+            if matched.empty:
+                return [], [f"{source}:board_not_found:{wanted}"], source
+            boards = matched.head(1)
+        else:
+            boards = board_df.sort_values("net_amount", ascending=False).head(5)
+
+        pct_by_code: Dict[str, float] = {}
+        close_by_code: Dict[str, float] = {}
+        try:
+            daily_df = query_tushare_api(
+                "daily",
+                params={"trade_date": ymd},
+                fields="ts_code,close,pct_chg",
+                timeout=15,
+            )
+            if daily_df is not None and not daily_df.empty:
+                for row in daily_df.to_dict(orient="records"):
+                    code = _normalize_code(row.get("ts_code"))
+                    pct_by_code[code] = _safe_float(row.get("pct_chg"))
+                    close_by_code[code] = _safe_float(row.get("close"))
+        except Exception:
+            daily_df = None
+
+        items: List[Dict[str, Any]] = []
+        errors: List[str] = [f"{source}:ind_dc:{err}" for err in backoff_errors]
+        per_board = 3
+        for board in boards.to_dict(orient="records"):
+            board_ts_code = _safe_str(board.get("ts_code"))
+            board_name = _safe_str(board.get("name"))
+            try:
+                member_df = query_tushare_api(
+                    "dc_member",
+                    params={"ts_code": board_ts_code, "trade_date": ymd},
+                    timeout=12,
+                )
+            except Exception as exc:  # pragma: no cover - network dependent
+                errors.append(f"{source}:dc_member:{board_ts_code}:{type(exc).__name__}:{exc}")
+                continue
+            if member_df is None or member_df.empty:
+                errors.append(f"{source}:dc_member:{board_ts_code}:empty_data")
+                continue
+            members = []
+            for member in member_df.to_dict(orient="records"):
+                code = _normalize_code(member.get("con_code") or member.get("ts_code"))
+                if not code or not code[:2] in ("60", "68", "00", "30"):
+                    continue
+                members.append({
+                    "code": code,
+                    "name": _safe_str(member.get("name")),
+                    "pct_chg": pct_by_code.get(code),
+                    "close": close_by_code.get(code),
+                })
+            members.sort(key=lambda m: (m["pct_chg"] is not None, m["pct_chg"] or -999), reverse=True)
+            for member in members[:per_board]:
+                items.append({
+                    "code": member["code"],
+                    "name": member["name"],
+                    "bk_code": board_ts_code.split(".")[0],
+                    "bk_name": board_name,
+                    "rank": None,
+                    "change_ratio": member["pct_chg"],
+                    "last_price": member["close"],
+                    "main_net_inflow": None,
+                    "net_inflow": _safe_float(board.get("net_amount")),
+                    "strength": None,
+                    "reason": f"板块{board_name}资金净流入居前，成员涨幅靠前（Tushare 降级）",
+                    "time": time_label,
+                    "raw": {"board": board, "member": member},
+                })
+            if len(items) >= limit:
+                break
+
+        return items[:limit], errors, source
 
     def get_stockapi_change_all_history(
         self,
@@ -1043,6 +1346,89 @@ class AkshareFundamentalAdapter:
             "errors": errors,
         }
 
+    def _fallback_popularity_rank(
+        self,
+        limit: int,
+    ) -> Tuple[List[Dict[str, Any]], List[str], str]:
+        """Rebuild the popularity rank from Tushare ``dc_hot``.
+
+        Used when the StockAPI ``renQi`` endpoint is unusable (expired token and
+        exhausted anonymous quota).  Rows are real upstream data; ``reason`` /
+        ``tag`` may be empty because Tushare does not ship StockAPI's AI notes.
+        """
+        source = "tushare:dc_hot"
+        errors: List[str] = []
+        rows: List[Dict[str, Any]] = []
+        cursor = datetime.strptime(_stockapi_default_completed_date(), "%Y-%m-%d").date()
+        for _ in range(5):
+            ymd = cursor.strftime("%Y%m%d")
+            try:
+                df = query_tushare_api(
+                    "dc_hot",
+                    params={"trade_date": ymd},
+                    fields=(
+                        "trade_date,data_type,ts_code,ts_name,rank,pct_change,"
+                        "current_price,hot,concept,rank_reason,rank_time"
+                    ),
+                    timeout=15,
+                )
+            except Exception as exc:  # pragma: no cover - network dependent
+                errors.append(f"{source}:{ymd}:{type(exc).__name__}:{exc}")
+                cursor -= timedelta(days=1)
+                continue
+            if df is not None and not df.empty:
+                rows = df.to_dict(orient="records")
+                break
+            cursor -= timedelta(days=1)
+
+        if not rows:
+            if not errors:
+                errors.append(f"{source}:empty_data")
+            return [], errors, source
+
+        latest: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            data_type = _safe_str(row.get("data_type"))
+            if data_type and data_type != "A股市场":
+                continue
+            code = _normalize_code(row.get("ts_code"))
+            if not code:
+                continue
+            rank_time = _safe_str(row.get("rank_time"))
+            current = latest.get(code)
+            current_time = _safe_str(current.get("rank_time")) if current else ""
+            row_rank = _safe_float(row.get("rank"))
+            current_rank = _safe_float(current.get("rank")) if current else None
+            if (
+                current is None
+                or rank_time > current_time
+                or (
+                    rank_time == current_time
+                    and row_rank is not None
+                    and (current_rank is None or row_rank < current_rank)
+                )
+            ):
+                latest[code] = row
+
+        ordered = sorted(
+            latest.values(),
+            key=lambda r: _safe_float(r.get("rank")) if _safe_float(r.get("rank")) is not None else 1e9,
+        )
+
+        items: List[Dict[str, Any]] = []
+        for row in ordered[:limit]:
+            rank = _safe_float(row.get("rank"))
+            items.append({
+                "code": _normalize_code(row.get("ts_code")),
+                "name": _safe_str(row.get("ts_name")),
+                "rank": rank,
+                "popularity": max(0.0, 101.0 - rank) if rank is not None else None,
+                "change_ratio": _safe_float(row.get("pct_change")),
+                "reason": _safe_str(row.get("rank_reason")),
+                "tag": _safe_str(row.get("concept")),
+            })
+        return items, errors, source
+
     def get_stockapi_popularity_rank(self, limit: int = 30) -> Dict[str, Any]:
         """Return StockAPI stock popularity ranking with AI-generated reasons."""
         effective_limit = max(1, min(int(limit or 30), 100))
@@ -1064,6 +1450,20 @@ class AkshareFundamentalAdapter:
                 "reason": _safe_str(row.get("analyse")),
                 "tag": row.get("tag") if isinstance(row.get("tag"), (dict, list)) else _safe_str(row.get("tag")),
             })
+
+        if not items:
+            fallback_items, fallback_errors, fallback_source = self._fallback_popularity_rank(effective_limit)
+            if fallback_items:
+                return {
+                    "status": "partial",
+                    "items": fallback_items,
+                    "source_chain": ["stockapi:renQi", fallback_source],
+                    "primary_source": "stockapi:renQi",
+                    "fallback_source": fallback_source,
+                    "degraded": True,
+                    "errors": errors + fallback_errors,
+                }
+            errors = errors + fallback_errors
 
         return {
             "status": "partial" if items else "failed",

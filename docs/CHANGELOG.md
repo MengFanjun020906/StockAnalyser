@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 板块资金流影子采集窗口由 15:30–16:00 放宽到 **15:30–18:00**（每 600s 检查），上游偶发连接失败时当天最多约 16 次尝试，避免三次全失败即当天零样本；当日快照 `complete` 后不再重复采集、不再追加运行记录。采集内容、板块口径、分位算法与 60 个交易日要求不变。
 - [改进] 运行产物 `selection_context` 新增 `prompt_versions`（`stock_selection` / `planning` 两个 prompt 模块的文本版本），便于回溯一次 Agent 运行实际使用的提示词版本；prompt 文案与默认行为不变。
 - [改进] 回测执行摘要新增 `execution_params`，回显实际生效的 `price_basis` / `t_plus` / `buy_lot_size` / 佣金·过户费·印花税·最低佣金 / `fee_policy_version`；撮合与账本逻辑不变（OBS-01 验收项 4）。
+- [修复] StockAPI token 过期（60046）与失效（60050）统一改为匿名额度重试；热榜、板块热榜自动降级并保留错误原因，龙头股接口匿名不可用时改用 Tushare `moneyflow_ind_dc` + `dc_member` + `daily` 重建；热榜匿名额度也用尽时改用 Tushare `dc_hot`。
+- [修复] 东财 push2 行情集群不可达时，`get_belong_boards` 的 Tushare `stock_basic.industry` 兜底改为主源并行预取（并做进程内缓存），不再排在慢速主源之后被超时截断；`AGENT_STOCK_INFO_BOARDS_TIMEOUT_SECONDS` 默认由 3s 放宽到 5s。板块热榜兜底顺序改为 Tushare `moneyflow_ind_dc` → akshare；板块资金流快照连续连接失败触发熔断并标记 `provider_unreachable`，不再逐板块重试。
+- [修复] 板块热榜/龙头股 Tushare 兜底支持按最近交易日回退：当日 `moneyflow_ind_dc` 尚未发布（`empty_data`）时，按工作日向前回退最多 6 天重试，命中日期同步用于 `daily` / `dc_member`，`time` 回填实际命中交易日；不再因当日空数据直接判 `failed`。
+- [修复] Tushare `anns_d` 无权限（403）时自动降级到巨潮公告 `akshare.stock_zh_a_disclosure_report_cninfo`，保留原始错误并标注 `degraded` / `fallback_source`。
+- [文档] `.env.example` 补充 StockAPI token 降级与 `anns_d` 权限降级说明。
 - [测试] 新增 `tests/test_prompt_versions.py`：校验两个 prompt 版本常量格式、`selection_context` 中的版本映射，以及版本号不会被注入 prompt 文本。
 - [测试] 新增 `tests/test_valuation_fact.py`：分位计算与 20 日变化、亏损股排除、同业样本不足、历史观测不足、120 天窗口截断、20 日前 PE≤0、缓存缺失降级、展示序列化与 desk/seed 隔离，共 9 例。
 - [文档] 新增 `docs/architecture/valuation-percentile-observation.md`：记录 FAC-03 的边界、数据源、5 个指标字段契约、缺失分档、配置开关，以及动态 PE 与估值综合评分两项不做的原因。

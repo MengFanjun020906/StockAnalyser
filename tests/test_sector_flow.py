@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -569,3 +570,29 @@ def test_desk_fact_sheet_dict_excludes_sector_flow():
         sector_flow=SectorFlowFact(score=0.9, state="persistent_inflow"),
     )
     assert "sector_flow" not in _fact_sheet_to_dict(fact_sheet)
+
+
+class _ConnectionErrorSource(FakeSource):
+    def board_history(self, board_name, limit):
+        self.history_calls += 1
+        time.sleep(0.03)
+        raise ConnectionError(
+            "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
+        )
+
+
+def test_connection_failures_trip_circuit_breaker():
+    catalog = _catalog(*[(f"BK{i:04d}", f"板块{i}", 10) for i in range(1, 13)])
+    source = _ConnectionErrorSource(catalog, {})
+    settings = dict(sf.load_settings())
+    settings["concurrency"] = 1
+    settings["retry"] = 0
+
+    snapshot = _snapshot(source, [item["bk_code"] for item in catalog], settings=settings)
+
+    assert snapshot.get("provider_unreachable") is True
+    breaker = [msg for msg in snapshot["errors"].values() if msg.startswith("provider_unreachable")]
+    assert breaker
+    # 熔断后剩余板块不再逐个调用上游
+    assert source.history_calls < len(catalog)
+    assert len(breaker) == len(catalog) - sf._FAILURE_STREAK_LIMIT

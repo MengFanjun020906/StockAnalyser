@@ -25,7 +25,7 @@ import re
 import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +44,28 @@ _SOURCE_HISTORY = "akshare.stock_sector_fund_flow_hist"
 _SOURCE_CONSTITUENTS = "akshare.stock_board_industry_cons_em"
 
 _BUILD_LOCK = threading.Lock()
+
+# 东财 push2 行情集群在部分网络下会整体 TCP 重置。连续失败达到阈值后熔断，
+# 不再对其余板块逐个重试，避免 496 个板块 × 重试把一次构建拖成数分钟。
+_CONNECTION_ERROR_MARKERS = (
+    "RemoteDisconnected",
+    "ConnectionError",
+    "Connection aborted",
+    "Max retries exceeded",
+    "NewConnectionError",
+    "ConnectionResetError",
+    "timed out",
+    "Timeout",
+)
+_FAILURE_STREAK_LIMIT = 8
+_CIRCUIT_BREAKER_ERROR = (
+    "provider_unreachable: circuit breaker tripped after repeated connection failures"
+)
+
+
+def _is_connection_error(message: str) -> bool:
+    text = str(message or "")
+    return any(marker in text for marker in _CONNECTION_ERROR_MARKERS)
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "version": 1,
@@ -751,7 +773,9 @@ def _fetch_board_series(
             ): code
             for code, meta in boards_meta
         }
-        for future, code in futures.items():
+        streak = 0
+        for future in as_completed(futures):
+            code = futures[future]
             try:
                 rows, error = future.result()
             except Exception as exc:  # pragma: no cover - 防御性
@@ -759,6 +783,23 @@ def _fetch_board_series(
             series[code] = rows
             if error:
                 errors[code] = error
+                streak = streak + 1 if _is_connection_error(error) else 0
+            else:
+                streak = 0
+            if streak < _FAILURE_STREAK_LIMIT:
+                continue
+            for pending, pending_code in futures.items():
+                if pending_code in series:
+                    continue
+                pending.cancel()
+                series.setdefault(pending_code, [])
+                errors[pending_code] = _CIRCUIT_BREAKER_ERROR
+            logger.warning(
+                "[SectorFlow] 连续 %s 个板块连接失败，熔断剩余 %s 个板块",
+                streak,
+                sum(1 for c in futures.values() if c not in series or not series.get(c)),
+            )
+            break
     return series, errors
 
 
@@ -924,6 +965,8 @@ def _build_snapshot_payload(
         "errors": errors,
     }
     payload.update(_snapshot_meta(raw, errors, catalog))
+    if any(str(message).startswith("provider_unreachable") for message in errors.values()):
+        payload["provider_unreachable"] = True
     return payload
 
 
@@ -1012,6 +1055,10 @@ def retry_failed_boards(
         last_error_retry_at=_now_iso(),
     )
     snapshot.update(_snapshot_meta(raw, errors, catalog))
+    if any(str(message).startswith("provider_unreachable") for message in errors.values()):
+        snapshot["provider_unreachable"] = True
+    else:
+        snapshot.pop("provider_unreachable", None)
     if cache_dir and snapshot.get("as_of_date"):
         _write_json_atomic(
             _resolve_cache_dir(cache_dir, settings) / _SNAPSHOT_TMPL.format(date=snapshot["as_of_date"]),

@@ -108,3 +108,70 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FailingBoardFetcher:
+    name = "efinance"
+
+    def get_belong_board(self, code):
+        raise ConnectionError("('Connection aborted.', RemoteDisconnected(...))")
+
+
+class BelongBoardsTushareFallbackTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        from data_provider.base import _TUSHARE_INDUSTRY_BOARD_CACHE
+
+        _TUSHARE_INDUSTRY_BOARD_CACHE.clear()
+
+    def test_falls_back_to_tushare_industry_when_all_fetchers_fail(self) -> None:
+        import pandas as pd
+        from unittest.mock import patch
+
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        manager._fetchers = [_FailingBoardFetcher()]
+        df = pd.DataFrame([{"ts_code": "603986.SH", "name": "兆易创新", "industry": "半导体"}])
+
+        with patch("data_provider.tushare_client.query_tushare_api", return_value=df) as mock_query:
+            boards = manager.get_belong_boards("603986")
+
+        self.assertEqual(len(boards), 1)
+        self.assertEqual(boards[0]["name"], "半导体")
+        self.assertTrue(boards[0]["degraded"])
+        self.assertEqual(boards[0]["source"], "tushare:stock_basic.industry")
+        self.assertEqual(mock_query.call_args.args[0], "stock_basic")
+
+    def test_prefers_primary_boards_when_available(self) -> None:
+        from unittest.mock import patch
+
+        from data_provider.base import DataFetcherManager
+
+        class _OkFetcher:
+            name = "efinance"
+
+            def get_belong_board(self, code):
+                return [{"name": "半导体", "type": "industry"}]
+
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        manager._fetchers = [_OkFetcher()]
+        with patch("data_provider.tushare_client.query_tushare_api") as mock_query:
+            boards = manager.get_belong_boards("603501")
+
+        self.assertEqual(boards, [{"name": "半导体", "type": "industry"}])
+        self.assertFalse(any(b.get("degraded") for b in boards))
+
+    def test_returns_empty_when_tushare_industry_missing(self) -> None:
+        import pandas as pd
+        from unittest.mock import patch
+
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        manager._fetchers = [_FailingBoardFetcher()]
+        df = pd.DataFrame([{"ts_code": "600519.SH", "name": "贵州茅台", "industry": ""}])
+
+        with patch("data_provider.tushare_client.query_tushare_api", return_value=df):
+            boards = manager.get_belong_boards("600519")
+
+        self.assertEqual(boards, [])
