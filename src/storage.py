@@ -383,6 +383,18 @@ class RawNewsEpisode(Base):
 
     subjects_json = Column(Text)
     stocks_json = Column(Text)
+    # Event-study foundation fields (filled when NEWS_EVENT_FOUNDATION_ENABLED
+    # or by the backfill script). ``stock_scope`` is never blank:
+    # single / multi / no_stock / unknown (legacy rows before backfill).
+    stock_codes_json = Column(Text)
+    stock_scope = Column(String(16), default='unknown', index=True)
+    trade_date = Column(Date, index=True)
+    event_category = Column(String(32), index=True)
+    event_category_rule = Column(String(64))
+    event_categories_json = Column(Text)
+    # Display-only triage snapshot for ``no_stock`` episodes. Never read by
+    # selection/scoring/prompt paths; see src/services/news_no_stock_triage.py.
+    no_stock_triage_json = Column(Text)
     source_chain_json = Column(Text)
     raw_payload_json = Column(Text)
     status = Column(String(32), default='ok', index=True)
@@ -425,6 +437,13 @@ class NewsExtractedEvent(Base):
     verification_status = Column(String(32), default='source_only', index=True)
     verification_sources_json = Column(Text)
     entity_links_json = Column(Text)
+    # Event-study foundation fields. See ``news_event_foundation`` for rules.
+    stock_codes_json = Column(Text)
+    stock_scope = Column(String(16), default='unknown', index=True)
+    primary_stock_code = Column(String(16), index=True)
+    trade_date = Column(Date, index=True)
+    event_category = Column(String(32), index=True)
+    event_category_rule = Column(String(64))
     diagnostics_json = Column(Text)
     status = Column(String(32), default='active', index=True)
 
@@ -631,12 +650,36 @@ class NewsSignalOutcome(Base):
     mae_pct = Column(Float)
     liquidity_status = Column(String(32), default='UNKNOWN', index=True)
     data_status = Column(String(24), default='pending', index=True)
+    # Event-level settlement fields (news event study). Legacy card/seed rows
+    # leave these empty; event rows are keyed by (event_id, stock_code, horizon).
+    event_id = Column(String(128), index=True)
+    stock_code = Column(String(16), index=True)
+    stock_scope = Column(String(16))
+    trade_date = Column(Date)
+    entry_date = Column(Date)
+    exit_date = Column(Date)
+    horizon = Column(String(8), index=True)
+    stock_return_pct = Column(Float)
+    benchmark_code = Column(String(16))
+    benchmark_return_pct = Column(Float)
+    excess_return_pct = Column(Float)
+    cost_bps = Column(Float)
+    reason = Column(String(120))
+    dataset_version = Column(String(32))
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
 
     __table_args__ = (
         UniqueConstraint('card_id', 'seed_item_id', 'evaluation_date', name='uix_news_signal_outcome_card_seed_date'),
         Index('ix_news_signal_outcome_card_status', 'card_id', 'data_status'),
+        Index(
+            'uix_news_signal_outcome_event_stock_horizon',
+            'event_id',
+            'stock_code',
+            'horizon',
+            'dataset_version',
+            unique=True,
+        ),
     )
 
 
@@ -1925,6 +1968,7 @@ class DatabaseManager:
             return
         self._migrate_raw_news_episode_quality()
         self._migrate_news_extracted_events()
+        self._migrate_news_event_foundation()
         self._migrate_news_signal_edge_quality()
         self._migrate_news_signal_card_layer()
         self._migrate_graphiti_outbox()
@@ -2158,6 +2202,130 @@ class DatabaseManager:
             )
             conn.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_raw_news_quality_date ON raw_news_episodes (quality_grade, signal_date)"
+            )
+
+    def _migrate_news_event_foundation(self) -> None:
+        """Add event-study foundation columns for databases created earlier.
+
+        These columns are additive only: legacy rows keep ``unknown`` scope and
+        ``NULL`` trade date until the one-off backfill script runs.
+        """
+
+        raw_columns = (
+            ("stock_codes_json", "ALTER TABLE raw_news_episodes ADD COLUMN stock_codes_json TEXT"),
+            (
+                "stock_scope",
+                "ALTER TABLE raw_news_episodes ADD COLUMN stock_scope VARCHAR(16) DEFAULT 'unknown'",
+            ),
+            ("trade_date", "ALTER TABLE raw_news_episodes ADD COLUMN trade_date DATE"),
+            ("event_category", "ALTER TABLE raw_news_episodes ADD COLUMN event_category VARCHAR(32)"),
+            (
+                "event_category_rule",
+                "ALTER TABLE raw_news_episodes ADD COLUMN event_category_rule VARCHAR(64)",
+            ),
+            (
+                "event_categories_json",
+                "ALTER TABLE raw_news_episodes ADD COLUMN event_categories_json TEXT",
+            ),
+            (
+                "no_stock_triage_json",
+                "ALTER TABLE raw_news_episodes ADD COLUMN no_stock_triage_json TEXT",
+            ),
+        )
+        event_columns = (
+            (
+                "stock_codes_json",
+                "ALTER TABLE news_extracted_events ADD COLUMN stock_codes_json TEXT",
+            ),
+            (
+                "stock_scope",
+                "ALTER TABLE news_extracted_events ADD COLUMN stock_scope VARCHAR(16) DEFAULT 'unknown'",
+            ),
+            (
+                "primary_stock_code",
+                "ALTER TABLE news_extracted_events ADD COLUMN primary_stock_code VARCHAR(16)",
+            ),
+            (
+                "trade_date",
+                "ALTER TABLE news_extracted_events ADD COLUMN trade_date DATE",
+            ),
+            (
+                "event_category",
+                "ALTER TABLE news_extracted_events ADD COLUMN event_category VARCHAR(32)",
+            ),
+            (
+                "event_category_rule",
+                "ALTER TABLE news_extracted_events ADD COLUMN event_category_rule VARCHAR(64)",
+            ),
+        )
+        outcome_columns = (
+            ("event_id", "ALTER TABLE news_signal_outcomes ADD COLUMN event_id VARCHAR(128)"),
+            ("stock_code", "ALTER TABLE news_signal_outcomes ADD COLUMN stock_code VARCHAR(16)"),
+            ("stock_scope", "ALTER TABLE news_signal_outcomes ADD COLUMN stock_scope VARCHAR(16)"),
+            ("trade_date", "ALTER TABLE news_signal_outcomes ADD COLUMN trade_date DATE"),
+            ("entry_date", "ALTER TABLE news_signal_outcomes ADD COLUMN entry_date DATE"),
+            ("exit_date", "ALTER TABLE news_signal_outcomes ADD COLUMN exit_date DATE"),
+            ("horizon", "ALTER TABLE news_signal_outcomes ADD COLUMN horizon VARCHAR(8)"),
+            ("stock_return_pct", "ALTER TABLE news_signal_outcomes ADD COLUMN stock_return_pct FLOAT"),
+            ("benchmark_code", "ALTER TABLE news_signal_outcomes ADD COLUMN benchmark_code VARCHAR(16)"),
+            (
+                "benchmark_return_pct",
+                "ALTER TABLE news_signal_outcomes ADD COLUMN benchmark_return_pct FLOAT",
+            ),
+            (
+                "excess_return_pct",
+                "ALTER TABLE news_signal_outcomes ADD COLUMN excess_return_pct FLOAT",
+            ),
+            ("cost_bps", "ALTER TABLE news_signal_outcomes ADD COLUMN cost_bps FLOAT"),
+            ("reason", "ALTER TABLE news_signal_outcomes ADD COLUMN reason VARCHAR(120)"),
+            ("dataset_version", "ALTER TABLE news_signal_outcomes ADD COLUMN dataset_version VARCHAR(32)"),
+        )
+        with self._engine.begin() as conn:
+            for table, columns in (
+                ("raw_news_episodes", raw_columns),
+                ("news_extracted_events", event_columns),
+                ("news_signal_outcomes", outcome_columns),
+            ):
+                exists = conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if exists is None:
+                    continue
+                for column, ddl in columns:
+                    self._add_sqlite_column_if_missing(conn, table, column, ddl)
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_raw_news_stock_scope ON raw_news_episodes (stock_scope)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_raw_news_trade_date ON raw_news_episodes (trade_date)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_raw_news_event_category ON raw_news_episodes (event_category)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_news_events_stock_scope "
+                "ON news_extracted_events (stock_scope)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_news_events_trade_date "
+                "ON news_extracted_events (trade_date)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_news_events_event_category "
+                "ON news_extracted_events (event_category)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_news_events_primary_stock "
+                "ON news_extracted_events (primary_stock_code)"
+            )
+            # v1 rows are preserved; the extra dataset_version column lets the
+            # corrected-benchmark v2 rows coexist with the legacy v1 outcome.
+            conn.exec_driver_sql(
+                "DROP INDEX IF EXISTS uix_news_signal_outcome_event_stock_horizon"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uix_news_signal_outcome_event_stock_horizon "
+                "ON news_signal_outcomes (event_id, stock_code, horizon, dataset_version)"
             )
 
     def _migrate_news_extracted_events(self) -> None:

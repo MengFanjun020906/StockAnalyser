@@ -1728,3 +1728,55 @@ def test_seed_candidate_payload_keeps_recall_score_as_source_diagnostic():
     assert payload["metrics"]["source_diagnostics"]["priority_score"] == 96.2
     assert payload["metrics"]["source_diagnostics"]["priority_score_raw"] == 108.0
     assert payload["metrics"]["source_diagnostics"]["score_kind"] == "seed_recall_priority"
+
+
+def test_seed_tool_call_retries_previous_weekday_when_requested_day_is_empty():
+    calls = []
+
+    def _tool(trade_date="", **kwargs):
+        calls.append(trade_date)
+        if trade_date in {"20261125", "2026-11-25"}:
+            return {"status": "empty", "trade_date": trade_date, "items": [], "errors": ["empty_data"]}
+        return {"status": "ok", "trade_date": trade_date, "items": [{"code": "600000"}]}
+
+    result = committee_module._safe_tool_call_with_recent_trade_date(
+        {"tool": _tool}, "tool", trade_date="20261125", limit=5
+    )
+
+    assert calls == ["20261125", "20261124"]
+    assert result["trade_date"] == "20261124"
+    assert result["trade_date_backoff"] == ["20261124"]
+    assert [item["code"] for item in result["items"]] == ["600000"]
+
+
+def test_seed_tool_call_skips_weekends_and_keeps_hard_failures_visible():
+    calls = []
+
+    def _tool(trade_date="", **kwargs):
+        calls.append(trade_date)
+        return {"status": "failed", "trade_date": trade_date, "items": [], "errors": ["token invalid"]}
+
+    result = committee_module._safe_tool_call_with_recent_trade_date(
+        {"tool": _tool}, "tool", trade_date="20261125"
+    )
+
+    assert calls == ["20261125"]
+    assert result["status"] == "failed"
+    assert "trade_date_backoff" not in result
+    assert committee_module._previous_weekday_ymds("20261123", lookback=2) == ["20261120", "20261119"]
+
+
+def test_seed_tool_call_does_not_retry_when_payload_has_items():
+    calls = []
+
+    def _tool(trade_date="", **kwargs):
+        calls.append(trade_date)
+        return {"status": "ok", "trade_date": trade_date, "items": [{"code": "600001"}]}
+
+    result = committee_module._safe_tool_call_with_recent_trade_date(
+        {"tool": _tool}, "tool", trade_date="20261125"
+    )
+
+    assert calls == ["20261125"]
+    assert result["trade_date"] == "20261125"
+    assert "trade_date_backoff" not in result

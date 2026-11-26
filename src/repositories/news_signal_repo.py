@@ -876,6 +876,7 @@ class NewsSignalRepository:
             "stocks": _json_list(row.stocks_json),
             "source_chain": _json_list(row.source_chain_json),
             "raw_payload": _json_dict(row.raw_payload_json),
+            "no_stock_triage": _json_dict(row.no_stock_triage_json),
             "status": row.status,
             "errors": _json_list(row.errors_json),
             "created_at": _iso(row.created_at),
@@ -1012,6 +1013,14 @@ class NewsSignalRepository:
         row.session = str(item.get("session") or "unknown")
         row.subjects_json = _json_dumps(item.get("subjects") or [])
         row.stocks_json = _json_dumps(item.get("stocks") or [])
+        row.stock_codes_json = _json_dumps(item.get("stock_codes") or [])
+        row.stock_scope = str(item.get("stock_scope") or "unknown")[:16]
+        row.trade_date = _coerce_date(item.get("trade_date"))
+        row.event_category = str(item.get("event_category") or "")[:32] or None
+        row.event_category_rule = str(item.get("event_category_rule") or "")[:64] or None
+        row.event_categories_json = _json_dumps(item.get("event_categories") or [])
+        triage = item.get("no_stock_triage")
+        row.no_stock_triage_json = _json_dumps(triage) if triage else None
         row.source_chain_json = _json_dumps(item.get("source_chain") or [])
         row.raw_payload_json = _json_dumps(item.get("raw_payload") or {})
         row.status = str(item.get("status") or "ok")
@@ -1039,6 +1048,12 @@ class NewsSignalRepository:
         row.verification_status = str(item.get("verification_status") or "source_only")
         row.verification_sources_json = _json_dumps(item.get("verification_sources") or [])
         row.entity_links_json = _json_dumps(item.get("entity_links") or [])
+        row.stock_codes_json = _json_dumps(item.get("stock_codes") or [])
+        row.stock_scope = str(item.get("stock_scope") or "unknown")[:16]
+        row.primary_stock_code = str(item.get("primary_stock_code") or "")[:16] or None
+        row.trade_date = _coerce_date(item.get("trade_date"))
+        row.event_category = str(item.get("event_category") or "")[:32] or None
+        row.event_category_rule = str(item.get("event_category_rule") or "")[:64] or None
         row.diagnostics_json = _json_dumps(item.get("diagnostics") or {})
         row.status = str(item.get("status") or "active")
         row.updated_at = datetime.now()

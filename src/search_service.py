@@ -56,9 +56,16 @@ _SEARCH_TRANSIENT_EXCEPTIONS = (
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type(_SEARCH_TRANSIENT_EXCEPTIONS),
     before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
 )
 def _post_with_retry(url: str, *, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> requests.Response:
-    """POST with retry on transient SSL/network errors."""
+    """POST with retry on transient SSL/network errors.
+
+    The request goes through ``requests`` so ``HTTPS_PROXY`` / ``ALL_PROXY``
+    (including ``socks5h://``) configured in the environment are honoured.
+    ``reraise=True`` keeps the original proxy/SSL error visible instead of
+    wrapping it in ``tenacity.RetryError``.
+    """
     return requests.post(url, headers=headers, json=json, timeout=timeout)
 
 
@@ -110,10 +117,14 @@ def fetch_url_content(url: str, timeout: int = 5) -> str:
 class SearchResult:
     """搜索结果数据类"""
     title: str
-    snippet: str  # 摘要
+    snippet: str  # 短摘要
     url: str
     source: str  # 来源网站
     published_date: Optional[str] = None
+    summary: Optional[str] = None  # 长摘要（如 DeepSeek Search summary）
+    site_name: Optional[str] = None
+    authority: Optional[float] = None
+    rerank_score: Optional[float] = None
     
     def to_text(self) -> str:
         """转换为文本格式"""
@@ -442,6 +453,190 @@ class AnySearchProvider(BaseSearchProvider):
                 except ValueError:
                     continue
         return None
+
+
+class DeepSeekSearchProvider(BaseSearchProvider):
+    """DeepSeek 官方 Search API 适配器。
+
+    - ``POST {base_url}/v1/tools/search``，Bearer 鉴权，复用 DEEPSEEK_API_KEY(S)
+    - ``query`` / ``count`` 原样提交，``site:`` / ``after:`` / ``lang:`` 语法由
+      调用方拼接后原样透传
+    - ``snippet`` 作为短摘要，``summary`` 作为长摘要写入 ``SearchResult``
+    """
+
+    DEFAULT_BASE_URL = "https://api.deepseek.com"
+    SEARCH_PATH = "/v1/tools/search"
+    RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+    MAX_ATTEMPTS = 3
+    MAX_QUERY_LENGTH = 128
+    MAX_COUNT = 50
+    RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+
+    def __init__(
+        self,
+        api_keys: List[str],
+        *,
+        base_url: Optional[str] = None,
+        timeout_seconds: int = 20,
+    ):
+        super().__init__(api_keys, "DeepSeek")
+        self._base_url = str(base_url or self.DEFAULT_BASE_URL).rstrip("/")
+        self._timeout_seconds = max(1, int(timeout_seconds or 20))
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+    ) -> SearchResponse:
+        del days  # 时间窗由调用方通过 after: 等查询语法表达
+        payload: Dict[str, Any] = {
+            "query": str(query or "").strip()[: self.MAX_QUERY_LENGTH],
+            "count": max(1, min(int(max_results or 10), self.MAX_COUNT)),
+        }
+
+        try:
+            response = self._post_with_status_retry(payload, api_key)
+        except _SEARCH_TRANSIENT_EXCEPTIONS as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=str(exc),
+            )
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+
+        if response.status_code == 402:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="DeepSeek 搜索余额不足 (HTTP 402)",
+            )
+        if response.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=self._error_message(body, response.status_code),
+            )
+
+        if not isinstance(body, dict):
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="DeepSeek 返回无效响应",
+            )
+
+        raw_results = body.get("results")
+        if raw_results is None and isinstance(body.get("data"), dict):
+            raw_results = body["data"].get("results")
+        if not isinstance(raw_results, list):
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="DeepSeek 返回无效响应",
+            )
+
+        results: List[SearchResult] = []
+        for item in raw_results[: payload["count"]]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if not title and not url:
+                continue
+            site_name = str(item.get("site_name") or "").strip()
+            summary = str(item.get("summary") or "").strip()
+            results.append(
+                SearchResult(
+                    title=title or url,
+                    snippet=str(item.get("snippet") or "").strip()[:1000],
+                    url=url,
+                    source=site_name or self._extract_domain(url),
+                    published_date=self._normalize_date(item.get("date")),
+                    summary=summary or None,
+                    site_name=site_name or None,
+                    authority=self._to_float(item.get("authority")),
+                    rerank_score=self._to_float(item.get("rerank_score")),
+                )
+            )
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+        )
+
+    def _post_with_status_retry(self, payload: Dict[str, Any], api_key: str) -> requests.Response:
+        """按状态码区分可重试与不可重试：408/429/5xx 重试，其余 4xx 直接返回。"""
+        url = f"{self._base_url}{self.SEARCH_PATH}"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        for attempt in range(self.MAX_ATTEMPTS):
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self._timeout_seconds,
+            )
+            if response.status_code not in self.RETRYABLE_STATUS_CODES:
+                return response
+            if attempt >= self.MAX_ATTEMPTS - 1:
+                return response
+            time.sleep(self.RETRY_BACKOFF_SECONDS[min(attempt, len(self.RETRY_BACKOFF_SECONDS) - 1)])
+        return response
+
+    @staticmethod
+    def _error_message(body: Any, status_code: int) -> str:
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict) and error.get("message"):
+                return str(error["message"])
+            if body.get("message"):
+                return str(body["message"])
+        return f"HTTP {status_code}"
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            return urlparse(url).netloc or "DeepSeek"
+        except Exception:
+            return "DeepSeek"
+
+    @staticmethod
+    def _normalize_date(value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+        except ValueError:
+            if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+                return text[:10]
+            return None
+
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
 
 class TavilySearchProvider(BaseSearchProvider):
@@ -2309,6 +2504,9 @@ class SearchService:
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
         anysearch_api_key: Optional[str] = None,
+        deepseek_search_api_keys: Optional[List[str]] = None,
+        deepseek_search_base_url: Optional[str] = None,
+        deepseek_search_timeout_seconds: int = 20,
     ):
         """
         初始化搜索服务
@@ -2325,6 +2523,9 @@ class SearchService:
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
             anysearch_api_key: AnySearch API Key；配置后运行时只使用 AnySearch
+            deepseek_search_api_keys: DeepSeek API Key 列表；有 key 时作为首选搜索源
+            deepseek_search_base_url: DeepSeek API Base URL
+            deepseek_search_timeout_seconds: DeepSeek 搜索超时（秒）
         """
         self._providers: List[BaseSearchProvider] = []
         self.news_max_age_days = max(1, news_max_age_days)
@@ -2343,6 +2544,20 @@ class SearchService:
             self.news_strategy_profile,
             NEWS_STRATEGY_WINDOWS["short"],
         )
+
+        # DeepSeek Search：有 key 即作为首选搜索源；失败时由后续 provider 降级。
+        deepseek_keys = [
+            str(key).strip() for key in (deepseek_search_api_keys or []) if str(key).strip()
+        ]
+        if deepseek_keys:
+            self._providers.append(
+                DeepSeekSearchProvider(
+                    deepseek_keys,
+                    base_url=deepseek_search_base_url,
+                    timeout_seconds=deepseek_search_timeout_seconds,
+                )
+            )
+            logger.info("已配置 DeepSeek Search 搜索（首选），共 %s 个 API Key", len(deepseek_keys))
 
         normalized_anysearch_key = str(anysearch_api_key or "").strip()
         if normalized_anysearch_key:
@@ -2764,6 +2979,19 @@ class SearchService:
 
         return None
 
+    def _get_active_providers(self) -> List[BaseSearchProvider]:
+        """返回本轮实际使用的 provider 列表。
+
+        配置了 DeepSeek 且可用时，DeepSeek 作为唯一实时搜索源，避免继续命中
+        已不可用的旧 provider（如超时的 AnySearch）；未配置 DeepSeek 时保持
+        原有 provider 顺序与降级逻辑不变。
+        """
+        available = [provider for provider in self._providers if provider.is_available]
+        deepseek_providers = [
+            provider for provider in available if isinstance(provider, DeepSeekSearchProvider)
+        ]
+        return deepseek_providers or available
+
     def _filter_news_response(
         self,
         response: SearchResponse,
@@ -2820,6 +3048,10 @@ class SearchService:
                     url=item.url,
                     source=item.source,
                     published_date=published.isoformat(),
+                    summary=item.summary,
+                    site_name=item.site_name,
+                    authority=item.authority,
+                    rerank_score=item.rerank_score,
                 )
             )
             if len(filtered) >= max_results:
@@ -2951,6 +3183,10 @@ class SearchService:
                     published_date=(
                         normalized_date.isoformat() if normalized_date is not None else item.published_date
                     ),
+                    summary=item.summary,
+                    site_name=item.site_name,
+                    authority=item.authority,
+                    rerank_score=item.rerank_score,
                 )
             )
 
@@ -3064,7 +3300,7 @@ class SearchService:
                 best_preferred_response: Optional[SearchResponse] = None
                 best_preferred_count = 0
                 provider_attempts = 0
-                for provider in self._providers:
+                for provider in self._get_active_providers():
                     if not provider.is_available:
                         continue
                     if max_provider_attempts is not None and provider_attempts >= max(1, int(max_provider_attempts)):
@@ -3217,7 +3453,7 @@ class SearchService:
 
         try:
             had_provider_success = False
-            for provider in self._providers:
+            for provider in self._get_active_providers():
                 if not provider.is_available:
                     continue
 
@@ -3292,7 +3528,7 @@ class SearchService:
         logger.info(f"搜索股票事件: {stock_name}({stock_code}) - {event_types}")
         
         # 依次尝试各个搜索引擎
-        for provider in self._providers:
+        for provider in self._get_active_providers():
             if not provider.is_available:
                 continue
             
@@ -3483,7 +3719,7 @@ class SearchService:
                 break
             
             # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
+            available_providers = self._get_active_providers()
             if not available_providers:
                 break
             
@@ -3574,7 +3810,7 @@ class SearchService:
                 ),
             }
 
-        providers = [provider for provider in self._providers if provider.is_available]
+        providers = self._get_active_providers()
         if not providers:
             return {
                 dimension: SearchResponse(
@@ -3748,7 +3984,7 @@ class SearchService:
             logger.info(f"[增强搜索] 第 {i+1}/{max_attempts} 次搜索: {query}")
             
             # 依次尝试各个搜索引擎
-            for provider in self._providers:
+            for provider in self._get_active_providers():
                 if not provider.is_available:
                     continue
                 
@@ -3890,6 +4126,9 @@ def get_search_service() -> SearchService:
                 
                 _search_service = SearchService(
                     anysearch_api_key=getattr(config, "anysearch_api_key", None),
+                    deepseek_search_api_keys=getattr(config, "deepseek_api_keys", None),
+                    deepseek_search_base_url=getattr(config, "deepseek_search_base_url", None),
+                    deepseek_search_timeout_seconds=getattr(config, "deepseek_search_timeout_seconds", 20),
                     searxng_public_instances_enabled=False,
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),

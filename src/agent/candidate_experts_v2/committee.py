@@ -34,6 +34,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.candidate_experts_v2.experts.base import (
@@ -804,6 +805,74 @@ def _safe_tool_call(tool_registry: Any, name: str, **kwargs: Any) -> Dict[str, A
     except Exception as exc:
         logger.debug("_safe_tool_call %s failed: %s", name, exc)
     return {}
+
+
+_HARD_SEED_TOOL_FAILURE_STATUSES = {"failed", "timeout", "not_supported", "unavailable"}
+
+
+def _previous_weekday_ymds(seed_ymd: str, lookback: int = 5) -> List[str]:
+    """Return ``YYYYMMDD`` weekdays before *seed_ymd*, newest first."""
+    text = re.sub(r"\D", "", str(seed_ymd or ""))
+    if len(text) != 8:
+        return []
+    try:
+        cursor = datetime.strptime(text, "%Y%m%d").date() - timedelta(days=1)
+    except ValueError:
+        return []
+    out: List[str] = []
+    for _ in range(max(1, lookback)):
+        while cursor.weekday() >= 5:
+            cursor -= timedelta(days=1)
+        out.append(cursor.strftime("%Y%m%d"))
+        cursor -= timedelta(days=1)
+    return out
+
+
+def _safe_tool_call_with_recent_trade_date(
+    tool_registry: Any,
+    name: str,
+    *,
+    trade_date: str = "",
+    lookback: int = 5,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Call a seed tool and retry previous weekdays when the day has no rows.
+
+    Tushare feeds behind the seed pool (moneyflow_dc / margin_detail /
+    block_trade / top_list / limit_list_d / daily_basic) publish with a lag, so
+    an after-close run may request a trading day whose rows are not available
+    yet. Rather than reporting the source as ``empty``, retry the previous
+    weekdays until one returns rows. The returned payload keeps the actual day
+    in ``trade_date`` and records skipped days in ``trade_date_backoff``.
+
+    Non-empty payloads and hard failures are returned unchanged without extra
+    calls, so genuine errors stay visible instead of being masked by retries.
+    """
+    result = _safe_tool_call(tool_registry, name, trade_date=trade_date, **kwargs)
+    if not trade_date or _extract_payload_items(result):
+        return result
+    status = str(result.get("status") or "").lower()
+    if status in _HARD_SEED_TOOL_FAILURE_STATUSES:
+        return result
+
+    skipped: List[str] = []
+    for candidate in _previous_weekday_ymds(trade_date, lookback):
+        retry = _safe_tool_call(tool_registry, name, trade_date=candidate, **kwargs)
+        retry_status = str(retry.get("status") or "").lower()
+        if retry_status in _HARD_SEED_TOOL_FAILURE_STATUSES:
+            skipped.append(candidate)
+            break
+        if _extract_payload_items(retry):
+            payload = dict(retry)
+            payload["trade_date"] = candidate
+            payload["trade_date_backoff"] = [*skipped, candidate]
+            return payload
+        skipped.append(candidate)
+
+    payload = dict(result)
+    if skipped:
+        payload["trade_date_backoff"] = skipped
+    return payload
 
 
 def _build_signal(
@@ -1925,7 +1994,7 @@ def _build_seed_pool_result(
         ("get_tushare_moneyflow_dc", "moneyflow_dc"),
     ):
         try:
-            result = _safe_tool_call(
+            result = _safe_tool_call_with_recent_trade_date(
                 tool_registry,
                 tool_name,
                 trade_date=trade_date,
@@ -1971,7 +2040,7 @@ def _build_seed_pool_result(
 
     # --- Source 3c: margin financing detail ---
     try:
-        result = _safe_tool_call(
+        result = _safe_tool_call_with_recent_trade_date(
             tool_registry,
             "get_tushare_margin_detail",
             trade_date=trade_date,
@@ -2014,7 +2083,7 @@ def _build_seed_pool_result(
 
     # --- Source 3d: block trades ---
     try:
-        result = _safe_tool_call(
+        result = _safe_tool_call_with_recent_trade_date(
             tool_registry,
             "get_tushare_block_trade",
             trade_date=trade_date,
@@ -2057,7 +2126,7 @@ def _build_seed_pool_result(
 
     # --- Source 3e: dragon-tiger abnormal attention ---
     try:
-        result = _safe_tool_call(
+        result = _safe_tool_call_with_recent_trade_date(
             tool_registry,
             "get_tushare_dragon_tiger_list",
             trade_date=trade_date,
@@ -2100,7 +2169,7 @@ def _build_seed_pool_result(
 
     # --- Source 3c: valuation/liquidity daily-basic anomaly ---
     try:
-        result = _safe_tool_call(
+        result = _safe_tool_call_with_recent_trade_date(
             tool_registry,
             "get_tushare_daily_basic",
             stock_code="",
@@ -2116,7 +2185,7 @@ def _build_seed_pool_result(
                 item,
                 market=market,
                 rank=rank,
-                freshness=str(item.get("trade_date") or trade_date or "latest_trade_date"),
+                freshness=str(item.get("trade_date") or result.get("trade_date") or trade_date or "latest_trade_date"),
             )
             if seed is None:
                 continue
@@ -2128,11 +2197,11 @@ def _build_seed_pool_result(
             status,
             count=accepted,
             error=str(result.get("error") or ""),
-            detail={"trade_date": trade_date, "raw_count": len(items)},
+            detail={"trade_date": result.get("trade_date") or trade_date, "raw_count": len(items)},
         )
         diagnostics.append(diagnostic)
         _log_seed_source_diagnostic(diagnostic)
-        source_quality["valuation_liquidity"] = _source_quality(status, freshness=trade_date or "latest_trade_date", error=str(result.get("error") or ""))
+        source_quality["valuation_liquidity"] = _source_quality(status, freshness=str(result.get("trade_date") or trade_date or "latest_trade_date"), error=str(result.get("error") or ""))
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         logger.debug("seed pool: valuation_liquidity failed: %s", exc)
@@ -2143,7 +2212,7 @@ def _build_seed_pool_result(
 
     # --- Source 4: limit-up pool ---
     try:
-        result = _safe_tool_call(
+        result = _safe_tool_call_with_recent_trade_date(
             tool_registry, "get_tushare_limit_list_d",
             trade_date=trade_date, limit=limit_per_source,
         )
@@ -2176,7 +2245,7 @@ def _build_seed_pool_result(
                     )
                 ],
                 priority_score=78.0 + min(float(_safe_float(streak) or 1.0), 5.0) * 2.0,
-                freshness=trade_date or "latest_trade_date",
+                freshness=str(item.get("trade_date") or result.get("trade_date") or trade_date or "latest_trade_date"),
                 context_hint="涨停池在线来源，只代表短线关注度上升，后续必须核验流动性和可参与空间。",
                 extras={
                     "metrics": {
@@ -2193,10 +2262,10 @@ def _build_seed_pool_result(
                 },
             ))
         status = str(result.get("status") or ("ok" if items else "empty")).lower()
-        diagnostic = _source_diagnostic("limit_up_pool", status, count=len(items), detail={"trade_date": trade_date})
+        diagnostic = _source_diagnostic("limit_up_pool", status, count=len(items), detail={"trade_date": result.get("trade_date") or trade_date})
         diagnostics.append(diagnostic)
         _log_seed_source_diagnostic(diagnostic)
-        source_quality["limit_up_pool"] = _source_quality(status, freshness=trade_date or "latest_trade_date", error=str(result.get("error") or ""))
+        source_quality["limit_up_pool"] = _source_quality(status, freshness=str(result.get("trade_date") or trade_date or "latest_trade_date"), error=str(result.get("error") or ""))
     except Exception as exc:
         logger.debug("seed pool: limit_list_d failed: %s", exc)
         message = f"{type(exc).__name__}: {exc}"

@@ -447,5 +447,16 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
         self.assertEqual(len({id(service) for service in services}), 1)
 
 
+class SearchRetryErrorSurfacingTestCase(unittest.TestCase):
+    def test_post_with_retry_reraises_original_connection_error(self) -> None:
+        import requests
+
+        from src.search_service import _post_with_retry
+
+        with patch("src.search_service.requests.post", side_effect=requests.exceptions.ConnectionError("proxy refused")):
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                _post_with_retry("https://api.anysearch.com/v1/search", headers={}, json={}, timeout=1)
+
+
 if __name__ == "__main__":
     unittest.main()

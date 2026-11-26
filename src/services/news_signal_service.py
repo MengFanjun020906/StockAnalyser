@@ -38,6 +38,15 @@ from src.core.trading_calendar import get_effective_trading_date
 from src.repositories.news_signal_repo import NewsSignalRepository
 from src.repositories.graphiti_outbox_repo import GraphitiOutboxRepository
 from src.services.graphiti.semantic_thresholds import resolve_semantic_threshold
+from src.services.news_event_foundation import (
+    SCOPE_NO_STOCK,
+    TradingCalendar,
+    build_event_foundation_fields,
+    build_raw_foundation_fields,
+    load_trading_calendar,
+)
+from src.data.stock_name_index import get_a_share_name_matcher
+from src.services.news_no_stock_triage import triage_news_item
 
 
 NEWS_SIGNAL_SCHEMA_VERSION = "news_signal_card.v1"
@@ -480,6 +489,90 @@ class NewsEventLLMExtractor:
                 }
             )
         return normalized
+
+
+_FOUNDATION_CALENDAR: Optional[TradingCalendar] = None
+
+
+def _news_event_foundation_enabled() -> bool:
+    try:
+        return bool(getattr(get_config(), "news_event_foundation_enabled", False))
+    except Exception:
+        return False
+
+
+def _news_no_stock_triage_enabled() -> bool:
+    try:
+        return bool(getattr(get_config(), "news_no_stock_triage_enabled", False))
+    except Exception:
+        return False
+
+
+def _no_stock_triage_name_matcher():
+    """返回扩展 A 股名称匹配器；仅在 triage 开关开启时使用。"""
+
+    try:
+        path = getattr(get_config(), "news_no_stock_triage_stock_basic_path", "") or None
+    except Exception:
+        path = None
+    try:
+        return get_a_share_name_matcher(path)
+    except Exception:
+        logger.debug("no_stock triage name matcher unavailable", exc_info=True)
+        return None
+
+
+def reset_news_event_foundation_calendar_cache() -> None:
+    """Clear the cached trading calendar (used by tests and backfills)."""
+
+    global _FOUNDATION_CALENDAR
+    _FOUNDATION_CALENDAR = None
+
+
+def _news_event_foundation_calendar() -> Optional[TradingCalendar]:
+    global _FOUNDATION_CALENDAR
+    if _FOUNDATION_CALENDAR is not None:
+        return _FOUNDATION_CALENDAR
+    try:
+        from sqlalchemy import select
+
+        from src.storage import DatabaseManager, StockDaily
+
+        with DatabaseManager.get_instance().get_session() as session:
+            dates = session.execute(select(StockDaily.date).distinct()).scalars().all()
+        _FOUNDATION_CALENDAR = load_trading_calendar(dates)
+    except Exception:
+        logger.debug("news event foundation calendar unavailable", exc_info=True)
+        return None
+    return _FOUNDATION_CALENDAR
+
+
+def _apply_raw_foundation(raw: Dict[str, Any]) -> None:
+    if not _news_event_foundation_enabled():
+        return
+    triage_enabled = _news_no_stock_triage_enabled()
+    name_matcher = _no_stock_triage_name_matcher() if triage_enabled else None
+    fields = build_raw_foundation_fields(
+        raw,
+        calendar=_news_event_foundation_calendar(),
+        name_matcher=name_matcher.find if name_matcher is not None else None,
+    )
+    raw.update(fields)
+    if triage_enabled and fields.get("stock_scope") == SCOPE_NO_STOCK:
+        # 仅挂内存 raw dict，用于分类/排序展示；不落库、不进事实包、不参与选股。
+        raw["no_stock_triage"] = triage_news_item(raw, name_matcher=name_matcher).to_dict()
+
+
+def _with_event_foundation(
+    events: List[Dict[str, Any]],
+    raw: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not _news_event_foundation_enabled():
+        return events
+    calendar = _news_event_foundation_calendar()
+    for event in events:
+        event.update(build_event_foundation_fields(event, raw=raw, calendar=calendar))
+    return events
 
 
 class NewsSignalService:
@@ -1974,6 +2067,7 @@ class NewsSignalService:
                 continue
             raw = _cjzc_theme_raw_episode(payload, item, target=target, published_at=publish_dt, ingested_at=now)
             _attach_raw_quality(raw, source=str(raw.get("source") or "news_theme_daily"))
+            _apply_raw_foundation(raw)
             raw_rows.append(raw)
             cards.append(self._card_from_theme_item(item, raw, target=target, source="news_theme_daily"))
         return raw_rows, cards
@@ -2038,6 +2132,7 @@ class NewsSignalService:
                 "errors": [],
             }
             _attach_raw_quality(raw, source=source, candidate_text=text)
+            _apply_raw_foundation(raw)
             raw_rows.append(raw)
             card_text = " ".join(
                 part
@@ -3564,7 +3659,7 @@ def _extract_news_events(
     ]
     if llm_extractor is None:
         _annotate_event_llm_diagnostics(fallback_events, {"status": "disabled", "reason": "no_extractor"})
-        return fallback_events
+        return _with_event_foundation(fallback_events, raw)
 
     context = {
         "raw": raw,
@@ -3587,9 +3682,9 @@ def _extract_news_events(
             "message": _compact_text(str(exc), 240),
         }
     if llm_events:
-        return llm_events
+        return _with_event_foundation(llm_events, raw)
     _annotate_event_llm_diagnostics(fallback_events, llm_diagnostics)
-    return fallback_events
+    return _with_event_foundation(fallback_events, raw)
 
 
 def _news_event_extractor_system_prompt() -> str:

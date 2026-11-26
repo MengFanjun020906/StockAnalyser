@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, List, Optional
 
+from src.agent.dimension_evidence import is_unreadable_fundamental_payload
 from src.agent.evidence.freshness import default_window_for_dimension, infer_freshness, valid_until_for
 from src.agent.evidence.schemas import (
     CounterEvidence,
@@ -41,6 +42,11 @@ _TOOL_DIMENSION = {
     "get_sector_rankings": "sector",
     "get_market_indices": "regime",
 }
+
+
+_FUNDAMENTAL_TOOLS = frozenset(
+    name for name, dimension in _TOOL_DIMENSION.items() if dimension == "fundamental"
+)
 
 
 def build_evidence_cards_for_stock(
@@ -83,7 +89,7 @@ def build_evidence_card(
     raw_ref: str,
 ) -> EvidenceCard:
     """Convert one raw tool result into an EvidenceCard."""
-    status = _quality_status(raw)
+    status = _quality_status(raw, tool_name)
     as_of = _as_of(raw)
     freshness = infer_freshness(as_of, dimension)
     source_chain = raw.get("source_chain") if isinstance(raw.get("source_chain"), list) else []
@@ -210,15 +216,22 @@ def packets_to_json(packets: Iterable[ExpertEvidencePacket]) -> List[Dict[str, A
     return [packet.model_dump(mode="json") for packet in packets]
 
 
-def _quality_status(raw: Dict[str, Any]) -> str:
+def _quality_status(raw: Dict[str, Any], tool_name: str = "") -> str:
     status = str(raw.get("status") or "").strip().lower()
     if raw.get("timeout") is True:
         return "timeout"
     if status in {"ok", "partial", "empty", "stale", "failed", "timeout", "unavailable", "not_supported"}:
-        return status
-    if raw.get("error") or raw.get("errors"):
+        resolved = status
+    elif raw.get("error") or raw.get("errors"):
         return "failed"
-    return "partial"
+    else:
+        resolved = "partial"
+    if resolved == "ok" and is_unreadable_fundamental_payload(tool_name, raw):
+        # A financial tool may answer "ok" while every number is a placeholder
+        # zero or the row list is empty; that is an empty payload, not usable
+        # fundamental evidence.
+        return "empty"
+    return resolved
 
 
 def _as_of(raw: Dict[str, Any]) -> Optional[str]:
@@ -265,7 +278,12 @@ def _missing_fields_for(tool_name: str, raw: Dict[str, Any]) -> List[str]:
         "search_stock_fundamentals": ["materials"],
         "detect_market_regime": ["regime", "risk_level"],
     }.get(tool_name, [])
-    return [field for field in required if raw.get(field) in (None, "", [], {})]
+    missing = [field for field in required if raw.get(field) in (None, "", [], {})]
+    if tool_name in _FUNDAMENTAL_TOOLS and is_unreadable_fundamental_payload(tool_name, raw):
+        for field in ("revenue", "net_profit", "grossprofit_margin"):
+            if field not in missing:
+                missing.append(field)
+    return missing
 
 
 def _signals_for(tool_name: str, raw: Dict[str, Any]) -> List[EvidenceSignal]:
@@ -294,7 +312,7 @@ def _signals_for(tool_name: str, raw: Dict[str, Any]) -> List[EvidenceSignal]:
         "get_tushare_express",
         "search_stock_fundamentals",
     }:
-        return _fundamental_signals(raw)
+        return _fundamental_signals(tool_name, raw)
     if tool_name == "search_comprehensive_intel":
         return _news_signals(raw)
     if tool_name == "detect_market_regime":
@@ -405,11 +423,12 @@ def _chip_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
     return signals
 
 
-def _fundamental_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
+def _fundamental_signals(tool_name: str, raw: Dict[str, Any]) -> List[EvidenceSignal]:
     status = str(raw.get("status") or "partial")
     boards = raw.get("belong_boards") or raw.get("boards") or []
-    delta = -6 if status in {"failed", "timeout"} else 1
-    return [_signal("fundamental_context", len(boards) if isinstance(boards, list) else None, None, delta, "基本面信息已获取。" if delta > 0 else "基本面信息不可用。")]
+    if status in {"failed", "timeout"} or is_unreadable_fundamental_payload(tool_name, raw):
+        return [_signal("fundamental_context", None, None, -6, "基本面信息不可用。")]
+    return [_signal("fundamental_context", len(boards) if isinstance(boards, list) else None, None, 1, "基本面信息已获取。")]
 
 
 def _news_signals(raw: Dict[str, Any]) -> List[EvidenceSignal]:
