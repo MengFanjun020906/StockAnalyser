@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.2...HEAD)
 
+- [新功能] 新增 DeepSeek Search API provider（`POST /v1/tools/search`）：配置 `DEEPSEEK_API_KEY(S)` 后自动作为首选搜索源并复用原有 key；无 key 或调用失败自动回落 AnySearch / 其他 provider。
+- [改进] 实时搜索新增 `summary` 长摘要字段（`snippet` 保持短摘要），并透传 `site:` / `after:` / `lang:` 查询语法；408/429/5xx 重试，402 与其余 4xx 不重试；`search_comprehensive_intel` 顶层 `summary` 默认由长摘要填充，`report` 仍由 triage 开关控制。
+
+- [新功能] 新增 `src/services/news_triage_input.py`：复用 `news_no_stock_triage.triage_news_item` 对实时搜索结果（`search_stock_news` / `search_comprehensive_intel`）现算分类与分数，按 `priority`/`score` 稳定降序、0 分沉底且不删除任何条目；`search_comprehensive_intel` 开启时填充既有 `report`/`summary` 输入槽位，使 `news_event` 维度不再永久 `missing_fields=["report"]`。
+- [新功能] 新增“当日外盘/宏观环境”摘要：读取 `raw_news_episodes.no_stock_triage_json` 中 `priority>0` 的新闻，按 `signal_date` 与通道聚合后注入深挖 payload 的 `market_env_brief`；只作背景输入，不参与评分、阈值、规则 8 或点位。
+- [改进] 新增开关 `NEWS_TRIAGE_SEARCH_SORT_ENABLED` 与 `NEWS_TRIAGE_MARKET_BRIEF_ENABLED`（均默认 `false`）；关闭时工具输出与深挖 payload 与既有完全一致。
+- [测试] 新增 `tests/test_news_triage_input.py` 与 `scripts/compare_news_triage_ab.py`：覆盖关闭原样返回、稳定排序与 0 分沉底、report/summary、当日摘要聚合，并提供开/关顺序对照与历史候选回放（≥2 维缺失 → 放行数量）。
+- [文档] `.env.example` 与 `docs/research/no-stock-news-triage.md` 补充实时搜索接入、`report` 字段桥接与回放口径说明。
+- [新功能] 新增无个股新闻分类与排序模块 `src/services/news_no_stock_triage.py`：按 `docs/research/no-stock-news-triage.md` §6 的关键词与地区规则，把 `stock_scope=no_stock` 新闻归到 `us_index` / `us_chain` / `jpkr_chain` / `commodity` / `industrial_policy` / `major_macro` 等通道；分数唯一来源为报告 §4 前瞻性实测效应量，公式 `score=round(100*min(1,|t|/6.8))`（标尺取纳指→电子 t=6.8），`|t|<2.0` 记 0；每条结果携带 `evidence`（β/t/R²/样本量/出处），无实测或无次日预测力的类别（欧洲、商品含同期 β、商品滞后一日、LPR/PMI/CPI、产业政策、重大宏观、复盘等）权重 0、仅保留展示，商品同期 β/t/R² 仅作参考不计分。
+- [改进] 新增开关 `NEWS_NO_STOCK_TRIAGE_ENABLED`（默认 `false`，需同时开启 `NEWS_EVENT_FOUNDATION_ENABLED=true`）与 `NEWS_NO_STOCK_TRIAGE_STOCK_BASIC_PATH`；开启后 triage 结果写入 `raw_news_episodes.no_stock_triage_json`（新增列），重启后可查询；不进事实包、不改变现有评分/阈值/gate/prompt 与选股结果；关闭时行为与既有完全一致。
+- [改进] `scripts/backfill_news_event_foundation.py` 在开关开启时一并计算并写入 `no_stock_triage_json`，报告新增通道/类别/分数分布与 keep/drop/priority>0 统计，可离线补齐历史行。
+- [新功能] 新增 A 股名称字典 `src/data/stock_name_index.py`：默认读取 `data/factor_eval_cache/stock_basic_LD.csv`（约 5,924 条，含退市），排除 `机器人/农产品/太阳能/大西洋` 等 3~4 字通用词；文件缺失时回退内置 `STOCK_NAME_MAP` 的 A 股子集；采用首字索引匹配，避免全量扫描。
+- [改进] `news_event_foundation.extract_security_refs` / `build_raw_foundation_fields` 新增可选 `name_matcher` 参数，仅在 triage 开关开启时使用扩展字典；不传时保持原有 `STOCK_NAME_MAP` 行为。
+- [测试] 新增 `tests/test_stock_name_index.py` 与 `tests/test_no_stock_news_triage.py`：覆盖 CSV 加载、停用词与短名排除、缺文件回退、首字索引匹配、16 档实测分数可追溯、零权重类别、硬丢弃、方向 gate、批量排序、展示隔离守卫。
+- [文档] `docs/research/no-stock-news-triage.md` 新增 §10「工程落地」：记录唯一打分公式、逐档权重与实测数字出处、零权重类别原因、配置项与文件清单；原 §6.5 手工草案标注为已被实现替代。
+
 - [新功能] `scripts/daily_run.sh` 新增 Step 1b：调用 `scripts/sync_main_db_daily.py` 按交易日把主库 `data/stock_analysis.db` 最近 30 个交易日的全市场日线缺口补齐，并同步 `data/adj_factors.db` 复权因子；使用 `INSERT OR IGNORE`，已完整交易日不重拉，不按标的循环。
 - [改进] 主库日线同步幂等且失败隔离：单日异常或上游尚未发布只输出 `[WARN]` 并留待下次运行补齐，不阻断财务快照、新闻信号等后续步骤；写入期间每交易日 PASSIVE checkpoint，结束 TRUNCATE WAL。
 - [测试] 新增 `tests/test_sync_main_db_daily.py`：已完整日跳过、`INSERT OR IGNORE` 不覆盖、重复运行零新增、单日失败不影响其他日、上游未发布显式告警、主库完整时仅补复权因子，共 5 例。
@@ -28,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 板块热榜/龙头股 Tushare 兜底支持按最近交易日回退：当日 `moneyflow_ind_dc` 尚未发布（`empty_data`）时，按工作日向前回退最多 6 天重试，命中日期同步用于 `daily` / `dc_member`，`time` 回填实际命中交易日；不再因当日空数据直接判 `failed`。
 - [修复] Tushare `anns_d` 无权限（403）时自动降级到巨潮公告 `akshare.stock_zh_a_disclosure_report_cninfo`，保留原始错误并标注 `degraded` / `fallback_source`。
 - [文档] `.env.example` 补充 StockAPI token 降级与 `anns_d` 权限降级说明。
+- [修复] 种子池 6 个依赖 Tushare 当日数据的来源（`capital_flow_anomaly` / `margin_financing` / `block_trade` / `dragon_tiger` / `valuation_liquidity` / `limit_up_pool`）统一接入同一个交易日回退辅助函数：收盘后当日接口无数据时，按工作日向前回退最多 5 天重试，命中日期写回 `trade_date` 并记录 `trade_date_backoff`；硬失败（`failed` / `timeout` / `not_supported` / `unavailable`）不重试、不伪装成功。
+- [修复] AnySearch 搜索重试保留原始异常（`reraise=True`）：代理/SSL 失败时直接暴露 `ConnectionError` 及其 SOCKS 细节，不再被 `RetryError` 包裹；`requests` 天然支持环境变量 `HTTPS_PROXY`/`ALL_PROXY`（含 `socks5h://`）。
+- [修复] 基本面证据伪成功：财务类工具返回 `status=ok` 但字段全为占位 0，或行接口返回 ok + 空行时，证据卡质量标为 `empty`、影响标为 `invalid`，深度维度判定计为缺失，不再计为可用。
 - [测试] 新增 `tests/test_prompt_versions.py`：校验两个 prompt 版本常量格式、`selection_context` 中的版本映射，以及版本号不会被注入 prompt 文本。
 - [测试] 新增 `tests/test_valuation_fact.py`：分位计算与 20 日变化、亏损股排除、同业样本不足、历史观测不足、120 天窗口截断、20 日前 PE≤0、缓存缺失降级、展示序列化与 desk/seed 隔离，共 9 例。
 - [文档] 新增 `docs/architecture/valuation-percentile-observation.md`：记录 FAC-03 的边界、数据源、5 个指标字段契约、缺失分档、配置开关，以及动态 PE 与估值综合评分两项不做的原因。
@@ -746,6 +765,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `scripts/update_fundamental_candidates.py` 在“有 pending 股票但无 `fina_indicator` 数据”时返回成功并提示未披露，不再把新股/未披露财报误判为 step2 失败；真实拉取错误仍返回失败。
 - [测试] 补充日线发布滞后回退（含 11-16→11-17 缺口补齐与完成日期）与财务快照“无财报非致命 / 全部报错仍失败”的单测。
 - [文档] `docs/full-guide.md` / `docs/full-guide_EN.md` 补充日线步骤的发布滞后回退语义。
+- [新功能] 新增新闻事件研究地基：`raw_news_episodes` / `news_extracted_events` 增加 `stock_codes_json`、`stock_scope`（`single` / `multi` / `no_stock`）、`trade_date`、`event_category` 与规则 id；抽不到证券代码时显式标 `no_stock`（无标的），不伪造标的。
+- [改进] 新增确定性事件类型映射（财报 / 业绩预告 / 减持 / 增持回购 / 质押 / 监管处罚 / 中标订单 / 分红 / 诉讼 / 停复牌 / 重组并购 / 其他），按固定关键词顺序命中并保留规则 id；`NEWS_EVENT_FOUNDATION_ENABLED` 默认关闭，关闭时入库行为不变。
+- [新功能] 新增手工脚本 `scripts/backfill_news_event_foundation.py`（历史存量回填与覆盖率报告）与 `scripts/settle_news_signal_outcomes.py`（可指定窗口 / 事件 / 重算 / 试算）。
 
 ## [3.14.2](https://github.com/MengFanjun020906/StockAnalyser/compare/v3.14.1...v3.14.2) - 2026-04-30
 

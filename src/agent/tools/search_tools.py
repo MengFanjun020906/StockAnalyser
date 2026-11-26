@@ -27,6 +27,11 @@ from src.agent.sentiment.news_events import score_news_items
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
+from src.services.news_triage_input import (
+    annotate_and_sort_items,
+    build_news_report,
+    build_triage_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +175,19 @@ def _get_search_service():
     """Return shared SearchService singleton."""
     from src.search_service import get_search_service
     return get_search_service()
+
+
+def _news_triage_sort_enabled() -> bool:
+    """实时搜索结果是否按 no_stock triage 排序（默认关闭）。
+
+    只影响条目顺序与附加字段，不改变任何评分公式、阈值或 prompt 判定文字。
+    """
+    try:
+        from src.config import get_config
+
+        return bool(getattr(get_config(), "news_triage_search_sort_enabled", False))
+    except Exception:
+        return False
 
 
 def _canonical_search_code(stock_code: str) -> str:
@@ -1414,6 +1432,7 @@ def _response_to_news_items(response) -> List[Dict[str, Any]]:
         {
             "title": getattr(item, "title", ""),
             "snippet": getattr(item, "snippet", ""),
+            "summary": getattr(item, "summary", None),
             "url": getattr(item, "url", ""),
             "source": getattr(item, "source", ""),
             "published_date": getattr(item, "published_date", None),
@@ -1472,13 +1491,22 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
         return {
             "title": result.title,
             "snippet": result.snippet,
+            "summary": getattr(result, "summary", None),
             "url": result.url,
             "source": result.source,
             "published_date": result.published_date,
             "date_verified": date_verified,
         }
 
-    return {
+    verified_items = [_item(result, date_verified=True) for result in verified_results]
+    unverified_items = [_item(result, date_verified=False) for result in unverified_results]
+    sort_enabled = _news_triage_sort_enabled()
+    if sort_enabled:
+        # 分组内排序，保持“已核验 / 待核验”边界不变；0 分沉底，不删除任何条目。
+        verified_items = annotate_and_sort_items(verified_items, enabled=True)
+        unverified_items = annotate_and_sort_items(unverified_items, enabled=True)
+
+    payload = {
         "status": status,
         "summary": summary,
         "query": response.query,
@@ -1490,11 +1518,11 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
         "results_count": len(visible_results),
         "verified_recent_count": len(verified_results),
         "unverified_results_count": len(unverified_results),
-        "results": [
-            *[_item(result, date_verified=True) for result in verified_results],
-            *[_item(result, date_verified=False) for result in unverified_results],
-        ],
+        "results": [*verified_items, *unverified_items],
     }
+    if sort_enabled:
+        payload["news_triage_sorted"] = True
+    return payload
 
 
 def _handle_score_stock_news_sentiment(
@@ -2158,6 +2186,22 @@ def _preprocess_intel_with_llm(
     }
 
 
+def _build_long_summary(items: List[Dict[str, Any]], *, limit: int = 5) -> str:
+    """用搜索结果的长摘要拼出顶层 summary。
+
+    ``summary`` 是搜索返回的原始长摘要，不依赖任何开关；``report`` 仍由
+    triage 开关控制，两者分工不混。
+    """
+    parts: List[str] = []
+    for item in items[:limit]:
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        title = str(item.get("title") or "").strip()
+        parts.append(f"{title}：{summary}" if title else summary)
+    return "\n".join(parts)
+
+
 def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict:
     """Multi-dimensional intelligence search with LLM-preprocessed structured output."""
     service = _get_search_service()
@@ -2210,13 +2254,19 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
                     "title": r.title,
                     "date": r.published_date or "",
                     "source": r.source,
-                    "snippet": (r.snippet or "")[:80],
+                    "snippet": r.snippet or "",
+                    "summary": getattr(r, "summary", None) or "",
                 })
+
+    sort_enabled = _news_triage_sort_enabled()
+    if sort_enabled and raw_items:
+        # 排序后再交给 LLM 预处理：LLM 看到的顺序即 triage 顺序，0 分沉底。
+        raw_items = annotate_and_sort_items(raw_items, enabled=True)
 
     # Lightweight LLM pass → fixed schema; fallback to raw compact list on failure
     intel = _preprocess_intel_with_llm(raw_items, stock_name, timeout_seconds=4.0)
 
-    return {
+    payload = {
         "status": "ok" if raw_items else "empty",
         "stock_code": _canonical_search_code(stock_code),
         "stock_name": stock_name,
@@ -2234,6 +2284,30 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
             "max_searches": 2,
         }],
     }
+    long_summary = _build_long_summary(raw_items)
+    if long_summary:
+        payload["summary"] = long_summary
+    if sort_enabled and raw_items:
+        # LLM 输出的条目顺序不可控，这里按标题回填 triage 后重排，保证工具输出可验证。
+        triage_by_title = {
+            str(item.get("title") or ""): item.get("news_triage") or {}
+            for item in raw_items
+        }
+
+        def _intel_sort_key(entry: Any) -> tuple:
+            if not isinstance(entry, dict):
+                return (0, 0)
+            triage = triage_by_title.get(str(entry.get("title") or ""), {})
+            return (int(triage.get("priority") or 0), int(triage.get("score") or 0))
+
+        items = intel.get("items") if isinstance(intel, dict) else None
+        if isinstance(items, list):
+            intel = {**intel, "items": sorted(items, key=_intel_sort_key, reverse=True)}
+            payload["intel"] = intel
+        payload["report"] = build_news_report(raw_items)
+        payload["news_triage_summary"] = build_triage_summary(raw_items)
+        payload["news_triage_sorted"] = True
+    return payload
 
 
 search_comprehensive_intel_tool = ToolDefinition(

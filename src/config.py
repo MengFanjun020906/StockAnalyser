@@ -714,6 +714,9 @@ class Config:
 
     # === 搜索引擎配置（支持多 Key 负载均衡）===
     anysearch_api_key: Optional[str] = None  # Unified AnySearch API key
+    # DeepSeek Search API：有 DEEPSEEK_API_KEY(S) 时默认作为首选搜索源
+    deepseek_search_base_url: str = "https://api.deepseek.com"
+    deepseek_search_timeout_seconds: int = 20
     anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
@@ -827,6 +830,11 @@ class Config:
     agent_valuation_fact_enabled: bool = False  # Attach FAC-03 valuation percentile block (display only; never re-ranks or gates)
     agent_valuation_cache_dir: str = ""  # Local factor_eval_cache dir; empty uses data/factor_eval_cache
     agent_decision_outcome_enabled: bool = False  # Write pending decision outcomes for later T+5 settlement (memory data only; never affects selection)
+    news_event_foundation_enabled: bool = False  # Enrich news episodes/events with stock codes, trade date and fine event category at ingest
+    news_no_stock_triage_enabled: bool = False  # Classify/rank no_stock news (display only; never affects selection)
+    news_no_stock_triage_stock_basic_path: str = ""  # A-share basic CSV; empty uses data/factor_eval_cache/stock_basic_LD.csv
+    news_triage_search_sort_enabled: bool = False  # Re-order real-time search news by no_stock triage (order only; no scoring/threshold change)
+    news_triage_market_brief_enabled: bool = False  # Inject a display-only market/overseas brief from triaged news into the deep-dive payload
     agent_candidate_blacklist_codes: List[str] = field(default_factory=list)  # Hard-excluded stock codes for L1 candidate pools
     agent_candidate_min_avg_amount: float = 0.0  # Minimum avg amount for candidates when a source provides liquidity data; 0 disables
     agent_candidate_min_listing_days: int = 0  # Minimum listing days when candidate sources provide listing age; 0 disables
@@ -1527,6 +1535,16 @@ class Config:
             ),
             vision_provider_priority=os.getenv('VISION_PROVIDER_PRIORITY', 'gemini,anthropic,openai'),
             anysearch_api_key=os.getenv('ANYSEARCH_API_KEY') or None,
+            deepseek_search_base_url=(
+                os.getenv('DEEPSEEK_SEARCH_BASE_URL') or 'https://api.deepseek.com'
+            ).strip().rstrip('/'),
+            deepseek_search_timeout_seconds=parse_env_int(
+                os.getenv('DEEPSEEK_SEARCH_TIMEOUT_SECONDS'),
+                20,
+                field_name='DEEPSEEK_SEARCH_TIMEOUT_SECONDS',
+                minimum=1,
+                maximum=120,
+            ),
             anspire_api_keys=anspire_api_keys,
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
@@ -1878,6 +1896,23 @@ class Config:
             agent_valuation_cache_dir=os.getenv('AGENT_VALUATION_CACHE_DIR', ''),
             agent_decision_outcome_enabled=parse_env_bool(
                 os.getenv('AGENT_DECISION_OUTCOME_ENABLED'),
+                default=False,
+            ),
+            news_event_foundation_enabled=parse_env_bool(
+                os.getenv('NEWS_EVENT_FOUNDATION_ENABLED'),
+                default=False,
+            ),
+            news_no_stock_triage_enabled=parse_env_bool(
+                os.getenv('NEWS_NO_STOCK_TRIAGE_ENABLED'),
+                default=False,
+            ),
+            news_no_stock_triage_stock_basic_path=(os.getenv('NEWS_NO_STOCK_TRIAGE_STOCK_BASIC_PATH') or '').strip(),
+            news_triage_search_sort_enabled=parse_env_bool(
+                os.getenv('NEWS_TRIAGE_SEARCH_SORT_ENABLED'),
+                default=False,
+            ),
+            news_triage_market_brief_enabled=parse_env_bool(
+                os.getenv('NEWS_TRIAGE_MARKET_BRIEF_ENABLED'),
                 default=False,
             ),
             agent_deterministic_price_plan_enabled=parse_env_bool(

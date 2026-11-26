@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.agent.evidence import build_evidence_cards_for_stock
 from src.agent.evidence.adapter import cards_to_json
+from src.agent.dimension_evidence import is_unreadable_fundamental_payload
 from src.agent.candidate_experts_v2.seed_facts import compact_seed_fact_packets_for_model
 from src.agent.judge_sanity import apply_judge_sanity
 from src.agent.trade_plan_guard import compute_atr20_pct, validate_plan_fields
@@ -558,6 +559,7 @@ def run_stock_selection_pipeline(
                 else {}
             )
             deep_dive_outputs: List[Dict[str, Any]] = []
+            market_env_brief = _news_triage_market_env_brief()
             for code in deep_targets:
                 detailed_evidence = _balanced_raw_evidence_for_code(ctx, code)
                 if detailed_evidence is None:
@@ -595,6 +597,8 @@ def run_stock_selection_pipeline(
                     "evidence_ledger_summary": _compact_evidence_ledger_for_prompt(ctx),
                     "stock_evidence": prompt_evidence,
                 }
+                if market_env_brief:
+                    deep_dive_payload_in["market_env_brief"] = market_env_brief
                 if setup_router_enabled:
                     deep_dive_payload_in.update(
                         _deep_dive_setup_fields(candidate_records.get(code), market=ctx.market)
@@ -5931,6 +5935,29 @@ def _deep_dive_setup_router_enabled() -> bool:
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _news_triage_market_env_brief() -> str:
+    """当日外盘/宏观环境摘要：仅作为深挖 payload 的背景输入，默认关闭。"""
+    try:
+        config = Config.get_instance()
+        enabled = bool(getattr(config, "news_triage_market_brief_enabled", False))
+    except Exception:
+        enabled = str(os.getenv("NEWS_TRIAGE_MARKET_BRIEF_ENABLED", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if not enabled:
+        return ""
+    try:
+        from src.services.news_triage_input import build_market_env_brief
+
+        return build_market_env_brief()
+    except Exception:
+        logger.debug("news triage market brief skipped", exc_info=True)
+        return ""
+
+
 def _env_float(name: str, default: float, *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
     raw = os.getenv(name)
     try:
@@ -6092,10 +6119,21 @@ def _selection_fundamental_dimension_summary(
         "get_tushare_forecast",
         "search_stock_fundamentals",
     )
-    available = [tool for tool in tools if evidence.get(tool)]
+    available = [
+        tool
+        for tool in tools
+        if evidence.get(tool) and not is_unreadable_fundamental_payload(tool, evidence.get(tool))
+    ]
+    zero_placeholder = [
+        tool
+        for tool in tools
+        if evidence.get(tool) and is_unreadable_fundamental_payload(tool, evidence.get(tool))
+    ]
     failed = [tool for tool in tools if tool in failures]
     if available:
         verdict = "neutral"
+    elif zero_placeholder:
+        verdict = "missing"
     elif failed:
         verdict = "tool_failed"
     else:

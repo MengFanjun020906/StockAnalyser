@@ -56,6 +56,136 @@ def infer_tool_dimension(tool_name: Any) -> str:
     return _TOOL_DIMENSIONS.get(str(tool_name or ""), "other")
 
 
+_FUNDAMENTAL_NUMBER_FIELDS = frozenset({
+    "revenue",
+    "total_revenue",
+    "total_revenue_ps",
+    "revenue_ps",
+    "operate_income",
+    "n_income",
+    "n_income_attr_p",
+    "net_profit",
+    "netprofit_margin",
+    "net_profit_margin",
+    "grossprofit_margin",
+    "gross_margin",
+    "eps",
+    "dt_eps",
+    "roe",
+    "roe_waa",
+    "bps",
+    "ocfps",
+    "pe_ttm",
+    "pb",
+    "dv_ttm",
+    "p_change_min",
+    "p_change_max",
+    "net_profit_min",
+    "net_profit_max",
+    "total_assets",
+    "total_liab",
+    "total_equity",
+})
+_FUNDAMENTAL_FIELD_SUFFIXES = ("_margin", "_revenue", "_profit", "_eps", "_roe", "_bps")
+_ROW_FUNDAMENTAL_TOOLS = frozenset({
+    "get_tushare_daily_basic",
+    "get_tushare_financial_indicators",
+    "get_tushare_financial_statements",
+    "get_tushare_forecast",
+    "get_tushare_express",
+})
+
+
+def is_unreadable_fundamental_payload(tool_name: Any, payload: Any) -> bool:
+    """Return True when a fundamental tool reports success without real values.
+
+    Covers both shapes of pseudo-success: financial fields that are all
+    placeholder zeros, and row-based endpoints that answer ``ok`` with an empty
+    row list. Non-fundamental tools and payloads with unknown shapes return
+    False so their existing handling is untouched.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if has_readable_fundamental_numbers(payload) is False:
+        return True
+    if str(tool_name or "") not in _ROW_FUNDAMENTAL_TOOLS:
+        return False
+    if str(payload.get("status") or "").strip().lower() != "ok":
+        return False
+    row_lists = [
+        payload.get(key)
+        for key in ("items", "rows", "data", "results")
+        if isinstance(payload.get(key), list)
+    ]
+    if not row_lists:
+        return False
+    return all(not rows for rows in row_lists)
+
+
+def has_readable_fundamental_numbers(payload: Any) -> Optional[bool]:
+    """Report whether a fundamental payload carries at least one real number.
+
+    ``None`` means the payload exposes no financial fields at all (for example a
+    pure business-context description), so callers should keep their default
+    handling. ``False`` means financial fields exist but every value is a
+    placeholder zero/blank: that is a pseudo-success and must be treated as
+    missing evidence instead of an available signal.
+    """
+    rows = list(_fundamental_rows(payload))
+    if not rows:
+        return None
+    saw_field = False
+    for row in rows:
+        for key, value in row.items():
+            field = str(key).lower()
+            if field not in _FUNDAMENTAL_NUMBER_FIELDS and not field.endswith(_FUNDAMENTAL_FIELD_SUFFIXES):
+                continue
+            saw_field = True
+            number = _number_or_none(value)
+            if number is not None and abs(number) > 0:
+                return True
+    if not saw_field:
+        return None
+    return False
+
+
+def _fundamental_rows(payload: Any, depth: int = 0) -> Iterable[Dict[str, Any]]:
+    if depth > 3:
+        return
+    if isinstance(payload, dict):
+        yield payload
+        for key in (
+            "items",
+            "rows",
+            "data",
+            "results",
+            "statements",
+            "metrics",
+            "signals",
+            "income",
+            "balance",
+            "cashflow",
+        ):
+            yield from _fundamental_rows(payload.get(key), depth + 1)
+    elif isinstance(payload, list):
+        for item in payload[:50]:
+            yield from _fundamental_rows(item, depth + 1)
+
+
+def _number_or_none(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip().replace(",", "").replace("%", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def select_balanced_tool_calls(
     tool_calls: Iterable[Dict[str, Any]],
     *,
@@ -204,8 +334,12 @@ def _tool_evidence_state(call: Dict[str, Any]) -> str:
             return "failed"
         return "available"
     state = _payload_evidence_state(payload)
-    if state == "available" and infer_tool_dimension(call.get("tool")) == "intel":
-        return _intel_evidence_state(payload)
+    if state == "available":
+        dimension = infer_tool_dimension(call.get("tool"))
+        if dimension == "intel":
+            return _intel_evidence_state(payload)
+        if dimension == "fundamental" and is_unreadable_fundamental_payload(call.get("tool"), payload):
+            return "failed"
     return state
 
 
